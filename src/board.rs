@@ -1,0 +1,1183 @@
+//! Builds the board from what each machine said: feed cards matched to the herdr workspaces
+//! they run in, plus a card for every other workspace with an agent, and the slot count of
+//! every session.
+
+use std::collections::{BTreeMap, HashSet};
+
+use chrono::{DateTime, Local, NaiveDate, TimeZone};
+
+use crate::config::{Config, Machine};
+use crate::feed::{Feed, FeedCard};
+use crate::herdr::{self, Agent, JUMP_TOKEN, Snapshot, Workspace};
+use crate::model::{AgentInfo, Attention, Card, Priority, Slots, Source, Stage, Summary, Verdict};
+use crate::poll::{Conn, MachineData};
+
+/// Everything Kerdr knows about one machine.
+#[derive(Clone, Debug)]
+pub struct MachineState {
+    pub machine: Machine,
+    pub conn: Conn,
+    /// The last read that worked: what the board shows, dimmed, while the machine is away.
+    pub data: Option<MachineData>,
+    pub feed: Option<Feed>,
+    pub feed_error: Option<String>,
+    pub last_ok: Option<DateTime<Local>>,
+}
+
+impl MachineState {
+    pub fn new(machine: Machine) -> MachineState {
+        let conn = if machine.hidden {
+            Conn::Hidden
+        } else {
+            Conn::Connecting
+        };
+        MachineState {
+            machine,
+            conn,
+            data: None,
+            feed: None,
+            feed_error: None,
+            last_ok: None,
+        }
+    }
+
+    /// The name the board uses: the config's, which for a picker entry is its SSH target until
+    /// the machine says its hostname.
+    pub fn name(&self) -> String {
+        if self.machine.is_local() {
+            return self.machine.name.clone();
+        }
+        match (&self.data, &self.machine.ssh) {
+            (
+                Some(MachineData {
+                    host: Some(host), ..
+                }),
+                Some(ssh),
+            ) if self.machine.name == *ssh => host.clone(),
+            _ => self.machine.name.clone(),
+        }
+    }
+
+    pub fn answers_to(&self, name: &str) -> bool {
+        let name = name.trim();
+        self.name().eq_ignore_ascii_case(name)
+            || self.machine.name.eq_ignore_ascii_case(name)
+            || self
+                .data
+                .as_ref()
+                .and_then(|d| d.host.as_deref())
+                .is_some_and(|h| h.eq_ignore_ascii_case(name))
+            || self
+                .machine
+                .ssh
+                .as_deref()
+                .is_some_and(|s| s.eq_ignore_ascii_case(name))
+    }
+
+    pub fn is_shown(&self) -> bool {
+        !matches!(self.conn, Conn::Hidden)
+    }
+
+    /// Set when the board's data for this machine isn't fresh.
+    pub fn cached_at(&self) -> Option<DateTime<Local>> {
+        if self.conn.is_live() {
+            None
+        } else {
+            self.last_ok
+        }
+    }
+
+    pub fn snapshot(&self, session: &str) -> Option<&Snapshot> {
+        self.data.as_ref()?.snapshots.get(session)?.as_ref().ok()
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct SessionRow {
+    pub machine: String,
+    pub session: String,
+    pub running: bool,
+    pub slots: Slots,
+    pub needs: usize,
+    pub cards: usize,
+    pub cached: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WorkspaceRow {
+    pub machine: String,
+    pub session: String,
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub card: Option<String>,
+    pub note: Option<String>,
+    pub cached: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Board {
+    pub cards: Vec<Card>,
+    pub sessions: Vec<SessionRow>,
+    pub workspaces: Vec<WorkspaceRow>,
+    pub machine_order: Vec<String>,
+}
+
+struct WsRef<'a> {
+    mi: usize,
+    session: String,
+    ws: &'a Workspace,
+    agents: Vec<&'a Agent>,
+}
+
+fn workspaces<'a>(machines: &'a [MachineState], cfg: &Config) -> Vec<WsRef<'a>> {
+    let mut out = Vec::new();
+    for (mi, m) in machines.iter().enumerate() {
+        if !m.is_shown() {
+            continue;
+        }
+        let Some(data) = &m.data else { continue };
+        for (session, snap) in &data.snapshots {
+            if !cfg.board.wants(session) {
+                continue;
+            }
+            let Ok(snap) = snap else { continue };
+            for ws in &snap.workspaces {
+                out.push(WsRef {
+                    mi,
+                    session: session.clone(),
+                    ws,
+                    agents: snap.agents_in(&ws.workspace_id).collect(),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// herdr's view of a workspace's agents, the most urgent first: blocked (asking), working,
+/// done (finished, not yet seen), idle.
+fn herdr_status(w: &WsRef) -> Option<String> {
+    let statuses: Vec<&str> = w
+        .agents
+        .iter()
+        .filter_map(|a| a.agent_status.as_deref())
+        .collect();
+    for want in ["blocked", "working", "done", "idle"] {
+        if statuses.contains(&want) {
+            return Some(want.to_string());
+        }
+    }
+    if !w.agents.is_empty() {
+        return w.ws.agent_status.clone().or(Some("unknown".into()));
+    }
+    None
+}
+
+fn running_title(w: &WsRef) -> Option<String> {
+    w.agents
+        .iter()
+        .find(|a| a.agent_status.as_deref() == Some("working"))
+        .and_then(|a| a.terminal_title_stripped.clone())
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// Decides what a card needs from you, from what the feed says and what herdr sees.
+pub struct Signals<'a> {
+    pub closed: bool,
+    pub token: Option<&'a str>,
+    pub herdr: Option<&'a str>,
+    pub feed: Option<Attention>,
+    pub feed_status: Option<&'a str>,
+    pub needs: Option<&'a str>,
+    pub blocker: Option<&'a str>,
+    pub running_title: Option<&'a str>,
+    pub from_feed: bool,
+}
+
+pub fn attention(s: &Signals) -> (Attention, String) {
+    let status_or = |fallback: &str| s.feed_status.unwrap_or(fallback).to_string();
+    if s.closed {
+        return (Attention::Done, "done".into());
+    }
+    if let Some(att) = s.token.and_then(Attention::parse) {
+        return (att, status_or(att.label()));
+    }
+    if s.herdr == Some("blocked") {
+        return (
+            Attention::NeedsYou,
+            s.needs.unwrap_or("asking you something").to_string(),
+        );
+    }
+    if s.feed == Some(Attention::NeedsYou) {
+        return (
+            Attention::NeedsYou,
+            s.needs
+                .map(str::to_string)
+                .unwrap_or_else(|| status_or("waiting on you")),
+        );
+    }
+    if s.feed == Some(Attention::Blocked) {
+        return (
+            Attention::Blocked,
+            s.blocker.unwrap_or("blocked").to_string(),
+        );
+    }
+    if s.herdr == Some("working") {
+        let why = s.running_title.or(s.feed_status).unwrap_or("working");
+        return (Attention::Running, why.to_string());
+    }
+    if s.feed == Some(Attention::Waiting) {
+        return (Attention::Waiting, status_or("waiting"));
+    }
+    match s.herdr {
+        // The silent wait: the agent stopped, and nothing it wrote says what for.
+        Some("done") | Some("idle") if s.from_feed => (
+            Attention::NeedsYou,
+            "its turn ended; nothing says what it's waiting on".into(),
+        ),
+        Some("done") => (Attention::NeedsYou, "finished, not yet seen".into()),
+        Some("idle") | Some("unknown") => (Attention::Idle, "idle".into()),
+        _ => match s.feed {
+            Some(Attention::Running) => (Attention::Running, status_or("under way")),
+            Some(att) => (att, status_or(att.label())),
+            None => (Attention::Idle, status_or("idle")),
+        },
+    }
+}
+
+fn parse_time(s: &str) -> Option<DateTime<Local>> {
+    if let Ok(t) = DateTime::parse_from_rfc3339(s.trim()) {
+        return Some(t.with_timezone(&Local));
+    }
+    let date = NaiveDate::parse_from_str(s.trim().get(..10)?, "%Y-%m-%d").ok()?;
+    Local
+        .from_local_datetime(&date.and_hms_opt(12, 0, 0)?)
+        .single()
+}
+
+fn last_two(id: &str) -> Option<String> {
+    let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
+    (digits.len() >= 2).then(|| digits[digits.len() - 2..].to_string())
+}
+
+pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
+    let all_ws = workspaces(machines, cfg);
+    let mut claimed: HashSet<(usize, String, String)> = HashSet::new();
+    let mut cards = Vec::new();
+
+    // One copy of each feed card: the one from its home machine, else one that's live.
+    let mut chosen: BTreeMap<String, (usize, &FeedCard, &Feed)> = BTreeMap::new();
+    for (mi, m) in machines.iter().enumerate() {
+        if !m.is_shown() {
+            continue;
+        }
+        let Some(feed) = &m.feed else { continue };
+        let source = feed.source.clone().unwrap_or_else(|| "feed".into());
+        for fc in &feed.cards {
+            let session = fc
+                .workspace
+                .as_ref()
+                .and_then(|w| w.session.as_deref())
+                .or_else(|| fc.home.as_ref().and_then(|h| h.session.as_deref()));
+            if session.is_some_and(|s| !cfg.board.wants(s)) {
+                continue;
+            }
+            let key = format!("{source}:{}", fc.id);
+            let home_here = |mi: usize| {
+                fc.home
+                    .as_ref()
+                    .and_then(|h| h.machine.as_deref())
+                    .is_some_and(|h| machines[mi].answers_to(h))
+            };
+            let better = match chosen.get(&key) {
+                None => true,
+                Some((pmi, _, _)) => {
+                    (home_here(mi) && !home_here(*pmi))
+                        || (home_here(mi) == home_here(*pmi)
+                            && m.conn.is_live()
+                            && !machines[*pmi].conn.is_live())
+                }
+            };
+            if better {
+                chosen.insert(key, (mi, fc, feed));
+            }
+        }
+    }
+
+    // Each feed card's stage and home, and the workspace its feed names.
+    struct Pending<'a> {
+        key: &'a String,
+        mi: usize,
+        fc: &'a FeedCard,
+        state: String,
+        stage: Stage,
+        home_mi: Option<usize>,
+        home_session: Option<String>,
+        ws: Option<usize>,
+    }
+    let ws_key = |w: &WsRef| (w.mi, w.session.clone(), w.ws.workspace_id.clone());
+    let mut pending: Vec<Pending> = Vec::new();
+    for (key, (mi, fc, _feed)) in &chosen {
+        let state = fc.state.as_deref().unwrap_or("active").to_ascii_lowercase();
+        let stage = fc
+            .stage
+            .as_deref()
+            .and_then(Stage::parse)
+            .unwrap_or(if state == "closed" {
+                Stage::Maintain
+            } else if state == "queued" || state == "shelved" {
+                Stage::Backlog
+            } else {
+                Stage::Build
+            });
+        let home_mi = fc
+            .home
+            .as_ref()
+            .and_then(|h| h.machine.as_deref())
+            .and_then(|h| {
+                machines
+                    .iter()
+                    .position(|m| m.is_shown() && m.answers_to(h))
+            });
+        let mut ws = None;
+        if let Some(fw) = &fc.workspace
+            && let (Some(session), Some(id)) = (&fw.session, &fw.id)
+        {
+            ws = all_ws
+                .iter()
+                .position(|w| w.mi == *mi && &w.session == session && &w.ws.workspace_id == id);
+        }
+        if let Some(i) = ws {
+            claimed.insert(ws_key(&all_ws[i]));
+        }
+        pending.push(Pending {
+            key,
+            mi: *mi,
+            fc,
+            state,
+            stage,
+            home_mi,
+            home_session: fc.home.as_ref().and_then(|h| h.session.clone()),
+            ws,
+        });
+    }
+
+    // A workspace named for a card ("43-...") is only a guess, so it's taken only when it's sure:
+    // the agent's pane title names the card, or exactly one open card in that session ends in
+    // those digits and no other card has the workspace. (#43 and #143 both end in 43.)
+    let open_work = |p: &Pending| !matches!(p.stage, Stage::Backlog | Stage::Maintain);
+    for k in 0..pending.len() {
+        let p = &pending[k];
+        if p.ws.is_some() || !open_work(p) {
+            continue;
+        }
+        let (Some(hmi), Some(session), Some(two)) =
+            (p.home_mi, p.home_session.clone(), last_two(&p.fc.id))
+        else {
+            continue;
+        };
+        let prefix = format!("{two}-");
+        let candidates: Vec<usize> = all_ws
+            .iter()
+            .enumerate()
+            .filter(|(_, w)| {
+                w.mi == hmi
+                    && w.session == session
+                    && w.ws.label.starts_with(&prefix)
+                    && !claimed.contains(&ws_key(w))
+            })
+            .map(|(i, _)| i)
+            .collect();
+        let named_as = format!("{} ", p.fc.reference());
+        let named: Vec<usize> = candidates
+            .iter()
+            .copied()
+            .filter(|&i| {
+                all_ws[i]
+                    .agents
+                    .iter()
+                    .any(|a| a.title.as_deref().is_some_and(|t| t.contains(&named_as)))
+            })
+            .collect();
+        let pick = if named.len() == 1 {
+            Some(named[0])
+        } else if candidates.len() == 1 {
+            let rivals = pending
+                .iter()
+                .filter(|o| {
+                    open_work(o)
+                        && o.ws.is_none()
+                        && o.home_mi == Some(hmi)
+                        && o.home_session.as_deref() == Some(session.as_str())
+                        && last_two(&o.fc.id).as_deref() == Some(two.as_str())
+                })
+                .count();
+            (rivals == 1).then_some(candidates[0])
+        } else {
+            None
+        };
+        if let Some(i) = pick {
+            claimed.insert(ws_key(&all_ws[i]));
+            pending[k].ws = Some(i);
+        }
+    }
+
+    for p in &pending {
+        let fc = p.fc;
+        let closed = p.state == "closed";
+        let ws: Option<&WsRef> = p.ws.map(|i| &all_ws[i]);
+        let card_mi = ws.map(|w| w.mi).or(p.home_mi).unwrap_or(p.mi);
+        let herdr = ws.and_then(herdr_status);
+        let title = ws.and_then(running_title);
+        let token = ws
+            .and_then(|w| w.ws.tokens.get("kerdr_status"))
+            .map(String::as_str);
+        let (att, why) = attention(&Signals {
+            closed,
+            token,
+            herdr: herdr.as_deref(),
+            feed: fc.attention.as_deref().and_then(Attention::parse),
+            feed_status: fc.status.as_deref(),
+            needs: fc.needs.as_deref(),
+            blocker: fc.blockers.first().map(String::as_str),
+            running_title: title.as_deref(),
+            from_feed: true,
+        });
+        let session = ws
+            .map(|w| w.session.clone())
+            .or_else(|| fc.workspace.as_ref().and_then(|w| w.session.clone()))
+            .or(p.home_session.clone());
+        cards.push(Card {
+            key: p.key.clone(),
+            reference: fc.reference(),
+            title: fc.title.clone(),
+            stage: p.stage,
+            attention: att,
+            why,
+            machine: machines[card_mi].name(),
+            machine_index: card_mi,
+            session,
+            workspace_id: ws.map(|w| w.ws.workspace_id.clone()),
+            workspace_label: ws.map(|w| w.ws.label.clone()),
+            priority: fc
+                .priority
+                .as_deref()
+                .map(Priority::parse)
+                .unwrap_or_default(),
+            background: fc.lane.as_deref() == Some("background") || p.state == "background",
+            cached_at: machines[card_mi].cached_at(),
+            updated: fc.updated.as_deref().and_then(parse_time),
+            stale_days: fc.stale_days,
+            state: fc.state.clone(),
+            detail: Some(fc.clone()),
+            agents: ws.map(agent_infos).unwrap_or_default(),
+            source: Source::Feed,
+            progress: fc.criteria_progress(),
+        });
+    }
+
+    // Every other workspace with an agent, or with a stage an agent reported, is a card too.
+    for w in &all_ws {
+        if claimed.contains(&(w.mi, w.session.clone(), w.ws.workspace_id.clone())) {
+            continue;
+        }
+        let reported_stage = w.ws.tokens.get("kerdr_stage").and_then(|s| Stage::parse(s));
+        if w.agents.is_empty() && reported_stage.is_none() {
+            continue;
+        }
+        let m = &machines[w.mi];
+        let herdr = herdr_status(w);
+        let title = running_title(w);
+        let token = w.ws.tokens.get("kerdr_status").map(String::as_str);
+        let note = w.ws.tokens.get("kerdr_note").map(String::as_str);
+        let (att, why) = attention(&Signals {
+            closed: reported_stage == Some(Stage::Maintain),
+            token,
+            herdr: herdr.as_deref(),
+            feed: None,
+            feed_status: note,
+            needs: note,
+            blocker: note,
+            running_title: title.as_deref(),
+            from_feed: false,
+        });
+        let agent_title = w
+            .agents
+            .iter()
+            .find_map(|a| a.title.as_deref().map(herdr::clean_title))
+            .filter(|t| !t.is_empty())
+            .or_else(|| {
+                w.agents
+                    .iter()
+                    .find_map(|a| a.terminal_title_stripped.clone())
+                    .filter(|t| !t.trim().is_empty())
+            });
+        let label = if w.ws.label.is_empty() {
+            w.ws.workspace_id.clone()
+        } else {
+            w.ws.label.clone()
+        };
+        cards.push(Card {
+            key: format!("ws:{}:{}:{}", m.name(), w.session, w.ws.workspace_id),
+            reference: label.clone(),
+            title: agent_title.unwrap_or_else(|| label.clone()),
+            stage: reported_stage.unwrap_or(Stage::Build),
+            attention: att,
+            why,
+            machine: m.name(),
+            machine_index: w.mi,
+            session: Some(w.session.clone()),
+            workspace_id: Some(w.ws.workspace_id.clone()),
+            workspace_label: Some(label),
+            priority: Priority::Normal,
+            background: cfg.board.unlimited.iter().any(|u| u == &w.session),
+            cached_at: m.cached_at(),
+            updated: None,
+            stale_days: None,
+            state: None,
+            detail: None,
+            agents: agent_infos(w),
+            source: Source::Workspace,
+            progress: w
+                .ws
+                .tokens
+                .get("kerdr_progress")
+                .and_then(|p| parse_progress(p)),
+        });
+    }
+
+    sort_cards(&mut cards);
+
+    // Sessions and their slots: the feed's count when it gives one, else Kerdr's own.
+    let mut sessions = Vec::new();
+    let mut machine_order = Vec::new();
+    for (mi, m) in machines.iter().enumerate() {
+        if !m.is_shown() {
+            continue;
+        }
+        let name = m.name();
+        machine_order.push(name.clone());
+        let Some(data) = &m.data else { continue };
+        for info in data.sessions.iter().filter(|s| cfg.board.wants(&s.name)) {
+            let unlimited = cfg.board.unlimited.iter().any(|u| u == &info.name);
+            let feed_slots = m.feed.as_ref().and_then(|f| f.sessions.get(&info.name));
+            let used_by_agents = all_ws
+                .iter()
+                .filter(|w| w.mi == mi && w.session == info.name && !w.agents.is_empty())
+                .count() as u32;
+            let slots = match feed_slots {
+                Some(fs) => Slots {
+                    used: fs.used,
+                    limit: fs.limit,
+                },
+                None => Slots {
+                    used: used_by_agents,
+                    limit: if unlimited {
+                        None
+                    } else {
+                        Some(cfg.board.slots)
+                    },
+                },
+            };
+            let in_session =
+                |c: &&Card| c.machine == name && c.session.as_deref() == Some(info.name.as_str());
+            let open_cards = cards
+                .iter()
+                .filter(in_session)
+                .filter(|c| !matches!(c.stage, Stage::Backlog | Stage::Maintain))
+                .count();
+            sessions.push(SessionRow {
+                machine: name.clone(),
+                session: info.name.clone(),
+                running: info.running,
+                slots,
+                needs: cards
+                    .iter()
+                    .filter(in_session)
+                    .filter(|c| c.needs_you())
+                    .count(),
+                cards: open_cards,
+                cached: !m.conn.is_live(),
+                error: data
+                    .snapshots
+                    .get(&info.name)
+                    .and_then(|s| s.as_ref().err().cloned())
+                    .or_else(|| m.feed_error.clone()),
+            });
+        }
+    }
+
+    let card_for_ws: BTreeMap<(String, String, String), &Card> = cards
+        .iter()
+        .filter_map(|c| {
+            Some((
+                (
+                    c.machine.clone(),
+                    c.session.clone()?,
+                    c.workspace_id.clone()?,
+                ),
+                c,
+            ))
+        })
+        .collect();
+    let workspaces = all_ws
+        .iter()
+        .map(|w| {
+            let m = &machines[w.mi];
+            let card = card_for_ws.get(&(m.name(), w.session.clone(), w.ws.workspace_id.clone()));
+            WorkspaceRow {
+                machine: m.name(),
+                session: w.session.clone(),
+                id: w.ws.workspace_id.clone(),
+                label: w.ws.label.clone(),
+                status: herdr_status(w).unwrap_or_else(|| "no agent".into()),
+                card: card.map(|c| c.key.clone()),
+                note: card
+                    .filter(|c| c.attention == Attention::Done)
+                    .map(|_| "its card is done".to_string()),
+                cached: !m.conn.is_live(),
+            }
+        })
+        .collect();
+
+    Board {
+        cards,
+        sessions,
+        workspaces,
+        machine_order,
+    }
+}
+
+fn agent_infos(w: &WsRef) -> Vec<AgentInfo> {
+    w.agents
+        .iter()
+        .map(|a| AgentInfo {
+            agent: a.agent.clone().unwrap_or_else(|| "agent".into()),
+            status: a.agent_status.clone().unwrap_or_else(|| "unknown".into()),
+            pane_id: a.pane_id.clone(),
+            title: a.title.as_deref().map(herdr::clean_title),
+        })
+        .collect()
+}
+
+pub fn parse_progress(s: &str) -> Option<(u32, u32)> {
+    let (a, b) = s.split_once('/')?;
+    let (a, b) = (a.trim().parse().ok()?, b.trim().parse().ok()?);
+    (b > 0 && a <= b).then_some((a, b))
+}
+
+fn backlog_group(c: &Card) -> u8 {
+    let waits = c
+        .detail
+        .as_ref()
+        .is_some_and(|d| d.waits_on.iter().any(|w| w.open != Some(false)));
+    if c.priority == Priority::High {
+        0
+    } else if c.state.as_deref() == Some("shelved") {
+        1
+    } else if waits {
+        2
+    } else {
+        3
+    }
+}
+
+fn sort_cards(cards: &mut [Card]) {
+    cards.sort_by(|a, b| {
+        a.stage.cmp(&b.stage).then_with(|| match a.stage {
+            Stage::Backlog => backlog_group(a)
+                .cmp(&backlog_group(b))
+                .then_with(|| b.stale_days.unwrap_or(0).cmp(&a.stale_days.unwrap_or(0)))
+                .then_with(|| a.reference.cmp(&b.reference)),
+            Stage::Maintain => {
+                let closed = |c: &Card| {
+                    c.detail
+                        .as_ref()
+                        .and_then(|d| d.closed.clone())
+                        .unwrap_or_default()
+                };
+                closed(b)
+                    .cmp(&closed(a))
+                    .then_with(|| b.reference.cmp(&a.reference))
+            }
+            _ => a
+                .attention
+                .cmp(&b.attention)
+                .then_with(|| a.priority.cmp(&b.priority))
+                .then_with(|| a.cached_at.is_some().cmp(&b.cached_at.is_some()))
+                .then_with(|| a.reference.cmp(&b.reference)),
+        })
+    });
+}
+
+/// Which part of the board is in view.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Scope {
+    All,
+    Machine(String),
+    Session(String, String),
+}
+
+impl Scope {
+    pub fn contains(&self, card: &Card) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Machine(m) => &card.machine == m,
+            Scope::Session(m, s) => {
+                &card.machine == m && card.session.as_deref() == Some(s.as_str())
+            }
+        }
+    }
+
+    pub fn contains_session(&self, row: &SessionRow) -> bool {
+        match self {
+            Scope::All => true,
+            Scope::Machine(m) => &row.machine == m,
+            Scope::Session(m, s) => &row.machine == m && &row.session == s,
+        }
+    }
+}
+
+pub fn summarize(board: &Board, scope: &Scope, machines: &[MachineState]) -> Summary {
+    let cards: Vec<&Card> = board.cards.iter().filter(|c| scope.contains(c)).collect();
+    let open = |c: &&&Card| !matches!(c.stage, Stage::Backlog | Stage::Maintain);
+    let mut s = Summary {
+        needs_you: cards
+            .iter()
+            .filter(open)
+            .filter(|c| c.attention == Attention::NeedsYou)
+            .count(),
+        running: cards
+            .iter()
+            .filter(open)
+            .filter(|c| matches!(c.attention, Attention::Running | Attention::Waiting))
+            .count(),
+        blocked: cards
+            .iter()
+            .filter(open)
+            .filter(|c| c.attention == Attention::Blocked)
+            .count(),
+        unreachable: cards
+            .iter()
+            .filter(open)
+            .filter(|c| c.attention == Attention::Unreachable)
+            .count(),
+        cached: cards
+            .iter()
+            .filter(open)
+            .filter(|c| c.cached_at.is_some())
+            .count(),
+        cached_since: cards.iter().filter_map(|c| c.cached_at).min(),
+        backlog: cards.iter().filter(|c| c.stage == Stage::Backlog).count(),
+        queued: cards
+            .iter()
+            .filter(|c| c.stage == Stage::Backlog && c.state.as_deref() != Some("shelved"))
+            .count(),
+        shelved: cards
+            .iter()
+            .filter(|c| c.state.as_deref() == Some("shelved"))
+            .count(),
+        ..Default::default()
+    };
+    let rows: Vec<&SessionRow> = board
+        .sessions
+        .iter()
+        .filter(|r| scope.contains_session(r))
+        .collect();
+    for r in rows.iter().filter(|r| r.running) {
+        if let Some(limit) = r.slots.limit {
+            s.slots_used += r.slots.used;
+            s.slots_limit += limit;
+            if r.slots.is_full() {
+                s.full_sessions.push(r.session.clone());
+            }
+        }
+    }
+    let _ = machines;
+    let limited: Vec<&&SessionRow> = rows
+        .iter()
+        .filter(|r| r.slots.limit.is_some() && r.running)
+        .collect();
+    s.verdict = Some(if s.needs_you > 0 {
+        Verdict::FinishFirst(s.needs_you)
+    } else if limited.is_empty() {
+        Verdict::Empty
+    } else if let Some(best) = limited
+        .iter()
+        .filter(|r| !r.slots.is_full())
+        .max_by_key(|r| {
+            (
+                r.slots.free().unwrap_or(0),
+                std::cmp::Reverse(r.session.clone()),
+            )
+        })
+    {
+        let machines_in_view: std::collections::BTreeSet<&str> =
+            limited.iter().map(|r| r.machine.as_str()).collect();
+        let place = if machines_in_view.len() > 1 {
+            format!("{} on {}", best.session, best.machine)
+        } else {
+            best.session.clone()
+        };
+        Verdict::Room {
+            session: place,
+            free: best.slots.free().unwrap_or(0),
+        }
+    } else {
+        Verdict::Full
+    });
+    s
+}
+
+/// The `kerdr_jump` token one of Kerdr's in-herdr keys left on a workspace, if any.
+pub fn jump_request(workspaces: &[Workspace]) -> Option<(String, String)> {
+    workspaces.iter().find_map(|w| {
+        w.tokens
+            .get(JUMP_TOKEN)
+            .map(|v| (w.workspace_id.clone(), v.clone()))
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::feed::{FeedSlots, FeedWorkspace, Home};
+    use crate::herdr::SessionInfo;
+
+    fn machine(name: &str, local: bool) -> Machine {
+        Machine {
+            name: name.into(),
+            ssh: (!local).then(|| name.to_lowercase()),
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        }
+    }
+
+    fn ws(id: &str, label: &str) -> Workspace {
+        Workspace {
+            workspace_id: id.into(),
+            label: label.into(),
+            ..Default::default()
+        }
+    }
+
+    fn agent(ws: &str, status: &str) -> Agent {
+        Agent {
+            agent: Some("claude".into()),
+            agent_status: Some(status.into()),
+            pane_id: format!("{ws}:p1"),
+            workspace_id: ws.into(),
+            ..Default::default()
+        }
+    }
+
+    fn live(machine: Machine, sessions: Vec<(&str, Snapshot)>, feed: Option<Feed>) -> MachineState {
+        let mut m = MachineState::new(machine);
+        m.conn = Conn::Live {
+            latency: Default::default(),
+        };
+        m.data = Some(MachineData {
+            host: Some(m.machine.name.clone()),
+            sessions: sessions
+                .iter()
+                .map(|(n, _)| SessionInfo {
+                    name: n.to_string(),
+                    running: true,
+                    default: false,
+                })
+                .collect(),
+            snapshots: sessions
+                .into_iter()
+                .map(|(n, s)| (n.to_string(), Ok(s)))
+                .collect(),
+            ..Default::default()
+        });
+        m.feed = feed;
+        m
+    }
+
+    fn feed_card(id: &str, stage: &str, state: &str) -> FeedCard {
+        FeedCard {
+            id: id.into(),
+            title: format!("card {id}"),
+            stage: Some(stage.into()),
+            state: Some(state.into()),
+            home: Some(Home {
+                machine: Some("build-box".into()),
+                session: Some("default".into()),
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn the_silent_wait_needs_you() {
+        let (att, why) = attention(&Signals {
+            closed: false,
+            token: None,
+            herdr: Some("done"),
+            feed: Some(Attention::Running),
+            feed_status: Some("Under way"),
+            needs: None,
+            blocker: None,
+            running_title: None,
+            from_feed: true,
+        });
+        assert_eq!(att, Attention::NeedsYou);
+        assert!(why.contains("turn ended"));
+    }
+
+    #[test]
+    fn waiting_on_a_review_is_not_needing_you() {
+        let (att, why) = attention(&Signals {
+            closed: false,
+            token: None,
+            herdr: Some("idle"),
+            feed: Some(Attention::Waiting),
+            feed_status: Some("Waiting on Codex's review"),
+            needs: None,
+            blocker: None,
+            running_title: None,
+            from_feed: true,
+        });
+        assert_eq!(att, Attention::Waiting);
+        assert_eq!(why, "Waiting on Codex's review");
+    }
+
+    #[test]
+    fn an_agent_asking_always_needs_you() {
+        let (att, _) = attention(&Signals {
+            closed: false,
+            token: None,
+            herdr: Some("blocked"),
+            feed: Some(Attention::Waiting),
+            feed_status: None,
+            needs: None,
+            blocker: None,
+            running_title: None,
+            from_feed: true,
+        });
+        assert_eq!(att, Attention::NeedsYou);
+    }
+
+    #[test]
+    fn feed_cards_find_their_workspace_by_name_and_others_become_cards() {
+        let snap = Snapshot {
+            workspaces: vec![
+                ws("w3", "43-next-flywheel"),
+                ws("w4", "notes"),
+                ws("w5", "omarchy-automation"),
+            ],
+            agents: vec![agent("w3", "done"), agent("w5", "working")],
+            ..Default::default()
+        };
+        let mut c = feed_card("0143", "test", "active");
+        c.attention = Some("running".into());
+        let feed = Feed {
+            kerdr_feed: 1,
+            source: Some("api".into()),
+            cards: vec![c, feed_card("0002", "backlog", "queued")],
+            sessions: [(
+                "default".to_string(),
+                FeedSlots {
+                    used: 3,
+                    limit: Some(3),
+                    max: Some(5),
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        let machines = vec![live(
+            machine("build-box", true),
+            vec![("default", snap)],
+            Some(feed),
+        )];
+        let board = build(&machines, &Config::default());
+
+        let flywheel = board.cards.iter().find(|c| c.reference == "#143").unwrap();
+        assert_eq!(flywheel.workspace_id.as_deref(), Some("w3"));
+        assert_eq!(flywheel.attention, Attention::NeedsYou);
+        assert_eq!(flywheel.stage, Stage::Test);
+
+        let automation = board
+            .cards
+            .iter()
+            .find(|c| c.reference == "omarchy-automation")
+            .unwrap();
+        assert_eq!(automation.attention, Attention::Running);
+        assert_eq!(automation.stage, Stage::Build);
+        assert!(
+            board.cards.iter().all(|c| c.reference != "notes"),
+            "a workspace without an agent isn't a card"
+        );
+
+        let summary = summarize(&board, &Scope::All, &machines);
+        assert_eq!(summary.needs_you, 1);
+        assert_eq!(summary.backlog, 1);
+        assert_eq!(summary.slots_used, 3);
+        assert_eq!(summary.full_sessions, ["default"]);
+        assert_eq!(summary.verdict, Some(Verdict::FinishFirst(1)));
+    }
+
+    #[test]
+    fn a_workspace_named_for_two_cards_goes_to_neither_unless_its_title_says() {
+        let mut flywheel = feed_card("0143", "test", "active");
+        flywheel.attention = Some("running".into());
+        let old = feed_card("0043", "build", "active");
+        let snap = |title: &str| Snapshot {
+            workspaces: vec![ws("w3", "43-next-flywheel")],
+            agents: vec![Agent {
+                title: Some(title.into()),
+                ..agent("w3", "working")
+            }],
+            ..Default::default()
+        };
+        let feed = Feed {
+            kerdr_feed: 1,
+            cards: vec![flywheel, old],
+            ..Default::default()
+        };
+        let board = build(
+            &[live(
+                machine("build-box", true),
+                vec![("default", snap("a shell"))],
+                Some(feed.clone()),
+            )],
+            &Config::default(),
+        );
+        assert!(
+            board
+                .cards
+                .iter()
+                .filter(|c| c.reference.starts_with('#'))
+                .all(|c| c.workspace_id.is_none())
+        );
+        let board = build(
+            &[live(
+                machine("build-box", true),
+                vec![(
+                    "default",
+                    snap("📌 #143 Under way · Find the next flywheel"),
+                )],
+                Some(feed),
+            )],
+            &Config::default(),
+        );
+        let card = |r: &str| board.cards.iter().find(|c| c.reference == r).unwrap();
+        assert_eq!(card("#143").workspace_id.as_deref(), Some("w3"));
+        assert_eq!(card("#43").workspace_id, None);
+    }
+
+    #[test]
+    fn the_home_machines_copy_of_a_card_wins() {
+        let mut far = feed_card("0125", "build", "active");
+        far.home = Some(Home {
+            machine: Some("laptop".into()),
+            session: Some("default".into()),
+        });
+        far.status = Some("from the server".into());
+        let mut near = far.clone();
+        near.status = Some("from the laptop".into());
+        near.workspace = Some(FeedWorkspace {
+            session: Some("default".into()),
+            id: Some("w1".into()),
+            label: None,
+        });
+        let server = live(
+            machine("build-box", true),
+            vec![("default", Snapshot::default())],
+            Some(Feed {
+                kerdr_feed: 1,
+                cards: vec![far],
+                ..Default::default()
+            }),
+        );
+        let laptop = live(
+            machine("laptop", false),
+            vec![(
+                "default",
+                Snapshot {
+                    workspaces: vec![ws("w1", "25-quick-prompt")],
+                    ..Default::default()
+                },
+            )],
+            Some(Feed {
+                kerdr_feed: 1,
+                cards: vec![near],
+                ..Default::default()
+            }),
+        );
+        let board = build(&[server, laptop], &Config::default());
+        let card = board.cards.iter().find(|c| c.reference == "#125").unwrap();
+        assert_eq!(card.machine, "laptop");
+        assert_eq!(card.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("from the laptop")
+        );
+    }
+
+    #[test]
+    fn cards_from_a_machine_that_dropped_are_marked_cached() {
+        let snap = Snapshot {
+            workspaces: vec![ws("w1", "api")],
+            agents: vec![agent("w1", "working")],
+            ..Default::default()
+        };
+        let mut m = live(machine("box", false), vec![("default", snap)], None);
+        m.last_ok = Some(Local::now());
+        m.conn = Conn::Reconnecting {
+            since: Local::now(),
+            attempt: 1,
+            retry_at: Local::now(),
+            detail: "timed out".into(),
+        };
+        let board = build(&[m], &Config::default());
+        assert!(board.cards[0].cached_at.is_some());
+        assert!(board.sessions[0].cached);
+    }
+
+    #[test]
+    fn verdict_points_at_the_session_with_most_room() {
+        let mut board = Board::default();
+        for (s, used) in [("default", 3), ("api", 1), ("web", 2)] {
+            board.sessions.push(SessionRow {
+                machine: "m".into(),
+                session: s.into(),
+                running: true,
+                slots: Slots {
+                    used,
+                    limit: Some(3),
+                },
+                needs: 0,
+                cards: 0,
+                cached: false,
+                error: None,
+            });
+        }
+        let s = summarize(&board, &Scope::All, &[]);
+        assert_eq!(
+            s.verdict,
+            Some(Verdict::Room {
+                session: "api".into(),
+                free: 2
+            })
+        );
+        assert_eq!(s.verdict.unwrap().text(), "Room for 2 more in api");
+    }
+
+    #[test]
+    fn reads_jump_requests() {
+        let mut w = ws("w2", "x");
+        assert_eq!(jump_request(std::slice::from_ref(&w)), None);
+        w.tokens.insert(JUMP_TOKEN.into(), "next:123".into());
+        assert_eq!(jump_request(&[w]), Some(("w2".into(), "next:123".into())));
+        assert_eq!(parse_progress("1/3"), Some((1, 3)));
+        assert_eq!(parse_progress("4/3"), None);
+    }
+}

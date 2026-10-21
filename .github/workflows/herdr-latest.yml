@@ -1,0 +1,42 @@
+# Kerdr runs herdr under the hood, and herdr ships every week or two. Every Monday this installs
+# herdr's latest release and checks Kerdr against it, opening an issue when something breaks.
+name: herdr latest
+
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Install herdr's latest release
+        run: |
+          curl -fsSL https://herdr.dev/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - id: herdr
+        run: echo "version=$(herdr --version)" >> "$GITHUB_OUTPUT"
+      - run: cargo test --locked
+      - name: Kerdr against a real herdr server
+        run: |
+          cargo build --locked
+          tests/live-herdr.sh target/debug/kerdr
+      - name: Open an issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HERDR_VERSION: ${{ steps.herdr.outputs.version }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          title="Kerdr fails against ${HERDR_VERSION:-herdr's latest release}"
+          if [ -z "$(gh issue list --state open --search "$title in:title" --json number --jq '.[].number')" ]; then
+            gh issue create --title "$title" --body "The weekly check against herdr's latest release failed: $RUN_URL"
+          fi
