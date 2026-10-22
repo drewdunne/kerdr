@@ -310,6 +310,12 @@ fn cards() -> anyhow::Result<()> {
                 "workspace": c.workspace_id,
                 "workspace_label": c.workspace_label,
                 "cached": c.cached_at.is_some(),
+                "owner": c.owner_label(),
+                "project": c.project(),
+                "dismissed": c.dismissed(),
+                "created": c.detail.as_ref().and_then(|d| d.created.as_deref()),
+                "refreshed_at": c.detail.as_ref().and_then(|d| d.refreshed_at.as_deref()),
+                "backlog_rank": c.backlog_rank(),
                 "progress": c.progress.map(|(m, t)| format!("{m}/{t}")),
             })
         })

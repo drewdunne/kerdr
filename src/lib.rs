@@ -1,5 +1,6 @@
 //! Kerdr: an opinionated kanban cockpit for driving herdr sessions.
 
+pub mod actions;
 pub mod app;
 pub mod board;
 pub mod config;

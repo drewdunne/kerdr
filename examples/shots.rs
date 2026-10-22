@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use fontdue::{Font, FontSettings};
 use image::{Rgb, RgbImage};
-use kerdr::app::{App, Mode, Selection};
+use kerdr::app::{App, IntentForm, Mode, Selection};
 use kerdr::config::Config;
 use kerdr::{demo, theme, ui};
 use ratatui::Terminal;
@@ -35,6 +35,22 @@ fn app(away: bool) -> App {
     a.fixed_now = Some(demo::now());
     a.width = COLS;
     a.rebuild();
+    for card in &mut a.board.cards {
+        if let Some(detail) = &mut card.detail {
+            detail.organization = Some("example-studio".into());
+            detail.tenant = (card.session.as_deref() == Some("web")).then(|| "shop".into());
+            detail.project = Some(card.session.clone().unwrap_or_else(|| "platform".into()));
+            detail.created = Some("2026-10-01".into());
+            detail.refreshed_at = Some(
+                if card.stale_days.unwrap_or(0) >= 14 {
+                    "2026-10-04"
+                } else {
+                    "2026-10-21"
+                }
+                .into(),
+            );
+        }
+    }
     a
 }
 
@@ -237,4 +253,84 @@ fn main() {
         scroll: 0,
     };
     rasterize(&render(&keys), &fonts, &out.join("keys.png"));
+    let mut machine = app(false);
+    machine.machine = Some("build-box".into());
+    machine.rebuild();
+    machine.tab = 1;
+    rasterize(&render(&machine), &fonts, &out.join("machine-sessions.png"));
+
+    let mut backlog = app(false);
+    backlog.mode = Mode::Backlog { sel: 0 };
+    rasterize(&render(&backlog), &fonts, &out.join("backlog.png"));
+
+    let mut palette = app(false);
+    palette.mode = Mode::Palette {
+        back: Box::new(Mode::Board),
+    };
+    rasterize(&render(&palette), &fonts, &out.join("commands.png"));
+
+    let mut compose = app(false);
+    compose.mode = Mode::Compose {
+        form: IntentForm {
+            title: "Compare the shortlist".into(),
+            words: "Show each game’s trade-offs before choosing one.".into(),
+            organization: "example-studio".into(),
+            tenant: "shop".into(),
+            project: "web".into(),
+            machine: 0,
+            session: "web".into(),
+            field: 1,
+        },
+        back: Box::new(Mode::Board),
+    };
+    rasterize(&render(&compose), &fonts, &out.join("new-intent.png"));
+
+    let mut confirmation = app(false);
+    confirmation.mode = Mode::Confirm { machine: 0,
+        request: serde_json::json!({"action":"dispatch","id":"40","override":true}),
+        title: "Start #40 in web?".into(),
+        message: "web has 3 active workspaces. The usual limit is 3. Starting this makes 4; the maximum is 5.".into(),
+        back: Box::new(Mode::Backlog { sel: 0 }),
+    };
+    rasterize(
+        &render(&confirmation),
+        &fonts,
+        &out.join("dispatch-confirmation.png"),
+    );
+
+    let mut dismissed = app(false);
+    if let Some(card) = dismissed
+        .board
+        .cards
+        .iter_mut()
+        .find(|c| c.stage == kerdr::model::Stage::Backlog)
+    {
+        if let Some(detail) = &mut card.detail {
+            detail.state = Some("wont_do".into());
+            detail.disposition = Some("wont_do".into());
+        }
+        card.state = Some("wont_do".into());
+    }
+    dismissed.wont_do = true;
+    dismissed.mode = Mode::Backlog { sel: 0 };
+    rasterize(&render(&dismissed), &fonts, &out.join("wont-do.png"));
+    let mut provider = app(false);
+    for (index, card) in provider.board.cards.iter_mut().enumerate() {
+        for agent in &mut card.agents {
+            agent.agent = if index % 2 == 0 { "codex" } else { "claude" }.into();
+        }
+    }
+    provider.provider = Some("codex".into());
+    if let Some(card) = provider
+        .board
+        .cards
+        .iter()
+        .find(|card| provider.card_visible(card))
+    {
+        provider.sel = Selection {
+            col: card.stage.index(),
+            key: Some(card.key.clone()),
+        };
+    }
+    rasterize(&render(&provider), &fonts, &out.join("provider.png"));
 }

@@ -35,6 +35,22 @@ pub struct FeedSlots {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct FeedCard {
     pub id: String,
+    #[serde(default)]
+    pub tenant: Option<String>,
+    #[serde(default)]
+    pub organization: Option<String>,
+    #[serde(default)]
+    pub project: Option<String>,
+    /// When the record was first created; keeping it fresh must not change this.
+    #[serde(default)]
+    pub created: Option<String>,
+    /// When the user last confirmed that the work is still wanted.
+    #[serde(default)]
+    pub refreshed_at: Option<String>,
+    #[serde(default)]
+    pub backlog_rank: Option<i64>,
+    #[serde(default)]
+    pub disposition: Option<String>,
     #[serde(default, rename = "ref")]
     pub reference: Option<String>,
     pub title: String,
@@ -196,6 +212,19 @@ mod tests {
     #[test]
     fn refuses_other_versions() {
         assert!(parse(r#"{"kerdr_feed":2}"#).is_err());
+    }
+
+    #[test]
+    fn preserves_scope_order_and_distinct_creation_and_refresh_dates() {
+        let feed = parse(r#"{"kerdr_feed":1,"cards":[{"id":"4","title":"t","tenant":"shop","organization":"org","project":"checkout","created":"2026-01-01","refreshed_at":"2026-10-22","backlog_rank":-2,"disposition":"kept"}]}"#).unwrap();
+        let card = serde_json::to_value(&feed.cards[0]).unwrap();
+        assert_eq!(card["tenant"], "shop");
+        assert_eq!(card["organization"], "org");
+        assert_eq!(card["project"], "checkout");
+        assert_eq!(card["created"], "2026-01-01");
+        assert_eq!(card["refreshed_at"], "2026-10-22");
+        assert_eq!(card["backlog_rank"], -2);
+        assert_eq!(card["disposition"], "kept");
     }
 
     #[test]

@@ -668,28 +668,12 @@ pub fn parse_progress(s: &str) -> Option<(u32, u32)> {
     (b > 0 && a <= b).then_some((a, b))
 }
 
-fn backlog_group(c: &Card) -> u8 {
-    let waits = c
-        .detail
-        .as_ref()
-        .is_some_and(|d| d.waits_on.iter().any(|w| w.open != Some(false)));
-    if c.priority == Priority::High {
-        0
-    } else if c.state.as_deref() == Some("shelved") {
-        1
-    } else if waits {
-        2
-    } else {
-        3
-    }
-}
-
 fn sort_cards(cards: &mut [Card]) {
     cards.sort_by(|a, b| {
         a.stage.cmp(&b.stage).then_with(|| match a.stage {
-            Stage::Backlog => backlog_group(a)
-                .cmp(&backlog_group(b))
-                .then_with(|| b.stale_days.unwrap_or(0).cmp(&a.stale_days.unwrap_or(0)))
+            Stage::Backlog => a
+                .backlog_rank()
+                .cmp(&b.backlog_rank())
                 .then_with(|| a.reference.cmp(&b.reference)),
             Stage::Maintain => {
                 let closed = |c: &Card| {
@@ -741,7 +725,11 @@ impl Scope {
 }
 
 pub fn summarize(board: &Board, scope: &Scope, machines: &[MachineState]) -> Summary {
-    let cards: Vec<&Card> = board.cards.iter().filter(|c| scope.contains(c)).collect();
+    let cards: Vec<&Card> = board
+        .cards
+        .iter()
+        .filter(|c| scope.contains(c) && !c.dismissed())
+        .collect();
     let open = |c: &&&Card| !matches!(c.stage, Stage::Backlog | Stage::Maintain);
     let mut s = Summary {
         needs_you: cards
@@ -843,6 +831,27 @@ pub fn jump_request(workspaces: &[Workspace]) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn manual_backlog_order_is_independent_of_affirmation_age() {
+        let board = build(&crate::demo::machines(false), &Config::default());
+        let seed = board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Backlog)
+            .unwrap();
+        let mut older = seed.clone();
+        older.reference = "#1".into();
+        older.stale_days = Some(99);
+        older.detail.as_mut().unwrap().backlog_rank = Some(2);
+        let mut first = seed.clone();
+        first.reference = "#2".into();
+        first.stale_days = Some(0);
+        first.detail.as_mut().unwrap().backlog_rank = Some(1);
+        let mut cards = vec![older, first];
+        sort_cards(&mut cards);
+        assert_eq!(cards[0].reference, "#2");
+    }
     use crate::feed::{FeedSlots, FeedWorkspace, Home};
     use crate::herdr::SessionInfo;
 

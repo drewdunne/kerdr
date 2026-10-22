@@ -121,7 +121,23 @@ fn event_loop(
     rx: &mpsc::Receiver<poll::Event>,
     client_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
+    let (action_tx, action_rx) = mpsc::channel::<(
+        usize,
+        serde_json::Value,
+        Result<crate::actions::Response, String>,
+    )>();
     loop {
+        while let Ok((machine, request, result)) = action_rx.try_recv() {
+            let succeeded = result
+                .as_ref()
+                .is_ok_and(|r: &crate::actions::Response| r.ok);
+            app.finish_action(machine, request, result);
+            if succeeded && let Some(l) = live.as_deref() {
+                for poller in l.pollers.iter().flatten() {
+                    let _ = poller.wake.send(Wake::Feed);
+                }
+            }
+        }
         while let Ok(ev) = rx.try_recv() {
             app.apply(ev);
         }
@@ -157,7 +173,41 @@ fn event_loop(
         };
         match app.on_key(key) {
             Action::None => {}
-            Action::Quit => return Ok(()),
+            Action::Quit => {
+                if app.busy {
+                    app.say(
+                        "An intent change is still running. Wait for its result before quitting.",
+                        Tone::Warn,
+                    );
+                } else {
+                    return Ok(());
+                }
+            }
+            Action::Mutate { machine, request } => {
+                if app.demo {
+                    app.say(
+                        "This is the demo: intent controls change your real board only.",
+                        Tone::Info,
+                    );
+                    continue;
+                }
+                if app.busy {
+                    continue;
+                }
+                let Some(command) = app.cfg.actions.command.clone() else {
+                    continue;
+                };
+                let Some(target) = app.machines.get(machine).map(|m| m.machine.clone()) else {
+                    continue;
+                };
+                let tx = action_tx.clone();
+                app.busy = true;
+                app.say("Changing the intent…", Tone::Info);
+                std::thread::spawn(move || {
+                    let result = crate::actions::run(&target, &command, &request);
+                    let _ = tx.send((machine, request, result));
+                });
+            }
             Action::Jump(card) => {
                 if app.demo {
                     app.say("This is the demo: on your own board, ⏎ opens herdr on this card's workspace.", Tone::Info);

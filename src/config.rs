@@ -12,6 +12,7 @@ pub struct Config {
     pub name: Option<String>,
     pub board: BoardConfig,
     pub feed: FeedConfig,
+    pub actions: ActionsConfig,
     pub machines: MachinesConfig,
     #[serde(rename = "machine")]
     pub machine: Vec<MachineConfig>,
@@ -64,6 +65,13 @@ impl Default for FeedConfig {
             every: 15,
         }
     }
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ActionsConfig {
+    /// An opt-in command that receives one JSON action on standard input (docs/feed.md).
+    pub command: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -333,5 +341,18 @@ mod tests {
     #[test]
     fn unknown_keys_are_an_error() {
         assert!(toml::from_str::<Config>("[board]\nslotz = 4\n").is_err());
+    }
+
+    #[test]
+    fn action_commands_are_an_explicit_opt_in() {
+        assert!(Config::default().actions.command.is_none());
+        assert_eq!(
+            cfg("[actions]\ncommand = '~/bin/cards-action'\n")
+                .actions
+                .command
+                .as_deref(),
+            Some("~/bin/cards-action")
+        );
+        assert!(toml::from_str::<Config>("[actions]\ncomand = 'oops'\n").is_err());
     }
 }

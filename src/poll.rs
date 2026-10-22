@@ -118,6 +118,7 @@ pub struct Event {
 
 pub enum Wake {
     Now,
+    Feed,
     Stop,
 }
 
@@ -209,6 +210,10 @@ pub fn spawn(index: usize, machine: Machine, timing: Timing, tx: SyncSender<Even
                 return;
             }
             match wake_rx.recv_timeout(wait) {
+                Ok(Wake::Feed) => {
+                    last_feed = None;
+                    continue;
+                }
                 Ok(Wake::Now) | Err(RecvTimeoutError::Timeout) => continue,
                 Ok(Wake::Stop) | Err(RecvTimeoutError::Disconnected) => return,
             }

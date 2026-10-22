@@ -4,7 +4,7 @@
 #   tests/live-herdr.sh [path to kerdr]
 set -eu
 KERDR=${1:-target/debug/kerdr}
-S="kerdr-live-$$"
+S="zz-kerdr-live-$$"
 unset HERDR_SOCKET_PATH HERDR_SESSION HERDR_PANE_ID HERDR_TAB_ID HERDR_WORKSPACE_ID HERDR_ENV HERDR_BIN_PATH
 TMP=$(mktemp -d)
 PID=""

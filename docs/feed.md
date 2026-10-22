@@ -24,6 +24,13 @@ Kerdr shows the last good feed, with herdr's live view, when a run fails.
       "id": "0041",
       "ref": "#41",
       "title": "Checkout handles expired cards",
+      "tenant": "shop",
+      "organization": "my-org",
+      "project": "checkout",
+      "created": "2026-10-19",
+      "refreshed_at": "2026-10-21",
+      "backlog_rank": 10,
+      "disposition": "kept",
       "stage": "test",
       "state": "active",
       "priority": "normal",
@@ -63,6 +70,7 @@ know rather than guessing.
 | `source` | Names the feed. Cards are unique by `source` and `id`, so two machines running the same feed show each card once (the copy from its `home.machine` wins). |
 | `sessions` | Slot use per herdr session, when your records count slots their own way. Without it, Kerdr counts workspaces with an agent against `[board] slots`. `limit: null` means no limit. |
 | `id`, `ref` | The card's identity, and the short handle drawn first on it (default: `#` and the id without leading zeros). |
+| `tenant`, `organization`, `project` | Optional scope labels for filtering and showing where work belongs. Leave an unknown scope absent. |
 | `stage` | `backlog`, `plan`, `design`, `build`, `test`, `deploy` or `maintain`: the column. Kerdr also accepts common synonyms (`review` is test, `done` is maintain). |
 | `state` | Free text: `queued` and `shelved` group the backlog; `closed` is finished work. |
 | `priority` | `high` cards go first, with a ▲. |
@@ -76,6 +84,61 @@ know rather than guessing.
 | `timeline` | Notes under each stage in the peek's lifecycle rail. |
 | `log` | The newest few log entries, newest first. |
 | `updated`, `stale_days` | How long ago it last moved. Queued work untouched for 14 days or more asks whether you still want it. |
+| `created` | The record's original creation date. Keeping old work must preserve this date. |
+| `refreshed_at` | The last date someone confirmed that the work is still wanted. This is separate from creation and ordinary record updates. |
+| `backlog_rank` | An optional signed integer ordering the backlog, lower numbers first. The action backend writes the canonical order. |
+| `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
+
+## Actions
+
+Actions are off by default. Opt in separately from the read-only feed:
+
+```toml
+[actions]
+command = "~/bin/my-tracker-action"
+```
+
+Kerdr runs this trusted shell command on the card's home machine, locally or over the same
+SSH connection used to read that machine. The backend must update the canonical records there;
+Kerdr does not edit a cached feed or invent a replacement record. The configured command must
+be available on each machine where you use actions.
+
+The command receives one JSON object on standard input. User text is JSON data, including quotes,
+newlines and shell punctuation. It is never appended to the configured command as shell source.
+Requests are limited to 64 KiB. The `action` field names the operation; the backend defines which
+additional fields that operation needs:
+
+```json
+{"action":"dispatch","id":"0041","session":"web","override":false}
+```
+
+The action names are `create`, `dispatch`, `refresh`, `dismiss`, `restore` and `move`.
+`refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
+the active backlog and `restore` brings it back. `move` changes backlog order.
+
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project` and `session` (strings),
+`override` and `top` (booleans), and `delta` (a signed integer). Omit fields that do not apply.
+The backend must validate the request, enforce its own permissions and slot limits, and print
+exactly one JSON response to standard output. Send diagnostic output to standard error.
+
+```json
+{"ok":true,"message":"Work started","id":"0041","session":"web"}
+```
+
+`ok` (boolean) and `message` (string) are required. Optional fields are `confirmation` (boolean,
+default false), `used` and `limit` (nonnegative integers or null), and `session` and `id` (strings
+or null). Unknown response fields are allowed for future additions. A valid JSON response is
+read even if the command exits nonzero, allowing the backend to explain a refused action or ask
+for confirmation:
+
+```json
+{"ok":false,"message":"Session web is full","confirmation":true,"used":3,"limit":3,"session":"web"}
+```
+
+A confirmation is a separate user decision before sending a new request with `override: true`.
+Actions have a 120-second deadline. A timeout or an invalid response does not prove the mutation
+failed: its result is unknown. Kerdr does not retry it automatically; check the canonical record
+before trying again. After success, the next feed read reflects the saved changes.
 
 ## Agents reporting for themselves
 

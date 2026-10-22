@@ -51,8 +51,8 @@ question, something stuck. Everything else keeps running without you.
 - **Work-in-progress limits.** Each herdr session holds three workspaces with an agent before
   Kerdr calls it full (change it in the config). A lane for background agents has no limit.
 - **One workspace, one piece of work, one card.**
-- **No new leader key.** On the board every key is Kerdr's. Inside herdr every key is herdr's,
-  except two that Kerdr adds under herdr's own prefix to step back out.
+- **A command menu on the board.** Ctrl+Space groups intent controls under a familiar prefix.
+  Inside herdr, its own prefix and key bindings still apply, including Kerdr's two step-out keys.
 
 ## Features
 
@@ -80,9 +80,9 @@ without them.
 
 ### Every session, every machine
 
-Tabs across the top group sessions by machine: `All`, then each machine and its sessions.
-`[` and `]` move between sessions, `{` and `}` between machines, and `1` to `9` jump straight
-to a session.
+The leftmost tab is the machine selector: `All`, then one machine at a time with `{` and `}`.
+Only the selected machine's sessions appear beside it. `[` and `]` move between those sessions,
+and `1` to `9` jump straight to a session. `0` returns to the all-machine overview.
 
 Kerdr reads every machine you list, over SSH, with one round trip per read and one shared SSH
 connection per machine. It never answers a prompt for you. Jumping into a card on another
@@ -107,14 +107,32 @@ anything), and hidden.
 
 ### Search everything
 
-`/` searches cards, workspaces and sessions on every machine, including workspaces no card
-claims and work that's already done.
+`/` searches cards in the current machine, owner and project view, including work that's
+already done. Session and workspace results follow the same filters; switch to All to search across machines.
 
 ### The backlog
 
-`b` shows what's waiting to start: high priority first, then shelved work, then work waiting
-on other work, then the queue, oldest first. Anything untouched for two weeks asks whether you
-still want it.
+`b` shows work waiting to start, in your chosen order. With an action adapter configured:
+
+- `y` affirms that you still want the selected intent. Its age is the time since your last
+  affirmation, falling back to creation when it has never been reviewed. Agent updates do not
+  reset this age. Creation stays visible in expanded details.
+- `J` / `K` moves an intent down or up; `10K` moves it up ten places. Ctrl+Space then `g`
+  moves it to the top of its owner/project backlog. Priority stays separate from order.
+- `d` dispatches the selected intent into its recorded machine and session. At the usual work
+  limit, Kerdr asks before starting another; the adapter still enforces its hard limit.
+- `x` moves an intent to **Won't do**, after confirmation. `w` opens that separate view;
+  `u` restores the selected intent. Its record and original creation date are retained.
+
+Ctrl+Space then `n` opens the new-intent form. Choose its organization, optional tenant,
+project, machine and session, then save it to the backlog. Creation does not start an agent.
+Ctrl+Space then `t` cycles owner/tenant views; `p` cycles project views. Ctrl+Space then `a`
+filters by the provider herdr reports: All, Claude, Codex, and additional detected providers.
+Cards with no reported agent appear in All. These filters combine with machine and session
+selection. Organization work stays distinct from tenant work.
+
+Controls are optional: [the action adapter contract](docs/feed.md#actions) lets your
+own record system validate and persist changes. Without an adapter, Kerdr remains a reader.
 
 ### Keys
 
@@ -133,6 +151,8 @@ still want it.
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
 | `/` | search |
 | `b` | backlog |
+| `w` | toggle Won't do view |
+| `Ctrl+Space` | intent controls: new, dispatch, affirm, order, filters, restore |
 | `M` | machines |
 | `r` / `R` | retry a machine that isn't answering / all of them |
 | `?` | keys |
@@ -247,9 +267,11 @@ you, the machine shows *needs you*, and `M` then `Enter` lets you answer it.
 
 ## Status
 
-Kerdr is new (0.1). It reads; it never changes your work records or your agents. In herdr, it
-focuses the workspace you jump into, shows a short hint there, and clears the short-lived token
-its keys leave. herdr moves every window attached to a session when its focus changes, so if
+Kerdr is new (0.2). Reading and navigation work without an action adapter. Opting into
+`[actions] command` enables record changes and dispatch through your own adapter, on the
+record's home machine. Commands run in the background and show their result; an unknown result
+is never retried automatically. In herdr, Kerdr focuses the workspace you jump into, shows a
+short hint there, and clears the short-lived token its keys leave. herdr moves every window attached to a session when its focus changes, so if
 you also keep a plain herdr window open on the same session, it follows.
 
 ## License

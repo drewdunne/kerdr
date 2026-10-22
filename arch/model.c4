@@ -1,0 +1,48 @@
+// Intent 0157: Kerdr is generic; ark-sdlc supplies its feed and optional write adapter.
+specification {
+  element person { style { shape person } }
+  element app { style { color primary } }
+  element adapter { style { color secondary } }
+  element store { style { shape storage; color slate } }
+  element service { style { color green } }
+}
+model {
+  drew = person "Drew"
+  kerdr = app "Kerdr terminal UI" {
+    description "Rust board, owner and project filters, selected machine's sessions, leader menu, intent composer, affirmation review and ranked backlog. Holds no canonical work records."
+  }
+  readfeed = adapter "Card feed (read only)" {
+    description "Configured command runs on each machine, locally or over SSH. ark-cards --json is the ark-sdlc implementation. Returns versioned cards, home locations and slot counts."
+  }
+  action = adapter "Optional action command" {
+    description "Explicit opt-in JSON on stdin and JSON response. Executes on the selected card's home machine, or chosen machine for create. ark-card-action validates and delegates to ark-sdlc tools. Confirms a soft-limit override; blocks at the hard cap."
+  }
+  records = store "Canonical intent records" {
+    description "ark-sdlc intent headers and OKF created/reaffirmed dates, owner organization/tenant/project, backlog ranks and wont-do state. Mutated only by the configured adapter's domain tools."
+  }
+  dispatch = service "ark-sdlc domain tools" {
+    description "Create, reaffirm, rank, restore, wont-do, dispatch and shelve operations. Enforce session capacity and canonical state; no direct UI writes."
+  }
+  herdr = service "herdr on each machine" {
+    description "Session/workspace snapshots, attention status and agent reports. Kerdr can focus the chosen workspace; dispatch opens authorized work."
+  }
+  local = store "Local UI settings" {
+    description "~/.config/kerdr/config.toml and UI state. Configured machine reachability, feed/action commands, board limits and hidden machines. Separate from canonical work."
+  }
+  drew -> kerdr "browse, create, review, start"
+  kerdr -> readfeed "poll JSON locally or over SSH"
+  readfeed -> records "read work and affirmation dates"
+  kerdr -> herdr "read snapshots; focus workspace"
+  kerdr -> action "explicit user action as JSON"
+  action -> dispatch "validate request; invoke domain operation"
+  dispatch -> records "write work, rank and affirmation state"
+  dispatch -> herdr "capacity check; start or shelve"
+  kerdr -> local "load settings; save UI choices"
+}
+views {
+  view index {
+    title "Kerdr reads feeds and delegates writes"
+    include *
+    autoLayout LeftRight
+  }
+}

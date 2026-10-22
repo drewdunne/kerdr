@@ -11,6 +11,21 @@ use crate::config::Config;
 use crate::model::{Attention, Card, Stage};
 use crate::poll::{Conn, Event};
 
+#[path = "controls.rs"]
+mod controls;
+
+#[derive(Clone, Debug, Default)]
+pub struct IntentForm {
+    pub title: String,
+    pub words: String,
+    pub organization: String,
+    pub tenant: String,
+    pub project: String,
+    pub machine: usize,
+    pub session: String,
+    pub field: usize,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tone {
     Info,
@@ -56,6 +71,20 @@ pub struct Search {
 
 #[derive(Clone, Debug)]
 pub enum Mode {
+    Palette {
+        back: Box<Mode>,
+    },
+    Compose {
+        form: IntentForm,
+        back: Box<Mode>,
+    },
+    Confirm {
+        machine: usize,
+        request: serde_json::Value,
+        title: String,
+        message: String,
+        back: Box<Mode>,
+    },
     Board,
     Peek {
         scroll: u16,
@@ -75,8 +104,44 @@ pub enum Mode {
     },
 }
 
+fn backlog_selection(mode: &Mode) -> Option<usize> {
+    match mode {
+        Mode::Backlog { sel } => Some(*sel),
+        Mode::Peek { back, .. }
+        | Mode::Palette { back }
+        | Mode::Compose { back, .. }
+        | Mode::Confirm { back, .. } => backlog_selection(back),
+        _ => None,
+    }
+}
+
+fn set_backlog_selection(mode: &mut Mode, selected: usize) {
+    match mode {
+        Mode::Backlog { sel } => *sel = selected,
+        Mode::Peek { back, .. }
+        | Mode::Palette { back }
+        | Mode::Compose { back, .. }
+        | Mode::Confirm { back, .. } => set_backlog_selection(back, selected),
+        _ => {}
+    }
+}
+
+fn holds_peek(mode: &Mode) -> bool {
+    match mode {
+        Mode::Peek { .. } => true,
+        Mode::Palette { back } | Mode::Compose { back, .. } | Mode::Confirm { back, .. } => {
+            holds_peek(back)
+        }
+        _ => false,
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
+    Mutate {
+        machine: usize,
+        request: serde_json::Value,
+    },
     None,
     Quit,
     /// Open herdr full screen on this card's workspace.
@@ -115,6 +180,15 @@ pub struct App {
     pub board: Board,
     pub tabs: Vec<Scope>,
     pub tab: usize,
+    /// None is the overview; session tabs belong only to this machine.
+    pub machine: Option<String>,
+    pub owner: Option<String>,
+    pub project: Option<String>,
+    pub provider: Option<String>,
+    pub wont_do: bool,
+    pub busy: bool,
+    pub count: String,
+    backlog_focus: Option<String>,
     pub sel: Selection,
     pub mode: Mode,
     pub message: Option<(String, Tone, Instant)>,
@@ -137,6 +211,14 @@ impl App {
             board: Board::default(),
             tabs: vec![Scope::All],
             tab: 0,
+            machine: None,
+            owner: None,
+            project: None,
+            provider: None,
+            wont_do: false,
+            busy: false,
+            count: String::new(),
+            backlog_focus: None,
             sel: Selection::default(),
             mode: Mode::Board,
             message: None,
@@ -201,18 +283,23 @@ impl App {
         let current = self.scope().clone();
         self.board = board::build(&self.machines, &self.cfg);
         let mut tabs = vec![Scope::All];
-        for m in self.machines.iter().filter(|m| m.is_shown()) {
-            let name = m.name();
-            tabs.push(Scope::Machine(name.clone()));
-            // A session that isn't running has nothing on the board; herdr also leaves one behind
-            // on this machine for every session it has attached to remotely.
-            for r in self
-                .board
-                .sessions
+        if let Some(name) = self.machine.clone() {
+            if self
+                .machines
                 .iter()
-                .filter(|r| r.machine == name && r.running)
+                .any(|m| m.is_shown() && m.answers_to(&name))
             {
-                tabs.push(Scope::Session(name.clone(), r.session.clone()));
+                tabs = vec![Scope::Machine(name.clone())];
+                for r in self
+                    .board
+                    .sessions
+                    .iter()
+                    .filter(|r| r.machine == name && r.running)
+                {
+                    tabs.push(Scope::Session(name.clone(), r.session.clone()));
+                }
+            } else {
+                self.machine = None;
             }
         }
         self.tab = tabs
@@ -225,6 +312,25 @@ impl App {
             .unwrap_or(0);
         self.tabs = tabs;
         self.fix_selection();
+        if let Some(sel) = backlog_selection(&self.mode) {
+            let items = self.backlog_cards();
+            let found = self
+                .backlog_focus
+                .as_ref()
+                .and_then(|key| items.iter().position(|&i| &self.board.cards[i].key == key));
+            let selected = found.unwrap_or(sel.min(items.len().saturating_sub(1)));
+            // A pending command retains its original target even if that record disappeared.
+            // Direct list navigation can move to the next available row.
+            if found.is_some()
+                || matches!(self.mode, Mode::Backlog { .. })
+                || self.backlog_focus.is_none()
+            {
+                self.backlog_focus = items
+                    .get(selected)
+                    .map(|&i| self.board.cards[i].key.clone());
+            }
+            set_backlog_selection(&mut self.mode, selected);
+        }
     }
 
     /// Columns drawn at this width: Backlog and Maintain give way first on a narrow screen.
@@ -242,7 +348,7 @@ impl App {
         let mut cols: [Vec<usize>; 7] = Default::default();
         let scope = self.scope();
         for (i, c) in self.board.cards.iter().enumerate() {
-            if scope.contains(c) {
+            if scope.contains(c) && self.card_visible(c) {
                 cols[c.stage.index()].push(i);
             }
         }
@@ -258,6 +364,14 @@ impl App {
     }
 
     fn fix_selection(&mut self) {
+        if holds_peek(&self.mode) {
+            // A peek is an operation on one stable record, including when its column is hidden.
+            // Losing the record must never silently point an action at a neighbor.
+            if let Some(card) = self.selected() {
+                self.sel.col = card.stage.index();
+            }
+            return;
+        }
         let cols = self.columns();
         let vis = self.visible_columns();
         if let Some(key) = &self.sel.key {
@@ -428,24 +542,30 @@ impl App {
     }
 
     fn step_machine(&mut self, dir: i32) {
-        let machine_tabs: Vec<usize> = self
-            .tabs
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| matches!(t, Scope::All | Scope::Machine(_)))
-            .map(|(i, _)| i)
+        let choices: Vec<Option<String>> = std::iter::once(None)
+            .chain(
+                self.machines
+                    .iter()
+                    .filter(|m| m.is_shown())
+                    .map(|m| Some(m.name())),
+            )
             .collect();
-        let current = match self.scope() {
-            Scope::Session(m, _) => self
-                .tabs
-                .iter()
-                .position(|t| *t == Scope::Machine(m.clone())),
-            _ => Some(self.tab),
+        let pos = choices.iter().position(|m| m == &self.machine).unwrap_or(0);
+        let next = (pos as i32 + dir).rem_euclid(choices.len() as i32) as usize;
+        self.machine = choices[next].clone();
+        self.rebuild();
+        self.set_tab(0);
+    }
+
+    fn choose_scope(&mut self, scope: Scope) {
+        self.machine = match &scope {
+            Scope::All => None,
+            Scope::Machine(m) | Scope::Session(m, _) => Some(m.clone()),
+        };
+        self.rebuild();
+        if let Some(tab) = self.tabs.iter().position(|t| *t == scope) {
+            self.set_tab(tab);
         }
-        .unwrap_or(0);
-        let pos = machine_tabs.iter().position(|&t| t == current).unwrap_or(0) as i32;
-        let next = (pos + dir).rem_euclid(machine_tabs.len() as i32) as usize;
-        self.set_tab(machine_tabs[next]);
     }
 
     fn session_tab(&mut self, n: usize) {
@@ -493,6 +613,9 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
+        if let Some(action) = self.control_key(key) {
+            return action;
+        }
         match self.mode.clone() {
             Mode::Board => self.board_key(key),
             Mode::Peek { scroll, back } => self.peek_key(key, scroll, back),
@@ -504,6 +627,7 @@ impl App {
             } => self.keys_key(key, filter, typing, scroll),
             Mode::Machines { sel } => self.machines_key(key, sel),
             Mode::Backlog { sel } => self.backlog_key(key, sel),
+            Mode::Palette { .. } | Mode::Compose { .. } | Mode::Confirm { .. } => Action::None,
         }
     }
 
@@ -575,7 +699,7 @@ impl App {
             KeyCode::Char('[') | KeyCode::BackTab => self.step_tab(-1),
             KeyCode::Char('}') => self.step_machine(1),
             KeyCode::Char('{') => self.step_machine(-1),
-            KeyCode::Char('0') => self.set_tab(0),
+            KeyCode::Char('0') => self.choose_scope(Scope::All),
             KeyCode::Char(c @ '1'..='9') => self.session_tab(c as usize - '0' as usize),
             KeyCode::Char('/') => {
                 self.mode = Mode::Search(Search {
@@ -584,7 +708,7 @@ impl App {
                     sel: 0,
                 })
             }
-            KeyCode::Char('b') => self.mode = Mode::Backlog { sel: 0 },
+            KeyCode::Char('b') => self.enter_backlog(false),
             KeyCode::Char('M') => self.mode = Mode::Machines { sel: 0 },
             KeyCode::Char('r') => {
                 let target = self
@@ -766,9 +890,7 @@ impl App {
             Hit::Session(i) => {
                 let r = &self.board.sessions[i];
                 let scope = Scope::Session(r.machine.clone(), r.session.clone());
-                if let Some(t) = self.tabs.iter().position(|t| *t == scope) {
-                    self.set_tab(t);
-                }
+                self.choose_scope(scope);
                 self.mode = Mode::Board;
                 Action::None
             }
@@ -782,6 +904,9 @@ impl App {
         let want = |f: SearchFilter| s.filter == SearchFilter::Everything || s.filter == f;
         if want(SearchFilter::Cards) || s.filter == SearchFilter::DoneToo {
             for (i, c) in self.board.cards.iter().enumerate() {
+                if !self.card_visible(c) {
+                    continue;
+                }
                 let done = c.attention == Attention::Done;
                 if done && s.filter != SearchFilter::DoneToo && q.is_empty() {
                     continue;
@@ -796,6 +921,23 @@ impl App {
                 if q.is_empty() && s.filter == SearchFilter::Everything {
                     continue;
                 }
+                let in_scope = match self.scope() {
+                    Scope::All => true,
+                    Scope::Machine(m) => &w.machine == m,
+                    Scope::Session(m, s) => &w.machine == m && &w.session == s,
+                };
+                if !in_scope {
+                    continue;
+                }
+                if (self.owner.is_some() || self.project.is_some() || self.provider.is_some())
+                    && !w
+                        .card
+                        .as_deref()
+                        .and_then(|key| self.card(key))
+                        .is_some_and(|c| self.card_visible(c))
+                {
+                    continue;
+                }
                 let hay = format!("{} {} {} {}", w.label, w.session, w.machine, w.id);
                 if let Some(score) = score(&q, &hay) {
                     hits.push((Hit::Workspace(i), 1000 + score));
@@ -805,6 +947,18 @@ impl App {
         if want(SearchFilter::Sessions) {
             for (i, r) in self.board.sessions.iter().enumerate() {
                 if q.is_empty() && s.filter == SearchFilter::Everything {
+                    continue;
+                }
+                if !self.scope().contains_session(r) {
+                    continue;
+                }
+                if (self.owner.is_some() || self.project.is_some() || self.provider.is_some())
+                    && !self.board.cards.iter().any(|c| {
+                        c.machine == r.machine
+                            && c.session.as_deref() == Some(r.session.as_str())
+                            && self.card_visible(c)
+                    })
+                {
                     continue;
                 }
                 let hay = format!("{} {}", r.session, r.machine);
@@ -926,9 +1080,7 @@ impl App {
                     Conn::Hidden => return Action::ToggleHidden(i),
                     _ => {
                         let scope = Scope::Machine(m.name());
-                        if let Some(t) = self.tabs.iter().position(|t| *t == scope) {
-                            self.set_tab(t);
-                        }
+                        self.choose_scope(scope);
                         self.mode = Mode::Board;
                     }
                 }
@@ -945,7 +1097,11 @@ impl App {
             .cards
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.stage == Stage::Backlog && scope.contains(c))
+            .filter(|(_, c)| {
+                (c.stage == Stage::Backlog || self.wont_do)
+                    && scope.contains(c)
+                    && self.card_visible(c)
+            })
             .map(|(i, _)| i)
             .collect()
     }
@@ -975,6 +1131,7 @@ impl App {
             KeyCode::Enter | KeyCode::Char('m') | KeyCode::Char(' ') => {
                 if let Some(&i) = items.get(sel) {
                     let key = self.board.cards[i].key.clone();
+                    self.backlog_focus = Some(key.clone());
                     self.sel = Selection {
                         col: 0,
                         key: Some(key),
@@ -986,6 +1143,9 @@ impl App {
                 }
             }
             _ => {}
+        }
+        if let Mode::Backlog { sel } = self.mode {
+            self.backlog_focus = items.get(sel).map(|&i| self.board.cards[i].key.clone());
         }
         Action::None
     }
@@ -1046,6 +1206,352 @@ pub fn match_range(query: &str, text: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn demo_app() -> App {
+        App::new(Config::default(), crate::demo::machines(false))
+    }
+
+    fn press(app: &mut App, c: char) -> Action {
+        app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn overview_does_not_mix_all_machines_sessions_in_the_tab_bar() {
+        let app = demo_app();
+        assert_eq!(app.tabs, vec![Scope::All]);
+    }
+
+    #[test]
+    fn braces_switch_machine_and_brackets_stay_in_its_sessions() {
+        let mut app = demo_app();
+        let first = app.machines[0].name();
+        let second = app.machines[1].name();
+        press(&mut app, '}');
+        assert_eq!(app.scope(), &Scope::Machine(first.clone()));
+        assert!(
+            app.tabs
+                .iter()
+                .all(|t| matches!(t, Scope::Machine(m) | Scope::Session(m, _) if m == &first))
+        );
+        press(&mut app, ']');
+        assert!(matches!(app.scope(), Scope::Session(m, _) if m == &first));
+        press(&mut app, '}');
+        assert_eq!(app.scope(), &Scope::Machine(second.clone()));
+        assert!(
+            app.tabs
+                .iter()
+                .all(|t| matches!(t, Scope::Machine(m) | Scope::Session(m, _) if m == &second))
+        );
+        press(&mut app, '0');
+        assert_eq!(app.scope(), &Scope::All);
+    }
+
+    #[test]
+    fn tenant_and_project_filters_compose_and_wont_do_has_its_own_view() {
+        let mut app = demo_app();
+        let key = app.board.cards[0].key.clone();
+        let card = &mut app.board.cards[0];
+        card.stage = Stage::Backlog;
+        let d = card.detail.get_or_insert_with(Default::default);
+        d.tenant = Some("pick4me".into());
+        d.project = Some("website".into());
+        app.owner = Some("tenant:pick4me".into());
+        app.project = Some("website".into());
+        assert!(
+            app.columns()[0]
+                .iter()
+                .any(|&i| app.board.cards[i].key == key)
+        );
+        app.project = Some("another".into());
+        assert!(app.columns().iter().all(Vec::is_empty));
+        app.project = Some("website".into());
+        app.board.cards[0].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        assert!(app.backlog_cards().is_empty());
+        app.wont_do = true;
+        assert_eq!(app.backlog_cards(), vec![0]);
+    }
+
+    #[test]
+    fn dispatch_confirmation_cancels_without_action_and_only_yes_overrides() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let request = serde_json::json!({"action":"dispatch","id":"0041"});
+        let response = crate::actions::Response {
+            ok: false,
+            message: "3 of 3 slots used".into(),
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            id: Some("0041".into()),
+        };
+        app.finish_action(0, request.clone(), Ok(response.clone()));
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(!matches!(app.mode, Mode::Confirm { .. }));
+        app.finish_action(0, request, Ok(response));
+        let Action::Mutate { machine, request } = press(&mut app, 'y') else {
+            panic!("expected action")
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request["id"], "0041");
+        assert_eq!(request["override"], true);
+    }
+
+    #[test]
+    fn leader_affirm_and_counted_move_name_the_selected_backlog_record() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.mode = Mode::Backlog { sel: 0 };
+        let i = app.backlog_cards()[0];
+        let id = app.board.cards[i].detail.as_ref().unwrap().id.clone();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        let Action::Mutate { request, .. } = press(&mut app, 'f') else {
+            panic!("expected affirmation")
+        };
+        assert_eq!(request["action"], "refresh");
+        assert_eq!(request["id"], id);
+        press(&mut app, '1');
+        press(&mut app, '0');
+        let Action::Mutate { request, .. } = press(&mut app, 'K') else {
+            panic!("expected reorder")
+        };
+        assert_eq!(request["action"], "move");
+        assert_eq!(request["delta"], -10);
+    }
+
+    #[test]
+    fn polling_preserves_peek_target_when_backlog_column_is_hidden() {
+        let mut app = demo_app();
+        app.width = 80;
+        app.mode = Mode::Backlog { sel: 0 };
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let before = app.selected().unwrap().key.clone();
+        app.rebuild();
+        assert_eq!(app.selected().unwrap().key, before);
+    }
+
+    #[test]
+    fn search_sessions_and_workspaces_respects_selected_machine() {
+        let mut app = demo_app();
+        press(&mut app, '}');
+        for filter in [SearchFilter::Sessions, SearchFilter::Workspaces] {
+            let search = Search {
+                query: String::new(),
+                filter,
+                sel: 0,
+            };
+            for (hit, _) in app.search_hits(&search) {
+                let machine = match hit {
+                    Hit::Session(i) => &app.board.sessions[i].machine,
+                    Hit::Workspace(i) => &app.board.workspaces[i].machine,
+                    _ => continue,
+                };
+                assert_eq!(machine, app.machine.as_ref().unwrap());
+            }
+        }
+    }
+
+    #[test]
+    fn owner_cycle_preserves_project_for_an_empty_intersection() {
+        let mut app = demo_app();
+        app.project = Some("website".into());
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 't');
+        assert_eq!(app.project.as_deref(), Some("website"));
+    }
+
+    #[test]
+    fn polling_reorder_never_retargets_a_palette_action_to_the_next_record() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.mode = Mode::Backlog { sel: 0 };
+        let i = app.backlog_cards()[0];
+        let id = app.board.cards[i].detail.as_ref().unwrap().id.clone();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        for machine in &mut app.machines {
+            if let Some(feed) = &mut machine.feed {
+                for card in &mut feed.cards {
+                    if card.id == id {
+                        card.backlog_rank = Some(99999);
+                    }
+                }
+            }
+        }
+        app.rebuild();
+        let Action::Mutate { request, .. } = press(&mut app, 'f') else {
+            panic!("expected affirmation")
+        };
+        assert_eq!(request["id"], id);
+    }
+
+    #[test]
+    fn reopening_backlog_or_switching_machine_actions_the_visible_row() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'b');
+        press(&mut app, 'j');
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        press(&mut app, 'b');
+        let id = app.board.cards[app.backlog_cards()[0]]
+            .detail
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("expected affirmation")
+        };
+        assert_eq!(request["id"], id);
+        press(&mut app, 'j');
+        press(&mut app, '}');
+        let id = app.board.cards[app.backlog_cards()[0]]
+            .detail
+            .as_ref()
+            .unwrap()
+            .id
+            .clone();
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("expected affirmation")
+        };
+        assert_eq!(request["id"], id);
+    }
+
+    fn provider_app() -> App {
+        let mut app = demo_app();
+        let seed = app.board.cards[0].clone();
+        app.board.cards = [
+            vec!["claude"],
+            vec!["codex"],
+            vec!["claude", "codex"],
+            vec!["future-agent"],
+            vec![],
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(i, agents)| {
+            let mut card = seed.clone();
+            card.key = format!("provider-{i}");
+            card.machine = "laptop".into();
+            card.stage = if i == 4 { Stage::Backlog } else { Stage::Build };
+            card.title = "Codex and Claude mentioned in title".into();
+            card.agents = agents
+                .into_iter()
+                .map(|name| crate::model::AgentInfo {
+                    agent: name.into(),
+                    status: "working".into(),
+                    pane_id: format!("p{i}"),
+                    title: None,
+                })
+                .collect();
+            card
+        })
+        .collect();
+        app
+    }
+
+    fn provider_command(app: &mut App) {
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert_eq!(press(app, 'a'), Action::None);
+    }
+
+    fn visible_ids(app: &App) -> Vec<usize> {
+        app.board
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| app.card_visible(card))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    #[test]
+    fn provider_cycle_uses_reported_agents_including_mixed_and_future_providers() {
+        let mut app = provider_app();
+        assert_eq!(visible_ids(&app), vec![0, 1, 2, 3, 4]);
+        provider_command(&mut app);
+        assert_eq!(visible_ids(&app), vec![0, 2]);
+        provider_command(&mut app);
+        assert_eq!(visible_ids(&app), vec![1, 2]);
+        provider_command(&mut app);
+        assert_eq!(visible_ids(&app), vec![3]);
+        provider_command(&mut app);
+        assert_eq!(visible_ids(&app), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn provider_filter_combines_with_machine_owner_project_and_dismissal() {
+        let mut app = provider_app();
+        for card in &mut app.board.cards {
+            let detail = card.detail.get_or_insert_with(Default::default);
+            detail.tenant = Some("pick4me".into());
+            detail.project = Some("web".into());
+        }
+        app.board.cards[2].machine = "build-box".into();
+        app.machine = Some("laptop".into());
+        app.tabs = vec![Scope::Machine("laptop".into())];
+        app.owner = Some("tenant:pick4me".into());
+        app.project = Some("web".into());
+        provider_command(&mut app);
+        assert_eq!(visible_ids(&app), vec![0]);
+        app.project = Some("other".into());
+        assert!(visible_ids(&app).is_empty());
+        app.project = Some("web".into());
+        app.board.cards[0].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        assert!(visible_ids(&app).is_empty());
+        app.wont_do = true;
+        assert_eq!(visible_ids(&app), vec![0]);
+    }
+
+    #[test]
+    fn provider_search_excludes_unmatched_workspaces_and_sessions() {
+        let mut app = demo_app();
+        for card in &mut app.board.cards {
+            for agent in &mut card.agents {
+                agent.agent = "claude".into();
+            }
+        }
+        let selected = app
+            .board
+            .cards
+            .iter_mut()
+            .find(|c| c.workspace_id.is_some() && !c.agents.is_empty())
+            .unwrap();
+        selected.agents[0].agent = "codex".into();
+        let machine = selected.machine.clone();
+        let session = selected.session.clone().unwrap();
+        provider_command(&mut app);
+        provider_command(&mut app);
+        for filter in [SearchFilter::Workspaces, SearchFilter::Sessions] {
+            let hits = app.search_hits(&Search {
+                query: String::new(),
+                filter,
+                sel: 0,
+            });
+            assert!(!hits.is_empty());
+            for (hit, _) in hits {
+                match hit {
+                    Hit::Workspace(i) => {
+                        let w = &app.board.workspaces[i];
+                        assert!(
+                            w.card
+                                .as_deref()
+                                .and_then(|key| app.card(key))
+                                .is_some_and(|c| c.agents.iter().any(|a| a.agent == "codex"))
+                        );
+                    }
+                    Hit::Session(i) => {
+                        assert_eq!(app.board.sessions[i].machine, machine);
+                        assert_eq!(app.board.sessions[i].session, session);
+                    }
+                    _ => panic!("wrong search group"),
+                }
+            }
+        }
+    }
 
     #[test]
     fn scores_substrings_before_scattered_letters() {

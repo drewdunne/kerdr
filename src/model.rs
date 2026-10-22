@@ -205,6 +205,51 @@ pub struct Card {
 }
 
 impl Card {
+    pub fn dismissed(&self) -> bool {
+        self.detail.as_ref().and_then(|d| d.disposition.as_deref()) == Some("wont_do")
+    }
+
+    pub fn owner_key(&self) -> String {
+        let d = self.detail.as_ref();
+        if let Some(t) = d
+            .and_then(|d| d.tenant.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            format!("tenant:{t}")
+        } else if let Some(o) = d
+            .and_then(|d| d.organization.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            format!("org:{o}")
+        } else {
+            "unassigned".into()
+        }
+    }
+
+    pub fn owner_label(&self) -> String {
+        let key = self.owner_key();
+        match key.split_once(':') {
+            Some(("org", name)) => format!("{name} (organization)"),
+            Some((_, name)) => name.to_string(),
+            None => "Unassigned".into(),
+        }
+    }
+
+    pub fn project(&self) -> &str {
+        self.detail
+            .as_ref()
+            .and_then(|d| d.project.as_deref())
+            .unwrap_or("")
+    }
+
+    pub fn backlog_rank(&self) -> i64 {
+        self.detail
+            .as_ref()
+            .and_then(|d| d.backlog_rank)
+            .or_else(|| self.detail.as_ref().and_then(|d| d.id.parse().ok()))
+            .unwrap_or(i64::MAX)
+    }
+
     pub fn is_open_workspace(&self) -> bool {
         self.workspace_id.is_some() && self.session.is_some()
     }
