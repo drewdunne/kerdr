@@ -83,7 +83,8 @@ without them.
 
 The leftmost tab is the machine selector: `All`, then one machine at a time with `{` and `}`.
 Only the selected machine's sessions appear beside it. `[` and `]` move between those sessions,
-and `1` to `9` jump straight to a session. `0` returns to the all-machine overview.
+and `1` to `9` jump straight to a session. `0` returns to the all-machine overview. Machine and session keys work even when the current
+board is empty; the empty view shows these keys and how to reach Misc conversations.
 
 Kerdr reads every machine you list, over SSH, with one round trip per read and one shared SSH
 connection per machine. It never answers a prompt for you. Jumping into a card on another
@@ -127,7 +128,7 @@ already done. Session and workspace results follow the same filters; switch to A
 
 Ctrl+Space then `n` opens the new-intent form. Choose its organization, optional tenant,
 project, machine and session, then save it to the backlog. Creation does not start an agent.
-Ctrl+Space then `t` cycles owner/tenant views; `p` cycles project views. Ctrl+Space then `a`
+Ctrl+Space then `t` cycles owner/tenant views; `p` cycles project views. `a` (or Ctrl+Space then `a`)
 filters by the provider herdr reports: All, Claude, Codex, and additional detected providers.
 Cards with no reported agent appear in All. These filters combine with machine and session
 selection. Organization work stays distinct from tenant work.
@@ -151,6 +152,7 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
 | `/` | search |
+| `a` | cycle provider: All, Claude, Codex, and detected providers |
 | `b` | backlog |
 | `w` | toggle Won't do view |
 | `Ctrl+Space` | intent controls: new, dispatch, affirm, order, filters, restore |

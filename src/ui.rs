@@ -283,6 +283,36 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     }
     strip(f, rows[2], app);
     columns(f, rows[3], app);
+    if app
+        .columns()
+        .iter()
+        .zip(app.visible_columns())
+        .all(|(cards, visible)| !visible || cards.is_empty())
+    {
+        let rect = Rect {
+            y: rows[3].y.saturating_add(3),
+            height: rows[3].height.saturating_sub(3),
+            ..rows[3]
+        };
+        let lines = vec![
+            Line::styled("No work cards in this view.", bold(FG2)),
+            Line::raw(""),
+            Line::styled(
+                if app.machine.is_none() {
+                    "{ } choose a machine, then [ ] choose a session"
+                } else {
+                    "[ ] choose session    { } change machine"
+                },
+                fg(CYAN),
+            ),
+            Line::styled("a provider    / search    i Misc", fg(CYAN)),
+            Line::styled("Ctrl+Space commands and work filters", fg(DIM)),
+        ];
+        f.render_widget(
+            Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
+            rect,
+        );
+    }
     if let Some(line) = pending {
         put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
     } else if let Some((text, tone)) = message {
@@ -300,6 +330,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     let hints = key_hints(&[
+        ("a", "provider"),
         ("Ctrl+Space", "commands"),
         ("h j k l", "move"),
         ("⏎", "jump in"),
@@ -490,7 +521,7 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
 
 fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
     let mut left = vec![
-        Span::styled(format!(" provider: {}", app.provider_label()), fg(CYAN)),
+        Span::styled(format!(" a provider: {}", app.provider_label()), fg(CYAN)),
         Span::styled(format!("   owner: {}", app.owner_label()), fg(CYAN)),
         Span::styled(format!("   project: {}", app.project_label()), fg(CYAN)),
     ];
@@ -1928,7 +1959,7 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
             ("Ctrl+Space", "open commands, then press a key below", ""),
             ("leader n", "compose a new intent", "Ctrl+Enter creates"),
             (
-                "leader a",
+                "a / leader a",
                 "filter by reported agent provider",
                 "all / Claude / Codex / others",
             ),
@@ -3380,6 +3411,24 @@ mod tests {
             a.mode = mode;
             let mut t = Terminal::new(TestBackend::new(80, 24)).unwrap();
             t.draw(|f| draw(f, &a)).unwrap();
+        }
+    }
+
+    #[test]
+    fn empty_board_shows_machine_session_provider_and_misc_navigation() {
+        let mut app = demo(false);
+        app.project = Some("no-matching-project".into());
+        let mut terminal = Terminal::new(TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let text = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        for hint in ["No work cards", "[ ]", "{ }", "provider", "Misc"] {
+            assert!(text.contains(hint), "missing {hint}: {text}");
         }
     }
 }

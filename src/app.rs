@@ -1347,6 +1347,29 @@ pub fn match_range(query: &str, text: &str) -> Option<(usize, usize)> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn a_cycles_provider_directly_even_when_current_filter_leaves_board_empty() {
+        let mut app = App::new(Config::default(), crate::demo::machines(false));
+        press(&mut app, 'a');
+        assert_eq!(app.provider.as_deref(), Some("claude"));
+        app.project = Some("no-matching-project".into());
+        assert!(app.columns().iter().all(Vec::is_empty));
+        press(&mut app, 'a');
+        assert_eq!(app.provider.as_deref(), Some("codex"));
+        press(&mut app, 'a');
+        assert_eq!(app.provider, None);
+    }
+
+    #[test]
+    fn empty_board_still_switches_machines_and_sessions() {
+        let mut app = App::new(Config::default(), crate::demo::machines(false));
+        app.project = Some("no-matching-project".into());
+        press(&mut app, '}');
+        let machine = app.machine.clone().unwrap();
+        press(&mut app, ']');
+        assert!(matches!(app.scope(), Scope::Session(m, _) if m == &machine));
+    }
+
     fn demo_app() -> App {
         App::new(Config::default(), crate::demo::machines(false))
     }

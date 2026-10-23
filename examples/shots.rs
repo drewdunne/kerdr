@@ -340,4 +340,7 @@ fn main() {
         };
     }
     rasterize(&render(&provider), &fonts, &out.join("provider.png"));
+    let mut empty = app(false);
+    empty.project = Some("no-matching-project".into());
+    rasterize(&render(&empty), &fonts, &out.join("empty.png"));
 }

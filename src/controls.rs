@@ -453,6 +453,18 @@ impl App {
             };
             return Some(Action::None);
         }
+        if key.code == KeyCode::Char('a')
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && matches!(
+                self.mode,
+                Mode::Board | Mode::Backlog { .. } | Mode::Misc { .. }
+            )
+        {
+            self.cycle_provider();
+            return Some(Action::None);
+        }
         if matches!(self.mode, Mode::Board | Mode::Backlog { .. }) && key.code == KeyCode::Char('w')
         {
             self.enter_backlog(!self.wont_do);
