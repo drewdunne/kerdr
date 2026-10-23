@@ -523,7 +523,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             key: format!("ws:{}:{}:{}", m.name(), w.session, w.ws.workspace_id),
             reference: label.clone(),
             title: agent_title.unwrap_or_else(|| label.clone()),
-            stage: reported_stage.unwrap_or(Stage::Build),
+            stage: Stage::Misc,
             attention: att,
             why,
             machine: m.name(),
@@ -586,7 +586,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             let open_cards = cards
                 .iter()
                 .filter(in_session)
-                .filter(|c| !matches!(c.stage, Stage::Backlog | Stage::Maintain))
+                .filter(|c| !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc))
                 .count();
             sessions.push(SessionRow {
                 machine: name.clone(),
@@ -596,6 +596,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 needs: cards
                     .iter()
                     .filter(in_session)
+                    .filter(|c| c.stage != Stage::Misc)
                     .filter(|c| c.needs_you())
                     .count(),
                 cards: open_cards,
@@ -728,7 +729,7 @@ pub fn summarize(board: &Board, scope: &Scope, machines: &[MachineState]) -> Sum
     let cards: Vec<&Card> = board
         .cards
         .iter()
-        .filter(|c| scope.contains(c) && !c.dismissed())
+        .filter(|c| scope.contains(c) && !c.dismissed() && c.stage != Stage::Misc)
         .collect();
     let open = |c: &&&Card| !matches!(c.stage, Stage::Backlog | Stage::Maintain);
     let mut s = Summary {
@@ -1019,7 +1020,7 @@ mod tests {
             .find(|c| c.reference == "omarchy-automation")
             .unwrap();
         assert_eq!(automation.attention, Attention::Running);
-        assert_eq!(automation.stage, Stage::Build);
+        assert_eq!(automation.stage.id(), "misc");
         assert!(
             board.cards.iter().all(|c| c.reference != "notes"),
             "a workspace without an agent isn't a card"
@@ -1027,6 +1028,11 @@ mod tests {
 
         let summary = summarize(&board, &Scope::All, &machines);
         assert_eq!(summary.needs_you, 1);
+        assert_eq!(
+            summary.running, 0,
+            "an unlinked automation is not intent work"
+        );
+        assert_eq!(board.sessions[0].cards, 1);
         assert_eq!(summary.backlog, 1);
         assert_eq!(summary.slots_used, 3);
         assert_eq!(summary.full_sessions, ["default"]);

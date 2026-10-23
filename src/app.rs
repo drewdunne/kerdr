@@ -102,6 +102,31 @@ pub enum Mode {
     Backlog {
         sel: usize,
     },
+    Misc {
+        sel: usize,
+    },
+}
+
+fn misc_selection(mode: &Mode) -> Option<usize> {
+    match mode {
+        Mode::Misc { sel } => Some(*sel),
+        Mode::Peek { back, .. }
+        | Mode::Palette { back }
+        | Mode::Compose { back, .. }
+        | Mode::Confirm { back, .. } => misc_selection(back),
+        _ => None,
+    }
+}
+
+fn set_misc_selection(mode: &mut Mode, selected: usize) {
+    match mode {
+        Mode::Misc { sel } => *sel = selected,
+        Mode::Peek { back, .. }
+        | Mode::Palette { back }
+        | Mode::Compose { back, .. }
+        | Mode::Confirm { back, .. } => set_misc_selection(back, selected),
+        _ => {}
+    }
 }
 
 fn backlog_selection(mode: &Mode) -> Option<usize> {
@@ -311,6 +336,23 @@ impl App {
             })
             .unwrap_or(0);
         self.tabs = tabs;
+        if let Some(sel) = misc_selection(&self.mode) {
+            let items = self.misc_cards();
+            let found = self
+                .sel
+                .key
+                .as_ref()
+                .and_then(|key| items.iter().position(|&i| &self.board.cards[i].key == key));
+            let selected = found.unwrap_or(sel.min(items.len().saturating_sub(1)));
+            if !holds_peek(&self.mode) {
+                self.sel.key = items
+                    .get(selected)
+                    .map(|&i| self.board.cards[i].key.clone());
+                self.sel.col = 0;
+            }
+            set_misc_selection(&mut self.mode, selected);
+            return;
+        }
         self.fix_selection();
         if let Some(sel) = backlog_selection(&self.mode) {
             let items = self.backlog_cards();
@@ -348,7 +390,7 @@ impl App {
         let mut cols: [Vec<usize>; 7] = Default::default();
         let scope = self.scope();
         for (i, c) in self.board.cards.iter().enumerate() {
-            if scope.contains(c) && self.card_visible(c) {
+            if c.stage != Stage::Misc && scope.contains(c) && self.card_visible(c) {
                 cols[c.stage.index()].push(i);
             }
         }
@@ -364,6 +406,22 @@ impl App {
     }
 
     fn fix_selection(&mut self) {
+        if let Some(sel) = misc_selection(&self.mode) {
+            if !holds_peek(&self.mode) {
+                let items = self.misc_cards();
+                let selected = self
+                    .sel
+                    .key
+                    .as_ref()
+                    .and_then(|key| items.iter().position(|&i| &self.board.cards[i].key == key))
+                    .unwrap_or(sel.min(items.len().saturating_sub(1)));
+                self.sel.key = items
+                    .get(selected)
+                    .map(|&i| self.board.cards[i].key.clone());
+                set_misc_selection(&mut self.mode, selected);
+            }
+            return;
+        }
         if holds_peek(&self.mode) {
             // A peek is an operation on one stable record, including when its column is hidden.
             // Losing the record must never silently point an action at a neighbor.
@@ -627,6 +685,7 @@ impl App {
             } => self.keys_key(key, filter, typing, scroll),
             Mode::Machines { sel } => self.machines_key(key, sel),
             Mode::Backlog { sel } => self.backlog_key(key, sel),
+            Mode::Misc { sel } => self.misc_key(key, sel),
             Mode::Palette { .. } | Mode::Compose { .. } | Mode::Confirm { .. } => Action::None,
         }
     }
@@ -741,7 +800,10 @@ impl App {
             && key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('m') | KeyCode::Char(' ') => {
-                self.mode = *back
+                self.mode = *back;
+                if misc_selection(&self.mode).is_some() {
+                    self.fix_selection();
+                }
             }
             KeyCode::Enter => {
                 if let Some(k) = self.sel.key.clone() {
@@ -1149,6 +1211,84 @@ impl App {
         }
         Action::None
     }
+
+    pub fn misc_cards(&self) -> Vec<usize> {
+        self.board
+            .cards
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.stage == Stage::Misc && self.card_visible(c))
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    pub(super) fn enter_misc(&mut self) {
+        self.mode = Mode::Misc { sel: 0 };
+        self.sel.col = 0;
+        self.sel.key = self
+            .misc_cards()
+            .first()
+            .map(|&i| self.board.cards[i].key.clone());
+    }
+
+    fn misc_key(&mut self, key: KeyEvent, sel: usize) -> Action {
+        let items = self.misc_cards();
+        let mut selected = sel.min(items.len().saturating_sub(1));
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q' | 'i') => {
+                self.mode = Mode::Board;
+                self.fix_selection();
+                return Action::None;
+            }
+            KeyCode::Char('j') | KeyCode::Down => {
+                selected = (selected + 1).min(items.len().saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => selected = selected.saturating_sub(1),
+            KeyCode::Char('g') | KeyCode::Home => selected = 0,
+            KeyCode::Char('G') | KeyCode::End => selected = items.len().saturating_sub(1),
+            KeyCode::Enter => {
+                if let Some(&i) = items.get(selected) {
+                    return self.jump_action(self.board.cards[i].key.clone());
+                }
+            }
+            KeyCode::Char('m' | ' ') => {
+                if !items.is_empty() {
+                    self.sel.key = Some(self.board.cards[items[selected]].key.clone());
+                    self.mode = Mode::Peek {
+                        scroll: 0,
+                        back: Box::new(Mode::Misc { sel: selected }),
+                    };
+                }
+                return Action::None;
+            }
+            KeyCode::Char('[') | KeyCode::BackTab => {
+                self.step_tab(-1);
+                self.rebuild();
+                return Action::None;
+            }
+            KeyCode::Char(']') | KeyCode::Tab => {
+                self.step_tab(1);
+                self.rebuild();
+                return Action::None;
+            }
+            KeyCode::Char('{') => {
+                self.step_machine(-1);
+                self.rebuild();
+                return Action::None;
+            }
+            KeyCode::Char('}') => {
+                self.step_machine(1);
+                self.rebuild();
+                return Action::None;
+            }
+            _ => {}
+        }
+        self.mode = Mode::Misc { sel: selected };
+        self.sel.key = items
+            .get(selected)
+            .map(|&i| self.board.cards[i].key.clone());
+        Action::None
+    }
 }
 
 /// Ranks a card for a query: matches in its reference or title beat matches in its session or
@@ -1213,6 +1353,160 @@ mod tests {
 
     fn press(app: &mut App, c: char) -> Action {
         app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    #[test]
+    fn unlinked_workspace_goes_to_misc_and_enter_still_jumps() {
+        let mut app = demo_app();
+        let misc = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.source == crate::model::Source::Workspace)
+            .unwrap()
+            .clone();
+        assert_eq!(misc.stage.id(), "misc");
+        assert!(
+            !app.columns()
+                .iter()
+                .flatten()
+                .any(|&i| app.board.cards[i].key == misc.key)
+        );
+        press(&mut app, 'i');
+        assert!(matches!(app.mode, Mode::Misc { .. }));
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Jump(misc.key)
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Board));
+        assert!(
+            app.selected()
+                .is_none_or(|c| c.source == crate::model::Source::Feed)
+        );
+    }
+
+    #[test]
+    fn misc_moves_to_its_intent_phase_once_and_survives_a_feed_error() {
+        let mut app = demo_app();
+        let misc = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Misc)
+            .unwrap()
+            .clone();
+        let mi = misc.machine_index;
+        let session = misc.session.clone().unwrap();
+        let record = crate::feed::FeedCard {
+            id: "1886".into(),
+            title: "Real intent".into(),
+            stage: Some("test".into()),
+            workspace: Some(crate::feed::FeedWorkspace {
+                session: Some(session),
+                id: misc.workspace_id.clone(),
+                label: None,
+            }),
+            ..Default::default()
+        };
+        app.machines[mi].feed = Some(crate::feed::Feed {
+            kerdr_feed: 1,
+            cards: vec![record],
+            ..Default::default()
+        });
+        app.rebuild();
+        assert!(!app.board.cards.iter().any(|c| c.key == misc.key));
+        let claimed: Vec<_> = app
+            .board
+            .cards
+            .iter()
+            .filter(|c| {
+                c.machine_index == mi
+                    && c.session == misc.session
+                    && c.workspace_id == misc.workspace_id
+            })
+            .collect();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].stage, Stage::Test);
+        let mut data = app.machines[mi].data.clone().unwrap();
+        data.feed = Some(Err("temporary feed failure".into()));
+        app.apply(Event {
+            machine: mi,
+            conn: app.machines[mi].conn.clone(),
+            data: Some(data),
+            at: Local::now(),
+        });
+        assert!(
+            app.board.cards.iter().any(
+                |c| c.detail.as_ref().is_some_and(|d| d.id == "1886") && c.stage == Stage::Test
+            )
+        );
+        assert!(!app.board.cards.iter().any(|c| c.key == misc.key));
+    }
+
+    #[test]
+    fn misc_menu_and_peek_preserve_selection_across_poll_and_filters() {
+        let mut app = demo_app();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 'm');
+        assert!(matches!(app.mode, Mode::Misc { .. }));
+        let original = app.selected().unwrap().clone();
+        press(&mut app, 'm');
+        app.rebuild();
+        assert_eq!(app.selected().unwrap().key, original.key);
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Misc { .. }));
+        app.provider = Some("no-such-provider".into());
+        app.rebuild();
+        assert!(app.misc_cards().is_empty());
+        assert!(app.selected().is_none());
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn misc_provider_menu_retargets_peek_before_the_next_poll() {
+        let mut app = demo_app();
+        press(&mut app, 'i');
+        let mut other = app.selected().unwrap().clone();
+        for a in &mut other.agents {
+            a.agent = "claude".into();
+        }
+        other.key = "misc-other".into();
+        other.title = "Other provider".into();
+        for c in &mut app.board.cards {
+            if c.stage == Stage::Misc {
+                for a in &mut c.agents {
+                    a.agent = "codex".into();
+                }
+            }
+        }
+        app.board.cards.push(other);
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 'a');
+        assert_eq!(app.provider.as_deref(), Some("claude"));
+        assert_eq!(app.selected().unwrap().key, "misc-other");
+        press(&mut app, 'm');
+        assert_eq!(app.selected().unwrap().key, "misc-other");
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::Jump("misc-other".into())
+        );
+    }
+
+    #[test]
+    fn misc_selection_survives_polling_while_composing_an_intent() {
+        let mut app = demo_app();
+        press(&mut app, 'i');
+        let original = app.selected().unwrap().key.clone();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        app.rebuild();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Misc { .. }));
+        assert_eq!(app.selected().unwrap().key, original);
     }
 
     #[test]

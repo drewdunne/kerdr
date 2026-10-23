@@ -16,6 +16,8 @@ pub enum Stage {
     Test,
     Deploy,
     Maintain,
+    /// Conversations without a feed record; kept outside the working stages.
+    Misc,
 }
 
 impl Stage {
@@ -54,6 +56,7 @@ impl Stage {
             Stage::Test => "test",
             Stage::Deploy => "deploy",
             Stage::Maintain => "maintain",
+            Stage::Misc => "misc",
         }
     }
 
@@ -66,6 +69,7 @@ impl Stage {
             Stage::Test => "Test",
             Stage::Deploy => "Deploy",
             Stage::Maintain => "Maintain",
+            Stage::Misc => "Misc",
         }
     }
 

@@ -45,7 +45,7 @@ import json, sys
 board = json.load(open(sys.argv[1]))
 assert board["machines"][0]["connection"] == "live", board["machines"]
 card = next(c for c in board["cards"] if c["ref"] == "01-alpha")
-assert card["stage"] == "test", card
+assert card["stage"] == "misc", card
 assert card["attention"] == "needs you", card
 assert card["why"] == "live check", card
 PY

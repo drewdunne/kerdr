@@ -263,6 +263,13 @@ fn main() {
     backlog.mode = Mode::Backlog { sel: 0 };
     rasterize(&render(&backlog), &fonts, &out.join("backlog.png"));
 
+    let mut misc = app(false);
+    misc.on_key(ratatui::crossterm::event::KeyEvent::new(
+        ratatui::crossterm::event::KeyCode::Char('i'),
+        ratatui::crossterm::event::KeyModifiers::NONE,
+    ));
+    rasterize(&render(&misc), &fonts, &out.join("misc.png"));
+
     let mut palette = app(false);
     palette.mode = Mode::Palette {
         back: Box::new(Mode::Board),

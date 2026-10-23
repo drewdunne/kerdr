@@ -93,6 +93,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
         }
         Mode::Machines { sel } => machines_view(f, area, app, *sel),
         Mode::Backlog { sel } => backlog_view(f, area, app, *sel),
+        Mode::Misc { sel } => misc_view(f, area, app, *sel),
         Mode::Search(s) => {
             board_view(f, area, app);
             dim_behind(f);
@@ -308,6 +309,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         ("[ ]", "tab"),
         ("{ }", "machine"),
         ("b", "backlog"),
+        ("i", "misc"),
         ("M", "machines"),
         ("?", "keys"),
         ("q", "quit"),
@@ -333,7 +335,7 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
                 .board
                 .cards
                 .iter()
-                .filter(|c| !matches!(c.stage, Stage::Backlog | Stage::Maintain))
+                .filter(|c| !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc))
                 .count();
             let style = if selected {
                 sel_style
@@ -384,6 +386,7 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
                     card.machine == *m
                         && card.session.as_deref() == Some(s.as_str())
                         && app.card_matches_filters(card)
+                        && card.stage != Stage::Misc
                         && card.needs_you()
                 })
                 .count();
@@ -527,7 +530,9 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         .board
         .cards
         .iter()
-        .filter(|c| c.machine == name && !matches!(c.stage, Stage::Backlog | Stage::Maintain))
+        .filter(|c| {
+            c.machine == name && !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc)
+        })
         .count();
     let as_of = m.last_ok.map(clock);
     let color = conn_color(&m.conn);
@@ -1239,7 +1244,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     let cell = (w / 7).max(8);
     let mut names = Vec::new();
     let mut notes = Vec::new();
-    for s in Stage::ALL {
+    for s in Stage::ALL.into_iter().filter(|_| c.stage != Stage::Misc) {
         let (glyph, style) = if s == c.stage {
             (
                 "●",
@@ -1426,7 +1431,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         }
         lines.push(Line::raw(""));
         lines.extend(wrapped(
-            "No feed describes this workspace, so Kerdr shows what herdr sees. An agent can place it with `kerdr report --stage <stage>`.",
+            "Misc conversation: no intent record is linked to this workspace. It joins the work board when a record claims it.",
             w,
             fg(DIM),
             None,
@@ -1472,7 +1477,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
 // ─── Work commands ─────────────────────────────────────────────────────────────────────────
 
 fn palette(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 68, 19, Some(4));
+    let rect = centered(area, 68, 20, Some(4));
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
     let mut lines = vec![
@@ -1490,6 +1495,7 @@ fn palette(f: &mut Frame, area: Rect) {
         ("a", "Provider: all / Claude / Codex / others"),
         ("w", "Show / hide won’t do"),
         ("b", "Backlog: review and reorder"),
+        ("m", "Misc: conversations without an intent"),
         ("g", "Go to top"),
         ("?", "All keys"),
     ] {
@@ -1963,6 +1969,7 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
             ),
             ("/", "search the current machine and work filters", ""),
             ("b", "the backlog", ""),
+            ("i", "misc: conversations without an intent", "leader m too"),
         ],
     ),
     (
@@ -2418,7 +2425,7 @@ fn machines_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                     .iter()
                     .filter(|c| {
                         c.machine == m.name()
-                            && !matches!(c.stage, Stage::Backlog | Stage::Maintain)
+                            && !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc)
                     })
                     .count();
                 format!(
@@ -2602,6 +2609,105 @@ fn machines_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
 }
 
 // ─── Backlog ────────────────────────────────────────────────────────────────────────────────
+
+fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
+    let inner = pad(area, 1, 0);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    header(f.buffer_mut(), rows[0], app);
+    filters(f.buffer_mut(), rows[1], app);
+    strip(f, rows[2], app);
+    let items = app.misc_cards();
+    put(
+        f.buffer_mut(),
+        rows[3].x,
+        rows[3].y,
+        rows[3].width,
+        vec![
+            Span::styled(format!("MISC  {}", items.len()), bold(CYAN)),
+            Span::styled("   Conversations without an intent", fg(FG2)),
+        ],
+    );
+    let selected = sel.min(items.len().saturating_sub(1));
+    let h = rows[4].height as usize / 2;
+    let start = selected.saturating_sub(h.saturating_sub(1));
+    if items.is_empty() {
+        put(
+            f.buffer_mut(),
+            rows[4].x,
+            rows[4].y,
+            rows[4].width,
+            vec![Span::styled(
+                "No miscellaneous conversations match these filters.",
+                fg(DIM),
+            )],
+        );
+    }
+    for (row, &i) in items.iter().enumerate().skip(start).take(h) {
+        let c = &app.board.cards[i];
+        let y = rows[4].y + ((row - start) * 2) as u16;
+        let rect = Rect {
+            x: rows[4].x,
+            y,
+            width: rows[4].width,
+            height: 2,
+        };
+        if row == selected {
+            f.buffer_mut().set_style(rect, Style::default().bg(SEL));
+        }
+        let color = attention_color(c.attention);
+        put_lr(
+            f.buffer_mut(),
+            rect,
+            y,
+            vec![
+                Span::styled(format!(" {} ", c.attention.glyph()), fg(color)),
+                Span::styled(c.title.clone(), bold(FG)),
+            ],
+            vec![Span::styled(c.attention.label(), fg(color))],
+        );
+        let mut place = format!(
+            "   {} › {} › {}",
+            c.machine,
+            c.session.as_deref().unwrap_or(""),
+            c.workspace_label.as_deref().unwrap_or("")
+        );
+        if let Some(at) = c.cached_at {
+            place.push_str(&format!(" · cached {}", clock(at)));
+        }
+        put(
+            f.buffer_mut(),
+            rect.x,
+            y + 1,
+            rect.width,
+            vec![Span::styled(place, fg(DIM))],
+        );
+    }
+    put(
+        f.buffer_mut(),
+        rows[5].x,
+        rows[5].y,
+        rows[5].width,
+        fit(
+            key_hints(&[
+                ("⏎", "jump in"),
+                ("j k", "select"),
+                ("m", "peek"),
+                ("[ ]", "session"),
+                ("{ }", "machine"),
+                ("Esc", "board"),
+            ]),
+            rows[5].width as usize,
+        ),
+    );
+}
 
 fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     let inner = pad(area, 1, 0);
@@ -2983,6 +3089,7 @@ mod tests {
                 sel: a.machines.len() + 3,
             },
             Mode::Backlog { sel: 99 },
+            Mode::Misc { sel: 99 },
             Mode::Palette {
                 back: Box::new(Mode::Backlog { sel: 0 }),
             },

@@ -316,6 +316,7 @@ impl App {
             KeyCode::Char('t') => self.cycle_owner(),
             KeyCode::Char('p') => self.cycle_project(),
             KeyCode::Char('a') => self.cycle_provider(),
+            KeyCode::Char('m' | 'i') => self.enter_misc(),
             KeyCode::Char('w') => {
                 self.enter_backlog(!self.wont_do);
             }
@@ -404,6 +405,11 @@ impl App {
     }
 
     pub(super) fn control_key(&mut self, key: KeyEvent) -> Option<Action> {
+        if key.code == KeyCode::Char('i') && matches!(self.mode, Mode::Board | Mode::Backlog { .. })
+        {
+            self.enter_misc();
+            return Some(Action::None);
+        }
         match self.mode.clone() {
             Mode::Compose { form, back } => return Some(self.compose_key(key, form, back)),
             Mode::Confirm {
@@ -436,7 +442,7 @@ impl App {
         if leader
             && matches!(
                 self.mode,
-                Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. }
+                Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
             )
         {
             if let Some(card) = self.selected_for_control() {

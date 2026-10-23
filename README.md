@@ -5,7 +5,8 @@
 ![Kerdr's board: every agent's work across two machines, by stage, with what needs you first](docs/screenshots/board.png)
 
 Kerdr is a full-screen board for people who run many coding agents at once in herdr. Every
-herdr workspace an agent works in becomes a card, in a column for the stage its work is at.
+record of work becomes a card, in a column for the stage its work is at. Agent conversations
+without a linked record live in **Misc**, opened with `i` or `Ctrl+Space m`.
 What needs you sorts to the top. Press Enter and herdr opens full screen on that card's
 workspace. Press herdr's prefix and then `q`, herdr's own detach, and you're back on the board,
 which has kept up while you were away.
@@ -181,15 +182,21 @@ config to keep them.
 week its CI installs the latest herdr release, runs Kerdr's tests against a real herdr server,
 and opens an issue if anything has changed under it.
 
-**Where cards come from.** Out of the box, every herdr workspace with an agent is a card, and
-herdr's own agent states say what needs you: an agent asking something, or finished and not yet
-seen. Agents can place their own card from inside their pane:
+**Misc conversations.** Every herdr workspace with an agent remains reachable, including fresh
+chats and experiments with no task record. These appear in **Misc** (`i`, or `Ctrl+Space m`),
+outside the work columns and their attention counts. Enter opens the conversation, `m` peeks,
+and Escape returns to the board. Machine, session and provider filters still apply. When a feed
+record claims the workspace, its card moves into the record's phase automatically. A temporary
+feed error preserves the last successful records.
+
+Agents can report their status from inside their pane:
 
 ```sh
 kerdr report --stage test --status needs-you --note "your OK on the retry copy" --progress 2/3
 ```
 
-That writes herdr workspace tokens, so it needs nothing beyond herdr.
+That writes herdr workspace tokens, so it needs nothing beyond herdr. Reporting a phase by
+itself does not create a task record or move an unlinked conversation out of Misc.
 
 Progress reported this way shows on the card, next to its status.
 

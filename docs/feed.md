@@ -142,7 +142,8 @@ before trying again. After success, the next feed read reflects the saved change
 
 ## Agents reporting for themselves
 
-Without a feed, agents can place their own card from inside their herdr pane:
+Agents can report status from inside their herdr pane. Without a feed record claiming the
+workspace, the conversation stays in Misc rather than being assigned a work phase:
 
 ```sh
 kerdr report --stage test --status needs-you --note "your OK on the retry copy" --progress 2/3
@@ -153,3 +154,7 @@ These are herdr workspace tokens (`kerdr_stage`, `kerdr_status`, `kerdr_note`,
 `kerdr_progress`), so they need nothing but herdr. herdr keeps them until they change, the
 workspace closes or its server restarts. A feed's card for the same workspace takes precedence,
 except that a reported status still applies.
+
+`kerdr cards` identifies unlinked conversations with `"stage": "misc"`. Misc is a separate
+view (`i`, or `Ctrl+Space m`), not a lifecycle column. A matching feed record moves the
+workspace into the work board; no duplicate Misc card remains.
