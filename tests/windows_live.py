@@ -194,9 +194,14 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
                     output.get_nowait()
                 except queue.Empty:
                     return
+        def processes():
+            query = f"@(Get-CimInstance Win32_Process -Filter 'ParentProcessId = {kerdr_pid}' | Select-Object ProcessId,Name,CommandLine) | ConvertTo-Json -Compress"
+            return json.loads(run(["powershell.exe", "-NoProfile", "-Command", query]) or "[]")
         def client_pids():
-            query = f"(Get-CimInstance Win32_Process -Filter 'ParentProcessId = {kerdr_pid}' | Where-Object Name -eq 'herdr.exe' | Select-Object -ExpandProperty ProcessId) -join ','"
-            return run(["powershell.exe", "-NoProfile", "-Command", query]).strip()
+            import re
+            pattern = r'--session\s+"?' + re.escape(session) + r'"?\s*$'
+            return {p["ProcessId"] for p in processes()
+                    if p["Name"].lower() == "herdr.exe" and re.search(pattern, p["CommandLine"] or "")}
         def snapshot():
             return json.loads(herdr("api", "snapshot"))["result"]["snapshot"]
         def verify_identity():
@@ -213,7 +218,9 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
             console.write("\r")
             wait_for(client_pids, "attached client starts")
             time.sleep(1)
-            return client_pids()
+            clients = client_pids()
+            assert clients, "interactive client exited before terminal input"
+            return clients
         def back(key):
             discard()
             print(f"Returning from Herdr with {key!r}", flush=True)
@@ -264,6 +271,13 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         print("PASS Kerdr exit restores original console modes and preserves original sessions", flush=True)
     finally:
         (results / "windows-console.txt").write_text("".join(transcript), encoding="utf-8")
+        if 'modes_file' in locals() and modes_file.exists():
+            (results / "console-modes-last.json").write_bytes(modes_file.read_bytes())
+        if kerdr_pid and alive(kerdr_pid):
+            try:
+                (results / "child-processes.json").write_text(json.dumps(processes()), encoding="utf-8")
+            except Exception:
+                pass
         if kerdr_pid and alive(kerdr_pid):
             run(["taskkill", "/PID", str(kerdr_pid), "/T", "/F"], check=False)
         if console and console.isalive():

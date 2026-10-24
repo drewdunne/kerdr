@@ -3,10 +3,6 @@
 
 use std::io::{Read, Seek, Write};
 use std::process::{Command, Stdio};
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -215,106 +211,32 @@ pub fn run_adapter(
     run_script(target, &script, deadline)
 }
 
-trait OutputPipe: Read + Send {
-    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
-}
-
-#[cfg(unix)]
-impl<T: Read + Send + std::os::fd::AsRawFd> OutputPipe for T {
-    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        let mut fd = libc::pollfd {
-            fd: self.as_raw_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one live descriptor, checked without blocking. This is its only reader.
-        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
-        if ready == 0 {
-            return Err(std::io::ErrorKind::WouldBlock.into());
-        }
-        if ready < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        self.read(buf)
-    }
-}
-
-#[cfg(windows)]
-impl<T: Read + Send + std::os::windows::io::AsRawHandle> OutputPipe for T {
-    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
-        let mut available = 0;
-        // SAFETY: this is a borrowed live pipe, and no other reader can consume its bytes.
-        let ok = unsafe {
-            PeekNamedPipe(
-                self.as_raw_handle() as _,
-                std::ptr::null_mut(),
-                0,
-                std::ptr::null_mut(),
-                &mut available,
-                std::ptr::null_mut(),
-            )
-        };
-        if ok == 0 {
-            let error = std::io::Error::last_os_error();
-            return if matches!(error.raw_os_error(), Some(109 | 232)) {
-                Ok(0)
-            } else {
-                Err(error)
-            };
-        }
-        if available == 0 {
-            return Err(std::io::ErrorKind::WouldBlock.into());
-        }
-        let len = buf.len().min(available as usize);
-        self.read(&mut buf[..len])
-    }
-}
-
-fn read_pipe(mut pipe: Box<dyn OutputPipe>, stop: Arc<AtomicBool>) -> thread::JoinHandle<Vec<u8>> {
-    thread::spawn(move || {
-        let mut output = Vec::new();
-        let mut buffer = [0u8; 16 * 1024];
-        let mut draining = None;
-        loop {
-            if stop.load(Ordering::Acquire) {
-                let since = draining.get_or_insert_with(Instant::now);
-                if since.elapsed() >= Duration::from_millis(50) {
-                    break;
-                }
-            }
-            match pipe.read_ready(&mut buffer) {
-                Ok(0) => break,
-                Ok(n) => output.extend_from_slice(&buffer[..n]),
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    if draining.is_some() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(3));
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => break,
-            }
-        }
-        output
-    })
-}
-
 fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: bool) -> Output {
     let started = Instant::now();
     // A temporary input stream avoids an unbounded writer thread when an action leaves a
     // persistent descendant holding stdin open. Adapters still receive exactly their JSON.
-    let stdin = match (|| -> std::io::Result<Stdio> {
-        if let Some(input) = input {
+    let captures = (|| -> std::io::Result<_> {
+        let stdin = if let Some(input) = input {
             let mut file = tempfile::tempfile()?;
             file.write_all(input)?;
             file.rewind()?;
-            Ok(Stdio::from(file))
+            Stdio::from(file)
         } else {
-            Ok(Stdio::null())
-        }
-    })() {
-        Ok(stdin) => stdin,
+            Stdio::null()
+        };
+        // Independent reader handles avoid moving an inherited writer's file position.
+        // Unlinking a temporary capture leaves persistent children with writable handles.
+        let stdout = tempfile::NamedTempFile::new()?;
+        let stderr = tempfile::NamedTempFile::new()?;
+        let out_reader = std::fs::File::open(stdout.path())?;
+        let err_reader = std::fs::File::open(stderr.path())?;
+        cmd.stdin(stdin)
+            .stdout(Stdio::from(stdout.as_file().try_clone()?))
+            .stderr(Stdio::from(stderr.as_file().try_clone()?));
+        Ok((stdout, stderr, out_reader, err_reader))
+    })();
+    let (stdout_file, stderr_file, out_reader, err_reader) = match captures {
+        Ok(captures) => captures,
         Err(e) => {
             return Output {
                 status: Some(127),
@@ -324,9 +246,7 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
             };
         }
     };
-    cmd.stdin(stdin)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    const MAX_CAPTURE: u64 = 32 * 1024 * 1024;
     // Its own process group, so the deadline, and the end of the run, stop everything it
     // started, not only the shell.
     #[cfg(unix)]
@@ -372,14 +292,25 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     } else {
         None
     };
-    let stop_readers = Arc::new(AtomicBool::new(false));
-    let out_reader = read_pipe(Box::new(child.stdout.take().unwrap()), stop_readers.clone());
-    let err_reader = read_pipe(Box::new(child.stderr.take().unwrap()), stop_readers.clone());
-
     let mut timed_out = false;
+    let mut overflow = false;
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status.code(),
+            Ok(None)
+                if stdout_file
+                    .as_file()
+                    .metadata()
+                    .is_ok_and(|m| m.len() > MAX_CAPTURE)
+                    || stderr_file
+                        .as_file()
+                        .metadata()
+                        .is_ok_and(|m| m.len() > MAX_CAPTURE) =>
+            {
+                overflow = true;
+                let _ = child.kill();
+                break child.wait().ok().and_then(|s| s.code());
+            }
             Ok(None) if started.elapsed() >= deadline => {
                 timed_out = true;
                 let _ = child.kill();
@@ -397,9 +328,21 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     }
     #[cfg(windows)]
     drop(_job);
-    stop_readers.store(true, Ordering::Release);
-    let stdout = out_reader.join().unwrap_or_default();
-    let stderr = err_reader.join().unwrap_or_default();
+    let capture = |reader: std::fs::File| {
+        let mut data = Vec::new();
+        let _ = reader.take(MAX_CAPTURE + 1).read_to_end(&mut data);
+        data
+    };
+    let stdout = capture(out_reader);
+    let stderr = capture(err_reader);
+    if overflow || stdout.len() as u64 > MAX_CAPTURE || stderr.len() as u64 > MAX_CAPTURE {
+        return Output {
+            status: Some(125),
+            stderr: "command output exceeded 32 MiB; its result is unknown".into(),
+            took: started.elapsed(),
+            ..Default::default()
+        };
+    }
     Output {
         status,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),

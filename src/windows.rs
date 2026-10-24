@@ -274,11 +274,19 @@ mod tests {
         };
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("persistent.pid");
+        let release = dir.path().join("write-now");
+        let marker = dir.path().join("still-running");
+        let script = format!(
+            "$ErrorActionPreference = 'Stop'; while (-not (Test-Path -LiteralPath {})) {{ Start-Sleep -Milliseconds 25 }}; [Console]::Out.WriteLine('running'); [IO.File]::WriteAllText({}, 'alive'); Start-Sleep 30",
+            transport::powershell_quote(release.to_str().unwrap()),
+            transport::powershell_quote(marker.to_str().unwrap())
+        );
+        let child = transport::powershell_command(&script);
+        let encoded = child.get_args().last().unwrap().to_str().unwrap();
         let command = format!(
-            "$p = Start-Process powershell.exe -NoNewWindow -PassThru -ArgumentList '-NoProfile -Command Start-Sleep 30'; [IO.File]::WriteAllText({}, [string]$p.Id); Write-Output '{{\"ok\":true,\"message\":\"started\"}}'",
+            "$p = Start-Process powershell.exe -NoNewWindow -PassThru -ArgumentList '-NoProfile -EncodedCommand {encoded}'; [IO.File]::WriteAllText({}, [string]$p.Id); Write-Output '{{\"ok\":true,\"message\":\"started\"}}'",
             transport::powershell_quote(pid_file.to_str().unwrap())
         );
-        let started = Instant::now();
         let out = transport::run_adapter(
             &Target::Local,
             &command,
@@ -286,6 +294,11 @@ mod tests {
             Duration::from_secs(10),
         );
         let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        std::fs::write(release, "go").unwrap();
+        let until = Instant::now() + Duration::from_secs(8);
+        while !marker.exists() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(25));
+        }
         // SAFETY: this is the exact fixture PID, opened only for query and cleanup.
         let was_alive = unsafe {
             let handle = OpenProcess(
@@ -300,13 +313,17 @@ mod tests {
             CloseHandle(handle);
             code == 259
         };
+        assert!(
+            marker.exists(),
+            "persistent child could not write stdout after its action returned"
+        );
         assert!(was_alive, "action child did not survive its invocation");
         assert!(out.ok(), "{out:?}");
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(&out.stdout).unwrap()["ok"],
             true
         );
-        assert!(started.elapsed() < Duration::from_secs(6), "{out:?}");
+        assert!(out.took < Duration::from_secs(6), "{out:?}");
     }
 
     #[test]
