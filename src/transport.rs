@@ -435,6 +435,27 @@ mod tests {
     }
 
     #[test]
+    fn installed_openssh_accepts_platform_options_without_connecting() {
+        let args = ssh_args();
+        #[cfg(windows)]
+        assert!(
+            !args
+                .iter()
+                .any(|a| a.starts_with("ControlPath=") || a == "ControlMaster=auto")
+        );
+        let out = Command::new("ssh")
+            .args(&args)
+            .args(["-G", "example.invalid"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    #[test]
     fn reads_ssh_failures() {
         let t = Target::Ssh("box".into());
         assert!(matches!(

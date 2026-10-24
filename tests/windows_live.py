@@ -54,7 +54,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         f'[machines]\npicker = false\n[board]\nonly = ["{session}"]\n', encoding="utf-8")
     env["XDG_CACHE_HOME"] = str(temp / "cache")
     env["XDG_STATE_HOME"] = str(temp / "state")
-    server_log = open(temp / "server.log", "w", encoding="utf-8")
+    server_log = open(results / "windows-server.txt", "w", encoding="utf-8")
     server = subprocess.Popen(["herdr", "--session", session, "server"], env=env,
                               stdout=server_log, stderr=subprocess.STDOUT)
     console = None
@@ -69,9 +69,13 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         panes = json.loads(herdr("pane", "list"))
         for pane in panes.get("result", {}).get("panes", []):
             if pane.get("pane_id"):
-                herdr("pane", "report-metadata", pane["pane_id"], "--source", "ark-helper", "--token", "role=helper")
+                herdr("pane", "report-metadata", pane["pane_id"], "--source", "arkship.ark-helpers", "--token", "role=helper")
         herdr("workspace", "report-metadata", wid, "--source", "kerdr",
-              "--token", "kerdr_status=needs_you", "--token", "kerdr_note=Windows live check")
+              "--token", "kerdr_stage=test", "--token", "kerdr_status=needs_you", "--token", "kerdr_note=Windows live check")
+        (results / "windows-sessions.json").write_text(run(["herdr", "session", "list", "--json"]), encoding="utf-8")
+        (results / "windows-snapshot.json").write_text(herdr("api", "snapshot"), encoding="utf-8")
+        doctor = run([kerdr, "doctor"])
+        print(doctor, flush=True)
         cards = json.loads(run([kerdr, "cards"]))
         assert cards["machines"][0]["connection"] == "live", cards
         assert any(c["ref"] == "01-windows" and c["attention"] == "needs you" for c in cards["cards"]), cards
@@ -141,4 +145,3 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         except subprocess.TimeoutExpired:
             server.kill()
         server_log.close()
-        (results / "windows-server.txt").write_text((temp / "server.log").read_text(encoding="utf-8", errors="replace"), encoding="utf-8")
