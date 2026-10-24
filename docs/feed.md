@@ -177,3 +177,8 @@ The action command is shared across machines: use a command available with the a
 shell syntax on every action target, or a cross-platform executable on PATH. The bundled
 ark-sdlc Bash/Python adapter examples require their existing Unix backend; this port does not
 make those Bash tools native Windows programs. The JSON contracts are unchanged.
+
+Persistent action backends must give their workers their own log files or a discard stream.
+The adapter's stdout carries its single JSON response. Kerdr bounds response capture to
+32 MiB per stream (action JSON remains limited to 64 KiB); it preserves inherited handles
+while the backend takes ownership, and persistent log storage belongs to the backend.

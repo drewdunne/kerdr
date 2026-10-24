@@ -80,6 +80,13 @@ def quote(text):
     return "'" + str(text).replace("'", "''") + "'"
 
 
+for count in [0, 1, 2]:
+    objects = ",".join("[pscustomobject]@{ProcessId=" + str(i) + ";Name='herdr.exe';CommandLine='fixture'}" for i in range(count))
+    value = json.loads(run(["powershell.exe", "-NoProfile", "-Command",
+                           "ConvertTo-Json -InputObject @(" + objects + ") -Compress"]))
+    assert isinstance(value, list) and len(value) == count, value
+print("PASS PowerShell process JSON for zero, one and multiple processes", flush=True)
+
 # Compare the native defaults with Herdr itself, without changing any config.
 default_env = env.copy()
 for key in ["HERDR_CONFIG_PATH", "KERDR_CONFIG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]:
@@ -203,8 +210,9 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
                 except queue.Empty:
                     return
         def processes():
-            query = f"@(Get-CimInstance Win32_Process -Filter 'ParentProcessId = {kerdr_pid}' | Select-Object ProcessId,Name,CommandLine) | ConvertTo-Json -Compress"
-            return json.loads(run(["powershell.exe", "-NoProfile", "-Command", query]) or "[]")
+            query = f"ConvertTo-Json -InputObject @(Get-CimInstance Win32_Process -Filter 'ParentProcessId = {kerdr_pid}' | Select-Object ProcessId,Name,CommandLine) -Compress"
+            value = json.loads(run(["powershell.exe", "-NoProfile", "-Command", query]) or "[]")
+            return [value] if isinstance(value, dict) else value or []
         def client_pids():
             import re
             pattern = r'--session\s+"?' + re.escape(session) + r'"?\s*$'
