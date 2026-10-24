@@ -69,7 +69,10 @@ impl CtrlCToHerdr {
 
 #[cfg(windows)]
 unsafe extern "system" fn windows_ctrl_c(event: u32) -> i32 {
-    i32::from(event == windows_sys::Win32::System::Console::CTRL_C_EVENT)
+    i32::from(
+        event == windows_sys::Win32::System::Console::CTRL_C_EVENT
+            || event == windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+    )
 }
 
 impl Drop for CtrlCToHerdr {
@@ -283,9 +286,13 @@ pub fn run(
         .unwrap_or(0);
     let ctrl_c = CtrlCToHerdr::new();
     leave(flags);
+    #[cfg(windows)]
+    let console_modes = crate::windows::ConsoleModes::capture();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            #[cfg(windows)]
+            drop(console_modes);
             enter(terminal, flags);
             return Outcome::Failed(format!("Couldn't start herdr: {e}"));
         }
@@ -386,6 +393,8 @@ pub fn run(
         }
     };
     stop.store(true, Ordering::Relaxed);
+    #[cfg(windows)]
+    drop(console_modes);
     enter(terminal, flags);
     drop(ctrl_c);
     let result = *request.lock().unwrap();
@@ -427,11 +436,15 @@ pub fn foreground(
 ) -> bool {
     let _ctrl_c = CtrlCToHerdr::new();
     leave(flags);
+    #[cfg(windows)]
+    let console_modes = crate::windows::ConsoleModes::capture();
     println!("\n{intro}\n");
     for var in HERDR_VARS {
         cmd.env_remove(var);
     }
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    #[cfg(windows)]
+    drop(console_modes);
     if !ok {
         println!("\nThat didn't finish cleanly. Press Enter to go back to Kerdr.");
         let mut line = String::new();

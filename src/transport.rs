@@ -195,7 +195,14 @@ pub fn run_adapter(
         ));
         clean_herdr_env(&mut cmd);
         cmd.current_dir(crate::config::home());
-        return run(&mut cmd, input.map(str::as_bytes), deadline, true);
+        // Actions may intentionally launch persistent work. Bound this invocation only;
+        // its backend must own that work's lifetime, including after an unknown result.
+        return run(
+            &mut cmd,
+            input.map(str::as_bytes),
+            deadline,
+            input.is_none(),
+        );
     }
     let script = format!(
         "{PATH_PREFIX}\nunset {}\nprintf '%s' {} | {command}\n",
@@ -216,6 +223,13 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     {
         use std::os::unix::process::CommandExt;
         cmd.process_group(0);
+    }
+    #[cfg(windows)]
+    if _kill_tree {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::{CREATE_NO_WINDOW, CREATE_SUSPENDED};
+        // Enroll disposable commands before they can start descendants.
+        cmd.creation_flags(CREATE_NO_WINDOW | CREATE_SUSPENDED);
     }
     let mut child = match cmd.spawn() {
         Ok(c) => c,

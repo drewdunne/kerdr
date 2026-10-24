@@ -273,6 +273,7 @@ pub struct Sections {
     pub keys: Option<bool>,
     pub snapshots: Vec<(String, String)>,
     pub feed: Option<String>,
+    pub feed_error: Option<String>,
     pub complete: bool,
 }
 
@@ -288,6 +289,7 @@ pub fn split_sections(text: &str) -> Sections {
                 "sessions" => out.sessions = Some(body),
                 "keys" => out.keys = Some(body.trim() == "yes"),
                 "feed" => out.feed = Some(body),
+                "feed_error" => out.feed_error = Some(body),
                 other => {
                     if let Some(session) = other.strip_prefix("snapshot ") {
                         out.snapshots.push((session.to_string(), body));
@@ -347,8 +349,9 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         .map(|(name, body)| (name, herdr::parse_snapshot(&body)))
         .collect();
     let feed = if feed_due {
-        Some(match sections.feed.as_deref() {
-            Some(body) if !body.trim().is_empty() => feed::parse(body),
+        Some(match (sections.feed_error, sections.feed.as_deref()) {
+            (Some(error), _) => Err(error),
+            (_, Some(body)) if !body.trim().is_empty() => feed::parse(body),
             _ => Err("the feed printed nothing".to_string()),
         })
     } else {
