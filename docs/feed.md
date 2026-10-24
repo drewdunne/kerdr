@@ -158,3 +158,20 @@ except that a reported status still applies.
 `kerdr cards` identifies unlinked conversations with `"stage": "misc"`. Misc is a separate
 view (`i`, or `Ctrl+Space m`), not a lifecycle column. A matching feed record moves the
 workspace into the work board; no duplicate Misc card remains.
+
+## Native Windows adapters
+
+On native Windows, local feed and action commands run in inbox Windows PowerShell 5.1 with
+UTF-8 stdin/stdout. Use PowerShell syntax, for example `& 'C:\Tools\cards.exe' --json`.
+Action JSON arrives on standard input; native adapters must read it as UTF-8. A PowerShell
+adapter can use `[Console]::In.ReadToEnd()`, and should write only its response JSON to stdout.
+Feed commands start in the user's home directory; local Windows action commands do too.
+Adapter descendants are closed when the command finishes or reaches its deadline. Actions
+are never retried automatically when their result is unknown.
+
+SSH targets continue to execute adapters in their POSIX shell, even when Kerdr runs on Windows.
+Use `[[machine]] feed` to override the default feed for a Linux host or disable it locally.
+The action command is shared across machines: use a command available with the appropriate
+shell syntax on every action target, or a cross-platform executable on PATH. The bundled
+ark-sdlc Bash/Python adapter examples require their existing Unix backend; this port does not
+make those Bash tools native Windows programs. The JSON contracts are unchanged.

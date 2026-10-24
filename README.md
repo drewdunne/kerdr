@@ -218,7 +218,13 @@ curl -fsSL https://raw.githubusercontent.com/drewdunne/kerdr/main/install.sh | s
 ```
 
 That puts the release binary for your platform in `~/.local/bin`. Releases cover Linux (x86_64
-and ARM) and Apple Silicon Macs. Anywhere else, build it:
+and ARM), Apple Silicon Macs, and native Windows x86_64. On Windows, download
+[`kerdr-x86_64-pc-windows-msvc.zip`](https://github.com/drewdunne/kerdr/releases/latest/download/kerdr-x86_64-pc-windows-msvc.zip),
+extract `kerdr.exe` to a folder on your PATH, and run it in Windows Terminal. Install
+[Herdr for Windows](https://herdr.dev/docs/windows-beta/) first. The ZIP has a matching SHA256
+checksum in the same release. See [Windows setup and requirements](docs/windows.md).
+
+Anywhere else, build it:
 
 ```sh
 cargo install --git https://github.com/drewdunne/kerdr
@@ -243,7 +249,7 @@ its feed works, and whether Kerdr's keys are in its herdr config.
 ## Configure
 
 Kerdr works with no config: it shows this machine. To add machines and a feed, write
-`~/.config/kerdr/config.toml`:
+`~/.config/kerdr/config.toml` (Windows: `%APPDATA%\kerdr\config.toml`):
 
 ```toml
 [feed]

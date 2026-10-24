@@ -101,21 +101,28 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
                 if text.lower() in seen.lower():
                     return
             raise AssertionError(f"console did not show {text!r}: {seen[-3000:]}")
+        def client_pids():
+            query = f"(Get-CimInstance Win32_Process -Filter 'ParentProcessId = {console.pid}' | Where-Object Name -eq 'herdr.exe' | Select-Object -ExpandProperty ProcessId) -join ','"
+            return run(["powershell.exe", "-NoProfile", "-Command", query]).strip()
         expect("Misc")
         console.write("i")
         expect("01-windows")
         # Ordinary Herdr detach returns to Kerdr without stopping the server.
         console.write("\r")
-        time.sleep(3)
+        wait_for(client_pids, "attached Herdr client starts")
+        time.sleep(2)
         console.write("\x02q")
+        wait_for(lambda: not client_pids(), "detach closes only the client")
         expect("01-windows")
         assert ready()
         print("PASS Enter -> Herdr -> prefix q -> Kerdr; server persists", flush=True)
         # Both installed custom commands must execute through Windows Herdr's cmd shell.
         for key, request in [("\x7f", "board"), (" ", "next")]:
             console.write("\r")
-            time.sleep(3)
+            wait_for(client_pids, "attached client starts for custom key")
+            time.sleep(2)
             console.write("\x02" + key)
+            wait_for(lambda: not client_pids(), "custom key closes only the client")
             expect("01-windows")
             assert ready()
             print(f"PASS prefix {request}: native command, token, client-only exit and board redraw", flush=True)
