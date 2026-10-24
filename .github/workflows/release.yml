@@ -24,6 +24,8 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: ${{ contains(matrix.target, 'windows') && '-C target-feature=+crt-static' || '' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -31,6 +33,12 @@ jobs:
           targets: ${{ matrix.target }}
       - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
+      - name: Run the Windows release executable
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          & ./target/${{ matrix.target }}/release/kerdr.exe --version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package Unix
         if: runner.os != 'Windows'
         run: |

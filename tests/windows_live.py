@@ -40,9 +40,24 @@ def alive(pid):
     return code.value == 259
 
 
+def call(args, timeout=45, child_env=None):
+    # File-backed captures cannot hang communicate() if a persistent backend retains a handle.
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        child = subprocess.Popen(args, env=child_env or env, stdout=stdout, stderr=stderr)
+        try:
+            code = child.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            child.kill()
+            child.wait(timeout=5)
+            raise
+        stdout.seek(0)
+        stderr.seek(0)
+        return subprocess.CompletedProcess(args, code, stdout.read().decode("utf-8", "replace"),
+                                           stderr.read().decode("utf-8", "replace"))
+
+
 def run(args, check=True, **kw):
-    p = subprocess.run(args, env=env, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=45, **kw)
+    p = call(args, **kw)
     if check and p.returncode:
         raise AssertionError(f"{args}: {p.returncode}\n{p.stdout}\n{p.stderr}")
     return p.stdout
@@ -105,14 +120,14 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
                 "Write-Output '{\"ok\":true,\"message\":\"started\"}'; "
                 + ("Start-Sleep 30" if index else "")
             )
-            p = subprocess.run([probe, "adapter", command, "5000"], env=env,
-                               capture_output=True, text=True, encoding="utf-8", timeout=20)
+            print(f"Starting persistent server through adapter {index}", flush=True)
+            p = call([probe, "adapter", command, "5000"], timeout=20)
+            print(f"Adapter {index} returned {p.returncode}", flush=True)
             assert p.returncode == (64 if index else 0), (p.returncode, p.stdout, p.stderr)
             pid = int(pidfile.read_text())
             server_pids.append(pid)
             def ready():
-                return subprocess.run(["herdr", "--session", name, "workspace", "list"],
-                                      env=env, capture_output=True, timeout=10).returncode == 0
+                return call(["herdr", "--session", name, "workspace", "list"], timeout=10).returncode == 0
             wait_for(ready, "action-created server is ready")
             assert alive(pid), "action completion/timeout killed its persistent backend"
             print(f"PASS persistent action-created server after {'timeout' if index else 'success'}", flush=True)
@@ -253,8 +268,18 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
             run(["taskkill", "/PID", str(kerdr_pid), "/T", "/F"], check=False)
         if console and console.isalive():
             console.terminate(force=True)
+        for pidfile in temp.glob("server-*.pid"):
+            try:
+                server_pids.append(int(pidfile.read_text()))
+            except (OSError, ValueError):
+                pass
         for name in test_sessions:
-            run(["herdr", "session", "stop", name], check=False)
-            run(["herdr", "session", "delete", name], check=False)
-        for pid in server_pids:
-            wait_for(lambda: not alive(pid), "test server stops")
+            for command in ["stop", "delete"]:
+                try:
+                    run(["herdr", "session", command, name], check=False, timeout=10)
+                except subprocess.TimeoutExpired:
+                    pass
+        for pid in set(server_pids):
+            if alive(pid):
+                run(["taskkill", "/PID", str(pid), "/T", "/F"], check=False, timeout=10)
+            wait_for(lambda: not alive(pid), "test server stops", timeout=10)
