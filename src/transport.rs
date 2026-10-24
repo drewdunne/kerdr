@@ -107,7 +107,7 @@ pub fn powershell_quote(value: &str) -> String {
 /// of stdin, leaving it available for adapter JSON, and preserves Unicode source text.
 pub fn powershell_command(script: &str) -> Command {
     use base64::Engine;
-    let utf8 = "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; $OutputEncoding = [Console]::OutputEncoding; ";
+    let utf8 = "$ProgressPreference = 'SilentlyContinue'; [Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; $OutputEncoding = [Console]::OutputEncoding; ";
     let bytes: Vec<u8> = format!("{utf8}{script}")
         .encode_utf16()
         .flat_map(u16::to_le_bytes)
@@ -119,6 +119,10 @@ pub fn powershell_command(script: &str) -> Command {
         "-NonInteractive",
         "-ExecutionPolicy",
         "Bypass",
+        "-InputFormat",
+        "Text",
+        "-OutputFormat",
+        "Text",
         "-EncodedCommand",
         &base64::engine::general_purpose::STANDARD.encode(bytes),
     ]);
