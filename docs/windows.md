@@ -72,3 +72,7 @@ confirmation responses, failures, and deadlines. The Windows integration test st
 isolated real Herdr server and uses Microsoft's ConPTY to exercise Enter, detach, both custom
 step-out keys, board redraw, and persistence after Kerdr exits. It never installs test builds
 or modifies an existing user's Herdr config. Release jobs test and package native MSVC builds.
+
+The hosted Windows runner has no route to a private Linux host. CI checks the POSIX collector
+against real Linux/macOS Herdr servers and checks the native Windows OpenSSH options, while
+the interactive Windows-to-Linux SSH handoff remains outside this suite's verified coverage.

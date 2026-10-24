@@ -180,6 +180,13 @@ pub fn leave(flags: &TerminalFlags) {
 pub fn enter(terminal: &mut DefaultTerminal, flags: &TerminalFlags) {
     let _ = enable_raw_mode();
     let mut out = stdout();
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        // A forcibly closed Herdr client cannot undo the host's Windows input protocol or
+        // modifyOtherKeys mode itself. Return the host to the board's ordinary key path.
+        let _ = out.write_all(b"\x1b[?9001l\x1b[>4;0m\x1b[?7h");
+    }
     // herdr resets these when it exits, but not when its window is cut off over SSH.
     let _ = execute!(
         out,

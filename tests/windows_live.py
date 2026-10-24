@@ -171,9 +171,11 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
 
         modes_file = temp / "console-modes.json"
         control_file = temp / "control-event"
+        # String zero avoids PtyProcess.spawn treating numeric zero as an omitted backend.
+        # winpty-rs defines ConPTY=0, WinPTY=1.
         print("Starting real ConPTY console probe", flush=True)
         console = PtyProcess.spawn([probe, "console", kerdr, str(modes_file), str(control_file)],
-                                   env=env, dimensions=(40, 140), backend=1)
+                                   env=env, dimensions=(40, 140), backend="0")
         output = queue.Queue()
         def drain():
             try:
