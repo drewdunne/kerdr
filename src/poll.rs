@@ -151,8 +151,7 @@ pub fn spawn(index: usize, machine: Machine, timing: Timing, tx: SyncSender<Even
         loop {
             let feed_due = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
-            let script = build_script(&machine.herdr, machine.feed.as_deref().filter(|_| feed_due));
-            let out = transport::run_script(&target, &script, Duration::from_secs(25));
+            let out = collect(&machine, feed_due);
             let now = Local::now();
             let (conn, data, wait) = match read(&target, &out, feed_due) {
                 Ok(data) => {
@@ -274,6 +273,7 @@ pub struct Sections {
     pub keys: Option<bool>,
     pub snapshots: Vec<(String, String)>,
     pub feed: Option<String>,
+    pub feed_error: Option<String>,
     pub complete: bool,
 }
 
@@ -289,6 +289,7 @@ pub fn split_sections(text: &str) -> Sections {
                 "sessions" => out.sessions = Some(body),
                 "keys" => out.keys = Some(body.trim() == "yes"),
                 "feed" => out.feed = Some(body),
+                "feed_error" => out.feed_error = Some(body),
                 other => {
                     if let Some(session) = other.strip_prefix("snapshot ") {
                         out.snapshots.push((session.to_string(), body));
@@ -348,8 +349,9 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         .map(|(name, body)| (name, herdr::parse_snapshot(&body)))
         .collect();
     let feed = if feed_due {
-        Some(match sections.feed.as_deref() {
-            Some(body) if !body.trim().is_empty() => feed::parse(body),
+        Some(match (sections.feed_error, sections.feed.as_deref()) {
+            (Some(error), _) => Err(error),
+            (_, Some(body)) if !body.trim().is_empty() => feed::parse(body),
             _ => Err("the feed printed nothing".to_string()),
         })
     } else {
@@ -365,14 +367,23 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
     })
 }
 
+fn collect(machine: &Machine, feed_due: bool) -> transport::Output {
+    #[cfg(windows)]
+    if machine.is_local() {
+        return crate::windows::poll(machine, feed_due);
+    }
+    let target = crate::jump::target(machine);
+    let script = build_script(&machine.herdr, machine.feed.as_deref().filter(|_| feed_due));
+    transport::run_script(&target, &script, Duration::from_secs(25))
+}
+
 /// One read, now, for `kerdr doctor` and `kerdr cards`.
 pub fn read_once(machine: &Machine) -> (Conn, Option<MachineData>) {
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
         None => Target::Local,
     };
-    let script = build_script(&machine.herdr, machine.feed.as_deref());
-    let out = transport::run_script(&target, &script, Duration::from_secs(25));
+    let out = collect(machine, machine.feed.is_some());
     let now = Local::now();
     match read(&target, &out, machine.feed.is_some()) {
         Ok(data) => (Conn::Live { latency: out.took }, Some(data)),
@@ -414,6 +425,7 @@ mod tests {
         assert!(s.complete);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_script_finds_running_sessions_without_jq() {
         let script = build_script("herdr", None);
@@ -438,6 +450,39 @@ esac
         let names: Vec<_> = data.snapshots.keys().cloned().collect();
         assert_eq!(names, ["default", "web"]);
         assert_eq!(data.version.as_deref(), Some("0.9.1"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_poll_collects_running_sessions_and_a_unicode_feed() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("fake herdr.cmd");
+        std::fs::write(&bin, r#"@echo off
+if "%~1"=="--version" (
+echo herdr 0.9.5
+exit /b 0
+)
+if "%~1"=="session" (
+echo {"sessions":[{"name":"default","running":true},{"name":"idle-one","running":false},{"name":"web","running":true}]}
+exit /b 0
+)
+echo {"result":{"snapshot":{"workspaces":[]}}}
+"#).unwrap();
+        let machine = Machine { name: "native".into(), ssh: None,
+            herdr: bin.to_str().unwrap().into(), hidden: false,
+            feed: Some("Write-Output '{\"kerdr_feed\":1,\"cards\":[{\"id\":\"1\",\"title\":\"🦀 café\"}]}'".into()) };
+        let (conn, data) = read_once(&machine);
+        assert!(conn.is_live(), "{conn:?}");
+        let data = data.unwrap();
+        assert_eq!(
+            data.snapshots
+                .keys()
+                .map(String::as_str)
+                .collect::<Vec<_>>(),
+            ["default", "web"]
+        );
+        assert_eq!(data.version.as_deref(), Some("0.9.5"));
+        assert_eq!(data.feed.unwrap().unwrap().cards[0].title, "🦀 café");
     }
 
     #[test]

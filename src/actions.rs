@@ -6,7 +6,7 @@ use serde::Deserialize;
 use serde_json::Value;
 
 use crate::config::Machine;
-use crate::transport::{self, HERDR_VARS, PATH_PREFIX, Target};
+use crate::transport::{self, Target};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 
@@ -43,14 +43,8 @@ fn run_with_deadline(
         Some(host) => Target::Ssh(host.clone()),
         None => Target::Local,
     };
-    // Only the configured command is shell source. Every byte supplied by the user is in a
-    // quoted JSON word passed to printf, then on the command's standard input.
-    let script = format!(
-        "{PATH_PREFIX}\nunset {}\nprintf '%s' {} | {command}\n",
-        HERDR_VARS.join(" "),
-        transport::quote(&json)
-    );
-    let output = transport::run_script(&target, &script, deadline);
+    // The configured command is source; user data is JSON on stdin, never source.
+    let output = transport::run_adapter(&target, command, Some(&json), deadline);
     if output.timed_out {
         return Err("the action timed out; its result is unknown. Check the canonical record before trying again. Do not retry automatically.".into());
     }
@@ -79,10 +73,19 @@ mod tests {
         Config::default().machines("here", &[]).remove(0)
     }
 
-    fn fixture(dir: &std::path::Path, body: &str) -> String {
-        let path = dir.join("action fixture.sh");
+    fn fixture(dir: &std::path::Path, body: &str, windows: &str) -> String {
+        let (name, body) = if cfg!(windows) {
+            ("action fixture.ps1", format!("\u{feff}{windows}"))
+        } else {
+            ("action fixture.sh", body.to_string())
+        };
+        let path = dir.join(name);
         fs::write(&path, body).unwrap();
-        format!("sh {}", quote(path.to_str().unwrap()))
+        if cfg!(windows) {
+            format!("& {}", transport::powershell_quote(path.to_str().unwrap()))
+        } else {
+            format!("sh {}", quote(path.to_str().unwrap()))
+        }
     }
 
     #[test]
@@ -101,6 +104,10 @@ mod tests {
                 "cat > {}\nprintf '%s' '{{\"ok\":true,\"message\":\"created\",\"id\":\"0004\"}}'\n",
                 quote(captured.to_str().unwrap())
             ),
+            &format!(
+                "[IO.File]::WriteAllText({}, [Console]::In.ReadToEnd(), (New-Object Text.UTF8Encoding $false)); Write-Output '{{\"ok\":true,\"message\":\"created\",\"id\":\"0004\"}}'",
+                transport::powershell_quote(captured.to_str().unwrap())
+            ),
         );
         let response = run(&machine(), &command, &request).unwrap();
         assert!(response.ok);
@@ -118,6 +125,7 @@ mod tests {
         let command = fixture(
             dir.path(),
             "cat >/dev/null\nprintf '%s' '{\"ok\":false,\"message\":\"session full\",\"confirmation\":true,\"used\":3,\"limit\":3,\"session\":\"web\"}'\nexit 3\n",
+            "[Console]::In.ReadToEnd() | Out-Null; Write-Output '{\"ok\":false,\"message\":\"session full\",\"confirmation\":true,\"used\":3,\"limit\":3,\"session\":\"web\"}'; exit 3",
         );
         let response = run(&machine(), &command, &json!({"action":"dispatch","id":"4"})).unwrap();
         assert!(!response.ok);
@@ -133,6 +141,7 @@ mod tests {
         let command = fixture(
             dir.path(),
             "cat >/dev/null\necho 'not JSON'\necho 'tracker unavailable' >&2\nexit 7\n",
+            "[Console]::In.ReadToEnd() | Out-Null; Write-Output 'not JSON'; [Console]::Error.WriteLine('tracker unavailable'); exit 7",
         );
         let error = run(&machine(), &command, &json!({"action":"refresh","id":"4"})).unwrap_err();
         assert!(error.contains("JSON"), "{error}");
@@ -143,7 +152,11 @@ mod tests {
     #[test]
     fn a_timeout_warns_that_the_result_is_unknown_and_must_not_be_retried() {
         let dir = tempfile::tempdir().unwrap();
-        let command = fixture(dir.path(), "cat >/dev/null\nsleep 5\n");
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\nsleep 5\n",
+            "[Console]::In.ReadToEnd() | Out-Null; Start-Sleep 5",
+        );
         let error = run_with_deadline(
             &machine(),
             &command,

@@ -158,3 +158,27 @@ except that a reported status still applies.
 `kerdr cards` identifies unlinked conversations with `"stage": "misc"`. Misc is a separate
 view (`i`, or `Ctrl+Space m`), not a lifecycle column. A matching feed record moves the
 workspace into the work board; no duplicate Misc card remains.
+
+## Native Windows adapters
+
+On native Windows, local feed and action commands run in inbox Windows PowerShell 5.1 with
+UTF-8 stdin/stdout. Use PowerShell syntax, for example `& 'C:\Tools\cards.exe' --json`.
+Action JSON arrives on standard input; native adapters must read it as UTF-8. A PowerShell
+adapter can use `[Console]::In.ReadToEnd()`, and should write only its response JSON to stdout.
+Feed commands start in the user's home directory; local Windows action commands do too.
+Feed descendants are closed when the feed finishes or reaches its deadline. Action deadlines
+stop the invocation shell; backend work it already started can continue under its own lifetime.
+This preserves dispatched sessions and is why actions are never retried automatically when
+their result is unknown.
+
+SSH targets continue to execute adapters in their POSIX shell, even when Kerdr runs on Windows.
+Use `[[machine]] feed` to override the default feed for a Linux host or disable it locally.
+The action command is shared across machines: use a command available with the appropriate
+shell syntax on every action target, or a cross-platform executable on PATH. The bundled
+ark-sdlc Bash/Python adapter examples require their existing Unix backend; this port does not
+make those Bash tools native Windows programs. The JSON contracts are unchanged.
+
+Persistent action backends must give their workers their own log files or a discard stream.
+The adapter's stdout carries its single JSON response. Kerdr bounds response capture to
+32 MiB per stream (action JSON remains limited to 64 KiB); it preserves inherited handles
+while the backend takes ownership, and persistent log storage belongs to the backend.

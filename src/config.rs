@@ -135,14 +135,14 @@ pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".config"))
+        .unwrap_or_else(platform_config_dir)
 }
 
 pub fn state_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".local").join("state"))
+        .unwrap_or_else(platform_state_dir)
         .join("kerdr")
 }
 
@@ -150,28 +150,52 @@ pub fn cache_dir() -> PathBuf {
     std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
-        .unwrap_or_else(|| home().join(".cache"))
+        .unwrap_or_else(platform_cache_dir)
         .join("kerdr")
 }
 
+fn platform_config_dir() -> PathBuf {
+    #[cfg(windows)]
+    return std::env::var_os("APPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData/Roaming"));
+    #[cfg(not(windows))]
+    home().join(".config")
+}
+
+fn platform_state_dir() -> PathBuf {
+    #[cfg(windows)]
+    return std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home().join("AppData/Local"));
+    #[cfg(not(windows))]
+    home().join(".local/state")
+}
+
+fn platform_cache_dir() -> PathBuf {
+    #[cfg(windows)]
+    return platform_state_dir().join("cache");
+    #[cfg(not(windows))]
+    home().join(".cache")
+}
+
 pub fn home() -> PathBuf {
+    #[cfg(windows)]
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        return PathBuf::from(profile);
+    }
     std::env::var_os("HOME")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+        .unwrap_or_else(std::env::temp_dir)
 }
 
 pub fn hostname() -> String {
-    let mut buf = [0u8; 256];
-    // SAFETY: gethostname writes at most buf.len() bytes into a buffer we own.
-    let rc = unsafe { libc::gethostname(buf.as_mut_ptr() as *mut libc::c_char, buf.len()) };
-    if rc == 0 {
-        let end = buf.iter().position(|b| *b == 0).unwrap_or(buf.len());
-        let name = String::from_utf8_lossy(&buf[..end]).to_string();
-        if !name.is_empty() {
-            return name.split('.').next().unwrap_or(&name).to_string();
-        }
-    }
-    "this machine".to_string()
+    hostname::get()
+        .ok()
+        .and_then(|h| h.into_string().ok())
+        .filter(|h| !h.is_empty())
+        .map(|h| h.split('.').next().unwrap_or(&h).to_string())
+        .unwrap_or_else(|| "this machine".to_string())
 }
 
 impl Config {

@@ -17,3 +17,6 @@ pub mod theme;
 pub mod transport;
 pub mod tui;
 pub mod ui;
+
+#[cfg(windows)]
+pub mod windows;

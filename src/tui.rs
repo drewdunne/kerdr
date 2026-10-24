@@ -73,6 +73,8 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
         }
     }
 
+    #[cfg(windows)]
+    let _console_modes = crate::windows::ConsoleModes::capture();
     let mut terminal = ratatui::init();
     let keyboard = supports_keyboard_enhancement().unwrap_or(false);
     if keyboard {

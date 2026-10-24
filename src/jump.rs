@@ -58,13 +58,29 @@ impl CtrlCToHerdr {
             let previous = unsafe { libc::signal(libc::SIGINT, handler) };
             CtrlCToHerdr { previous }
         }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(windows_ctrl_c), 1);
+        }
         #[cfg(not(unix))]
         CtrlCToHerdr {}
     }
 }
 
+#[cfg(windows)]
+unsafe extern "system" fn windows_ctrl_c(event: u32) -> i32 {
+    i32::from(
+        event == windows_sys::Win32::System::Console::CTRL_C_EVENT
+            || event == windows_sys::Win32::System::Console::CTRL_BREAK_EVENT,
+    )
+}
+
 impl Drop for CtrlCToHerdr {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(windows_ctrl_c), 0);
+        }
         #[cfg(unix)]
         // SAFETY: puts back the handler that was there before.
         unsafe {
@@ -164,6 +180,13 @@ pub fn leave(flags: &TerminalFlags) {
 pub fn enter(terminal: &mut DefaultTerminal, flags: &TerminalFlags) {
     let _ = enable_raw_mode();
     let mut out = stdout();
+    #[cfg(windows)]
+    {
+        use std::io::Write;
+        // A forcibly closed Herdr client cannot undo the host's Windows input protocol or
+        // modifyOtherKeys mode itself. Return the host to the board's ordinary key path.
+        let _ = out.write_all(b"\x1b[?9001l\x1b[>4;0m\x1b[?7h");
+    }
     // herdr resets these when it exits, but not when its window is cut off over SSH.
     let _ = execute!(
         out,
@@ -270,9 +293,13 @@ pub fn run(
         .unwrap_or(0);
     let ctrl_c = CtrlCToHerdr::new();
     leave(flags);
+    #[cfg(windows)]
+    let console_modes = crate::windows::ConsoleModes::capture();
     let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            #[cfg(windows)]
+            drop(console_modes);
             enter(terminal, flags);
             return Outcome::Failed(format!("Couldn't start herdr: {e}"));
         }
@@ -364,10 +391,7 @@ pub fn run(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if !asked_to_close && request.lock().unwrap().is_some() {
-                    // SAFETY: signals our own child, which hasn't been waited for yet.
-                    unsafe {
-                        libc::kill(child.id() as i32, libc::SIGTERM);
-                    }
+                    close_client(&mut child);
                     asked_to_close = true;
                 }
                 thread::sleep(Duration::from_millis(30));
@@ -376,6 +400,8 @@ pub fn run(
         }
     };
     stop.store(true, Ordering::Relaxed);
+    #[cfg(windows)]
+    drop(console_modes);
     enter(terminal, flags);
     drop(ctrl_c);
     let result = *request.lock().unwrap();
@@ -394,6 +420,19 @@ pub fn run(
     }
 }
 
+/// Close only the attached client. Never terminate a tree or a server when stepping out.
+pub fn close_client(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: child is our live, unreaped client. SIGTERM lets Herdr restore the terminal.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = child.kill();
+    }
+}
+
 /// Runs a command in the foreground on the plain terminal, for things that need you: answering
 /// SSH, or herdr's own setup. Returns whether it exited cleanly.
 pub fn foreground(
@@ -404,11 +443,15 @@ pub fn foreground(
 ) -> bool {
     let _ctrl_c = CtrlCToHerdr::new();
     leave(flags);
+    #[cfg(windows)]
+    let console_modes = crate::windows::ConsoleModes::capture();
     println!("\n{intro}\n");
     for var in HERDR_VARS {
         cmd.env_remove(var);
     }
     let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    #[cfg(windows)]
+    drop(console_modes);
     if !ok {
         println!("\nThat didn't finish cleanly. Press Enter to go back to Kerdr.");
         let mut line = String::new();
@@ -458,6 +501,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_remote_window_config_hides_the_sidebar() {
         let dir = tempfile::tempdir().unwrap();
