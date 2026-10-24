@@ -58,13 +58,26 @@ impl CtrlCToHerdr {
             let previous = unsafe { libc::signal(libc::SIGINT, handler) };
             CtrlCToHerdr { previous }
         }
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(windows_ctrl_c), 1);
+        }
         #[cfg(not(unix))]
         CtrlCToHerdr {}
     }
 }
 
+#[cfg(windows)]
+unsafe extern "system" fn windows_ctrl_c(event: u32) -> i32 {
+    i32::from(event == windows_sys::Win32::System::Console::CTRL_C_EVENT)
+}
+
 impl Drop for CtrlCToHerdr {
     fn drop(&mut self) {
+        #[cfg(windows)]
+        unsafe {
+            windows_sys::Win32::System::Console::SetConsoleCtrlHandler(Some(windows_ctrl_c), 0);
+        }
         #[cfg(unix)]
         // SAFETY: puts back the handler that was there before.
         unsafe {
@@ -364,10 +377,7 @@ pub fn run(
             Ok(Some(status)) => break Some(status),
             Ok(None) => {
                 if !asked_to_close && request.lock().unwrap().is_some() {
-                    // SAFETY: signals our own child, which hasn't been waited for yet.
-                    unsafe {
-                        libc::kill(child.id() as i32, libc::SIGTERM);
-                    }
+                    close_client(&mut child);
                     asked_to_close = true;
                 }
                 thread::sleep(Duration::from_millis(30));
@@ -391,6 +401,19 @@ pub fn run(
             )),
             _ => Outcome::Board,
         },
+    }
+}
+
+/// Close only the attached client. Never terminate a tree or a server when stepping out.
+pub fn close_client(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    // SAFETY: child is our live, unreaped client. SIGTERM lets Herdr restore the terminal.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    #[cfg(windows)]
+    {
+        let _ = child.kill();
     }
 }
 
@@ -458,6 +481,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_remote_window_config_hides_the_sidebar() {
         let dir = tempfile::tempdir().unwrap();

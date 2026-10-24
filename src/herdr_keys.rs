@@ -13,6 +13,7 @@ use crate::herdr::JUMP_TOKEN;
 
 pub const MARKER: &str = "kerdr_jump";
 
+#[cfg(not(windows))]
 pub const SNIPPET: &str = r#"
 # Kerdr (https://github.com/drewdunne/kerdr): two keys that step out of herdr to Kerdr's board.
 # herdr lists them in its keybinds menu (prefix+?) under custom. Outside Kerdr they do nothing.
@@ -26,6 +27,23 @@ description = "kerdr · next card that needs you"
 key = "prefix+backspace"
 type = "shell"
 command = "\"$HERDR_BIN_PATH\" workspace report-metadata \"$HERDR_ACTIVE_WORKSPACE_ID\" --source kerdr --token kerdr_jump=board:$(date +%s) --ttl-ms 15000"
+description = "kerdr · back to the board"
+"#;
+
+/// Windows Herdr runs shell commands through cmd.exe, so explicitly enter PowerShell.
+#[cfg(windows)]
+pub const SNIPPET: &str = r#"
+# Kerdr (https://github.com/drewdunne/kerdr): two keys that step out to the board.
+[[keys.command]]
+key = "prefix+space"
+type = "shell"
+command = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"& $env:HERDR_BIN_PATH workspace report-metadata $env:HERDR_ACTIVE_WORKSPACE_ID --source kerdr --token ('kerdr_jump=next:' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) --ttl-ms 15000\""
+description = "kerdr · next card that needs you"
+
+[[keys.command]]
+key = "prefix+backspace"
+type = "shell"
+command = "powershell.exe -NoLogo -NoProfile -NonInteractive -Command \"& $env:HERDR_BIN_PATH workspace report-metadata $env:HERDR_ACTIVE_WORKSPACE_ID --source kerdr --token ('kerdr_jump=board:' + [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) --ttl-ms 15000\""
 description = "kerdr · back to the board"
 "#;
 

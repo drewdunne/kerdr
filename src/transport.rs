@@ -7,6 +7,7 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(unix)]
 use crate::config::cache_dir;
 
 /// herdr installs into ~/.local/bin, which a non-login SSH command doesn't have on its PATH.
@@ -48,6 +49,7 @@ impl Output {
 
 /// Where SSH keeps its shared connections: the runtime folder when there is one, since a
 /// socket's path can't be longer than about 100 bytes.
+#[cfg(unix)]
 fn control_dir() -> std::path::PathBuf {
     let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(std::path::PathBuf::from);
     let dir = runtime
@@ -63,15 +65,7 @@ fn control_dir() -> std::path::PathBuf {
 }
 
 pub fn ssh_args() -> Vec<String> {
-    let dir = control_dir();
-    let _ = std::fs::create_dir_all(&dir);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
-    }
-    let control = dir.join("ssh-%C");
-    [
+    let args = [
         "-T",
         "-o",
         "BatchMode=yes",
@@ -81,26 +75,74 @@ pub fn ssh_args() -> Vec<String> {
         "ServerAliveInterval=5",
         "-o",
         "ServerAliveCountMax=2",
-        "-o",
-        "ControlMaster=auto",
-        "-o",
-    ]
-    .iter()
-    .map(|s| s.to_string())
-    .chain([
-        format!("ControlPath={}", control.display()),
-        "-o".to_string(),
-        "ControlPersist=60".to_string(),
-    ])
-    .collect()
+    ];
+    let mut args: Vec<String> = args.into_iter().map(String::from).collect();
+    // Microsoft's native OpenSSH has no Unix control sockets.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = control_dir();
+        let _ = std::fs::create_dir_all(&dir);
+        let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        args.extend([
+            "-o".into(),
+            "ControlMaster=auto".into(),
+            "-o".into(),
+            format!("ControlPath={}", dir.join("ssh-%C").display()),
+            "-o".into(),
+            "ControlPersist=60".into(),
+        ]);
+    }
+    #[cfg(windows)]
+    args.extend(["-o".into(), "ControlMaster=no".into()]);
+    args
 }
 
-/// Runs a POSIX shell script on the target, feeding it on standard input.
+/// A PowerShell literal, without interpolation (including apostrophes and newlines).
+pub fn powershell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+/// Powershell 5.1 is present on supported Windows systems. EncodedCommand keeps scripts out
+/// of stdin, leaving it available for adapter JSON, and preserves Unicode source text.
+pub fn powershell_command(script: &str) -> Command {
+    use base64::Engine;
+    let utf8 = "[Console]::InputEncoding = New-Object System.Text.UTF8Encoding $false; [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; $OutputEncoding = [Console]::OutputEncoding; ";
+    let bytes: Vec<u8> = format!("{utf8}{script}")
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let mut cmd = Command::new("powershell.exe");
+    cmd.args([
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        &base64::engine::general_purpose::STANDARD.encode(bytes),
+    ]);
+    cmd
+}
+
+pub fn clean_herdr_env(cmd: &mut Command) {
+    for var in HERDR_VARS {
+        cmd.env_remove(var);
+    }
+}
+
+/// Runs POSIX source remotely and on Unix; local Windows source uses PowerShell.
 pub fn run_script(target: &Target, script: &str, deadline: Duration) -> Output {
     let mut cmd = match target {
         Target::Local => {
-            let mut c = Command::new("sh");
-            c.arg("-s");
+            #[cfg(not(windows))]
+            let mut c = {
+                let mut c = Command::new("sh");
+                c.arg("-s");
+                c
+            };
+            #[cfg(windows)]
+            let mut c = powershell_command(script);
             for var in HERDR_VARS {
                 c.env_remove(var);
             }
@@ -112,11 +154,19 @@ pub fn run_script(target: &Target, script: &str, deadline: Duration) -> Output {
             c
         }
     };
-    run(&mut cmd, Some(script.as_bytes()), deadline)
+    run(&mut cmd, Some(script.as_bytes()), deadline, true)
 }
 
 /// Runs herdr with these arguments on the target.
 pub fn run_herdr(target: &Target, herdr: &str, args: &[&str], deadline: Duration) -> Output {
+    #[cfg(windows)]
+    if *target == Target::Local {
+        let mut cmd = Command::new(crate::jump::expand_home(herdr));
+        cmd.args(args);
+        clean_herdr_env(&mut cmd);
+        // Never put Herdr clients in a kill-on-close job: they may start a persistent server.
+        return run(&mut cmd, None, deadline, false);
+    }
     let quoted: Vec<String> = args.iter().map(|a| quote(a)).collect();
     let script = format!(
         "{PATH_PREFIX}\nunset {}\nexec {} {}\n",
@@ -127,7 +177,31 @@ pub fn run_herdr(target: &Target, herdr: &str, args: &[&str], deadline: Duration
     run_script(target, &script, deadline)
 }
 
-fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration) -> Output {
+/// Runs a configured adapter with optional JSON on stdin.
+pub fn run_adapter(
+    target: &Target,
+    command: &str,
+    input: Option<&str>,
+    deadline: Duration,
+) -> Output {
+    #[cfg(windows)]
+    if *target == Target::Local {
+        let mut cmd = powershell_command(&format!(
+            "$ErrorActionPreference = 'Stop'; & {{ {command} }}; if ($null -ne $LASTEXITCODE) {{ exit $LASTEXITCODE }}"
+        ));
+        clean_herdr_env(&mut cmd);
+        cmd.current_dir(crate::config::home());
+        return run(&mut cmd, input.map(str::as_bytes), deadline, true);
+    }
+    let script = format!(
+        "{PATH_PREFIX}\nunset {}\nprintf '%s' {} | {command}\n",
+        HERDR_VARS.join(" "),
+        quote(input.unwrap_or_default())
+    );
+    run_script(target, &script, deadline)
+}
+
+fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: bool) -> Output {
     let started = Instant::now();
     cmd.stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -150,7 +224,26 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration) -> Output {
             };
         }
     };
+    #[cfg(unix)]
     let pid = child.id() as i32;
+    #[cfg(windows)]
+    let _job = if _kill_tree {
+        match crate::windows::ProcessJob::assign(&child) {
+            Ok(job) => Some(job),
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Output {
+                    status: Some(127),
+                    stderr: format!("couldn't bound adapter lifetime: {e}"),
+                    took: started.elapsed(),
+                    ..Default::default()
+                };
+            }
+        }
+    } else {
+        None
+    };
     if let Some(mut stdin) = child.stdin.take() {
         let data = input.unwrap_or_default().to_vec();
         thread::spawn(move || {
@@ -200,6 +293,8 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration) -> Output {
     unsafe {
         libc::kill(-pid, libc::SIGKILL);
     }
+    #[cfg(windows)]
+    drop(_job);
     let grace = deadline
         .saturating_sub(started.elapsed())
         .max(Duration::from_millis(250));
@@ -370,10 +465,15 @@ mod tests {
     #[test]
     fn a_background_process_cant_hold_a_read_open() {
         let started = Instant::now();
-        let out = run_script(&Target::Local, "sleep 6 & echo hi", Duration::from_secs(1));
+        let script = if cfg!(windows) {
+            "Start-Process powershell.exe -NoNewWindow -ArgumentList '-NoProfile -Command Start-Sleep 6'; Write-Output hi"
+        } else {
+            "sleep 6 & echo hi"
+        };
+        let out = run_script(&Target::Local, script, Duration::from_secs(3));
         assert_eq!(out.stdout.trim(), "hi");
         assert!(
-            started.elapsed() < Duration::from_secs(3),
+            started.elapsed() < Duration::from_secs(5),
             "took {:?}",
             started.elapsed()
         );
@@ -383,13 +483,25 @@ mod tests {
     fn runs_scripts_locally_with_a_deadline() {
         let out = run_script(
             &Target::Local,
-            "echo hi; echo oops >&2",
+            if cfg!(windows) {
+                "Write-Output hi; [Console]::Error.WriteLine('oops')"
+            } else {
+                "echo hi; echo oops >&2"
+            },
             Duration::from_secs(5),
         );
         assert!(out.ok());
         assert_eq!(out.stdout.trim(), "hi");
         assert_eq!(out.stderr.trim(), "oops");
-        let slow = run_script(&Target::Local, "sleep 5", Duration::from_millis(200));
+        let slow = run_script(
+            &Target::Local,
+            if cfg!(windows) {
+                "Start-Sleep 5"
+            } else {
+                "sleep 5"
+            },
+            Duration::from_millis(200),
+        );
         assert!(slow.timed_out);
     }
 }

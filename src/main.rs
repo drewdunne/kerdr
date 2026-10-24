@@ -11,7 +11,6 @@ use kerdr::herdr_keys;
 use kerdr::poll::{self, Conn};
 use kerdr::report::{self, Report};
 use kerdr::state::State;
-use kerdr::transport::{self, Target};
 
 /// An opinionated kanban cockpit for driving herdr sessions.
 #[derive(Parser)]
@@ -250,16 +249,7 @@ fn doctor() -> anyhow::Result<()> {
             (Some(cmd), None, None) => println!("  feed: not read ({cmd})"),
         }
         if s.conn.is_live() {
-            let target = match &s.machine.ssh {
-                Some(h) => Target::Ssh(h.clone()),
-                None => Target::Local,
-            };
-            let out = transport::run_script(
-                &target,
-                "grep -q kerdr_jump \"${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}\" 2>/dev/null && echo yes || echo no",
-                std::time::Duration::from_secs(10),
-            );
-            let has = out.stdout.trim() == "yes";
+            let has = s.data.as_ref().is_some_and(|d| d.keys);
             println!(
                 "  Kerdr's keys in herdr's config: {}",
                 if has {

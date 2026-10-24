@@ -16,6 +16,8 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: ubuntu-22.04-arm
             target: aarch64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
           - os: macos-14
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
@@ -24,16 +26,29 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+      - run: cargo test --locked --target ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }}
-      - name: Package
+      - name: Package Unix
+        if: runner.os != 'Windows'
         run: |
           cd target/${{ matrix.target }}/release
           tar -czf kerdr-${{ matrix.target }}.tar.gz kerdr
           shasum -a 256 kerdr-${{ matrix.target }}.tar.gz > kerdr-${{ matrix.target }}.tar.gz.sha256
+      - name: Package Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Set-Location target/${{ matrix.target }}/release
+          Compress-Archive -Path kerdr.exe -DestinationPath kerdr-${{ matrix.target }}.zip
+          $hash = (Get-FileHash kerdr-${{ matrix.target }}.zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  kerdr-${{ matrix.target }}.zip" | Set-Content kerdr-${{ matrix.target }}.zip.sha256 -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
           name: kerdr-${{ matrix.target }}
-          path: target/${{ matrix.target }}/release/kerdr-${{ matrix.target }}.tar.gz*
+          path: |
+            target/${{ matrix.target }}/release/kerdr-${{ matrix.target }}.tar.gz*
+            target/${{ matrix.target }}/release/kerdr-${{ matrix.target }}.zip*
 
   publish:
     needs: build

@@ -2,15 +2,20 @@ name: ci
 
 on:
   push:
-    branches: [main]
+    branches: [main, 'feat/native-windows-*']
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -20,11 +25,34 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --locked
-      - name: Install herdr's latest release
+      - run: cargo build --locked
+      - name: Install herdr's latest Unix release
+        if: runner.os != 'Windows'
         run: |
           curl -fsSL https://herdr.dev/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Kerdr against a real herdr server
+      - name: Kerdr against a real Unix herdr server
+        if: runner.os != 'Windows'
+        run: tests/live-herdr.sh target/debug/kerdr
+      - name: Install herdr's latest Windows release
+        if: runner.os == 'Windows'
+        shell: powershell
         run: |
-          cargo build --locked
-          tests/live-herdr.sh target/debug/kerdr
+          $ErrorActionPreference = 'Stop'
+          Invoke-RestMethod https://herdr.dev/install.ps1 | Invoke-Expression
+          "$env:LOCALAPPDATA\Programs\Herdr\bin" | Out-File -FilePath $env:GITHUB_PATH -Append -Encoding utf8
+      - uses: actions/setup-python@v5
+        if: runner.os == 'Windows'
+        with:
+          python-version: '3.12'
+      - name: Install Windows console test driver
+        if: runner.os == 'Windows'
+        run: python -m pip install pywinpty==3.0.2
+      - name: Kerdr against a real Windows herdr server and ConPTY
+        if: runner.os == 'Windows'
+        run: python tests/windows_live.py target/debug/kerdr.exe
+      - uses: actions/upload-artifact@v4
+        if: always() && runner.os == 'Windows'
+        with:
+          name: windows-console-evidence
+          path: test-results/
