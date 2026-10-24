@@ -140,6 +140,14 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
             herdr("workspace", "report-metadata", wid, "--source", "kerdr",
                   "--token", "kerdr_stage=test", "--token", "kerdr_status=needs_you",
                   "--token", "kerdr_note=Windows live check")
+        feed = {"kerdr_feed": 1, "source": "windows-live", "cards": [
+            {"id": str(index + 1), "ref": f"0{index + 1}-windows", "title": f"Windows card {index + 1}",
+             "stage": "test", "state": "active", "attention": "needs_you",
+             "story": "Native café 🦀", "workspace": {"session": session, "id": wid}}
+            for index, wid in enumerate(workspaces)]}
+        feed_command = "Write-Output " + quote(json.dumps(feed, ensure_ascii=False))
+        with Path(env["KERDR_CONFIG"]).open("a", encoding="utf-8") as cfg:
+            cfg.write("[feed]\ncommand = " + json.dumps(feed_command, ensure_ascii=False) + "\n")
         panes = json.loads(herdr("pane", "list"))
         for pane in panes.get("result", {}).get("panes", []):
             if pane.get("pane_id"):
@@ -207,9 +215,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         def verify_identity():
             assert alive(server_pids[0]), "original persistent server exited"
             assert set(workspaces) <= {w["workspace_id"] for w in snapshot()["workspaces"]}
-        expect("Misc")
-        console.write("i")
-        expect("Conversations without an intent")
+        expect("Windows card 1")
         time.sleep(0.3)
         board_modes = state()["modes"]
         def enter():
@@ -226,7 +232,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
             print(f"Returning from Herdr with {key!r}", flush=True)
             console.write("\x02" + key)
             wait_for(lambda: not client_pids(), "only attached client exits")
-            expect("Conversations without an intent")
+            expect("MAINTAIN")
             time.sleep(0.2)
             assert state()["modes"] == board_modes, (state(), board_modes)
             verify_identity()
@@ -257,7 +263,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
             if client_pids():
                 back("q")
             else:
-                expect("Conversations without an intent")
+                expect("MAINTAIN")
                 assert state()["modes"] == board_modes
                 verify_identity()
             print(f"PASS console {'Ctrl+C' if event == 0 else 'Ctrl+Break'} during handoff", flush=True)
