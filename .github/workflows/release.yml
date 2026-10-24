@@ -60,6 +60,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: kerdr-*
           merge-multiple: true
       - env:
           GH_TOKEN: ${{ github.token }}

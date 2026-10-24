@@ -117,8 +117,12 @@ impl ConsoleModes {
         Self(modes)
     }
 
-    pub fn values(&self) -> Vec<u32> {
-        self.0.iter().map(|(_, mode)| *mode).collect()
+    pub fn current_values() -> Vec<u32> {
+        let mut snapshot = Self::capture();
+        std::mem::take(&mut snapshot.0)
+            .into_iter()
+            .map(|(_, mode)| mode)
+            .collect()
     }
 }
 
@@ -260,6 +264,49 @@ mod tests {
                 assert_ne!(exit, 259, "adapter descendant survived job cleanup");
             }
         }
+    }
+
+    #[test]
+    fn persistent_action_child_can_keep_pipes_without_hiding_the_response() {
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_TERMINATE,
+            TerminateProcess,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("persistent.pid");
+        let command = format!(
+            "$p = Start-Process powershell.exe -NoNewWindow -PassThru -ArgumentList '-NoProfile -Command Start-Sleep 30'; [IO.File]::WriteAllText({}, [string]$p.Id); Write-Output '{{\"ok\":true,\"message\":\"started\"}}'",
+            transport::powershell_quote(pid_file.to_str().unwrap())
+        );
+        let started = Instant::now();
+        let out = transport::run_adapter(
+            &Target::Local,
+            &command,
+            Some("{}"),
+            Duration::from_secs(10),
+        );
+        let pid: u32 = std::fs::read_to_string(pid_file).unwrap().parse().unwrap();
+        // SAFETY: this is the exact fixture PID, opened only for query and cleanup.
+        let was_alive = unsafe {
+            let handle = OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE,
+                0,
+                pid,
+            );
+            assert!(!handle.is_null());
+            let mut code = 0;
+            GetExitCodeProcess(handle, &mut code);
+            TerminateProcess(handle, 0);
+            CloseHandle(handle);
+            code == 259
+        };
+        assert!(was_alive, "action child did not survive its invocation");
+        assert!(out.ok(), "{out:?}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&out.stdout).unwrap()["ok"],
+            true
+        );
+        assert!(started.elapsed() < Duration::from_secs(6), "{out:?}");
     }
 
     #[test]

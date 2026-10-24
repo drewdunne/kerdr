@@ -7,6 +7,17 @@ fn main() {
     use windows_sys::Win32::System::Console::SetConsoleCtrlHandler;
 
     let args: Vec<String> = std::env::args().collect();
+    if args[1] == "paths" {
+        println!(
+            "{}",
+            serde_json::json!({
+                "herdr": kerdr::herdr_keys::herdr_config_path(),
+                "kerdr": kerdr::config::config_path(), "home":kerdr::config::home(),
+                "state":kerdr::config::state_dir(), "cache":kerdr::config::cache_dir()
+            })
+        );
+        return;
+    }
     if args[1] == "adapter" {
         let out = kerdr::transport::run_adapter(
             &kerdr::transport::Target::Local,
@@ -29,7 +40,7 @@ fn main() {
     unsafe {
         SetConsoleCtrlHandler(Some(control), 1);
     }
-    let baseline = kerdr::windows::ConsoleModes::capture().values();
+    let baseline = kerdr::windows::ConsoleModes::current_values();
     let mut child = Command::new(&args[2]).spawn().unwrap();
     let pid = child.id();
     loop {
@@ -42,7 +53,7 @@ fn main() {
                 );
             }
         }
-        let modes = kerdr::windows::ConsoleModes::capture().values();
+        let modes = kerdr::windows::ConsoleModes::current_values();
         let status = child.try_wait().unwrap();
         fs::write(
             &args[3],

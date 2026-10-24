@@ -1,5 +1,6 @@
 """Disposable native Windows integration using real Herdr and Microsoft's ConPTY."""
 import ctypes
+import faulthandler
 from ctypes import wintypes
 import json
 import os
@@ -14,6 +15,7 @@ import time
 from winpty import PtyProcess
 
 sys.stdout.reconfigure(encoding="utf-8")
+faulthandler.dump_traceback_later(180, exit=True)
 kerdr = str(Path(sys.argv[1]).resolve())
 probe = str(Path(kerdr).parent / "examples" / "windows_probe.exe")
 results = Path("test-results").resolve()
@@ -62,6 +64,17 @@ def wait_for(check, label, timeout=35):
 def quote(text):
     return "'" + str(text).replace("'", "''") + "'"
 
+
+# Compare the native defaults with Herdr itself, without changing any config.
+default_env = env.copy()
+for key in ["HERDR_CONFIG_PATH", "KERDR_CONFIG", "XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"]:
+    default_env.pop(key, None)
+paths = json.loads(subprocess.check_output([probe, "paths"], env=default_env, encoding="utf-8"))
+herdr_help = subprocess.check_output(["herdr", "--help"], env=default_env, encoding="utf-8")
+assert ("Config: " + paths["herdr"]).lower() in herdr_help.lower(), (paths, herdr_help)
+assert Path(paths["kerdr"]) == Path(env["APPDATA"]) / "kerdr" / "config.toml"
+assert Path(paths["home"]) == Path(env["USERPROFILE"])
+print("PASS default Windows paths agree with native Herdr", flush=True)
 
 with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
     temp = Path(temp)
@@ -128,6 +141,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
 
         modes_file = temp / "console-modes.json"
         control_file = temp / "control-event"
+        print("Starting real ConPTY console probe", flush=True)
         console = PtyProcess.spawn([probe, "console", kerdr, str(modes_file), str(control_file)],
                                    env=env, dimensions=(40, 140), backend=1)
         output = queue.Queue()
@@ -147,6 +161,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
                 return None
         wait_for(state, "console probe starts")
         kerdr_pid = state()["pid"]
+        print(f"Console probe started Kerdr process {kerdr_pid}", flush=True)
         def expect(text, timeout=35):
             seen = ""
             until = time.monotonic() + timeout
@@ -179,12 +194,14 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         board_modes = state()["modes"]
         def enter():
             discard()
+            print("Entering Herdr", flush=True)
             console.write("\r")
             wait_for(client_pids, "attached client starts")
             time.sleep(1)
             return client_pids()
         def back(key):
             discard()
+            print(f"Returning from Herdr with {key!r}", flush=True)
             console.write("\x02" + key)
             wait_for(lambda: not client_pids(), "only attached client exits")
             expect("Conversations without an intent")

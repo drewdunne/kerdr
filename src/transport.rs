@@ -1,9 +1,12 @@
 //! Running commands on a machine: this one directly, others over SSH. Every SSH command shares
 //! one connection per machine (OpenSSH's ControlMaster), never prompts, and has a deadline.
 
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::process::{Command, Stdio};
-use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -212,9 +215,116 @@ pub fn run_adapter(
     run_script(target, &script, deadline)
 }
 
+trait OutputPipe: Read + Send {
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+}
+
+#[cfg(unix)]
+impl<T: Read + Send + std::os::fd::AsRawFd> OutputPipe for T {
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut fd = libc::pollfd {
+            fd: self.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one live descriptor, checked without blocking. This is its only reader.
+        let ready = unsafe { libc::poll(&mut fd, 1, 0) };
+        if ready == 0 {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        if ready < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        self.read(buf)
+    }
+}
+
+#[cfg(windows)]
+impl<T: Read + Send + std::os::windows::io::AsRawHandle> OutputPipe for T {
+    fn read_ready(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        use windows_sys::Win32::System::Pipes::PeekNamedPipe;
+        let mut available = 0;
+        // SAFETY: this is a borrowed live pipe, and no other reader can consume its bytes.
+        let ok = unsafe {
+            PeekNamedPipe(
+                self.as_raw_handle() as _,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                &mut available,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            let error = std::io::Error::last_os_error();
+            return if matches!(error.raw_os_error(), Some(109 | 232)) {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
+        if available == 0 {
+            return Err(std::io::ErrorKind::WouldBlock.into());
+        }
+        let len = buf.len().min(available as usize);
+        self.read(&mut buf[..len])
+    }
+}
+
+fn read_pipe(mut pipe: Box<dyn OutputPipe>, stop: Arc<AtomicBool>) -> thread::JoinHandle<Vec<u8>> {
+    thread::spawn(move || {
+        let mut output = Vec::new();
+        let mut buffer = [0u8; 16 * 1024];
+        let mut draining = None;
+        loop {
+            if stop.load(Ordering::Acquire) {
+                let since = draining.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_millis(50) {
+                    break;
+                }
+            }
+            match pipe.read_ready(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => output.extend_from_slice(&buffer[..n]),
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    if draining.is_some() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(3));
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => break,
+            }
+        }
+        output
+    })
+}
+
 fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: bool) -> Output {
     let started = Instant::now();
-    cmd.stdin(Stdio::piped())
+    // A temporary input stream avoids an unbounded writer thread when an action leaves a
+    // persistent descendant holding stdin open. Adapters still receive exactly their JSON.
+    let stdin = match (|| -> std::io::Result<Stdio> {
+        if let Some(input) = input {
+            let mut file = tempfile::tempfile()?;
+            file.write_all(input)?;
+            file.rewind()?;
+            Ok(Stdio::from(file))
+        } else {
+            Ok(Stdio::null())
+        }
+    })() {
+        Ok(stdin) => stdin,
+        Err(e) => {
+            return Output {
+                status: Some(127),
+                stderr: e.to_string(),
+                took: started.elapsed(),
+                ..Default::default()
+            };
+        }
+    };
+    cmd.stdin(stdin)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     // Its own process group, so the deadline, and the end of the run, stop everything it
@@ -262,35 +372,9 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     } else {
         None
     };
-    if let Some(mut stdin) = child.stdin.take() {
-        let data = input.unwrap_or_default().to_vec();
-        thread::spawn(move || {
-            let _ = stdin.write_all(&data);
-        });
-    }
-    let reader = |stream: Option<Box<dyn Read + Send>>| {
-        let (tx, rx) = mpsc::channel();
-        if let Some(mut s) = stream {
-            thread::spawn(move || {
-                let mut buf = Vec::new();
-                let _ = s.read_to_end(&mut buf);
-                let _ = tx.send(buf);
-            });
-        }
-        rx
-    };
-    let out_rx = reader(
-        child
-            .stdout
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
-    let err_rx = reader(
-        child
-            .stderr
-            .take()
-            .map(|s| Box::new(s) as Box<dyn Read + Send>),
-    );
+    let stop_readers = Arc::new(AtomicBool::new(false));
+    let out_reader = read_pipe(Box::new(child.stdout.take().unwrap()), stop_readers.clone());
+    let err_reader = read_pipe(Box::new(child.stderr.take().unwrap()), stop_readers.clone());
 
     let mut timed_out = false;
     let status = loop {
@@ -313,13 +397,9 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     }
     #[cfg(windows)]
     drop(_job);
-    let grace = deadline
-        .saturating_sub(started.elapsed())
-        .max(Duration::from_millis(250));
-    let stdout = out_rx.recv_timeout(grace).unwrap_or_default();
-    let stderr = err_rx
-        .recv_timeout(Duration::from_millis(250))
-        .unwrap_or_default();
+    stop_readers.store(true, Ordering::Release);
+    let stdout = out_reader.join().unwrap_or_default();
+    let stderr = err_reader.join().unwrap_or_default();
     Output {
         status,
         stdout: String::from_utf8_lossy(&stdout).into_owned(),
