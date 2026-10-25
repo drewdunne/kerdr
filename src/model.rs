@@ -263,6 +263,40 @@ impl Card {
         self.workspace_id.is_some() && self.session.is_some()
     }
 
+    /// Work under way whose workspace is gone: a record in a working stage, not done, dismissed or
+    /// still being written up, with no workspace open. Enter asks the action backend to reopen it.
+    pub fn can_reopen(&self) -> bool {
+        self.under_way() && !self.is_open_workspace()
+    }
+
+    /// Work under way, whatever its workspace: a record in a working stage, not done, dismissed or
+    /// still being written up. What a reopen needs, once its workspace is known to have gone.
+    pub fn under_way(&self) -> bool {
+        self.detail.is_some()
+            && matches!(
+                self.stage,
+                Stage::Plan | Stage::Design | Stage::Build | Stage::Test | Stage::Deploy
+            )
+            && self.attention != Attention::Done
+            && !self.dismissed()
+            && self.intake().is_none()
+    }
+
+    /// The agent whose conversation a reopen would resume, named for people: "Claude", "Codex".
+    pub fn resume_agent(&self) -> Option<String> {
+        let agent = self
+            .detail
+            .as_ref()?
+            .resume
+            .as_ref()?
+            .agent
+            .as_deref()?
+            .trim();
+        let mut chars = agent.chars();
+        let first = chars.next()?;
+        Some(first.to_uppercase().chain(chars).collect())
+    }
+
     /// How a message names this card's workspace: "#41's workspace", or "Workspace 41-dark-mode"
     /// for a card that is only a workspace.
     pub fn workspace_name(&self) -> String {
@@ -288,6 +322,57 @@ impl Card {
             self.machine,
             self.why
         )
+    }
+}
+
+/// A card as it was when an action about it started: which card, on which machine, its home, the
+/// conversation a reopen would resume and its workspace. A late question, its yes and a jump apply
+/// only to the same work.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CardSnapshot {
+    pub key: String,
+    pub machine: usize,
+    pub home_machine: Option<String>,
+    pub home_session: Option<String>,
+    pub resume_agent: Option<String>,
+    pub resume_conversation: Option<String>,
+    pub workspace: Option<String>,
+}
+
+impl CardSnapshot {
+    pub fn of(card: &Card) -> CardSnapshot {
+        let d = card.detail.as_ref();
+        let home = d.and_then(|d| d.home.as_ref());
+        let resume = d.and_then(|d| d.resume.as_ref());
+        CardSnapshot {
+            key: card.key.clone(),
+            machine: card.machine_index,
+            home_machine: home.and_then(|h| h.machine.clone()),
+            home_session: home.and_then(|h| h.session.clone()),
+            resume_agent: resume.and_then(|r| r.agent.clone()),
+            resume_conversation: resume.and_then(|r| r.conversation.clone()),
+            workspace: card.workspace_id.clone(),
+        }
+    }
+
+    /// Whether this card is still the same work, allowing only for its workspace to have gone.
+    pub fn same_work(&self, card: &Card) -> bool {
+        self.same_work_or(card, None)
+    }
+
+    /// The same, also allowing for it to have the workspace `made` (the one a reopen just made).
+    pub fn same_work_or(&self, card: &Card, made: Option<&str>) -> bool {
+        let now = CardSnapshot::of(card);
+        now.workspace
+            .as_deref()
+            .is_none_or(|w| self.workspace.as_deref() == Some(w) || made == Some(w))
+            && CardSnapshot {
+                workspace: None,
+                ..now
+            } == CardSnapshot {
+                workspace: None,
+                ..self.clone()
+            }
     }
 }
 

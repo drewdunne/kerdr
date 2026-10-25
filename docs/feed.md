@@ -53,7 +53,8 @@ Kerdr shows the last good feed, with herdr's live view, when a run fails.
       "result": "For finished work: what it delivered, in one line",
       "closed": "2026-10-21",
       "path": "intents/0041-checkout-expired-cards",
-      "parent": "0038"
+      "parent": "0038",
+      "resume": {"agent": "claude", "conversation": "4f2b8c1e-…"}
     }
   ],
   "warnings": []
@@ -89,6 +90,7 @@ know rather than guessing.
 | `backlog_rank` | An optional signed integer ordering the backlog, lower numbers first. The action backend writes the canonical order. |
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
 | `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
+| `resume` | For work under way: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
 
 ## Actions
 
@@ -113,7 +115,7 @@ additional fields that operation needs:
 {"action":"dispatch","id":"0041","session":"web","override":false}
 ```
 
-The action names are `create`, `dispatch`, `refresh`, `dismiss`, `restore` and `move`.
+The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore` and `move`.
 `create` carries the user's own words, the session they were looking at, and an id for this
 submission, nothing else:
 
@@ -132,10 +134,11 @@ written up, give the card `intake: "pending"` in the feed. A response that names
 the record exists even when `ok` is false (saved but not published, say): Kerdr won't send the
 same words again.
 `refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
-the active backlog and `restore` brings it back. `move` changes backlog order.
+the active backlog and `restore` brings it back. `move` changes backlog order. `reopen` is
+described below.
 
-Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session` and `submission` (strings),
-`override` and `top` (booleans), and `delta` (a signed integer). Omit fields that do not apply.
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `submission` and `confirm` (strings),
+`override`, `top` and `queue` (booleans), and `delta` (a signed integer). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
 exactly one JSON response to standard output. Send diagnostic output to standard error.
 
@@ -144,8 +147,8 @@ exactly one JSON response to standard output. Send diagnostic output to standard
 ```
 
 `ok` (boolean) and `message` (string) are required. Optional fields are `confirmation` (boolean,
-default false), `used` and `limit` (nonnegative integers or null), and `session` and `id` (strings
-or null). Unknown response fields are allowed for future additions. A valid JSON response is
+default false), `used` and `limit` (nonnegative integers or null), and `session`, `id`,
+`workspace`, `label` and `confirm` (strings or null). Unknown response fields are allowed for future additions. A valid JSON response is
 read even if the command exits nonzero, allowing the backend to explain a refused action or ask
 for confirmation:
 
@@ -154,9 +157,47 @@ for confirmation:
 ```
 
 A confirmation is a separate user decision before sending a new request with `override: true`.
+Kerdr asks it for `dispatch` and `reopen`.
 Actions have a 120-second deadline. A timeout or an invalid response does not prove the mutation
 failed: its result is unknown. Kerdr does not retry it automatically; check the canonical record
 before trying again. After success, the next feed read reflects the saved changes.
+
+## Reopening work whose workspace closed
+
+`Enter` on a card for work under way (a record in Plan, Design, Build, Test or Deploy that isn't
+done, dismissed or still being written up) whose herdr workspace is gone sends `reopen` to the
+card's home machine instead of stopping at "nothing to jump into":
+
+```json
+{"action":"reopen","id":"0041","session":"web"}
+```
+
+`session` is the record's `home.session`, or the session tab you're on; leave it out when
+neither is known and choose one in the backend. The backend decides everything else: where the
+workspace goes, how it's named, which agent conversation to resume (or a fresh agent when there
+is none), and whether to ask first. When it opened a workspace, or found one already open (the
+conversation running in another pane, say), it answers with it, and Kerdr goes straight in:
+
+```json
+{"ok":true,"message":"Reopened #41 in web, resuming its Claude conversation.","id":"0041","session":"web","workspace":"w12","label":"41-checkout-expired-cards"}
+```
+
+`workspace` is a herdr workspace id in `session` on the machine the action ran on. Kerdr goes in
+only while you're still on that card; if you've moved on, or pressed `Esc`, it says the work is
+open again instead.
+
+To ask first (the session is at its usual limit, the conversation may still be open somewhere
+else), answer with `"confirmation": true`, a `message` that names every reason, and optionally
+`confirm`, an opaque token of what you asked about. Kerdr shows the question only while you're
+still on the card, as it was when you pressed `Enter`, and on a yes sends the request again with
+`override: true`, the `session` the answer named and that `confirm` token, so the backend can go
+ahead with exactly what was agreed. When something has changed since, answer the yes with a new
+question and a new token: Kerdr asks again. Before sending a yes, Kerdr also rechecks that the
+card has the same home and conversation and no new workspace.
+
+When the question says the session is full (it carries `used`), it also offers `w`: the request
+again with `queue: true`, for the backend to queue the work in that session instead, as starting
+new work would be. Without `[actions]`, `Enter` says the card has no workspace and sends nothing.
 
 ## Agents reporting for themselves
 

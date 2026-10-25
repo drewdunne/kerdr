@@ -90,11 +90,13 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             title,
             message,
             back,
+            request,
+            queue,
             ..
         } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
-            confirm(f, area, title, message);
+            confirm(f, area, title, message, request["action"].as_str(), *queue);
         }
         Mode::Machines { sel } => machines_view(f, area, app, *sel),
         Mode::Backlog { sel } => backlog_view(f, area, app, *sel),
@@ -1415,6 +1417,8 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         lines.extend(wrapped(&needs, w, fg(FG), Some(("▌ ", ORANGE))));
         let how = if c.is_open_workspace() {
             "Answer in its pane: ⏎ jumps in."
+        } else if c.can_reopen() && app.actions_on() {
+            "Its workspace closed: ⏎ reopens it to answer in."
         } else {
             "It has no workspace open to answer in."
         };
@@ -1571,6 +1575,11 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         vec![Span::styled("─".repeat(w), fg(BORDER))],
     );
     // Waiting work has nothing to jump into: its line names the keys that start or change it.
+    // Work whose workspace closed says what ⏎ does for it: reopen it, resuming its agent.
+    let reopen = match c.resume_agent() {
+        Some(agent) => format!("reopen it, resuming its {agent} conversation"),
+        None => "reopen its workspace".to_string(),
+    };
     let mut hints = match app.backlog_card_for_keys() {
         Some(c) if c.dismissed() => vec![("u", "bring it back")],
         Some(_) => vec![
@@ -1580,6 +1589,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             ("J K", "move down / up"),
             ("t", "to the top"),
         ],
+        None if c.can_reopen() && app.actions_on() => vec![("⏎", reopen.as_str())],
         None => vec![("⏎", "jump in")],
     };
     hints.push(("n N", "next that needs you"));
@@ -2011,7 +2021,14 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
     );
 }
 
-fn confirm(f: &mut Frame, area: Rect, title: &str, message: &str) {
+fn confirm(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    message: &str,
+    action: Option<&str>,
+    queue: bool,
+) {
     let rect = centered(area, 86, 16, None);
     dialog(f, rect, YELLOW);
     let inner = pad(rect, 3, 1);
@@ -2019,13 +2036,15 @@ fn confirm(f: &mut Frame, area: Rect, title: &str, message: &str) {
     let mut lines = wrapped(title, w, bold(YELLOW), None);
     lines.push(Line::raw(""));
     lines.extend(wrapped(message, w, fg(FG), None));
-    lines.push(Line::raw(""));
-    lines.extend(wrapped(
-        "Starting more work takes another slot. At the maximum, finish or shelve one first.",
-        w,
-        fg(DIM),
-        None,
-    ));
+    if action == Some("dispatch") {
+        lines.push(Line::raw(""));
+        lines.extend(wrapped(
+            "Starting more work takes another slot. At the maximum, finish or shelve one first.",
+            w,
+            fg(DIM),
+            None,
+        ));
+    }
     let body = Rect {
         height: inner.height.saturating_sub(2),
         ..inner
@@ -2037,7 +2056,24 @@ fn confirm(f: &mut Frame, area: Rect, title: &str, message: &str) {
         inner.bottom().saturating_sub(1),
         inner.width,
         fit(
-            key_hints(&[("Enter / y", "start anyway"), ("Esc / n", "cancel")]),
+            key_hints(
+                &[
+                    (
+                        "Enter / y",
+                        match action {
+                            Some("dispatch") => "start anyway",
+                            Some("reopen") => "go ahead",
+                            _ => "yes",
+                        },
+                    ),
+                    ("w", "queue it for a free slot"),
+                    ("Esc / n", "cancel"),
+                ][..]
+                    .iter()
+                    .filter(|(k, _)| queue || *k != "w")
+                    .copied()
+                    .collect::<Vec<_>>(),
+            ),
             w,
         ),
     );
@@ -2298,6 +2334,11 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
                 "⏎",
                 "jump in: herdr, full screen, on the card's workspace",
                 "",
+            ),
+            (
+                "⏎",
+                "on work whose workspace closed: reopen it, resuming its agent's conversation",
+                "with actions on",
             ),
             (
                 "space",
@@ -3518,10 +3559,13 @@ mod tests {
             },
             Mode::Confirm {
                 machine: 0,
-                request: serde_json::json!({}),
+                request: serde_json::json!({"action":"dispatch"}),
                 title: "Start this work?".into(),
                 message: "Session web has 3 of 3 workspaces.".into(),
                 back: Box::new(Mode::Board),
+                target: None,
+                queue: false,
+                ready_at: None,
             },
         ]
     }

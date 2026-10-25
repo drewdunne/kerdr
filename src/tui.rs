@@ -130,11 +130,7 @@ fn event_loop(
     inbox: &Inbox,
     client_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let (action_tx, action_rx) = mpsc::channel::<(
-        usize,
-        serde_json::Value,
-        Result<crate::actions::Response, String>,
-    )>();
+    let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     loop {
         while let Ok((machine, request, result)) = action_rx.try_recv() {
             let succeeded = result
@@ -146,6 +142,45 @@ fn event_loop(
                     let _ = poller.wake.send(Wake::Feed);
                 }
             }
+        }
+        // A reopen answered with its workspace while you're still on its card: go in, and on
+        // ctrl+space space carry on to the next card that needs you, as from any other.
+        if let Some(open) = app.open_after.take() {
+            let outcome = jump_workspace(
+                terminal,
+                flags,
+                app,
+                live.as_deref_mut(),
+                client_config.as_ref(),
+                open.machine,
+                open.session,
+                open.workspace,
+                Some(open.label),
+            );
+            if outcome == Some(Outcome::Next) {
+                // Choose from the board as it is now, as jump_cards does, not as it was on the way in.
+                read_again(app, live.as_deref(), inbox, open.machine, true);
+                match app.next_needs_you_after(&open.from, &[]) {
+                    Some(next) => jump_cards(
+                        terminal,
+                        flags,
+                        app,
+                        live.as_deref_mut(),
+                        inbox,
+                        client_config.as_ref(),
+                        next,
+                        false,
+                    ),
+                    None => app.say("Nothing else needs you right now.", Tone::Good),
+                }
+            }
+        }
+        // A card whose workspace closed as you went in: work under way reopens instead.
+        if let Some(key) = app.pending_reopen.take()
+            && let Some(card) = app.card(&key).cloned()
+            && let Action::Mutate { machine, request } = app.reopen_action(&card)
+        {
+            start_action(app, &action_tx, machine, request);
         }
         for ev in inbox.take() {
             app.apply(ev);
@@ -159,6 +194,7 @@ fn event_loop(
                 inbox,
                 client_config.as_ref(),
                 key,
+                true,
             );
         }
         app.width = terminal.size()?.width;
@@ -197,19 +233,7 @@ fn event_loop(
                 if app.busy {
                     continue;
                 }
-                let Some(command) = app.cfg.actions.command.clone() else {
-                    continue;
-                };
-                let Some(target) = app.machines.get(machine).map(|m| m.machine.clone()) else {
-                    continue;
-                };
-                let tx = action_tx.clone();
-                app.busy = true;
-                app.say("Changing the intent…", Tone::Info);
-                std::thread::spawn(move || {
-                    let result = crate::actions::run(&target, &command, &request);
-                    let _ = tx.send((machine, request, result));
-                });
+                start_action(app, &action_tx, machine, request);
             }
             Action::Jump(card) => {
                 if app.demo {
@@ -223,6 +247,7 @@ fn event_loop(
                         inbox,
                         client_config.as_ref(),
                         card,
+                        true,
                     );
                 }
             }
@@ -238,47 +263,17 @@ fn event_loop(
                 let Some(mi) = app.machine_index(&machine) else {
                     continue;
                 };
-                if !app.machines[mi].conn.is_live() {
-                    app.say(
-                        format!("{machine} isn't answering; r tries it now."),
-                        Tone::Warn,
-                    );
-                    continue;
-                }
-                let label = app
-                    .board
-                    .workspaces
-                    .iter()
-                    .find(|w| w.machine == machine && w.session == session && w.id == id)
-                    .map(|w| w.label.clone())
-                    .unwrap_or_else(|| id.clone());
-                let via = via_for(app, mi, &session);
-                let j = Jump {
-                    machine: app.machines[mi].machine.clone(),
-                    session,
-                    workspace: id,
-                    label,
-                    others: app.needs_you_order().len(),
-                    via,
-                    prefix: app.prefix.clone(),
-                    keys: keys_on(app, mi),
-                };
-                let outcome = jump::run(
+                jump_workspace(
                     terminal,
                     flags,
-                    &j,
-                    client_config.as_deref().unwrap_or(std::path::Path::new("")),
+                    app,
+                    live.as_deref_mut(),
+                    client_config.as_ref(),
+                    mi,
+                    session,
+                    id,
+                    None,
                 );
-                if let Some(l) = live.as_deref() {
-                    l.wake(mi);
-                }
-                match outcome {
-                    Outcome::Failed(e) => app.say(e, Tone::Warn),
-                    Outcome::Closed => {
-                        app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn)
-                    }
-                    Outcome::Board | Outcome::Next => {}
-                }
             }
             Action::Retry(target) => {
                 let Some(l) = live.as_deref() else {
@@ -401,6 +396,105 @@ fn event_loop(
     }
 }
 
+type ActionResult = (
+    usize,
+    serde_json::Value,
+    Result<crate::actions::Response, String>,
+);
+
+/// Runs an action in the background; its answer comes back on the channel.
+fn start_action(
+    app: &mut App,
+    tx: &mpsc::Sender<ActionResult>,
+    machine: usize,
+    request: serde_json::Value,
+) {
+    if app.demo {
+        app.say(
+            "This is the demo: intent controls change your real board only.",
+            Tone::Info,
+        );
+        return;
+    }
+    if app.busy {
+        return;
+    }
+    let Some(command) = app.cfg.actions.command.clone() else {
+        return;
+    };
+    let Some(target) = app.machines.get(machine).map(|m| m.machine.clone()) else {
+        return;
+    };
+    let tx = tx.clone();
+    app.busy = true;
+    app.say(app.working_on(&request), Tone::Info);
+    std::thread::spawn(move || {
+        let result = crate::actions::run(&target, &command, &request);
+        let _ = tx.send((machine, request, result));
+    });
+}
+
+/// Opens herdr full screen on one workspace by its id, whether or not a card claims it yet: a
+/// workspace no card claims, or one a reopen just made. The outcome, when herdr opened.
+#[allow(clippy::too_many_arguments)]
+fn jump_workspace(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    live: Option<&mut Live>,
+    client_config: Option<&PathBuf>,
+    mi: usize,
+    session: String,
+    id: String,
+    label: Option<String>,
+) -> Option<Outcome> {
+    let machine = app.machines[mi].name();
+    if !app.machines[mi].conn.is_live() {
+        app.say(
+            format!("{machine} isn't answering; r tries it now."),
+            Tone::Warn,
+        );
+        return None;
+    }
+    let label = label
+        .or_else(|| {
+            app.board
+                .workspaces
+                .iter()
+                .find(|w| w.machine == machine && w.session == session && w.id == id)
+                .map(|w| w.label.clone())
+        })
+        .unwrap_or_else(|| id.clone());
+    let via = via_for(app, mi, &session);
+    let j = Jump {
+        machine: app.machines[mi].machine.clone(),
+        session,
+        workspace: id,
+        label,
+        others: app.needs_you_order().len(),
+        via,
+        prefix: app.prefix.clone(),
+        keys: keys_on(app, mi),
+    };
+    let outcome = jump::run(
+        terminal,
+        flags,
+        &j,
+        client_config
+            .map(|p| p.as_path())
+            .unwrap_or(std::path::Path::new("")),
+    );
+    if let Some(l) = live.as_deref() {
+        l.wake(mi);
+    }
+    match &outcome {
+        Outcome::Failed(e) => app.say(e.clone(), Tone::Warn),
+        Outcome::Closed => app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn),
+        Outcome::Board | Outcome::Next => {}
+    }
+    Some(outcome)
+}
+
 /// Whether Kerdr's two keys are installed in that machine's herdr config.
 fn keys_on(app: &App, mi: usize) -> bool {
     app.machines[mi].data.as_ref().is_some_and(|d| d.keys)
@@ -418,7 +512,9 @@ fn via_for(app: &App, mi: usize, session: &str) -> jump::Via {
     jump::choose_via(&m.machine, server.as_deref(), here.as_deref())
 }
 
-/// Jumps into a card, and on ctrl+space space keeps going to the next one that needs you.
+/// Jumps into a card, and on ctrl+space space keeps going to the next one that needs you. `yours`
+/// is whether you picked the first card yourself.
+#[allow(clippy::too_many_arguments)]
 fn jump_cards(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
@@ -427,10 +523,9 @@ fn jump_cards(
     inbox: &Inbox,
     client_config: Option<&PathBuf>,
     first: String,
+    mut yours: bool,
 ) {
     let mut key = first;
-    // Whether you picked this card yourself; after the first, Kerdr picks the next for you.
-    let mut yours = true;
     // Cards Kerdr picked whose workspace turned out to have closed: skipped from then on.
     let mut closed_on_the_way: Vec<String> = Vec::new();
     loop {
@@ -491,9 +586,14 @@ fn jump_cards(
                 app.say(e, Tone::Warn);
                 return;
             }
-            // The card you picked yourself: say so. One Kerdr picked for you: go on to the next.
+            // The card you picked yourself: work still under way reopens; otherwise say so. One
+            // Kerdr picked for you: go on to the next.
             Outcome::Closed if yours => {
-                app.say(closed(&card.workspace_name()), Tone::Warn);
+                // herdr has just said it closed, so a board slow to notice still counts it gone;
+                // a card that has meanwhile moved to another workspace doesn't reopen.
+                if !app.closed_under_you(&key, card.workspace_id.as_deref()) {
+                    app.say(closed(&card.workspace_name()), Tone::Warn);
+                }
                 return;
             }
             Outcome::Closed => closed_on_the_way.push(key.clone()),

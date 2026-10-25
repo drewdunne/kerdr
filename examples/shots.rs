@@ -311,6 +311,9 @@ fn main() {
         title: "Start #40 in web?".into(),
         message: "web has 3 active workspaces. The usual limit is 3. Starting this makes 4; the maximum is 5.".into(),
         back: Box::new(Mode::Backlog { sel: 0 }),
+        target: None,
+        queue: false,
+        ready_at: None,
     };
     rasterize(
         &render(&confirmation),

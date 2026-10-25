@@ -104,6 +104,18 @@ pub struct FeedCard {
     pub path: Option<String>,
     #[serde(default)]
     pub parent: Option<String>,
+    /// For work under way: the agent conversation that worked it, which a reopen resumes.
+    #[serde(default)]
+    pub resume: Option<Resume>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Resume {
+    /// The agent that held it, such as `claude` or `codex`.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub conversation: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -229,6 +241,24 @@ mod tests {
         assert_eq!(card["refreshed_at"], "2026-10-22");
         assert_eq!(card["backlog_rank"], -2);
         assert_eq!(card["disposition"], "kept");
+    }
+
+    #[test]
+    fn reads_the_conversation_a_reopen_resumes() {
+        let feed = parse(r#"{"kerdr_feed":1,"cards":[{"id":"41","title":"t","stage":"deploy","resume":{"agent":"codex","conversation":"4f2b8c1e-5d3a-4b6f-9c2e-1a7d3e9b0c41","new":1}}]}"#).unwrap();
+        let resume = feed.cards[0].resume.as_ref().unwrap();
+        assert_eq!(resume.agent.as_deref(), Some("codex"));
+        assert_eq!(
+            resume.conversation.as_deref(),
+            Some("4f2b8c1e-5d3a-4b6f-9c2e-1a7d3e9b0c41")
+        );
+        assert!(
+            parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"t"}]}"#)
+                .unwrap()
+                .cards[0]
+                .resume
+                .is_none()
+        );
     }
 
     #[test]
