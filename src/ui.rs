@@ -666,8 +666,8 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
 }
 
 fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
-    let key = app.pending_jump.as_deref()?;
-    let card = app.card(key)?;
+    let pending = app.pending_jump.as_ref()?;
+    let card = app.card(&pending.key)?;
     let conn = app
         .machines
         .get(card.machine_index)
@@ -2265,7 +2265,7 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
         Conn::Connecting => vec!["Reaching it for the first time.".into()],
         Conn::Reconnecting { since, attempt, retry_at, detail } => vec![
             format!(
-                "Lost the connection {} ago ({}). Trying again in {}s (try {}). The wait grows to two minutes, like herdr's own reconnects.",
+                "Lost the connection {} ago ({}). Trying again in {}s (try {}). The wait grows to 15 seconds.",
                 ago(*since, now),
                 detail,
                 (*retry_at - now).num_seconds().max(0),
@@ -2278,7 +2278,7 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
         ],
         Conn::Unreachable { since, retry_at, detail } => vec![
             format!("No answer since {} ({detail}): asleep, off, or off the network.", clock(*since)),
-            format!("Kerdr tries again in {}s, then every two minutes; r tries now.", (*retry_at - now).num_seconds().max(0)),
+            format!("Kerdr tries again in {}s, then every 15 seconds; r tries now.", (*retry_at - now).num_seconds().max(0)),
         ],
         Conn::HostKey { detail } => vec![
             format!("SSH asked whether to trust this machine's host key ({detail})."),
@@ -2320,7 +2320,7 @@ const LEGEND: &[(&str, ratatui::style::Color, &str, &str)] = &[
         "⟳",
         YELLOW,
         "reconnecting",
-        "Dropped. Retries with longer waits, up to two minutes. Cards stay, dimmed.",
+        "Dropped. Retries with longer waits, up to 15 seconds. Cards stay, dimmed.",
     ),
     (
         "○",

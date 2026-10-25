@@ -133,6 +133,8 @@ awk 'BEGIN { done = 0 }
 pub enum Outcome {
     Board,
     Next,
+    /// herdr says the workspace isn't there: it closed after the board last read it.
+    Closed,
     Failed(String),
 }
 
@@ -157,6 +159,13 @@ fn first_line(out: &transport::Output) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("no answer")
         .to_string()
+}
+
+/// Whether herdr refused because the workspace no longer exists.
+fn workspace_gone(out: &transport::Output) -> bool {
+    [&out.stdout, &out.stderr]
+        .iter()
+        .any(|s| s.contains("\"workspace_not_found\""))
 }
 
 pub struct TerminalFlags {
@@ -229,6 +238,9 @@ pub fn run(
         ));
     }
     if !out.ok() {
+        if workspace_gone(&out) {
+            return Outcome::Closed;
+        }
         return Outcome::Failed(format!(
             "herdr couldn't open {}: {}",
             jump.label,
@@ -499,6 +511,23 @@ mod tests {
             choose_via(&machine(None), Some("0.9.1"), Some("0.9.3")),
             Via::Local
         );
+    }
+
+    #[test]
+    fn a_closed_workspace_is_told_apart_from_other_failures() {
+        // What herdr 0.9.1 prints for `workspace focus` on a workspace that has closed.
+        let gone = transport::Output {
+            status: Some(1),
+            stdout: r#"{"error":{"code":"workspace_not_found","message":"workspace w1 not found"},"id":"cli:workspace:focus"}"#.into(),
+            ..Default::default()
+        };
+        assert!(workspace_gone(&gone));
+        let other = transport::Output {
+            status: Some(1),
+            stderr: "error: couldn't connect to the herdr server".into(),
+            ..Default::default()
+        };
+        assert!(!workspace_gone(&other));
     }
 
     #[cfg(unix)]

@@ -3,8 +3,8 @@
 use std::io::stdout;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::mpsc;
-use std::time::Duration;
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -17,12 +17,16 @@ use crate::app::{Action, App, Selection, Tone};
 use crate::config::Machine;
 use crate::herdr_keys;
 use crate::jump::{self, Jump, Outcome, TerminalFlags};
-use crate::poll::{self, Conn, Poller, Timing, Wake};
+use crate::poll::{self, Conn, Inbox, Poller, Timing, Wake};
 use crate::state::State;
+
+/// How long the board waits, on the way to the next card that needs you, for the live machines
+/// to say what's there now.
+const FRESH_WAIT: Duration = Duration::from_millis(1500);
 
 struct Live {
     pollers: Vec<Option<Poller>>,
-    tx: mpsc::SyncSender<poll::Event>,
+    inbox: Arc<Inbox>,
 }
 
 impl Live {
@@ -41,7 +45,7 @@ impl Live {
     fn start(&mut self, app: &App, i: usize) {
         let m = app.machines[i].machine.clone();
         let timing = Self::timing(app, &m);
-        self.pollers[i] = Some(poll::spawn(i, m, timing, self.tx.clone()));
+        self.pollers[i] = Some(poll::spawn(i, m, timing, self.inbox.clone()));
     }
 
     fn stop(&mut self, i: usize) {
@@ -58,12 +62,11 @@ impl Live {
 }
 
 pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
-    // Bounded: while you're inside herdr nobody reads it, and readers drop reads rather than
-    // piling up copies of every session.
-    let (tx, rx) = mpsc::sync_channel(2 * app.machines.len().max(1));
+    // One read per machine at most, the newest: while you're inside herdr nobody applies them.
+    let inbox = Arc::new(Inbox::default());
     let mut live = live.then(|| Live {
         pollers: (0..app.machines.len()).map(|_| None).collect(),
-        tx,
+        inbox: inbox.clone(),
     });
     if let Some(l) = live.as_mut() {
         for i in 0..app.machines.len() {
@@ -97,7 +100,7 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
         &flags,
         &mut app,
         live.as_mut(),
-        &rx,
+        &inbox,
         client_config,
     );
     if keyboard {
@@ -120,7 +123,7 @@ fn event_loop(
     flags: &TerminalFlags,
     app: &mut App,
     mut live: Option<&mut Live>,
-    rx: &mpsc::Receiver<poll::Event>,
+    inbox: &Inbox,
     client_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<(
@@ -140,30 +143,19 @@ fn event_loop(
                 }
             }
         }
-        while let Ok(ev) = rx.try_recv() {
+        for ev in inbox.take() {
             app.apply(ev);
         }
-        if let Some(key) = app.pending_jump.clone() {
-            let ready = app
-                .card(&key)
-                .map(|c| c.machine_index)
-                .map(|i| app.machines[i].conn.is_live());
-            match ready {
-                Some(true) => {
-                    app.pending_jump = None;
-                    jump_cards(
-                        terminal,
-                        flags,
-                        app,
-                        live.as_deref_mut(),
-                        rx,
-                        client_config.as_ref(),
-                        key,
-                    );
-                }
-                None => app.pending_jump = None,
-                Some(false) => {}
-            }
+        if let Some(key) = app.pending_jump_ready() {
+            jump_cards(
+                terminal,
+                flags,
+                app,
+                live.as_deref_mut(),
+                inbox,
+                client_config.as_ref(),
+                key,
+            );
         }
         app.width = terminal.size()?.width;
         terminal.draw(|f| crate::ui::draw(f, app))?;
@@ -219,7 +211,7 @@ fn event_loop(
                         flags,
                         app,
                         live.as_deref_mut(),
-                        rx,
+                        inbox,
                         client_config.as_ref(),
                         card,
                     );
@@ -271,8 +263,12 @@ fn event_loop(
                 if let Some(l) = live.as_deref() {
                     l.wake(mi);
                 }
-                if let Outcome::Failed(e) = outcome {
-                    app.say(e, Tone::Warn);
+                match outcome {
+                    Outcome::Failed(e) => app.say(e, Tone::Warn),
+                    Outcome::Closed => {
+                        app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn)
+                    }
+                    Outcome::Board | Outcome::Next => {}
                 }
             }
             Action::Retry(target) => {
@@ -418,12 +414,16 @@ fn jump_cards(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
     app: &mut App,
-    mut live: Option<&mut Live>,
-    rx: &mpsc::Receiver<poll::Event>,
+    live: Option<&mut Live>,
+    inbox: &Inbox,
     client_config: Option<&PathBuf>,
     first: String,
 ) {
     let mut key = first;
+    // Whether you picked this card yourself; after the first, Kerdr picks the next for you.
+    let mut yours = true;
+    // Cards Kerdr picked whose workspace turned out to have closed: skipped from then on.
+    let mut closed_on_the_way: Vec<String> = Vec::new();
     loop {
         let Some(card) = app.card(&key).cloned() else {
             return;
@@ -441,7 +441,7 @@ fn jump_cards(
             return;
         }
         if !app.machines[mi].conn.is_live() {
-            app.pending_jump = Some(key.clone());
+            app.wait_to_jump(&card);
             if let Some(l) = live.as_deref() {
                 l.wake(mi);
             }
@@ -474,25 +474,62 @@ fn jump_cards(
                 .map(|p| p.as_path())
                 .unwrap_or(std::path::Path::new("")),
         );
-        if let Some(l) = live.as_deref_mut() {
-            l.wake(mi);
-        }
-        while let Ok(ev) = rx.try_recv() {
-            app.apply(ev);
-        }
+        let choosing_next = matches!(outcome, Outcome::Next | Outcome::Closed);
+        read_again(app, live.as_deref(), inbox, mi, choosing_next);
         match outcome {
             Outcome::Board => return,
             Outcome::Failed(e) => {
                 app.say(e, Tone::Warn);
                 return;
             }
-            Outcome::Next => match app.next_needs_you_after(&key) {
-                Some(next) => key = next,
-                None => {
-                    app.say("Nothing else needs you right now.", Tone::Good);
-                    return;
-                }
-            },
+            // The card you picked yourself: say so. One Kerdr picked for you: go on to the next.
+            Outcome::Closed if yours => {
+                app.say(closed(&card.workspace_name()), Tone::Warn);
+                return;
+            }
+            Outcome::Closed => closed_on_the_way.push(key.clone()),
+            Outcome::Next => {}
+        }
+        match app.next_needs_you_after(&key, &closed_on_the_way) {
+            Some(next) => {
+                key = next;
+                yours = false;
+            }
+            None => {
+                app.say("Nothing else needs you right now.", Tone::Good);
+                return;
+            }
         }
     }
+}
+
+/// Reads the card's machine again and applies what's waiting. Choosing the next card, it reads
+/// every live machine and waits a moment (FRESH_WAIT at most) for what they say, so the choice is
+/// made from the board as it is now, not as it was when you went into herdr.
+fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choosing_next: bool) {
+    if let Some(l) = live {
+        let mut machines = vec![mi];
+        if choosing_next {
+            machines.extend(
+                (0..app.machines.len()).filter(|&i| {
+                    i != mi && app.machines[i].conn.is_live() && l.pollers[i].is_some()
+                }),
+            );
+        }
+        let since = Instant::now();
+        for &i in &machines {
+            l.wake(i);
+        }
+        if choosing_next {
+            inbox.wait_since(&machines, since, FRESH_WAIT);
+        }
+    }
+    for ev in inbox.take() {
+        app.apply(ev);
+    }
+}
+
+/// What the board says when herdr finds that a workspace has closed.
+fn closed(workspace: &str) -> String {
+    format!("{workspace} has closed since the board last read it.")
 }

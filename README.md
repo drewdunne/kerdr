@@ -95,8 +95,8 @@ instead until the versions match.
 
 When a connection drops (a laptop on a train, a server rebooting), its cards stay on the board,
 dimmed, with the time they were last seen. Kerdr retries with longer and longer waits, up to
-two minutes, like herdr's own reconnects. `Enter` on one of those cards waits for the machine,
-then jumps in.
+15 seconds, so a laptop back from sleep has them again within seconds. `Enter` on one of those
+cards waits for the machine, then jumps in, or says so if its workspace closed in the meantime.
 
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 

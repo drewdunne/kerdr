@@ -258,6 +258,16 @@ impl Card {
         self.workspace_id.is_some() && self.session.is_some()
     }
 
+    /// How a message names this card's workspace: "#41's workspace", or "Workspace 41-dark-mode"
+    /// for a card that is only a workspace.
+    pub fn workspace_name(&self) -> String {
+        match self.source {
+            _ if self.reference.is_empty() => "That workspace".into(),
+            Source::Feed => format!("{}'s workspace", self.reference),
+            Source::Workspace => format!("Workspace {}", self.reference),
+        }
+    }
+
     pub fn needs_you(&self) -> bool {
         self.attention == Attention::NeedsYou
     }

@@ -199,6 +199,15 @@ pub struct Selection {
     pub key: Option<String>,
 }
 
+/// A card to jump into as soon as its machine answers, and what to call it if the card is gone
+/// by then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingJump {
+    pub key: String,
+    pub workspace: String,
+    pub machine: String,
+}
+
 pub struct App {
     pub cfg: Config,
     pub machines: Vec<MachineState>,
@@ -218,7 +227,7 @@ pub struct App {
     pub mode: Mode,
     pub message: Option<(String, Tone, Instant)>,
     /// A card to jump into as soon as its machine answers.
-    pub pending_jump: Option<String>,
+    pub pending_jump: Option<PendingJump>,
     pub width: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
@@ -573,8 +582,9 @@ impl App {
         Some(key)
     }
 
-    /// The next card that needs you after `key`, skipping it: for jumping straight on.
-    pub fn next_needs_you_after(&self, key: &str) -> Option<String> {
+    /// The next card that needs you after `key`, skipping it and any in `skip` (workspaces found
+    /// closed on the way): for jumping straight on.
+    pub fn next_needs_you_after(&self, key: &str, skip: &[String]) -> Option<String> {
         let order = self.needs_you_order();
         let pos = order.iter().position(|o| o == key);
         let candidates: Vec<&String> = match pos {
@@ -583,8 +593,48 @@ impl App {
         };
         candidates
             .into_iter()
+            .filter(|k| !skip.contains(k))
             .find(|k| self.card(k).is_some_and(|c| c.is_open_workspace()))
             .cloned()
+    }
+
+    /// Waits for this card's machine to answer, then jumps in.
+    pub fn wait_to_jump(&mut self, card: &Card) {
+        self.pending_jump = Some(PendingJump {
+            key: card.key.clone(),
+            workspace: card.workspace_name(),
+            machine: card.machine.clone(),
+        });
+    }
+
+    /// The waiting jump, once its machine answers: the card to jump into now. None while it still
+    /// waits, or once Kerdr has said why it can't: the workspace closed while the machine was
+    /// away.
+    pub fn pending_jump_ready(&mut self) -> Option<String> {
+        let pending = self.pending_jump.clone()?;
+        let open = match self.card(&pending.key) {
+            Some(c) if !self.machines[c.machine_index].conn.is_live() => return None,
+            Some(c) => Some(c.is_open_workspace()),
+            None => None,
+        };
+        self.pending_jump = None;
+        let PendingJump {
+            key,
+            workspace,
+            machine,
+        } = pending;
+        match open {
+            Some(true) => return Some(key),
+            Some(false) => self.say(
+                format!("{workspace} closed while {machine} was away."),
+                Tone::Warn,
+            ),
+            None => self.say(
+                format!("{workspace} closed while {machine} was away; it's off the board now."),
+                Tone::Warn,
+            ),
+        }
+        None
     }
 
     fn set_tab(&mut self, tab: usize) {
@@ -1888,5 +1938,123 @@ mod tests {
         let (a, b) = match_range("move", "İstanbul office move").unwrap();
         assert!(a <= b);
         assert!(score("move", "İstanbul office move").is_some());
+    }
+
+    /// The build box answers again, without this card's workspace.
+    fn build_box_back_without(app: &mut App, card: &Card) {
+        let mi = card.machine_index;
+        let ws = card.workspace_id.clone().unwrap();
+        let session = card.session.clone().unwrap();
+        let mut data = app.machines[mi].data.clone().unwrap();
+        if let Some(Ok(snap)) = data.snapshots.get_mut(&session) {
+            snap.workspaces.retain(|w| w.workspace_id != ws);
+            snap.agents.retain(|a| a.workspace_id != ws);
+        }
+        app.apply(Event {
+            machine: mi,
+            conn: Conn::Live {
+                latency: Duration::from_millis(9),
+            },
+            data: Some(data),
+            at: Local::now(),
+        });
+    }
+
+    fn away_card(app: &App, source: crate::model::Source) -> Card {
+        let mi = app.machine_index("build-box").unwrap();
+        app.board
+            .cards
+            .iter()
+            .find(|c| c.machine_index == mi && c.source == source && c.is_open_workspace())
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_waiting_jump_says_so_when_its_workspace_closed_while_the_machine_was_away() {
+        let mut app = App::new(Config::default(), crate::demo::machines(true));
+        let card = away_card(&app, crate::model::Source::Workspace);
+        app.wait_to_jump(&card);
+        assert_eq!(app.pending_jump_ready(), None);
+        assert!(
+            app.pending_jump.is_some(),
+            "still waiting while build-box is away"
+        );
+        build_box_back_without(&mut app, &card);
+        assert!(app.card(&card.key).is_none());
+        assert_eq!(app.pending_jump_ready(), None);
+        assert!(app.pending_jump.is_none());
+        assert_eq!(
+            app.message(),
+            Some((
+                format!(
+                    "Workspace {} closed while build-box was away; it's off the board now.",
+                    card.reference
+                )
+                .as_str(),
+                Tone::Warn
+            ))
+        );
+    }
+
+    #[test]
+    fn a_waiting_jump_into_an_intent_whose_workspace_closed_says_so_and_keeps_the_card() {
+        let mut app = App::new(Config::default(), crate::demo::machines(true));
+        let card = away_card(&app, crate::model::Source::Feed);
+        app.wait_to_jump(&card);
+        build_box_back_without(&mut app, &card);
+        assert!(app.card(&card.key).is_some_and(|c| !c.is_open_workspace()));
+        assert_eq!(app.pending_jump_ready(), None);
+        assert!(app.pending_jump.is_none());
+        let (text, _) = app.message().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{}'s workspace closed while build-box was away.",
+                card.reference
+            )
+        );
+    }
+
+    #[test]
+    fn a_waiting_jump_goes_ahead_once_its_machine_answers_with_the_workspace() {
+        let mut app = App::new(Config::default(), crate::demo::machines(true));
+        let card = away_card(&app, crate::model::Source::Workspace);
+        app.wait_to_jump(&card);
+        let mi = card.machine_index;
+        let data = app.machines[mi].data.clone();
+        app.apply(Event {
+            machine: mi,
+            conn: Conn::Live {
+                latency: Duration::from_millis(9),
+            },
+            data,
+            at: Local::now(),
+        });
+        assert_eq!(app.pending_jump_ready(), Some(card.key));
+        assert!(app.pending_jump.is_none());
+    }
+
+    #[test]
+    fn the_next_card_skips_workspaces_found_closed() {
+        let app = demo_app();
+        let open: Vec<String> = app
+            .needs_you_order()
+            .into_iter()
+            .filter(|k| app.card(k).is_some_and(|c| c.is_open_workspace()))
+            .collect();
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert_eq!(
+            app.next_needs_you_after(&open[0], &[]),
+            Some(open[1].clone())
+        );
+        assert_eq!(
+            app.next_needs_you_after(&open[1], &[]),
+            Some(open[0].clone())
+        );
+        assert_eq!(
+            app.next_needs_you_after(&open[0], std::slice::from_ref(&open[1])),
+            None
+        );
     }
 }
