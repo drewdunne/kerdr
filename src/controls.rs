@@ -3,7 +3,7 @@
 
 use super::*;
 use crate::actions::Response;
-use crate::model::Summary;
+use crate::model::{CardSnapshot, Summary};
 use serde_json::{Value, json};
 
 /// The most the new-intent box holds, kept under the actions' 64 KiB request limit.
@@ -416,6 +416,112 @@ impl App {
         }
     }
 
+    /// The machine a card's record lives on, where its actions run: its home, or the machine its
+    /// card came from. None, said, when its home isn't one of Kerdr's machines.
+    fn home_machine(&mut self, card: &Card) -> Option<usize> {
+        let target = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.home.as_ref())
+            .and_then(|h| h.machine.clone());
+        match target {
+            Some(name) => {
+                let found = self.machine_index(&name);
+                if found.is_none() {
+                    self.say(format!("The home machine {name} is not configured. Add it before changing this intent."), Tone::Warn);
+                }
+                found
+            }
+            None => Some(card.machine_index),
+        }
+    }
+
+    /// Enter on work under way whose workspace is gone: the action backend on its home machine
+    /// reopens it, resuming its agent's conversation, and Kerdr goes in once it answers.
+    pub fn reopen_action(&mut self, card: &Card) -> Action {
+        let Some(detail) = &card.detail else {
+            return Action::None;
+        };
+        if self
+            .cfg
+            .actions
+            .command
+            .as_deref()
+            .is_none_or(|s| s.trim().is_empty())
+        {
+            self.say(
+                format!(
+                    "{} has no herdr workspace open; with [actions] configured, ⏎ reopens it. m peeks at it.",
+                    card.reference
+                ),
+                Tone::Info,
+            );
+            return Action::None;
+        }
+        let Some(machine) = self.home_machine(card) else {
+            return Action::None;
+        };
+        if !self.can_write(machine) {
+            return Action::None;
+        }
+        // Its home session, else the session tab you're on, if it's that machine's.
+        let session = detail
+            .home
+            .as_ref()
+            .and_then(|h| h.session.clone())
+            .or_else(|| match self.scope() {
+                Scope::Session(m, s) if self.machine_index(m) == Some(machine) => Some(s.clone()),
+                _ => None,
+            });
+        let mut request = json!({"action":"reopen","id":detail.id});
+        if let Some(session) = session {
+            request["session"] = json!(session);
+        }
+        self.action_from = Some(CardSnapshot::of(card));
+        Action::Mutate { machine, request }
+    }
+
+    /// Whether you're still on this work, in the view you're looking at (the board, a peek, the
+    /// backlog or Misc), and it hasn't changed since the action started: where a late answer may
+    /// ask you something or take you in. Typing a search, a filter or a new intent isn't.
+    fn still_on(&self, from: &CardSnapshot, made: Option<&str>) -> bool {
+        matches!(
+            self.mode,
+            Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
+        ) && self
+            .selected_for_control()
+            .is_some_and(|c| c.key == from.key && from.same_work_or(c, made))
+    }
+
+    /// Whether intent actions are configured, so ⏎ can reopen and d start work.
+    pub fn actions_on(&self) -> bool {
+        self.cfg
+            .actions
+            .command
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+    }
+
+    /// What the board says while an action runs.
+    pub fn working_on(&self, request: &Value) -> String {
+        if request["action"] == "reopen" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Reopening {}…", self.reference_for(id))
+        } else {
+            "Changing the intent…".into()
+        }
+    }
+
+    /// How a message names the record with this id: its card's reference, or the id.
+    fn reference_for(&self, id: &str) -> String {
+        self.board
+            .cards
+            .iter()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .map(|c| c.reference.clone())
+            .unwrap_or_else(|| id.to_string())
+    }
+
     fn intent_action(&mut self, action: &str, extra: Value) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
             self.say("Select an intent first.", Tone::Info);
@@ -453,16 +559,8 @@ impl App {
             );
             return Action::None;
         }
-        let target = detail.home.as_ref().and_then(|h| h.machine.as_deref());
-        let machine = match target {
-            Some(name) => match self.machine_index(name) {
-                Some(i) => i,
-                None => {
-                    self.say(format!("The home machine {name} is not configured. Add it before changing this intent."), Tone::Warn);
-                    return Action::None;
-                }
-            },
-            None => card.machine_index,
+        let Some(machine) = self.home_machine(&card) else {
+            return Action::None;
         };
         if !self.can_write(machine) {
             return Action::None;
@@ -476,9 +574,13 @@ impl App {
                 machine, request, title: format!("Won't do {}?", card.reference),
                 message: "Keep the intent in Won't do, outside the active backlog. You can restore it later.".into(),
                 back: Box::new(self.mode.clone()),
+                target: Some(Box::new(CardSnapshot::of(&card))),
+                queue: false,
+                ready_at: None,
             };
             Action::None
         } else {
+            self.action_from = Some(CardSnapshot::of(&card));
             Action::Mutate { machine, request }
         }
     }
@@ -684,25 +786,55 @@ impl App {
                 machine,
                 mut request,
                 back,
+                target,
+                queue,
+                ready_at,
                 ..
             } => {
+                // A question that just appeared, or a key held down, never answers it.
+                let early = key.kind == KeyEventKind::Repeat
+                    || ready_at.is_some_and(|at| Instant::now() < at);
+                if early && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w')) {
+                    return Some(Action::None);
+                }
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n' | 'q') => {
                         self.mode = *back;
                     }
-                    KeyCode::Enter | KeyCode::Char('y') => {
+                    // A full session's other answer: the reopen waits in its queue.
+                    KeyCode::Char('w') if queue => {
                         self.mode = *back;
-                        if !self.confirm_still_applies(machine, &request) {
+                        if !self.confirm_still_applies(machine, &request, target.as_deref()) {
                             self.say(
                                 "That intent changed while you were deciding, so nothing was sent. Select it again.",
                                 Tone::Warn,
                             );
                             return Some(Action::None);
                         }
-                        if request["action"] == "dispatch" {
+                        request["queue"] = json!(true);
+                        let action = self.emit_mutation(machine, request);
+                        if matches!(action, Action::Mutate { .. }) {
+                            self.action_from = target.map(|t| *t);
+                        }
+                        return Some(action);
+                    }
+                    KeyCode::Enter | KeyCode::Char('y') => {
+                        self.mode = *back;
+                        if !self.confirm_still_applies(machine, &request, target.as_deref()) {
+                            self.say(
+                                "That intent changed while you were deciding, so nothing was sent. Select it again.",
+                                Tone::Warn,
+                            );
+                            return Some(Action::None);
+                        }
+                        if matches!(request["action"].as_str(), Some("dispatch" | "reopen")) {
                             request["override"] = json!(true);
                         }
-                        return Some(self.emit_mutation(machine, request));
+                        let action = self.emit_mutation(machine, request);
+                        if matches!(action, Action::Mutate { .. }) {
+                            self.action_from = target.map(|t| *t);
+                        }
+                        return Some(action);
                     }
                     _ => {}
                 }
@@ -824,23 +956,65 @@ impl App {
         result: Result<Response, String>,
     ) {
         self.busy = false;
+        let from = self.action_from.take();
+        // A question, or after a yes a new one: something changed, so it carries a new token.
+        let asks = |response: &Response| {
+            response.confirmation
+                && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+                && (request["override"] != true
+                    || response
+                        .confirm
+                        .as_deref()
+                        .is_some_and(|t| request["confirm"].as_str() != Some(t)))
+        };
         match result {
-            Ok(response)
-                if response.confirmation
-                    && request["action"] == "dispatch"
-                    && request["override"] != true =>
-            {
-                let title = format!(
-                    "Start {} in {}?",
-                    request["id"].as_str().unwrap_or("this intent"),
-                    response.session.as_deref().unwrap_or("its home session")
-                );
-                let message = match (response.used, response.limit) {
-                    (Some(used), Some(limit)) => format!(
-                        "{used} active workspaces; the usual limit is {limit}. {}",
-                        response.message
-                    ),
-                    _ => response.message,
+            Ok(response) if asks(&response) => {
+                let id = request["id"].as_str().unwrap_or("this intent").to_string();
+                let card = from.as_ref().and_then(|f| self.card(&f.key)).cloned();
+                let reference = card
+                    .as_ref()
+                    .map(|c| c.reference.clone())
+                    .unwrap_or_else(|| self.reference_for(&id));
+                // Only while you're still on that work: a question that pops up over typing would
+                // take the next key for its answer.
+                if !from.as_ref().is_some_and(|f| self.still_on(f, None)) {
+                    let key = if request["action"] == "reopen" {
+                        "⏎"
+                    } else {
+                        "d"
+                    };
+                    self.say(
+                        format!("{reference} needs a yes first: {key} on it again asks."),
+                        Tone::Warn,
+                    );
+                    return;
+                }
+                let mut request = request;
+                request.as_object_mut().map(|o| o.remove("override"));
+                // The yes goes back for what was asked: the session it named and its token.
+                if let Some(session) = &response.session {
+                    request["session"] = json!(session);
+                }
+                if let Some(token) = &response.confirm {
+                    request["confirm"] = json!(token);
+                }
+                let session = response.session.as_deref().unwrap_or("its home session");
+                let (is_reopen, full) = (request["action"] == "reopen", response.used.is_some());
+                // A reopen's answer says every reason itself: a copy open elsewhere, a full session.
+                let (title, message) = if request["action"] == "reopen" {
+                    (
+                        format!("Reopen {reference} in {session}?"),
+                        response.message,
+                    )
+                } else {
+                    let message = match (response.used, response.limit) {
+                        (Some(used), Some(limit)) => format!(
+                            "{used} active workspaces; the usual limit is {limit}. {}",
+                            response.message
+                        ),
+                        _ => response.message,
+                    };
+                    (format!("Start {id} in {session}?"), message)
                 };
                 self.mode = Mode::Confirm {
                     machine,
@@ -848,6 +1022,9 @@ impl App {
                     title,
                     message,
                     back: Box::new(self.mode.clone()),
+                    target: from.map(Box::new),
+                    queue: is_reopen && full,
+                    ready_at: Some(Instant::now() + Duration::from_millis(500)),
                 };
             }
             Ok(response) => {
@@ -872,6 +1049,29 @@ impl App {
                         );
                     }
                 }
+                // A reopen takes you in only while you're still on its card; otherwise it says so.
+                if request["action"] == "reopen"
+                    && response.ok
+                    && let (Some(session), Some(workspace)) =
+                        (response.session.clone(), response.workspace.clone())
+                {
+                    // The board may already show the workspace it just made: that's still the card.
+                    match from
+                        .filter(|f| self.still_on(f, Some(&workspace)))
+                        .map(|f| f.key)
+                    {
+                        Some(from) => {
+                            self.open_after = Some(OpenAfter {
+                                machine,
+                                label: response.label.clone().unwrap_or_else(|| workspace.clone()),
+                                session,
+                                workspace,
+                                from,
+                            })
+                        }
+                        None => message.push_str(" ⏎ on its card goes in."),
+                    }
+                }
                 self.say(message, if response.ok { Tone::Good } else { Tone::Warn });
             }
             Err(error) => {
@@ -885,22 +1085,33 @@ impl App {
         }
     }
 
-    /// Whether a confirmed change still fits its record: a refresh while the question was open
-    /// may have started, finished or restored it.
-    fn confirm_still_applies(&self, machine: usize, request: &Value) -> bool {
+    /// Whether a confirmed change still fits the card it asked about, as it was: a refresh while
+    /// the question was open may have started, finished, restored or rehomed it.
+    fn confirm_still_applies(
+        &self,
+        machine: usize,
+        request: &Value,
+        target: Option<&CardSnapshot>,
+    ) -> bool {
         let Some(id) = request["id"].as_str() else {
             return false;
         };
         let name = self.machines.get(machine).map(|m| m.name());
         self.board.cards.iter().any(|c| {
-            c.detail.as_ref().is_some_and(|d| {
-                d.id == id
-                    && (c.machine_index == machine
-                        || d.home.as_ref().and_then(|h| h.machine.as_deref()) == name.as_deref())
-            }) && match request["action"].as_str() {
-                Some("restore") => c.dismissed(),
-                _ => waiting_work(c),
-            }
+            target.is_none_or(|t| c.key == t.key)
+                && c.detail.as_ref().is_some_and(|d| {
+                    d.id == id
+                        && (c.machine_index == machine
+                            || d.home.as_ref().and_then(|h| h.machine.as_deref())
+                                == name.as_deref())
+                })
+                && match request["action"].as_str() {
+                    Some("restore") => c.dismissed(),
+                    Some("reopen") => c.under_way() && target.is_some_and(|t| t.same_work(c)),
+                    // Started where it was asked: its home hasn't moved since.
+                    Some("dispatch") => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
+                    _ => waiting_work(c),
+                }
         })
     }
 }

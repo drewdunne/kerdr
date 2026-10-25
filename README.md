@@ -102,6 +102,14 @@ dimmed, with the time they were last seen. Kerdr retries with longer and longer 
 15 seconds, so a laptop back from sleep has them again within seconds. `Enter` on one of those
 cards waits for the machine, then jumps in, or says so if its workspace closed in the meantime.
 
+Work that's still under way never leaves you at a dead end. When a card in a working column has
+no workspace any more (its pane closed, the machine restarted, or an agent worked it outside
+herdr), `Enter` asks your action backend to reopen it: it opens a workspace where the work
+belongs, resumes the agent conversation that worked it (`claude --resume`, `codex resume`), and
+Kerdr takes you straight in. The backend asks first when that would go past the session's
+workspace limit or the conversation may still be open somewhere else. See
+[docs/feed.md](docs/feed.md#reopening-work-whose-workspace-closed).
+
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
 `M` lists every machine and every state it can be in: live, connecting, reconnecting, can't
@@ -157,7 +165,7 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 | On the board | |
 |---|---|
 | `h j k l` or arrows | move between columns and cards |
-| `Enter` | jump in |
+| `Enter` | jump in; on work whose workspace closed, reopen it (with actions) |
 | `m` or `Space` | peek |
 | `n` / `N` | next / previous card that needs you (also `Ctrl+Alt+j/k`) |
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
@@ -298,9 +306,9 @@ you, the machine shows *needs you*, and `M` then `Enter` lets you answer it.
 
 ## Status
 
-Kerdr is new (0.2). Reading and navigation work without an action adapter. Opting into
-`[actions] command` enables record changes and dispatch through your own adapter, on the
-record's home machine. Commands run in the background and show their result; an unknown result
+Kerdr is new (0.5). Reading and navigation work without an action adapter. Opting into
+`[actions] command` enables record changes, dispatch and reopening through your own adapter, on
+the record's home machine. Commands run in the background and show their result; an unknown result
 is never retried automatically. In herdr, Kerdr focuses the workspace you jump into, shows a
 short hint there, and clears the short-lived token its keys leave. herdr moves every window attached to a session when its focus changes, so if
 you also keep a plain herdr window open on the same session, it follows.

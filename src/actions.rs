@@ -10,7 +10,7 @@ use crate::transport::{self, Target};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Response {
     pub ok: bool,
     pub message: String,
@@ -20,6 +20,13 @@ pub struct Response {
     pub limit: Option<u32>,
     pub session: Option<String>,
     pub id: Option<String>,
+    /// A herdr workspace to go into now, in `session` on the machine the action ran on: what a
+    /// reopen answers with.
+    pub workspace: Option<String>,
+    /// That workspace's name, for messages.
+    pub label: Option<String>,
+    /// With a confirmation: a token of what it asked about, sent back with the yes.
+    pub confirm: Option<String>,
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {

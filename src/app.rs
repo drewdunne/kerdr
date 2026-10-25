@@ -8,7 +8,7 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use crate::board::{self, Board, MachineState, Scope};
 use crate::config::Config;
-use crate::model::{Attention, Card, Stage};
+use crate::model::{Attention, Card, CardSnapshot, Stage};
 use crate::poll::{Conn, Event};
 
 #[path = "controls.rs"]
@@ -115,6 +115,14 @@ pub enum Mode {
         title: String,
         message: String,
         back: Box<Mode>,
+        /// The card it asks about, as it was when the action started: a yes applies to that
+        /// work as it was, never to another card or a changed one.
+        target: Option<Box<CardSnapshot>>,
+        /// A full session's other answer, for a reopen: wait in its queue (w).
+        queue: bool,
+        /// For a question that appears on its own (an action's answer): keys before this are
+        /// ignored, so one held or typed before it appeared can't answer it.
+        ready_at: Option<Instant>,
     },
     Board,
     Peek {
@@ -235,6 +243,18 @@ pub struct Selection {
     pub key: Option<String>,
 }
 
+/// A workspace a reopen just made, to go into as soon as its answer arrives: on the machine the
+/// action ran on, before any card claims it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OpenAfter {
+    pub machine: usize,
+    pub session: String,
+    pub workspace: String,
+    pub label: String,
+    /// The card it was reopened from, for going on to the next that needs you.
+    pub from: String,
+}
+
 /// A card to jump into as soon as its machine answers, and what to call it if the card is gone
 /// by then.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -270,6 +290,13 @@ pub struct App {
     pub message: Option<(String, Tone, Instant)>,
     /// A card to jump into as soon as its machine answers.
     pub pending_jump: Option<PendingJump>,
+    /// The workspace a reopen just made, to go into now.
+    pub open_after: Option<OpenAfter>,
+    /// The card the running action was asked from, as it was then: its answer asks or takes you
+    /// in only while you're still on that work. Esc lets it go.
+    pub action_from: Option<CardSnapshot>,
+    /// A card whose workspace turned out to have closed when you went in: reopen it next.
+    pub pending_reopen: Option<String>,
     pub width: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
@@ -302,6 +329,9 @@ impl App {
             mode: Mode::Board,
             message: None,
             pending_jump: None,
+            open_after: None,
+            action_from: None,
+            pending_reopen: None,
             width: 200,
             demo: false,
             fixed_now: None,
@@ -653,6 +683,20 @@ impl App {
             .cloned()
     }
 
+    /// herdr has just said the workspace you went into, `tried`, has closed: work still under way
+    /// reopens next, even before the board catches up; a card that has meanwhile moved to another
+    /// workspace doesn't. Whether it will.
+    pub fn closed_under_you(&mut self, key: &str, tried: Option<&str>) -> bool {
+        let reopen = self.actions_on()
+            && self.card(key).is_some_and(|c| {
+                c.under_way() && (c.workspace_id.is_none() || c.workspace_id.as_deref() == tried)
+            });
+        if reopen {
+            self.pending_reopen = Some(key.to_string());
+        }
+        reopen
+    }
+
     /// Waits for this card's machine to answer, then jumps in.
     pub fn wait_to_jump(&mut self, card: &Card) {
         self.pending_jump = Some(PendingJump {
@@ -680,6 +724,10 @@ impl App {
         } = pending;
         match open {
             Some(true) => return Some(key),
+            // Work still under way whose workspace closed meanwhile: reopen it instead.
+            Some(false) if self.card(&key).is_some_and(|c| c.can_reopen()) && self.actions_on() => {
+                self.pending_reopen = Some(key);
+            }
             Some(false) => self.say(
                 format!("{workspace} closed while {machine} was away."),
                 Tone::Warn,
@@ -750,11 +798,15 @@ impl App {
     }
 
     fn jump_action(&mut self, key: String) -> Action {
-        let Some(card) = self.card(&key) else {
+        let Some(card) = self.card(&key).cloned() else {
             return Action::None;
         };
         if card.is_open_workspace() {
             return Action::Jump(key);
+        }
+        // Work under way whose workspace closed: reopen it rather than leave a dead end.
+        if card.can_reopen() {
+            return self.reopen_action(&card);
         }
         let what = match card.stage {
             Stage::Backlog => "it hasn't started",
@@ -773,6 +825,22 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
+        // Esc anywhere lets a running action's answer go: it still finishes, but neither asks nor
+        // takes you anywhere, and a reopen waiting its turn is dropped.
+        let stopped = key.code == KeyCode::Esc
+            && (self.pending_reopen.take().is_some()
+                | (self.busy && self.action_from.take().is_some()));
+        let action = self.handle_key(key);
+        if stopped {
+            self.say(
+                "Stopped waiting: it still finishes, and won't take you anywhere.",
+                Tone::Info,
+            );
+        }
+        action
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return Action::Quit;
         }
@@ -1035,6 +1103,9 @@ impl App {
                 if card.is_open_workspace() {
                     self.mode = Mode::Board;
                     Action::Jump(card.key)
+                } else if card.can_reopen() {
+                    self.mode = Mode::Board;
+                    self.reopen_action(&card)
                 } else {
                     self.mode = Mode::Peek {
                         scroll: 0,
@@ -1488,6 +1559,13 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
+    /// As if the question on screen had been up long enough to be answered.
+    fn settle(app: &mut App) {
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+    }
+
     #[test]
     fn unlinked_workspace_goes_to_misc_and_enter_still_jumps() {
         let mut app = demo_app();
@@ -1704,6 +1782,10 @@ mod tests {
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id) = waiting_backlog_card(&app);
         let home = app.card(&key).unwrap().machine_index;
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
         let request = serde_json::json!({"action":"dispatch","id":id});
         let response = crate::actions::Response {
             ok: false,
@@ -1713,15 +1795,20 @@ mod tests {
             limit: Some(3),
             session: Some("web".into()),
             id: Some(id.clone()),
+            ..Default::default()
         };
+        app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
         app.finish_action(home, request.clone(), Ok(response.clone()));
+        settle(&mut app);
         assert!(matches!(app.mode, Mode::Confirm { .. }));
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Action::None
         );
         assert!(!matches!(app.mode, Mode::Confirm { .. }));
+        app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
         app.finish_action(home, request, Ok(response));
+        settle(&mut app);
         let Action::Mutate { machine, request } = press(&mut app, 'y') else {
             panic!("expected action")
         };
@@ -2234,8 +2321,10 @@ mod tests {
                 limit: None,
                 session: Some("default".into()),
                 id: Some("9001".into()),
+                ..Default::default()
             }),
         );
+        settle(&mut app);
         assert!(app.draft.is_empty());
         assert!(matches!(app.mode, Mode::Backlog { .. }));
         assert_eq!(app.new_intent_id, Some((0, "9001".to_string())));
@@ -2263,8 +2352,10 @@ mod tests {
                 limit: None,
                 session: None,
                 id: Some("9002".into()),
+                ..Default::default()
             }),
         );
+        settle(&mut app);
         assert!(app.draft.is_empty());
         assert!(!matches!(app.mode, Mode::Compose { .. }));
         assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
@@ -2279,6 +2370,7 @@ mod tests {
             limit: None,
             session: None,
             id: id.map(str::to_string),
+            ..Default::default()
         })
     }
 
@@ -2305,13 +2397,16 @@ mod tests {
         // No answer (a timeout): it may have been made, so the same words keep the same id,
         // even past a later refusal, which can't say what the first send did.
         app.finish_action(0, first, Err("timed out; the result is unknown".into()));
+        settle(&mut app);
         let second = send_words(&mut app, "Back up the NAS");
         assert_eq!(second["submission"], id.as_str());
         app.finish_action(0, second, answer(false, None));
+        settle(&mut app);
         let third = send_words(&mut app, "Back up the NAS");
         assert_eq!(third["submission"], id.as_str());
         // The answer names the record: settled, and the next words are new work.
         app.finish_action(0, third, answer(true, Some("9003")));
+        settle(&mut app);
         let fourth = send_words(&mut app, "Back up the NAS");
         assert_ne!(fourth["submission"], id.as_str());
     }
@@ -2323,11 +2418,13 @@ mod tests {
         let first = send_words(&mut app, "Back up the NAS");
         let id = first["submission"].as_str().unwrap().to_string();
         app.finish_action(0, first, Err("timed out".into()));
+        settle(&mut app);
         let edited = send_words(&mut app, "Back up the NAS and the laptop");
         assert_ne!(edited["submission"], id.as_str());
         // A refusal of a send nobody lost settles it.
         let edited_id = edited["submission"].as_str().unwrap().to_string();
         app.finish_action(0, edited, answer(false, None));
+        settle(&mut app);
         let again = send_words(&mut app, "Back up the NAS and the laptop");
         assert_ne!(again["submission"], edited_id.as_str());
     }
@@ -2571,5 +2668,532 @@ mod tests {
             (request["action"].as_str(), request["id"].as_str()),
             (Some("dismiss"), Some(id.as_str()))
         );
+    }
+
+    /// A demo card for work under way whose workspace has closed: in Build, with a record, no
+    /// workspace, homed in session `web` on the first machine.
+    fn closed_workspace_card(app: &mut App) -> (String, String) {
+        let i = app
+            .board
+            .cards
+            .iter()
+            .position(|c| c.detail.is_some() && c.stage == Stage::Build)
+            .expect("a Build card in the demo");
+        let machine = app.machines[0].name();
+        let card = &mut app.board.cards[i];
+        card.workspace_id = None;
+        card.session = None;
+        card.attention = Attention::Idle;
+        card.machine_index = 0;
+        let d = card.detail.as_mut().unwrap();
+        d.disposition = None;
+        d.intake = None;
+        d.home = Some(crate::feed::Home {
+            machine: Some(machine),
+            session: Some("web".into()),
+        });
+        d.resume = Some(crate::feed::Resume {
+            agent: Some("codex".into()),
+            conversation: Some("4f2b8c1e-5d3a-4b6f-9c2e-1a7d3e9b0c41".into()),
+        });
+        let (key, id) = (card.key.clone(), d.id.clone());
+        app.sel = Selection {
+            col: Stage::Build.index(),
+            key: Some(key.clone()),
+        };
+        (key, id)
+    }
+
+    fn enter(app: &mut App) -> Action {
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+    }
+
+    fn esc(app: &mut App) -> Action {
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+    }
+
+    /// Enter on the card, as you would: the request it sends, with Kerdr remembering the card.
+    fn reopen_by_enter(app: &mut App) -> serde_json::Value {
+        let Action::Mutate { request, .. } = enter(app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        app.busy = true;
+        request
+    }
+
+    fn reopen_reply(
+        session: &str,
+        ok: bool,
+        confirmation: bool,
+        token: &str,
+    ) -> Result<crate::actions::Response, String> {
+        Ok(crate::actions::Response {
+            ok,
+            message: if confirmation {
+                format!("{session} has 3 workspaces, its usual limit. Reopen it anyway?")
+            } else {
+                "Reopened, resuming its Codex conversation.".into()
+            },
+            confirmation,
+            used: confirmation.then_some(3),
+            limit: confirmation.then_some(3),
+            session: Some(session.into()),
+            workspace: (ok && !confirmation).then(|| "w7".into()),
+            label: (ok && !confirmation).then(|| "41-checkout-expired-cards".into()),
+            confirm: confirmation.then(|| token.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn enter_on_work_whose_workspace_closed_asks_its_home_to_reopen_it() {
+        let mut app = demo_app();
+        let (key, id) = closed_workspace_card(&mut app);
+        assert!(app.card(&key).unwrap().can_reopen());
+        assert_eq!(
+            app.card(&key).unwrap().resume_agent().as_deref(),
+            Some("Codex")
+        );
+        // Without actions there's no one to ask: it says how to get there, and sends nothing.
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("[actions]"));
+        app.cfg.actions.command = Some("test-adapter".into());
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"], id.as_str());
+        assert_eq!(request["session"], "web");
+        assert!(request.get("override").is_none());
+        assert_eq!(
+            app.action_from.as_ref().map(|f| f.key.as_str()),
+            Some(key.as_str())
+        );
+        assert_eq!(
+            app.working_on(&request),
+            format!("Reopening {}…", app.card(&key).unwrap().reference)
+        );
+        // From a peek too, which closes on the way.
+        app.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        assert!(matches!(enter(&mut app), Action::Mutate { .. }));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn enter_on_finished_waiting_or_unrecorded_work_still_reopens_nothing() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        for (stage, attention) in [
+            (Stage::Backlog, Attention::Idle),
+            (Stage::Maintain, Attention::Done),
+            (Stage::Build, Attention::Done),
+        ] {
+            app.board.cards[i].stage = stage;
+            app.board.cards[i].attention = attention;
+            assert!(!app.board.cards[i].can_reopen());
+        }
+        app.board.cards[i].stage = Stage::Build;
+        app.board.cards[i].attention = Attention::Idle;
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        assert!(!app.board.cards[i].can_reopen());
+        app.board.cards[i].detail.as_mut().unwrap().intake = None;
+        app.board.cards[i].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        assert!(!app.board.cards[i].can_reopen());
+        app.board.cards[i].detail = None;
+        assert!(!app.board.cards[i].can_reopen());
+        app.sel = Selection {
+            col: Stage::Build.index(),
+            key: Some(key),
+        };
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("nothing to jump into"));
+    }
+
+    #[test]
+    fn a_reopen_question_and_its_yes_are_for_what_was_asked() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        // The backend asks about another session than the request named: the yes is for that one.
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("api", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        let Mode::Confirm { title, queue, .. } = &app.mode else {
+            panic!("no question")
+        };
+        assert_eq!(
+            title,
+            &format!("Reopen {} in api?", app.card(&key).unwrap().reference)
+        );
+        assert!(*queue, "a full session's question offers the queue");
+        let Action::Mutate { request: sent, .. } = press(&mut app, 'y') else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(
+            (
+                sent["override"].as_bool(),
+                sent["session"].as_str(),
+                sent["confirm"].as_str()
+            ),
+            (Some(true), Some("api"), Some("0123456789ab0004"))
+        );
+        // Something changed since: the backend asks again, with a new token, and that's a new
+        // question for a new yes, not a failure.
+        app.busy = true;
+        app.finish_action(
+            0,
+            sent,
+            reopen_reply("api", false, true, "0123456789ab0005"),
+        );
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        let Action::Mutate { request: again, .. } = press(&mut app, 'y') else {
+            panic!("the second yes sent nothing")
+        };
+        assert_eq!(again["confirm"], "0123456789ab0005");
+        // The same answer to the yes, the same token: no loop of questions.
+        app.busy = true;
+        app.finish_action(
+            0,
+            again,
+            reopen_reply("api", false, true, "0123456789ab0005"),
+        );
+        settle(&mut app);
+        assert!(!matches!(app.mode, Mode::Confirm { .. }));
+    }
+
+    #[test]
+    fn a_full_session_can_queue_the_reopen_instead() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        let Action::Mutate { request: sent, .. } = press(&mut app, 'w') else {
+            panic!("w sent nothing")
+        };
+        assert_eq!(
+            (sent["queue"].as_bool(), sent.get("override")),
+            (Some(true), None)
+        );
+        app.finish_action(
+            0,
+            sent,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: "Queued in web.".into(),
+                ..Default::default()
+            }),
+        );
+        settle(&mut app);
+        assert_eq!(app.open_after, None);
+    }
+
+    #[test]
+    fn a_yes_is_refused_when_the_work_changed_since_it_was_asked_for() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        // The feed names another conversation while the request runs: no question at all.
+        let request = reopen_by_enter(&mut app);
+        app.board.cards[i]
+            .detail
+            .as_mut()
+            .unwrap()
+            .resume
+            .as_mut()
+            .unwrap()
+            .conversation = Some("9a8b7c6d-0000-4000-8000-000000000002".into());
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        assert!(!matches!(app.mode, Mode::Confirm { .. }));
+        // Its agent changes while the question is up: the yes sends nothing.
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        app.board.cards[i]
+            .detail
+            .as_mut()
+            .unwrap()
+            .resume
+            .as_mut()
+            .unwrap()
+            .agent = Some("claude".into());
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        // It gets a workspace of its own while the question is up: the yes sends nothing either.
+        let (key, _) = closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].workspace_id = Some("w9".into());
+        app.board.cards[i].session = Some("web".into());
+        assert_eq!(press(&mut app, 'y'), Action::None);
+    }
+
+    #[test]
+    fn a_late_answer_never_catches_keys_meant_for_another_view_or_card() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        // Searching when it arrives: no question, and the search keeps its keys.
+        let request = reopen_by_enter(&mut app);
+        app.mode = Mode::Search(Search {
+            query: "chec".into(),
+            filter: SearchFilter::Everything,
+            sel: 0,
+        });
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Search(_)));
+        assert!(app.message().unwrap().0.contains("needs a yes first"));
+        press(&mut app, 'y');
+        assert!(matches!(&app.mode, Mode::Search(s) if s.query == "checy"));
+        // Reopened from the board, then into the backlog: the board's selection still names it,
+        // but you're looking at the backlog, so it doesn't pull you out.
+        app.mode = Mode::Board;
+        app.sel.key = Some(key.clone());
+        let request = reopen_by_enter(&mut app);
+        press(&mut app, 'b');
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        settle(&mut app);
+        assert_eq!(app.open_after, None);
+        // A dispatch from the backlog, then moving to another backlog card: no question for it.
+        app.mode = Mode::Backlog { sel: 0 };
+        app.rebuild();
+        let first = app.backlog_card_for_keys().map(|c| c.key.clone());
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing")
+        };
+        app.busy = true;
+        press(&mut app, 'j');
+        assert_ne!(app.backlog_card_for_keys().map(|c| c.key.clone()), first);
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+    }
+
+    #[test]
+    fn a_reopen_takes_you_in_only_while_you_are_still_on_its_card() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key)
+            .unwrap()
+            .key
+            .clone();
+        // Moved to another card while it ran: it says so instead of taking you away.
+        let request = reopen_by_enter(&mut app);
+        app.sel.key = Some(other);
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        settle(&mut app);
+        assert_eq!(app.open_after, None);
+        assert!(app.message().unwrap().0.contains("on its card goes in"));
+        // Esc while it runs, from its peek: it finishes, but takes you nowhere.
+        app.sel.key = Some(key.clone());
+        let request = reopen_by_enter(&mut app);
+        app.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Board));
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        settle(&mut app);
+        assert_eq!(app.open_after, None);
+        // Still on it, in its peek: in it goes, remembering where it came from.
+        let request = reopen_by_enter(&mut app);
+        app.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        app.finish_action(0, request.clone(), reopen_reply("web", true, false, ""));
+        settle(&mut app);
+        assert_eq!(
+            app.open_after.take(),
+            Some(OpenAfter {
+                machine: 0,
+                session: "web".into(),
+                workspace: "w7".into(),
+                label: "41-checkout-expired-cards".into(),
+                from: key.clone(),
+            })
+        );
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Good));
+        // The board already shows the workspace it made by the time the answer comes: still in.
+        app.mode = Mode::Board;
+        let request = reopen_by_enter(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].workspace_id = Some("w7".into());
+        app.board.cards[i].session = Some("web".into());
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        settle(&mut app);
+        assert!(app.open_after.take().is_some());
+        // But a workspace other than the one it made is another matter.
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        app.board.cards[i].workspace_id = Some("w8".into());
+        app.board.cards[i].session = Some("web".into());
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        settle(&mut app);
+        assert_eq!(app.open_after, None);
+        closed_workspace_card(&mut app);
+        // A refusal goes nowhere.
+        app.mode = Mode::Board;
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(0, request, reopen_reply("web", false, false, ""));
+        settle(&mut app);
+        assert_eq!(app.open_after, None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn a_workspace_found_closed_on_the_way_in_reopens_work_under_way() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        // herdr says w5 closed, and the board hasn't caught up: it still shows w5. Reopen.
+        app.board.cards[i].workspace_id = Some("w5".into());
+        app.board.cards[i].session = Some("web".into());
+        assert!(app.closed_under_you(&key, Some("w5")));
+        assert_eq!(app.pending_reopen.take().as_deref(), Some(key.as_str()));
+        // It has moved to another workspace meanwhile: that one's not closed, so no reopen.
+        assert!(!app.closed_under_you(&key, Some("w4")));
+        assert_eq!(app.pending_reopen, None);
+        // Esc before its turn drops the reopen too.
+        assert!(app.closed_under_you(&key, Some("w5")));
+        esc(&mut app);
+        assert_eq!(app.pending_reopen, None);
+        // Its machine was away and its workspace closed meanwhile: reopen when it answers.
+        app.board.cards[i].workspace_id = None;
+        app.board.cards[i].session = None;
+        let pending = |app: &App| PendingJump {
+            key: key.clone(),
+            workspace: "#41's workspace".into(),
+            machine: app.card(&key).unwrap().machine.clone(),
+        };
+        app.pending_jump = Some(pending(&app));
+        assert_eq!(app.pending_jump_ready(), None);
+        assert_eq!(app.pending_reopen.as_deref(), Some(key.as_str()));
+        // Without actions, it says what happened, as before.
+        app.pending_reopen = None;
+        app.cfg.actions.command = None;
+        app.pending_jump = Some(pending(&app));
+        assert_eq!(app.pending_jump_ready(), None);
+        assert_eq!(app.pending_reopen, None);
+        assert!(app.message().unwrap().0.contains("closed while"));
+        assert!(!app.closed_under_you(&key, None));
+    }
+
+    #[test]
+    fn a_question_that_appears_on_its_own_ignores_keys_held_or_typed_before_it() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(
+            0,
+            request,
+            reopen_reply("web", false, true, "0123456789ab0004"),
+        );
+        // Enter still held from opening it, a repeat of y, w: none answers it.
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert_eq!(press(&mut app, 'w'), Action::None);
+        let mut held = KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE);
+        held.kind = KeyEventKind::Repeat;
+        settle(&mut app);
+        assert_eq!(app.on_key(held), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        // A fresh y once it has been up a moment does.
+        assert!(matches!(press(&mut app, 'y'), Action::Mutate { .. }));
+    }
+
+    #[test]
+    fn a_start_work_yes_goes_where_it_was_asked_and_not_after_the_home_moved() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        let Action::Mutate { request, machine } = press(&mut app, 'd') else {
+            panic!("d sent nothing")
+        };
+        app.busy = true;
+        let asks = crate::actions::Response {
+            ok: false,
+            message: "web has 3 workspaces. Start anyway?".into(),
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            ..Default::default()
+        };
+        app.finish_action(machine, request.clone(), Ok(asks.clone()));
+        settle(&mut app);
+        let Action::Mutate { request: sent, .. } = press(&mut app, 'y') else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(
+            (sent["override"].as_bool(), sent["session"].as_str()),
+            (Some(true), Some("web"))
+        );
+        // Its home moves while the question is up: the yes sends nothing.
+        app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+        app.finish_action(machine, request, Ok(asks));
+        settle(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(app.machines[0].name()),
+            session: Some("api".into()),
+        });
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
     }
 }
