@@ -107,6 +107,8 @@ pub struct MachineData {
     pub keys: bool,
     /// None when the feed wasn't due this time; the last one still stands.
     pub feed: Option<Result<Feed, String>>,
+    /// A feed read that failed after the good one above, when two reads were merged into one.
+    pub feed_failed_after: Option<String>,
 }
 
 #[derive(Debug)]
@@ -123,15 +125,20 @@ pub struct Event {
 /// so the board ends up where applying both in turn would have left it.
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
-        (Some(data), Some(old_data)) => {
-            // A failed feed read after a good one keeps the good cards: the board keeps an
-            // older feed on an error anyway, and the next feed read reports the error again.
-            let keep_old = data.feed.is_none()
-                || (matches!(data.feed, Some(Err(_))) && matches!(old_data.feed, Some(Ok(_))));
-            if keep_old {
-                data.feed = old_data.feed;
+        (Some(data), Some(old_data)) => match (data.feed.take(), old_data.feed) {
+            // No feed this time: the older read's stands, with any failure that followed it.
+            (None, old_feed) => {
+                data.feed = old_feed;
+                data.feed_failed_after = old_data.feed_failed_after;
             }
-        }
+            // A failure after good cards keeps the cards and says it failed, as applying the
+            // two reads in turn would have.
+            (Some(Err(e)), Some(Ok(feed))) => {
+                data.feed = Some(Ok(feed));
+                data.feed_failed_after = Some(e);
+            }
+            (new_feed, _) => data.feed = new_feed,
+        },
         (None, Some(old_data)) => {
             new.data = Some(old_data);
             new.at = old.at;
@@ -146,58 +153,61 @@ fn replace(old: Event, mut new: Event) -> Event {
 /// gets each machine as it is now, never a queue of what it was, and nothing new is dropped.
 #[derive(Default)]
 pub struct Inbox {
-    /// Per machine: the read, and when it began.
-    slots: Mutex<Vec<Option<(Event, Instant)>>>,
-    /// Per machine: which reader's reads count. A reader that was stopped (a machine hidden,
-    /// then shown again) may still be mid-read; what it finds is older than its replacement's.
-    readers: Mutex<Vec<u64>>,
+    /// Per machine, under one lock so a reader can't be retired between its check and its read
+    /// landing.
+    slots: Mutex<Vec<Slot>>,
     arrived: Condvar,
 }
 
+#[derive(Default)]
+struct Slot {
+    /// Which reader's reads count. A reader that was stopped (a machine hidden, then shown
+    /// again) may still be mid-read; what it finds is older than its replacement's.
+    reader: u64,
+    /// The read, and when it began.
+    read: Option<(Event, Instant)>,
+}
+
 impl Inbox {
-    fn slots(&self) -> MutexGuard<'_, Vec<Option<(Event, Instant)>>> {
+    fn slots(&self, i: usize) -> MutexGuard<'_, Vec<Slot>> {
         // A reader that panicked can only have left whole reads behind.
-        self.slots.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn readers(&self) -> MutexGuard<'_, Vec<u64>> {
-        self.readers.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    /// A new reader for machine `i`: from now on only its reads count. Also called when a
-    /// reader stops, so nothing it was still reading lands.
-    pub fn next_reader(&self, i: usize) -> u64 {
-        let mut readers = self.readers();
-        if readers.len() <= i {
-            readers.resize(i + 1, 0);
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if slots.len() <= i {
+            slots.resize_with(i + 1, Slot::default);
         }
-        readers[i] += 1;
-        readers[i]
+        slots
+    }
+
+    /// A new reader for machine `i`: from now on only its reads count, and an older reader's
+    /// unread one is dropped. Also called when a reader stops, so nothing it was still reading
+    /// lands.
+    pub fn next_reader(&self, i: usize) -> u64 {
+        let mut slots = self.slots(i);
+        slots[i].reader += 1;
+        slots[i].read = None;
+        slots[i].reader
     }
 
     /// A read that began at `started`, from reader `reader` (see `next_reader`).
     pub fn put(&self, ev: Event, started: Instant, reader: u64) {
-        if self.readers().get(ev.machine).copied().unwrap_or(0) != reader {
+        let i = ev.machine;
+        let mut slots = self.slots(i);
+        if slots[i].reader != reader {
             return;
         }
-        let mut slots = self.slots();
-        let i = ev.machine;
-        if slots.len() <= i {
-            slots.resize_with(i + 1, || None);
-        }
-        let ev = match slots[i].take() {
+        let ev = match slots[i].read.take() {
             Some((old, _)) => replace(old, ev),
             None => ev,
         };
-        slots[i] = Some((ev, started));
+        slots[i].read = Some((ev, started));
         self.arrived.notify_all();
     }
 
     /// Every read waiting, in machine order.
     pub fn take(&self) -> Vec<Event> {
-        self.slots()
+        self.slots(0)
             .iter_mut()
-            .filter_map(|s| s.take().map(|(ev, _)| ev))
+            .filter_map(|s| s.read.take().map(|(ev, _)| ev))
             .collect()
     }
 
@@ -205,11 +215,11 @@ impl Inbox {
     /// `timeout` passes. Says whether they all came.
     pub fn wait_since(&self, machines: &[usize], since: Instant, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
-        let mut slots = self.slots();
+        let mut slots = self.slots(0);
         loop {
-            let fresh = machines
-                .iter()
-                .all(|&i| matches!(slots.get(i), Some(Some((_, started))) if *started >= since));
+            let fresh = machines.iter().all(|&i| {
+                matches!(slots.get(i).and_then(|s| s.read.as_ref()), Some((_, started)) if *started >= since)
+            });
             let left = deadline.saturating_duration_since(Instant::now());
             if fresh || left.is_zero() {
                 return fresh;
@@ -486,6 +496,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         snapshots,
         keys: sections.keys.unwrap_or(false),
         feed,
+        feed_failed_after: None,
     })
 }
 
@@ -596,7 +607,38 @@ mod tests {
         inbox.put(read_of(0, live(), Some("feed not due"), false), t, 0);
         let ev = inbox.take().pop().unwrap();
         assert_eq!(host(&ev), Some("feed not due"));
-        assert!(matches!(ev.data.unwrap().feed, Some(Ok(_))));
+        let data = ev.data.unwrap();
+        assert!(matches!(data.feed, Some(Ok(_))));
+        assert_eq!(data.feed_failed_after.as_deref(), Some("feed timed out"));
+    }
+
+    #[test]
+    fn a_retired_reader_can_never_land_a_read() {
+        let inbox = Arc::new(Inbox::default());
+        for _ in 0..200 {
+            let old = inbox.next_reader(0);
+            inbox.put(
+                read_of(0, live(), Some("old, unread"), false),
+                Instant::now(),
+                old,
+            );
+            let writer = {
+                let inbox = inbox.clone();
+                std::thread::spawn(move || {
+                    inbox.put(
+                        read_of(0, live(), Some("old, late"), false),
+                        Instant::now(),
+                        old,
+                    )
+                })
+            };
+            let new = inbox.next_reader(0);
+            writer.join().unwrap();
+            inbox.put(read_of(0, live(), Some("new"), false), Instant::now(), new);
+            let reads = inbox.take();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(host(&reads[0]), Some("new"));
+        }
     }
 
     #[test]

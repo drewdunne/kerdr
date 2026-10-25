@@ -525,10 +525,7 @@ impl App {
         );
         // A refresh while the menu was open may have moved or removed the card it opened on;
         // its keys then act on nothing rather than on whatever took its place.
-        if card_key
-            && target.is_some()
-            && self.backlog_card_for_keys().map(|c| &c.key) != target.as_ref()
-        {
+        if card_key && self.backlog_card_for_keys().map(|c| &c.key) != target.as_ref() {
             self.say("The selected intent changed while the menu was open. Select it again before changing it.", Tone::Warn);
             return Action::None;
         }
@@ -602,8 +599,21 @@ impl App {
                 if draft.words.trim().is_empty() {
                     self.say("Write what you want first.", Tone::Info);
                 } else {
-                    let submission = self.submission.get_or_insert_with(new_submission).clone();
-                    let request = json!({"action":"create","words":draft.words.trim(),"session":draft.session,"submission":submission});
+                    let words = draft.words.trim().to_string();
+                    let same = self.submission.as_ref().is_some_and(|s| {
+                        s.words == words && s.machine == draft.machine && s.session == draft.session
+                    });
+                    if !same {
+                        self.submission = Some(Submission {
+                            id: new_submission(),
+                            words: words.clone(),
+                            machine: draft.machine,
+                            session: draft.session.clone(),
+                            unknown: false,
+                        });
+                    }
+                    let id = self.submission.as_ref().map(|s| s.id.clone());
+                    let request = json!({"action":"create","words":words,"session":draft.session,"submission":id});
                     let machine = draft.machine;
                     self.mode = Mode::Compose { draft, back };
                     return self.emit_mutation(machine, request);
@@ -681,10 +691,17 @@ impl App {
                         self.mode = *back;
                     }
                     KeyCode::Enter | KeyCode::Char('y') => {
+                        self.mode = *back;
+                        if !self.confirm_still_applies(machine, &request) {
+                            self.say(
+                                "That intent changed while you were deciding, so nothing was sent. Select it again.",
+                                Tone::Warn,
+                            );
+                            return Some(Action::None);
+                        }
                         if request["action"] == "dispatch" {
                             request["override"] = json!(true);
                         }
-                        self.mode = *back;
                         return Some(self.emit_mutation(machine, request));
                     }
                     _ => {}
@@ -835,8 +852,12 @@ impl App {
             }
             Ok(response) => {
                 let mut message = response.message.clone();
-                if request["action"] == "create" {
-                    // Answered either way: the next words get an id of their own.
+                if request["action"] == "create"
+                    && (response.id.is_some()
+                        || !self.submission.as_ref().is_some_and(|s| s.unknown))
+                {
+                    // Settled: the record is named, or nothing was made and no earlier send of
+                    // these words went unheard. The next words get an id of their own.
                     self.submission = None;
                 }
                 // A failure that names an intent still made one (saved here but not pushed,
@@ -853,7 +874,33 @@ impl App {
                 }
                 self.say(message, if response.ok { Tone::Good } else { Tone::Warn });
             }
-            Err(error) => self.say(error, Tone::Warn),
+            Err(error) => {
+                if request["action"] == "create"
+                    && let Some(s) = self.submission.as_mut()
+                {
+                    s.unknown = true;
+                }
+                self.say(error, Tone::Warn)
+            }
         }
+    }
+
+    /// Whether a confirmed change still fits its record: a refresh while the question was open
+    /// may have started, finished or restored it.
+    fn confirm_still_applies(&self, machine: usize, request: &Value) -> bool {
+        let Some(id) = request["id"].as_str() else {
+            return false;
+        };
+        let name = self.machines.get(machine).map(|m| m.name());
+        self.board.cards.iter().any(|c| {
+            c.detail.as_ref().is_some_and(|d| {
+                d.id == id
+                    && (c.machine_index == machine
+                        || d.home.as_ref().and_then(|h| h.machine.as_deref()) == name.as_deref())
+            }) && match request["action"].as_str() {
+                Some("restore") => c.dismissed(),
+                _ => waiting_work(c),
+            }
+        })
     }
 }

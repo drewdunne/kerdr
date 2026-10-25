@@ -121,8 +121,10 @@ submission, nothing else:
 {"action":"create","words":"The laptop's Wi-Fi drops after sleep.\nMake it reconnect on its own.","session":"default","submission":"kerdr-18f2c3a9d0e1-4d2"}
 ```
 
-Kerdr sends the same `submission` again only when it never got an answer (a timeout, say).
-When a record already exists for it, answer with that record's `id` instead of making another.
+Kerdr sends the same `submission` again only for the same words to the same session, and only
+while an earlier send of them never got an answer (a timeout, say). When a record already exists
+for it, answer with that record's `id` instead of making another. Changed words are new work
+with a new `submission`.
 
 Write the record up from the words however your system does (a person, a script, an agent),
 and answer with its `id` as soon as it's saved, before any slow write-up. While it's being

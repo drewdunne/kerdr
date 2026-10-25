@@ -23,6 +23,19 @@ pub struct Draft {
     pub session: String,
 }
 
+/// One new intent as sent: its id lets the adapter tell a resend of the same words from new
+/// work. It's reused only for the same words to the same place, and only until an answer
+/// names the record (or says plainly that nothing was made, when no earlier send went unheard).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub id: String,
+    pub words: String,
+    pub machine: usize,
+    pub session: String,
+    /// An earlier send of it got no answer, so it may have been made.
+    pub unknown: bool,
+}
+
 /// One line of the filter list: an owner (organization or tenant), or one of its projects.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilterRow {
@@ -245,9 +258,8 @@ pub struct App {
     pub count: String,
     /// Words typed into the new-intent box and not sent yet, kept for the next time it opens.
     pub draft: String,
-    /// The id sent with a new intent whose answer never came, so sending it again finds the
-    /// one already made instead of making a second.
-    pub submission: Option<String>,
+    /// The new intent last sent, while its answer is still owed or unknown.
+    pub submission: Option<Submission>,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
     pub new_intent_id: Option<(usize, String)>,
     backlog_focus: Option<String>,
@@ -333,7 +345,7 @@ impl App {
             match data.feed.take() {
                 Some(Ok(feed)) => {
                     m.feed = Some(feed);
-                    m.feed_error = None;
+                    m.feed_error = data.feed_failed_after.take();
                 }
                 Some(Err(e)) => m.feed_error = Some(e),
                 None => {}
@@ -1688,7 +1700,9 @@ mod tests {
     fn dispatch_confirmation_cancels_without_action_and_only_yes_overrides() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        let request = serde_json::json!({"action":"dispatch","id":"0041"});
+        let (key, id) = waiting_backlog_card(&app);
+        let home = app.card(&key).unwrap().machine_index;
+        let request = serde_json::json!({"action":"dispatch","id":id});
         let response = crate::actions::Response {
             ok: false,
             message: "3 of 3 slots used".into(),
@@ -1696,21 +1710,21 @@ mod tests {
             used: Some(3),
             limit: Some(3),
             session: Some("web".into()),
-            id: Some("0041".into()),
+            id: Some(id.clone()),
         };
-        app.finish_action(0, request.clone(), Ok(response.clone()));
+        app.finish_action(home, request.clone(), Ok(response.clone()));
         assert!(matches!(app.mode, Mode::Confirm { .. }));
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Action::None
         );
         assert!(!matches!(app.mode, Mode::Confirm { .. }));
-        app.finish_action(0, request, Ok(response));
+        app.finish_action(home, request, Ok(response));
         let Action::Mutate { machine, request } = press(&mut app, 'y') else {
             panic!("expected action")
         };
-        assert_eq!(machine, 0);
-        assert_eq!(request["id"], "0041");
+        assert_eq!(machine, home);
+        assert_eq!(request["id"], id.as_str());
         assert_eq!(request["override"], true);
     }
 
@@ -2254,45 +2268,66 @@ mod tests {
         assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
     }
 
+    fn answer(ok: bool, id: Option<&str>) -> Result<crate::actions::Response, String> {
+        Ok(crate::actions::Response {
+            ok,
+            message: if ok { "Saved." } else { "The store is locked" }.into(),
+            confirmation: false,
+            used: None,
+            limit: None,
+            session: None,
+            id: id.map(str::to_string),
+        })
+    }
+
+    fn send_words(app: &mut App, words: &str) -> serde_json::Value {
+        app.busy = false;
+        app.draft = words.into();
+        app.mode = Mode::Board;
+        press(app, 'c');
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        request
+    }
+
     #[test]
     fn a_resend_after_a_lost_answer_names_the_same_submission() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        app.draft = "Back up the NAS".into();
-        press(&mut app, 'c');
-        let send = |app: &mut App| {
-            app.busy = false;
-            let Action::Mutate { request, .. } =
-                app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
-            else {
-                panic!("Enter didn't send")
-            };
-            request
-        };
-        let first = send(&mut app);
+        let first = send_words(&mut app, "Back up the NAS");
         let id = first["submission"].as_str().unwrap().to_string();
         assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && id.len() <= 64);
-        // No answer (a timeout): the same words go again under the same id.
+        // No answer (a timeout): it may have been made, so the same words keep the same id,
+        // even past a later refusal, which can't say what the first send did.
         app.finish_action(0, first, Err("timed out; the result is unknown".into()));
-        assert!(matches!(app.mode, Mode::Compose { .. }));
-        let second = send(&mut app);
+        let second = send_words(&mut app, "Back up the NAS");
         assert_eq!(second["submission"], id.as_str());
-        // A plain refusal made nothing, so the next try is new work.
-        app.finish_action(
-            0,
-            second,
-            Ok(crate::actions::Response {
-                ok: false,
-                message: "The store is locked".into(),
-                confirmation: false,
-                used: None,
-                limit: None,
-                session: None,
-                id: None,
-            }),
-        );
-        let third = send(&mut app);
-        assert_ne!(third["submission"], id.as_str());
+        app.finish_action(0, second, answer(false, None));
+        let third = send_words(&mut app, "Back up the NAS");
+        assert_eq!(third["submission"], id.as_str());
+        // The answer names the record: settled, and the next words are new work.
+        app.finish_action(0, third, answer(true, Some("9003")));
+        let fourth = send_words(&mut app, "Back up the NAS");
+        assert_ne!(fourth["submission"], id.as_str());
+    }
+
+    #[test]
+    fn changed_words_after_a_lost_answer_are_new_work() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let first = send_words(&mut app, "Back up the NAS");
+        let id = first["submission"].as_str().unwrap().to_string();
+        app.finish_action(0, first, Err("timed out".into()));
+        let edited = send_words(&mut app, "Back up the NAS and the laptop");
+        assert_ne!(edited["submission"], id.as_str());
+        // A refusal of a send nobody lost settles it.
+        let edited_id = edited["submission"].as_str().unwrap().to_string();
+        app.finish_action(0, edited, answer(false, None));
+        let again = send_words(&mut app, "Back up the NAS and the laptop");
+        assert_ne!(again["submission"], edited_id.as_str());
     }
 
     #[test]
@@ -2483,5 +2518,56 @@ mod tests {
             panic!("left the keys list")
         };
         assert_eq!((filter.as_str(), *scroll), ("machine now", 0));
+    }
+
+    #[test]
+    fn a_menu_opened_on_no_card_acts_on_none_that_arrives_later() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.sel = Selection::default();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, Mode::Palette { target: None, .. }));
+        // A card turns up selected while the menu is open.
+        let (key, _) = waiting_backlog_card(&app);
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key),
+        };
+        assert_eq!(press(&mut app, 'd'), Action::None);
+    }
+
+    #[test]
+    fn a_confirmation_rechecks_its_intent_before_sending() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        // It starts elsewhere while the question is open.
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].stage = Stage::Build;
+        app.board.cards[i].state = Some("active".into());
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        // Still waiting: yes sends it.
+        app.board.cards[i].stage = Stage::Backlog;
+        app.board.cards[i].state = Some("queued".into());
+        press(&mut app, 'x');
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(
+            (request["action"].as_str(), request["id"].as_str()),
+            (Some("dismiss"), Some(id.as_str()))
+        );
     }
 }
