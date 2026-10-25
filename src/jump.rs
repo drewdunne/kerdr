@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -180,6 +180,7 @@ pub fn leave(flags: &TerminalFlags) {
     let _ = execute!(
         out,
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         ratatui::crossterm::cursor::Show
     );
@@ -196,12 +197,13 @@ pub fn enter(terminal: &mut DefaultTerminal, flags: &TerminalFlags) {
         // modifyOtherKeys mode itself. Return the host to the board's ordinary key path.
         let _ = out.write_all(b"\x1b[?9001l\x1b[>4;0m\x1b[?7h");
     }
-    // herdr resets these when it exits, but not when its window is cut off over SSH.
+    // herdr resets these when it exits, but not when its window is cut off over SSH. The
+    // board takes pastes whole (the new-intent box keeps their line breaks).
     let _ = execute!(
         out,
         DisableMouseCapture,
-        DisableBracketedPaste,
         DisableFocusChange,
+        EnableBracketedPaste,
         EnterAlternateScreen,
         ratatui::crossterm::cursor::Hide
     );

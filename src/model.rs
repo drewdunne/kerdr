@@ -213,6 +213,11 @@ impl Card {
         self.detail.as_ref().and_then(|d| d.disposition.as_deref()) == Some("wont_do")
     }
 
+    /// `pending` or `failed` while an agent hasn't written the intent up from its words.
+    pub fn intake(&self) -> Option<&str> {
+        self.detail.as_ref().and_then(|d| d.intake.as_deref())
+    }
+
     pub fn owner_key(&self) -> String {
         let d = self.detail.as_ref();
         if let Some(t) = d

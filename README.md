@@ -6,7 +6,7 @@
 
 Kerdr is a full-screen board for people who run many coding agents at once in herdr. Every
 record of work becomes a card, in a column for the stage its work is at. Agent conversations
-without a linked record live in **Misc**, opened with `i` or `Ctrl+Space m`.
+without a linked record live in **Misc**, opened with `i` or `Ctrl+Space i`.
 What needs you sorts to the top. Press Enter and herdr opens full screen on that card's
 workspace. Press herdr's prefix and then `q`, herdr's own detach, and you're back on the board,
 which has kept up while you were away.
@@ -52,8 +52,12 @@ question, something stuck. Everything else keeps running without you.
 - **Work-in-progress limits.** Each herdr session holds three workspaces with an agent before
   Kerdr calls it full (change it in the config). A lane for background agents has no limit.
 - **One workspace, one piece of work, one card.**
-- **A command menu on the board.** Ctrl+Space groups intent controls under a familiar prefix.
-  Inside herdr, its own prefix and key bindings still apply, including Kerdr's two step-out keys.
+- **New work in your own words.** `c` opens one box: write what you want, the way you'd say it
+  to an agent, and your record system's adapter writes it up.
+- **The same key does the same thing everywhere.** The keys that change a backlog card work on
+  the board, in the backlog and in a peek, and the bottom line names them for the card you're
+  on. Ctrl+Space lists them, with the same letters. Inside herdr, its own prefix and key
+  bindings still apply, including Kerdr's two step-out keys.
 
 ## Features
 
@@ -114,24 +118,32 @@ already done. Session and workspace results follow the same filters; switch to A
 
 ### The backlog
 
-`b` shows work waiting to start, in your chosen order. With an action adapter configured:
+`b` shows work waiting to start, in your chosen order. With an action adapter configured, these
+keys change the selected backlog intent, on the board's Backlog column, in the backlog and in a
+peek alike:
 
-- `y` affirms that you still want the selected intent. Its age is the time since your last
-  affirmation, falling back to creation when it has never been reviewed. Agent updates do not
-  reset this age. Creation stays visible in expanded details.
-- `J` / `K` moves an intent down or up; `10K` moves it up ten places. Ctrl+Space then `g`
+- `d` starts it in its recorded machine and session. At the usual work limit, Kerdr asks before
+  starting another; the adapter still enforces its hard limit.
+- `y` says you still want it. Its age is the time since you last said so, falling back to
+  creation when it has never been reviewed. Agent updates do not reset this age. Creation stays
+  visible in expanded details.
+- `J` / `K` moves it down or up; in the backlog and a peek, `10K` moves it up ten places. `t`
   moves it to the top of its owner/project backlog. Priority stays separate from order.
-- `d` dispatches the selected intent into its recorded machine and session. At the usual work
-  limit, Kerdr asks before starting another; the adapter still enforces its hard limit.
-- `x` moves an intent to **Won't do**, after confirmation. `w` opens that separate view;
-  `u` restores the selected intent. Its record and original creation date are retained.
+- `x` moves it to **Won't do**, after confirmation. `w` opens that separate view; `u` brings the
+  selected intent back. Its record and original creation date are retained.
 
-Ctrl+Space then `n` opens the new-intent form. Choose its organization, optional tenant,
-project, machine and session, then save it to the backlog. Creation does not start an agent.
-Ctrl+Space then `t` cycles owner/tenant views; `p` cycles project views. `a` (or Ctrl+Space then `a`)
-filters by the provider herdr reports: All, Claude, Codex, and additional detected providers.
-Cards with no reported agent appear in All. These filters combine with machine and session
-selection. Organization work stays distinct from tenant work.
+`c` opens the new-intent box: one field for what you want, in your own words. Enter sends it;
+Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its line breaks. Escape
+keeps your words for the next time you open it. The adapter files it in the backlog of the
+session you're looking at and writes it up (see [docs/feed.md](docs/feed.md#actions)); Kerdr
+shows it as being written up until that's done, and creating it never starts an agent by itself.
+
+`f` lists every owner (organization or tenant) and its projects, with how much of each is under
+way and waiting; type to narrow the list and Enter to show only that one. `F` shows everything
+again. `a` cycles the provider herdr reports: All, Claude, Codex, and additional detected
+providers. Cards with no reported agent appear in All. These filters combine with machine and
+session selection, and the top of the board names them while one is on. Organization work stays
+distinct from tenant work.
 
 Controls are optional: [the action adapter contract](docs/feed.md#actions) lets your
 own record system validate and persist changes. Without an adapter, Kerdr remains a reader.
@@ -152,10 +164,14 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
 | `/` | search |
+| `c` | new intent, in your own words |
+| `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
+| `f` / `F` | show only one owner or project / show everything |
 | `a` | cycle provider: All, Claude, Codex, and detected providers |
 | `b` | backlog |
 | `w` | toggle Won't do view |
-| `Ctrl+Space` | intent controls: new, dispatch, affirm, order, filters, restore |
+| `i` | Misc: workspaces with no record |
+| `Ctrl+Space` | a menu of the work and view keys, with the same letters |
 | `M` | machines |
 | `r` / `R` | retry a machine that isn't answering / all of them |
 | `?` | keys |
@@ -185,8 +201,8 @@ week its CI installs the latest herdr release, runs Kerdr's tests against a real
 and opens an issue if anything has changed under it.
 
 **Misc conversations.** Every herdr workspace with an agent remains reachable, including fresh
-chats and experiments with no task record. These appear in **Misc** (`i`, or `Ctrl+Space m`),
-outside the work columns and their attention counts. Enter opens the conversation, `m` peeks,
+chats and experiments with no task record. These appear in **Misc** (`i`, or `Ctrl+Space i`),
+outside the work columns and their attention counts. Enter opens the conversation, Space peeks,
 and Escape returns to the board. Machine, session and provider filters still apply. When a feed
 record claims the workspace, its card moves into the record's phase automatically. A temporary
 feed error preserves the last successful records.

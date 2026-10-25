@@ -88,6 +88,7 @@ know rather than guessing.
 | `refreshed_at` | The last date someone confirmed that the work is still wanted. This is separate from creation and ordinary record updates. |
 | `backlog_rank` | An optional signed integer ordering the backlog, lower numbers first. The action backend writes the canonical order. |
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
+| `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
 
 ## Actions
 
@@ -113,6 +114,17 @@ additional fields that operation needs:
 ```
 
 The action names are `create`, `dispatch`, `refresh`, `dismiss`, `restore` and `move`.
+`create` carries the user's own words and the session they were looking at, nothing else:
+
+```json
+{"action":"create","words":"The laptop's Wi-Fi drops after sleep.\nMake it reconnect on its own.","session":"default"}
+```
+
+Write the record up from the words however your system does (a person, a script, an agent),
+and answer with its `id` as soon as it's saved, before any slow write-up. While it's being
+written up, give the card `intake: "pending"` in the feed. A response that names an `id` means
+the record exists even when `ok` is false (saved but not published, say): Kerdr won't send the
+same words again.
 `refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
 the active backlog and `restore` brings it back. `move` changes backlog order.
 

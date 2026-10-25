@@ -86,6 +86,7 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
             PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES)
         );
     }
+    let _ = execute!(stdout(), ratatui::crossterm::event::EnableBracketedPaste);
     let flags = TerminalFlags { keyboard };
     let client_config = herdr_keys::write_client_config().ok();
     if std::env::var_os("HERDR_PANE_ID").is_some() && !app.demo {
@@ -109,6 +110,7 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
             ratatui::crossterm::event::PopKeyboardEnhancementFlags
         );
     }
+    let _ = execute!(stdout(), ratatui::crossterm::event::DisableBracketedPaste);
     ratatui::restore();
     if let Some(l) = live.as_mut() {
         for i in 0..l.pollers.len() {
@@ -162,8 +164,13 @@ fn event_loop(
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else {
-            continue;
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Paste(text) => {
+                app.on_paste(&text);
+                continue;
+            }
+            _ => continue,
         };
         match app.on_key(key) {
             Action::None => {}

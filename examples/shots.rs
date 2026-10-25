@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 
 use fontdue::{Font, FontSettings};
 use image::{Rgb, RgbImage};
-use kerdr::app::{App, IntentForm, Mode, Selection};
+use kerdr::app::{App, Draft, Mode, Selection};
 use kerdr::config::Config;
 use kerdr::{demo, theme, ui};
 use ratatui::Terminal;
@@ -230,6 +230,22 @@ fn main() {
     let board = app(false);
     rasterize(&render(&board), &fonts, &out.join("board.png"));
 
+    let mut backlog_card = app(false);
+    select(&mut backlog_card, "#21");
+    rasterize(
+        &render(&backlog_card),
+        &fonts,
+        &out.join("board-backlog-card.png"),
+    );
+
+    let mut filter = app(false);
+    filter.mode = Mode::Filter {
+        query: String::new(),
+        sel: 0,
+        back: Box::new(Mode::Board),
+    };
+    rasterize(&render(&filter), &fonts, &out.join("filter.png"));
+
     let mut peek = app(false);
     select(&mut peek, "#41");
     peek.mode = Mode::Peek {
@@ -271,6 +287,7 @@ fn main() {
     rasterize(&render(&misc), &fonts, &out.join("misc.png"));
 
     let mut palette = app(false);
+    select(&mut palette, "#21");
     palette.mode = Mode::Palette {
         back: Box::new(Mode::Board),
     };
@@ -278,15 +295,10 @@ fn main() {
 
     let mut compose = app(false);
     compose.mode = Mode::Compose {
-        form: IntentForm {
-            title: "Compare the shortlist".into(),
-            words: "Show each game’s trade-offs before choosing one.".into(),
-            organization: "example-studio".into(),
-            tenant: "shop".into(),
-            project: "web".into(),
+        draft: Draft {
+            words: "Show each game’s trade-offs before choosing one, so I can pick without opening every store page.\n\nNot urgent.".into(),
             machine: 0,
             session: "web".into(),
-            field: 1,
         },
         back: Box::new(Mode::Board),
     };
