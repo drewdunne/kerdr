@@ -6,9 +6,9 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Clear, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::app::{App, Hit, IntentForm, Mode, Search, SearchFilter, Tone, match_range};
+use crate::app::{App, Draft, Hit, Mode, Search, SearchFilter, Tone, match_range};
 use crate::board::{Scope, SessionRow};
 use crate::herdr;
 use crate::model::{Attention, Card, Priority, Stage, Verdict};
@@ -71,15 +71,20 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             dim_behind(f);
             peek(f, area, app, *scroll);
         }
-        Mode::Palette { back } => {
+        Mode::Palette { back, .. } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
-            palette(f, area);
+            palette(f, area, app);
         }
-        Mode::Compose { form, back } => {
+        Mode::Compose { draft, back } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
-            compose(f, area, app, form);
+            compose(f, area, app, draft);
+        }
+        Mode::Filter { query, sel, back } => {
+            draw_mode(f, area, app, back);
+            dim_behind(f);
+            filter_view(f, area, app, query, *sel);
         }
         Mode::Confirm {
             title,
@@ -113,7 +118,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
 }
 
 fn put(buf: &mut Buffer, x: u16, y: u16, w: u16, spans: Vec<Span<'static>>) {
-    if w == 0 {
+    if w == 0 || y >= buf.area.bottom() || x >= buf.area.right() {
         return;
     }
     buf.set_line(x, y, &Line::from(spans), w);
@@ -165,6 +170,37 @@ fn key_hints(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
         spans.push(Span::styled(k.to_string(), bold(FG)));
         spans.push(Span::styled(format!(" {what}"), fg(DIM)));
     }
+    spans
+}
+
+/// The keys for the selected backlog card, led by its number, so the bottom line says what
+/// can be done to the card you're on. Empty when the selected card isn't waiting work.
+fn card_hints(app: &App) -> Vec<Span<'static>> {
+    let Some(card) = app.backlog_card_for_keys() else {
+        return vec![];
+    };
+    let mut spans = vec![
+        Span::styled(
+            format!(" {} ", card.reference),
+            Style::default()
+                .bg(YELLOW)
+                .fg(BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ];
+    spans.extend(key_hints(if card.dismissed() {
+        &[("u", "bring it back")]
+    } else {
+        &[
+            ("d", "start it"),
+            ("y", "still want it"),
+            ("x", "won’t do"),
+            ("J K", "move down / up"),
+            ("t", "to the top"),
+        ]
+    }));
+    spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
 }
 
@@ -252,8 +288,9 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let banner = banner(app);
     let pending = pending_line(app);
     let message = app.message();
+    let filter_line = filtered(app);
     let rows = Layout::vertical([
-        Constraint::Length(2),
+        Constraint::Length(1 + u16::from(filter_line)),
         Constraint::Length(u16::from(banner.is_some())),
         Constraint::Length(3),
         Constraint::Min(4),
@@ -269,15 +306,17 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         },
         app,
     );
-    filters(
-        f.buffer_mut(),
-        Rect {
-            y: rows[0].y + 1,
-            height: 1,
-            ..rows[0]
-        },
-        app,
-    );
+    if filter_line {
+        filters(
+            f.buffer_mut(),
+            Rect {
+                y: rows[0].y + 1,
+                height: 1,
+                ..rows[0]
+            },
+            app,
+        );
+    }
     if let Some((left, right)) = banner {
         put_lr(f.buffer_mut(), rows[1], rows[1].y, left, right);
     }
@@ -305,8 +344,11 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
                 },
                 fg(CYAN),
             ),
-            Line::styled("a provider    / search    i Misc", fg(CYAN)),
-            Line::styled("Ctrl+Space commands and work filters", fg(DIM)),
+            Line::styled("f filter    a agents    / search    i misc", fg(CYAN)),
+            Line::styled(
+                "c makes a new intent · Ctrl+Space lists every command",
+                fg(DIM),
+            ),
         ];
         f.render_widget(
             Paragraph::new(lines).alignment(ratatui::layout::Alignment::Center),
@@ -329,22 +371,31 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             vec![Span::styled(text.to_string(), fg(color))],
         );
     }
-    let hints = key_hints(&[
-        ("a", "provider"),
-        ("Ctrl+Space", "commands"),
-        ("h j k l", "move"),
-        ("⏎", "jump in"),
-        ("m", "peek"),
-        ("n N", "next that needs you"),
-        ("/", "search"),
-        ("[ ]", "tab"),
-        ("{ }", "machine"),
-        ("b", "backlog"),
-        ("i", "misc"),
-        ("M", "machines"),
-        ("?", "keys"),
-        ("q", "quit"),
-    ]);
+    let mut hints = card_hints(app);
+    // With a backlog card's keys in front, the rest gives up what the menu already lists.
+    hints.extend(key_hints(if hints.is_empty() {
+        &[
+            ("c", "new intent"),
+            ("⏎", "jump in"),
+            ("space", "peek"),
+            ("n N", "next that needs you"),
+            ("/", "search"),
+            ("f", "filter"),
+            ("b", "backlog"),
+            ("ctrl+space", "menu"),
+            ("?", "keys"),
+            ("q", "quit"),
+        ]
+    } else {
+        &[
+            ("c", "new intent"),
+            ("n N", "next that needs you"),
+            ("/", "search"),
+            ("f", "filter"),
+            ("ctrl+space", "menu"),
+            ("?", "keys"),
+        ]
+    }));
     put(
         f.buffer_mut(),
         rows[5].x,
@@ -519,12 +570,40 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
     }
 }
 
+/// Whether the board shows only part of the work, so its header names what.
+fn filtered(app: &App) -> bool {
+    app.owner.is_some()
+        || app.project.is_some()
+        || app.provider.is_some()
+        || app.wont_do
+        || app.busy
+        || !app.count.is_empty()
+}
+
 fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
-    let mut left = vec![
-        Span::styled(format!(" a provider: {}", app.provider_label()), fg(CYAN)),
-        Span::styled(format!("   owner: {}", app.owner_label()), fg(CYAN)),
-        Span::styled(format!("   project: {}", app.project_label()), fg(CYAN)),
-    ];
+    let mut shown = Vec::new();
+    if app.owner.is_some() {
+        shown.push(app.owner_label());
+    }
+    if let Some(p) = &app.project {
+        shown.push(p.clone());
+    }
+    if app.provider.is_some() {
+        shown.push(app.provider_label());
+    }
+    let mut left = if shown.is_empty() {
+        vec![Span::styled(" everything shown · f filters", fg(DIM))]
+    } else {
+        vec![
+            Span::styled(" showing ", fg(DIM)),
+            Span::styled(shown.join(" · "), bold(CYAN)),
+            Span::styled(" · ", fg(DIM)),
+            Span::styled("f", bold(FG)),
+            Span::styled(" change · ", fg(DIM)),
+            Span::styled("F", bold(FG)),
+            Span::styled(" show everything", fg(DIM)),
+        ]
+    };
     if app.wont_do {
         left.push(Span::styled("   WON’T DO", bold(YELLOW)));
     }
@@ -532,8 +611,6 @@ fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
         vec![Span::styled("◐ action in progress", fg(BLUE))]
     } else if !app.count.is_empty() {
         vec![Span::styled(format!("count: {}", app.count), fg(CYAN))]
-    } else if rect.width >= 90 {
-        key_hints(&[("Ctrl+Space", "commands")])
     } else {
         vec![]
     };
@@ -666,8 +743,8 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
 }
 
 fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
-    let key = app.pending_jump.as_deref()?;
-    let card = app.card(key)?;
+    let pending = app.pending_jump.as_ref()?;
+    let card = app.card(&pending.key)?;
     let conn = app
         .machines
         .get(card.machine_index)
@@ -935,6 +1012,8 @@ fn list_glyph(
                 ("✓", GREEN, when, DIM)
             }
         }
+        _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
+        _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
         _ => {
             let (glyph, color) = if c.dismissed() {
                 ("×", DIM)
@@ -1491,7 +1570,19 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         inner.width,
         vec![Span::styled("─".repeat(w), fg(BORDER))],
     );
-    let mut hints = vec![("⏎", "jump in"), ("n N", "next that needs you")];
+    // Waiting work has nothing to jump into: its line names the keys that start or change it.
+    let mut hints = match app.backlog_card_for_keys() {
+        Some(c) if c.dismissed() => vec![("u", "bring it back")],
+        Some(_) => vec![
+            ("d", "start it in its session"),
+            ("y", "still want it"),
+            ("x", "won’t do"),
+            ("J K", "move down / up"),
+            ("t", "to the top"),
+        ],
+        None => vec![("⏎", "jump in")],
+    };
+    hints.push(("n N", "next that needs you"));
     if max_scroll > 0 {
         hints.push(("j k", "scroll"));
     }
@@ -1507,40 +1598,145 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
 
 // ─── Work commands ─────────────────────────────────────────────────────────────────────────
 
-fn palette(f: &mut Frame, area: Rect) {
-    let rect = centered(area, 68, 20, Some(4));
+/// One column of the Ctrl+Space menu: its name, a line under it, and its keys.
+type MenuGroup<'a> = (&'a str, String, &'a [(&'a str, &'a str)]);
+
+fn palette(f: &mut Frame, area: Rect, app: &App) {
+    // Three columns with a line under each heading on a wide screen; two compact columns on an
+    // ordinary one (80×24); one when even that won't fit.
+    let wide = area.width >= 116;
+    let one_column = !wide && area.width.saturating_sub(2).min(76) < 70;
+    let rect = if wide {
+        centered(area, 112, 16, Some(6))
+    } else {
+        centered(area, 76, if one_column { 24 } else { 16 }, Some(1))
+    };
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
-    let mut lines = vec![
-        Line::from(Span::styled("COMMANDS", bold(CYAN))),
-        Line::raw(""),
+    let card = app.backlog_card_for_keys();
+    let this_card = card
+        .map(|c| format!("{} {}", c.reference, c.title))
+        .unwrap_or_else(|| "select a backlog card first".into());
+    let buf = f.buffer_mut();
+    let mut title = vec![
+        Span::styled("CTRL+SPACE", bold(CYAN)),
+        Span::styled("   press a key", fg(FG2)),
     ];
-    for (key, label) in [
-        ("n", "New intent"),
-        ("d", "Dispatch selected work"),
-        ("f", "Affirm: keep this work"),
-        ("x", "Move to won’t do"),
-        ("u", "Restore to backlog"),
-        ("t", "Change owner / tenant"),
-        ("p", "Change project"),
-        ("a", "Provider: all / Claude / Codex / others"),
-        ("w", "Show / hide won’t do"),
-        ("b", "Backlog: review and reorder"),
-        ("m", "Misc: conversations without an intent"),
-        ("g", "Go to top"),
-        ("?", "All keys"),
-    ] {
-        lines.push(Line::from(vec![
-            Span::styled(format!(" {key:<4}"), bold(CYAN)),
-            Span::styled(label, fg(FG)),
-        ]));
+    if !wide {
+        title.push(Span::styled(format!("   {this_card}"), fg(DIM)));
     }
-    lines.push(Line::raw(""));
-    lines.push(Line::from(Span::styled(
-        "Press a key · Esc closes",
-        fg(DIM),
-    )));
-    f.render_widget(Paragraph::new(lines), inner);
+    put_lr(
+        buf,
+        inner,
+        inner.y,
+        title,
+        vec![Span::styled("esc close", fg(DIM))],
+    );
+    let restore = card.is_some_and(|c| c.dismissed());
+    let card_keys: &[(&str, &str)] = if restore {
+        &[("u", "bring it back")]
+    } else {
+        &[
+            ("d", "start it"),
+            ("y", "still want it"),
+            ("x", "won’t do"),
+            ("J K", "move down / up"),
+            ("t", "move to the top"),
+        ]
+    };
+    let groups: [MenuGroup; 3] = [
+        ("THIS CARD", this_card, card_keys),
+        ("NEW", "in your own words".into(), &[("c", "new intent")]),
+        (
+            "SHOW",
+            "what the board lists".into(),
+            &[
+                ("b", "the backlog"),
+                ("w", "won’t do"),
+                ("i", "workspaces with no intent"),
+                ("f", "filter by who or project"),
+                ("a", "agents: all, Claude, Codex"),
+                ("M", "machines"),
+                ("?", "every key"),
+            ],
+        ),
+    ];
+    let columns: u16 = if wide {
+        3
+    } else if one_column {
+        1
+    } else {
+        2
+    };
+    let col_w = inner.width.saturating_sub(4 * (columns - 1)) / columns;
+    let top = inner.y + 2;
+    let mut y = top;
+    for (n, (name, sub, keys)) in groups.iter().enumerate() {
+        // Wide: a column each. Two columns: THIS CARD and NEW share the first.
+        let col = match columns {
+            3 => n as u16,
+            2 => u16::from(n == 2),
+            _ => 0,
+        };
+        if (columns == 3) || (columns == 2 && n != 1) {
+            y = top;
+        } else if n > 0 {
+            y += 1;
+        }
+        let x = inner.x + col * (col_w + 4);
+        let faint = card.is_none() && n == 0;
+        put(
+            buf,
+            x,
+            y,
+            col_w,
+            vec![Span::styled(name.to_string(), bold(FG2))],
+        );
+        y += 1;
+        if wide {
+            put(
+                buf,
+                x,
+                y,
+                col_w,
+                vec![Span::styled(
+                    trunc(sub, col_w as usize),
+                    fg(if faint { FAINT } else { DIM }),
+                )],
+            );
+            y += 2;
+        }
+        for (key, what) in keys.iter() {
+            put(
+                buf,
+                x,
+                y,
+                col_w,
+                vec![
+                    Span::styled(format!("{key:<5}"), bold(CYAN)),
+                    Span::styled(what.to_string(), fg(if faint { FAINT } else { FG })),
+                ],
+            );
+            y += 1;
+        }
+    }
+    put(
+        buf,
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        fit(
+            vec![Span::styled(
+                if inner.width >= 62 {
+                    "Every letter here also works on its own, without Ctrl+Space."
+                } else {
+                    "Each letter works without Ctrl+Space too."
+                },
+                fg(DIM),
+            )],
+            inner.width as usize,
+        ),
+    );
 }
 
 fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) -> Vec<String> {
@@ -1555,6 +1751,10 @@ fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) ->
         next.push(ch);
         if width(&next) > max_width && !line.is_empty() {
             lines.push(std::mem::take(&mut line));
+            if ch == ' ' {
+                // A wrapped line never starts with the space it broke at.
+                continue;
+            }
         }
         line.push(ch);
     }
@@ -1569,109 +1769,245 @@ fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) ->
     lines
 }
 
-fn compose(f: &mut Frame, area: Rect, app: &App, form: &IntentForm) {
-    let rect = centered(area, 94, 27, None);
+fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
+    let rect = centered(area, 100, 24, Some(4));
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
     let w = inner.width as usize;
-    let target = app
-        .machines
-        .get(form.machine)
-        .map(|m| m.name())
-        .unwrap_or_else(|| "no machine".into());
-    let fields = [
-        ("Title", form.title.as_str()),
-        ("Request", form.words.as_str()),
-        ("Organization", form.organization.as_str()),
-        ("Tenant", form.tenant.as_str()),
-        ("Project", form.project.as_str()),
-        ("Machine", target.as_str()),
-        ("Session", form.session.as_str()),
-    ];
-    let mut lines = vec![
-        Line::from(Span::styled("NEW INTENT", bold(CYAN))),
-        Line::from(Span::styled(
-            "Write the outcome you want. Leave Tenant empty for organization work.",
-            fg(DIM),
-        )),
-        Line::raw(""),
-    ];
-    let mut focused_line = 0;
-    for (index, (label, value)) in fields.iter().enumerate() {
-        let active = form.field == index;
-        if active {
-            focused_line = lines.len();
-        }
-        let name = format!("{}{label:<13}", if active { "› " } else { "  " });
-        let body = if value.is_empty() {
-            match index {
-                3 => "(organization work)",
-                4 => "(optional)",
-                _ => "…",
-            }
-        } else {
-            value
-        };
-        let parts = field_lines(
-            body,
-            w.saturating_sub(15).max(1),
-            if index == 1 { 3 } else { 1 },
-            active,
-        );
-        for (row, part) in parts.into_iter().enumerate() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    if row == 0 {
-                        name.clone()
-                    } else {
-                        " ".repeat(15)
-                    },
-                    if active { bold(CYAN) } else { fg(DIM) },
-                ),
-                Span::styled(
-                    part,
-                    if active {
-                        Style::default().fg(FG).bg(SEL)
-                    } else {
-                        fg(FG2)
-                    },
-                ),
-            ]));
-        }
-        lines.push(Line::raw(""));
-    }
-    if form.field == 7 {
-        focused_line = lines.len();
-    }
-    lines.push(Line::from(Span::styled(
-        "  Create intent  ",
-        if form.field == 7 {
-            Style::default()
-                .bg(CYAN)
-                .fg(BG)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            bold(CYAN)
-        },
-    )));
-    let body = Rect {
-        height: inner.height.saturating_sub(2),
-        ..inner
+    let buf = f.buffer_mut();
+    put_lr(
+        buf,
+        inner,
+        inner.y,
+        vec![
+            Span::styled("NEW INTENT", bold(CYAN)),
+            Span::styled(
+                "   Say what you want, the way you would to an agent.",
+                fg(FG2),
+            ),
+        ],
+        vec![Span::styled("esc cancel", fg(DIM))],
+    );
+    let boxed = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(8),
     };
-    let scroll = focused_line.saturating_sub(body.height.saturating_sub(1) as usize) as u16;
-    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
-    let hints = key_hints(&[
-        ("Tab / Shift+Tab", "field"),
-        ("← →", "machine"),
-        ("Ctrl+Enter", "create"),
-        ("Esc", "cancel"),
-    ]);
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(fg(BORDER))
+            .style(Style::default().bg(BG)),
+        boxed,
+    );
+    let text = pad(boxed, 2, 1);
+    let rows = text.height.max(1) as usize;
+    let lines: Vec<Line> = if draft.words.is_empty() {
+        vec![Line::from(vec![
+            Span::styled("▏", fg(CYAN)),
+            Span::styled(
+                "For example: the laptop's Wi-Fi drops after sleep; make it reconnect on its own.",
+                fg(FAINT),
+            ),
+        ])]
+    } else {
+        field_lines(&draft.words, text.width.max(1) as usize, rows, !app.busy)
+            .into_iter()
+            .map(|l| Line::styled(l, fg(FG)))
+            .collect()
+    };
+    f.render_widget(Paragraph::new(lines), text);
+    let machine = app
+        .machines
+        .get(draft.machine)
+        .map(|m| m.name())
+        .unwrap_or_else(|| "this machine".into());
+    let buf = f.buffer_mut();
+    let y = boxed.bottom() + 1;
+    let where_line = vec![
+        Span::styled("It goes in the backlog of ", fg(FG2)),
+        Span::styled(draft.session.clone(), bold(FG)),
+        Span::styled(" on ", fg(FG2)),
+        Span::styled(machine, bold(FG)),
+        Span::styled(
+            ", the session you're looking at, until you start it.",
+            fg(FG2),
+        ),
+    ];
+    put(buf, inner.x, y, inner.width, fit(where_line, w));
+    for (n, line) in wrap(
+        "Say \"start it now\", or name another session or who it's for, and the agent that writes it up does that instead.",
+        w,
+        2,
+    )
+    .into_iter()
+    .enumerate()
+    {
+        put(
+            buf,
+            inner.x,
+            y + 1 + n as u16,
+            inner.width,
+            vec![Span::styled(line, fg(DIM))],
+        );
+    }
+    let hints = if app.busy {
+        vec![Span::styled("◐ saving it…", fg(BLUE))]
+    } else {
+        key_hints(&[
+            ("⏎", "send"),
+            ("shift+⏎ / alt+⏎", "new line"),
+            ("ctrl+u", "clear"),
+            ("esc", "cancel, your words kept for next time"),
+        ])
+    };
     put(
-        f.buffer_mut(),
+        buf,
         inner.x,
         inner.bottom().saturating_sub(1),
         inner.width,
         fit(hints, w),
+    );
+}
+
+/// The filter list (f): who the work is for, or one of their projects.
+fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
+    let rows = app.filter_matches(query);
+    let list_h = (rows.len() as u16)
+        .min(area.height.saturating_sub(14))
+        .max(1);
+    let rect = centered(area, 84, list_h + 10, Some(4));
+    dialog(f, rect, CYAN);
+    let inner = pad(rect, 3, 1);
+    let w = inner.width as usize;
+    let buf = f.buffer_mut();
+    put_lr(
+        buf,
+        inner,
+        inner.y,
+        vec![
+            Span::styled("SHOW ONLY", bold(CYAN)),
+            Span::styled("   who it's for, or one project", fg(FG2)),
+        ],
+        vec![Span::styled("esc close", fg(DIM))],
+    );
+    put(
+        buf,
+        inner.x,
+        inner.y + 2,
+        inner.width,
+        if query.is_empty() {
+            vec![
+                Span::styled("› ", bold(CYAN)),
+                Span::styled("type to narrow", fg(DIM)),
+            ]
+        } else {
+            vec![
+                Span::styled("› ", bold(CYAN)),
+                Span::styled(query.to_string(), bold(FG)),
+                Span::styled("▏", fg(CYAN)),
+            ]
+        },
+    );
+    let top = inner.y + 4;
+    let sel = sel.min(rows.len().saturating_sub(1));
+    let skip = sel.saturating_sub(list_h.saturating_sub(1) as usize);
+    if rows.is_empty() {
+        put(
+            buf,
+            inner.x,
+            top,
+            inner.width,
+            vec![Span::styled("Nothing matches.", fg(DIM))],
+        );
+    }
+    for (n, row) in rows.iter().enumerate().skip(skip).take(list_h as usize) {
+        let y = top + (n - skip) as u16;
+        let on = row.owner == app.owner && row.project == app.project;
+        let counts = format!("{:>3} open {:>4} backlog", row.open, row.backlog);
+        let left = vec![
+            Span::styled(if on { "✓ " } else { "  " }, bold(CYAN)),
+            Span::raw("  ".repeat(row.depth as usize)),
+            Span::styled(
+                row.label.clone(),
+                if n == sel || on { bold(FG) } else { fg(FG) },
+            ),
+            Span::styled(
+                if row.kind.is_empty() {
+                    String::new()
+                } else {
+                    format!("  {}", row.kind)
+                },
+                fg(DIM),
+            ),
+        ];
+        let line = Rect {
+            y,
+            height: 1,
+            ..inner
+        };
+        if y >= inner.bottom().saturating_sub(3) {
+            break;
+        }
+        if n == sel {
+            buf.set_style(line, Style::default().bg(SEL));
+        }
+        put_lr(buf, line, y, left, vec![Span::styled(counts, fg(FG2))]);
+    }
+    let agents_y = inner.bottom().saturating_sub(3);
+    let mut agents = vec![Span::styled("AGENTS   ", bold(FG2))];
+    for (name, value) in [
+        ("all", None),
+        ("Claude", Some("claude")),
+        ("Codex", Some("codex")),
+    ] {
+        let on = app.provider.as_deref() == value;
+        agents.push(Span::styled(
+            format!(" {name} "),
+            if on {
+                Style::default().bg(SEL).fg(FG).add_modifier(Modifier::BOLD)
+            } else {
+                fg(FG2)
+            },
+        ));
+        agents.push(Span::raw(" "));
+    }
+    if let Some(other) = app
+        .provider
+        .as_deref()
+        .filter(|p| !matches!(*p, "claude" | "codex"))
+    {
+        agents.push(Span::styled(
+            format!(" {other} "),
+            Style::default().bg(SEL).fg(FG).add_modifier(Modifier::BOLD),
+        ));
+    }
+    put_lr(
+        buf,
+        Rect {
+            y: agents_y,
+            height: 1,
+            ..inner
+        },
+        agents_y,
+        agents,
+        key_hints(&[("tab", "switches here"), ("a", "anywhere")]),
+    );
+    put(
+        buf,
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        fit(
+            key_hints(&[
+                ("↑ ↓", "move"),
+                ("⏎", "show only this"),
+                ("All work", "shows everything"),
+                ("esc", "close"),
+            ]),
+            w,
+        ),
     );
 }
 
@@ -1954,53 +2290,26 @@ pub type KeyRow = (&'static str, &'static str, &'static str);
 
 pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
     (
-        "WORK COMMANDS",
-        &[
-            ("Ctrl+Space", "open commands, then press a key below", ""),
-            ("leader n", "compose a new intent", "Ctrl+Enter creates"),
-            (
-                "a / leader a",
-                "filter by reported agent provider",
-                "all / Claude / Codex / others",
-            ),
-            ("leader d", "dispatch selected work", "d in backlog"),
-            (
-                "leader f",
-                "affirm: still want selected work",
-                "y in backlog",
-            ),
-            ("leader x/u", "move to won’t do / restore", "x/u in backlog"),
-            ("leader t/p", "cycle owner or project filter", ""),
-            ("w", "toggle won’t-do view", "leader w too"),
-            (
-                "10K / 10J",
-                "move backlog item ten positions",
-                "K/J move one",
-            ),
-        ],
-    ),
-    (
-        "CARDS",
+        "MOVE AND LOOK",
         &[
             ("h j k l", "move between columns and cards", "arrows too"),
+            ("g  G", "first / last card in the column", ""),
             (
                 "⏎",
                 "jump in: herdr, full screen, on the card's workspace",
                 "",
             ),
             (
-                "m",
+                "space",
                 "peek: its stage, what it needs, its last update",
-                "space too",
+                "m too",
             ),
             (
                 "n  N",
                 "next / previous card that needs you",
                 "ctrl+alt+j/k too",
             ),
-            ("/", "search the current machine and work filters", ""),
-            ("b", "the backlog", ""),
-            ("i", "misc: conversations without an intent", "leader m too"),
+            ("/", "search cards, workspaces and sessions", ""),
         ],
     ),
     (
@@ -2008,13 +2317,13 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
         &[
             (
                 "[  ]",
-                "previous / next session of chosen machine",
-                "ctrl+alt+h/l, tab too",
+                "previous / next session on this machine",
+                "tab, ctrl+alt+h/l too",
             ),
             ("{  }", "previous / next machine", "ctrl+alt+shift+h/l too"),
-            ("0", "all-machine overview", ""),
-            ("1..9", "session tab 1 to 9", ""),
-            ("M", "machines: every connection and its state", ""),
+            ("0", "every session on every machine", ""),
+            ("1..9", "session 1 to 9", ""),
+            ("M", "machines and how each connection is doing", ""),
         ],
     ),
     (
@@ -2031,10 +2340,45 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
             ("M x", "hide a machine, or show it again", ""),
         ],
     ),
+];
+
+/// The right-hand column: making and changing work, what the board shows, and the menu.
+pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
     (
-        "KERDR",
+        "WORK · the same keys on the board, the backlog and a peek",
         &[
-            ("?", "this menu", ""),
+            ("c", "new intent, in your own words", ""),
+            (
+                "d",
+                "start the selected backlog intent",
+                "asks first past the usual limit",
+            ),
+            ("y", "still want it: its age starts again", ""),
+            ("x", "won’t do", "asks first"),
+            ("u", "bring it back from won’t do", ""),
+            ("J  K", "move it down / up your order", "10J moves ten"),
+            ("t", "move it to the top of your order", ""),
+        ],
+    ),
+    (
+        "SHOW",
+        &[
+            ("b", "the backlog, in your order", ""),
+            ("w", "the won’t do list", ""),
+            ("i", "workspaces with no intent (misc)", ""),
+            (
+                "f",
+                "show only one owner, tenant or project",
+                "F shows everything",
+            ),
+            ("a", "agents: all, Claude, Codex, then others", ""),
+        ],
+    ),
+    (
+        "MENU",
+        &[
+            ("ctrl+space", "a menu of the work and show keys", ""),
+            ("?", "this list", ""),
             ("q", "quit Kerdr; every session keeps running", ""),
         ],
     ),
@@ -2068,7 +2412,7 @@ fn keys(f: &mut Frame, area: Rect, app: &App, filter: &str, typing: bool, scroll
         vec![
             Span::styled("kerdr keys", bold(CYAN)),
             Span::styled(
-                "   Ctrl+Space opens work commands. Inside herdr, use herdr’s own prefix.",
+                "   On the board every key is Kerdr's. Inside herdr every key is herdr's, plus the ones below.",
                 fg(DIM),
             ),
         ],
@@ -2149,6 +2493,17 @@ fn keys(f: &mut Frame, area: Rect, app: &App, filter: &str, typing: bool, scroll
     }
 
     let mut out: Vec<Vec<Span<'static>>> = Vec::new();
+    for (group, items) in WORK_KEYS {
+        let shown: Vec<_> = items.iter().filter(|(k, d, a)| matches(k, d, a)).collect();
+        if shown.is_empty() {
+            continue;
+        }
+        out.push(heading(group));
+        for (k, d, a) in shown {
+            out.extend(entry(k, d, a, 13, right.width));
+        }
+        out.push(vec![]);
+    }
     let herdr_rows: Vec<(String, &str, &str)> = HERDR_KEYS
         .iter()
         .map(|(k, d, a)| (format!("{} {k}", app.prefix), *d, *a))
@@ -2161,35 +2516,19 @@ fn keys(f: &mut Frame, area: Rect, app: &App, filter: &str, typing: bool, scroll
         }
         out.push(vec![]);
         for l in wrap(
-            "Everything else inside is herdr's, unchanged: tabs, panes, agents. The space and backspace keys are Kerdr's: kerdr herdr-keys --install adds them to herdr's config on each machine, so they work over SSH too.",
+            "Everything else inside is herdr's, unchanged. The space and backspace keys are Kerdr's: kerdr herdr-keys --install adds them to herdr's config on each machine.",
             right.width as usize,
-            4,
+            3,
         ) {
             out.push(vec![Span::styled(l, fg(DIM))]);
         }
     }
-    if q.is_empty() {
-        out.push(vec![]);
-        out.push(heading("WORK COMMANDS"));
-        for l in wrap(
-            "Press Ctrl+Space, then a command key, to create, dispatch or review work and change filters. Movement and search still work directly. Inside herdr, its prefix brings you back to Kerdr.",
-            right.width as usize,
-            6,
-        ) {
-            out.push(vec![Span::styled(l, fg(DIM))]);
-        }
-        out.push(vec![]);
-        out.push(heading("WHILE A MACHINE RECONNECTS"));
-        out.extend(entry(
-            "⏎",
-            "waits for the machine, then jumps in",
-            "",
-            22,
-            right.width,
-        ));
-        out.extend(entry("esc", "stops waiting", "", 22, right.width));
-    }
-    for (r, spans) in out.iter().take(right.height as usize).enumerate() {
+    for (r, spans) in out
+        .iter()
+        .skip(scroll as usize)
+        .take(right.height as usize)
+        .enumerate()
+    {
         put(buf, right.x, right.y + r as u16, right.width, spans.clone());
     }
     let footer_y = (inner.y + inner.height).saturating_sub(1);
@@ -2265,7 +2604,7 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
         Conn::Connecting => vec!["Reaching it for the first time.".into()],
         Conn::Reconnecting { since, attempt, retry_at, detail } => vec![
             format!(
-                "Lost the connection {} ago ({}). Trying again in {}s (try {}). The wait grows to two minutes, like herdr's own reconnects.",
+                "Lost the connection {} ago ({}). Trying again in {}s (try {}). The wait grows to 15 seconds.",
                 ago(*since, now),
                 detail,
                 (*retry_at - now).num_seconds().max(0),
@@ -2278,7 +2617,7 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
         ],
         Conn::Unreachable { since, retry_at, detail } => vec![
             format!("No answer since {} ({detail}): asleep, off, or off the network.", clock(*since)),
-            format!("Kerdr tries again in {}s, then every two minutes; r tries now.", (*retry_at - now).num_seconds().max(0)),
+            format!("Kerdr tries again in {}s, then every 15 seconds; r tries now.", (*retry_at - now).num_seconds().max(0)),
         ],
         Conn::HostKey { detail } => vec![
             format!("SSH asked whether to trust this machine's host key ({detail})."),
@@ -2320,7 +2659,7 @@ const LEGEND: &[(&str, ratatui::style::Color, &str, &str)] = &[
         "⟳",
         YELLOW,
         "reconnecting",
-        "Dropped. Retries with longer waits, up to two minutes. Cards stay, dimmed.",
+        "Dropped. Retries with longer waits, up to 15 seconds. Cards stay, dimmed.",
     ),
     (
         "○",
@@ -2730,10 +3069,12 @@ fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             key_hints(&[
                 ("⏎", "jump in"),
                 ("j k", "select"),
-                ("m", "peek"),
+                ("space", "peek"),
                 ("[ ]", "session"),
                 ("{ }", "machine"),
-                ("Esc", "board"),
+                ("c", "new intent"),
+                ("f", "filter"),
+                ("esc", "board"),
             ]),
             rows[5].width as usize,
         ),
@@ -2836,7 +3177,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     )];
     for (k, &i) in items.iter().enumerate() {
         let c = &app.board.cards[i];
-        let (glyph, gc, _, _) = list_glyph(c, now);
+        let (glyph, gc, meta, meta_color) = list_glyph(c, now);
         let age = c
             .stale_days
             .map(|days| {
@@ -2859,14 +3200,18 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                 Span::styled(format!("{:<6}", c.reference), bold(FG)),
                 Span::styled(c.title.clone(), fg(FG)),
             ],
-            vec![Span::styled(
-                age,
-                fg(if c.stale_days.unwrap_or(0) >= 14 {
-                    YELLOW
-                } else {
-                    DIM
-                }),
-            )],
+            if c.intake().is_some() {
+                vec![Span::styled(meta, fg(meta_color))]
+            } else {
+                vec![Span::styled(
+                    age,
+                    fg(if c.stale_days.unwrap_or(0) >= 14 {
+                        YELLOW
+                    } else {
+                        DIM
+                    }),
+                )]
+            },
         ));
     }
     if items.is_empty() {
@@ -2960,6 +3305,27 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             fg(DIM),
             None,
         ));
+        match c.intake() {
+            Some("pending") => {
+                out.push(Line::raw(""));
+                out.extend(wrapped(
+                    "✎ An agent is writing this up from your words: its title, who it's for and its triage. It stays here until you start it.",
+                    w,
+                    fg(PURPLE),
+                    None,
+                ));
+            }
+            Some("failed") => {
+                out.push(Line::raw(""));
+                out.extend(wrapped(
+                    "✎ No agent could write this up, so it keeps your words and their first ones as its title. The agent that starts it writes it up.",
+                    w,
+                    fg(YELLOW),
+                    None,
+                ));
+            }
+            _ => {}
+        }
         if let Some(d) = &c.detail {
             for wo in d.waits_on.iter().filter(|w| w.open != Some(false)) {
                 out.extend(wrapped(
@@ -2992,7 +3358,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                 .filter(|&&j| app.board.cards[j].stale_days.unwrap_or(0) >= 14)
                 .count();
             out.extend(wrapped(
-                &format!("{stale_n} items need review. Affirm the work you still want, or move it to won’t do. You can restore it later."),
+                &format!("{stale_n} items need review. y for the work you still want, x for won’t do; u brings it back later."),
                 w,
                 fg(FG),
                 Some(("▌ ", YELLOW)),
@@ -3023,14 +3389,14 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                         .max_by_key(|o| o.slots.free().unwrap_or(0));
                     match other {
                         Some(o) => format!(
-                            "{} is at its usual limit of {}. Dispatch asks before opening another slot. Or use {}, which has {} free.",
+                            "{} is at its usual limit of {}. Starting it with d asks before opening another slot. Or use {}, which has {} free.",
                             r.session,
                             r.slots.limit.unwrap_or(0),
                             o.session,
                             o.slots.free().unwrap_or(0)
                         ),
                         None => format!(
-                            "{} is at its usual limit. Dispatch asks before opening another slot. At the maximum, finish or shelve one first.",
+                            "{} is at its usual limit. Starting it with d asks before opening another slot. At the maximum, finish or shelve one first.",
                             r.session
                         ),
                     }
@@ -3053,17 +3419,30 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         rows[4].y,
         rows[4].width,
         fit(
-            key_hints(&[
-                ("j k", "move"),
-                ("10K / 10J", "reorder"),
-                ("y", "affirm"),
-                ("d", "dispatch"),
-                ("x", "won’t do"),
-                ("u", "restore"),
-                ("w", "view won’t do"),
-                ("⏎", "peek"),
-                ("esc", "board"),
-            ]),
+            key_hints(if app.wont_do {
+                &[
+                    ("j k", "move"),
+                    ("u", "bring it back"),
+                    ("⏎", "peek"),
+                    ("w", "the backlog"),
+                    ("f", "filter"),
+                    ("esc", "board"),
+                ]
+            } else {
+                &[
+                    ("j k", "move"),
+                    ("d", "start it"),
+                    ("y", "still want it"),
+                    ("x", "won’t do"),
+                    ("J K", "move down / up · 10J ten places"),
+                    ("t", "to the top"),
+                    ("c", "new intent"),
+                    ("⏎", "peek"),
+                    ("w", "won’t do list"),
+                    ("f", "filter"),
+                    ("esc", "board"),
+                ]
+            }),
             rows[4].width as usize,
         ),
     );
@@ -3123,14 +3502,18 @@ mod tests {
             Mode::Misc { sel: 99 },
             Mode::Palette {
                 back: Box::new(Mode::Backlog { sel: 0 }),
+                target: None,
             },
             Mode::Compose {
-                form: IntentForm {
-                    title: "New useful work".into(),
+                draft: Draft {
                     words: "A clear outcome".into(),
-                    field: 7,
                     ..Default::default()
                 },
+                back: Box::new(Mode::Board),
+            },
+            Mode::Filter {
+                query: "zzz".into(),
+                sel: 99,
                 back: Box::new(Mode::Board),
             },
             Mode::Confirm {
@@ -3217,64 +3600,40 @@ mod tests {
         let a = demo(false);
         let text = rendered(&a, 176, 44);
         assert!(
-            text.contains("Ctrl+Space"),
-            "leader commands must be discoverable"
+            text.contains("ctrl+space menu"),
+            "the menu must be discoverable"
         );
+        assert!(text.contains("{ } machine · [ ] session"));
         assert!(
-            text.to_lowercase().contains("owner: all"),
-            "owner scope must remain visible"
+            !text.contains("owner:") && !text.contains("showing"),
+            "an unfiltered board spends no line on filters"
         );
     }
 
     #[test]
-    fn composer_shows_user_text_and_target_before_submission() {
+    fn new_intent_box_takes_prose_and_says_where_it_goes() {
         let mut a = demo(false);
         a.mode = Mode::Compose {
-            form: IntentForm {
-                title: "Compare the shortlist".into(),
+            draft: Draft {
                 words: "Show trade-offs before choosing".into(),
-                organization: "Arkship".into(),
-                tenant: "pick4me".into(),
-                project: "picker".into(),
                 machine: 0,
                 session: "web".into(),
-                field: 0,
             },
             back: Box::new(Mode::Board),
         };
         let text = rendered(&a, 176, 44);
         for expected in [
             "NEW INTENT",
-            "Compare the shortlist",
             "Show trade-offs before choosing",
-            "pick4me",
-            "picker",
-            "laptop",
-            "web",
-            "Ctrl+Enter",
+            "backlog of web",
+            "start it now",
+            "send",
+            "new line",
         ] {
-            assert!(text.contains(expected), "composer hid {expected}");
+            assert!(text.contains(expected), "the box hid {expected}");
         }
-    }
-
-    #[test]
-    fn confirmation_preserves_reason_and_cancel_action() {
-        let mut a = demo(false);
-        a.mode = Mode::Confirm {
-            machine: 0,
-            request: serde_json::json!({}),
-            title: "Start shortlist review?".into(),
-            message: "web has 3 active workspaces; the usual limit is 3.".into(),
-            back: Box::new(Mode::Backlog { sel: 0 }),
-        };
-        let text = rendered(&a, 176, 44);
-        for expected in [
-            "Start shortlist review?",
-            "3 active workspaces",
-            "start anyway",
-            "cancel",
-        ] {
-            assert!(text.contains(expected), "confirmation hid {expected}");
+        for gone in ["Title", "Organization", "Tenant", "Create intent"] {
+            assert!(!text.contains(gone), "the old form's {gone} is back");
         }
     }
 
@@ -3284,7 +3643,7 @@ mod tests {
         for mode in [
             Mode::Backlog { sel: 0 },
             Mode::Compose {
-                form: IntentForm::default(),
+                draft: Draft::default(),
                 back: Box::new(Mode::Board),
             },
             Mode::Peek {
@@ -3324,25 +3683,22 @@ mod tests {
         let text = rendered(&a, 176, 44);
         assert!(text.contains("RESTORE TO BACKLOG"));
         assert!(!text.contains("STARTING IT"));
-        assert!(text.contains("owner:"));
+        assert!(text.contains("WON’T DO"));
+        assert!(text.contains("u bring it back"));
     }
 
     #[test]
     fn composer_keeps_the_end_of_multiline_input_visible() {
         let mut a = demo(false);
         a.mode = Mode::Compose {
-            form: IntentForm {
-                title: "A new task".into(),
-                words: format!("{}\nLatest input", "Earlier input with context ".repeat(30)),
-                field: 1,
+            draft: Draft {
+                words: format!("{}\nLatest input", "Earlier input with context ".repeat(80)),
                 ..Default::default()
             },
             back: Box::new(Mode::Board),
         };
         let text = rendered(&a, 176, 44);
         assert!(text.contains("Latest input"));
-        assert!(text.contains("Create intent"));
-        assert!(!text.contains("Create & start"));
     }
 
     #[test]
@@ -3351,16 +3707,14 @@ mod tests {
         a.provider = Some("codex".into());
         for width in [60, 100, 176] {
             let text = rendered(&a, width, 30);
-            assert!(
-                text.contains("provider: Codex"),
-                "provider hidden at {width}"
-            );
+            assert!(text.contains("showing Codex"), "provider hidden at {width}");
             a.mode = Mode::Palette {
                 back: Box::new(Mode::Board),
+                target: None,
             };
             let text = rendered(&a, width, 30);
             assert!(
-                text.contains("Provider"),
+                text.contains("agents: all, Claude, Codex"),
                 "provider command hidden at {width}"
             );
             a.mode = Mode::Board;
@@ -3391,6 +3745,55 @@ mod tests {
             !first.contains("●2"),
             "unmatched provider attention leaked: {first}"
         );
+    }
+
+    #[test]
+    fn the_menu_shows_every_command_in_an_ordinary_window() {
+        let mut a = demo(false);
+        a.mode = Mode::Palette {
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        for (w, h) in [(80, 24), (100, 30), (60, 30), (176, 44)] {
+            let text = rendered(&a, w, h);
+            for expected in [
+                "start it",
+                "move to the top",
+                "new intent",
+                "the backlog",
+                "filter by who or project",
+                "agents: all, Claude, Codex",
+                "machines",
+                "every key",
+                "without Ctrl+Space",
+            ] {
+                assert!(text.contains(expected), "{expected} missing at {w}x{h}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_peek_at_waiting_work_names_the_key_that_starts_it() {
+        let mut a = demo(false);
+        let key = a
+            .board
+            .cards
+            .iter()
+            .find(|c| crate::app::waiting_work(c))
+            .unwrap()
+            .key
+            .clone();
+        a.sel = crate::app::Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key),
+        };
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("d start it in its session"), "{text}");
+        assert!(!text.contains("⏎ jump in"));
     }
 
     #[test]
@@ -3427,7 +3830,7 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect::<String>();
-        for hint in ["No work cards", "[ ]", "{ }", "provider", "Misc"] {
+        for hint in ["No work cards", "[ ]", "{ }", "a agents", "i misc"] {
             assert!(text.contains(hint), "missing {hint}: {text}");
         }
     }

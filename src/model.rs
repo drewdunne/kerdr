@@ -213,6 +213,11 @@ impl Card {
         self.detail.as_ref().and_then(|d| d.disposition.as_deref()) == Some("wont_do")
     }
 
+    /// `pending` or `failed` while an agent hasn't written the intent up from its words.
+    pub fn intake(&self) -> Option<&str> {
+        self.detail.as_ref().and_then(|d| d.intake.as_deref())
+    }
+
     pub fn owner_key(&self) -> String {
         let d = self.detail.as_ref();
         if let Some(t) = d
@@ -256,6 +261,16 @@ impl Card {
 
     pub fn is_open_workspace(&self) -> bool {
         self.workspace_id.is_some() && self.session.is_some()
+    }
+
+    /// How a message names this card's workspace: "#41's workspace", or "Workspace 41-dark-mode"
+    /// for a card that is only a workspace.
+    pub fn workspace_name(&self) -> String {
+        match self.source {
+            _ if self.reference.is_empty() => "That workspace".into(),
+            Source::Feed => format!("{}'s workspace", self.reference),
+            Source::Workspace => format!("Workspace {}", self.reference),
+        }
     }
 
     pub fn needs_you(&self) -> bool {

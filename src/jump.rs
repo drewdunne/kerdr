@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -133,6 +133,8 @@ awk 'BEGIN { done = 0 }
 pub enum Outcome {
     Board,
     Next,
+    /// herdr says the workspace isn't there: it closed after the board last read it.
+    Closed,
     Failed(String),
 }
 
@@ -159,6 +161,13 @@ fn first_line(out: &transport::Output) -> String {
         .to_string()
 }
 
+/// Whether herdr refused because the workspace no longer exists.
+fn workspace_gone(out: &transport::Output) -> bool {
+    [&out.stdout, &out.stderr]
+        .iter()
+        .any(|s| s.contains("\"workspace_not_found\""))
+}
+
 pub struct TerminalFlags {
     pub keyboard: bool,
 }
@@ -171,6 +180,7 @@ pub fn leave(flags: &TerminalFlags) {
     let _ = execute!(
         out,
         DisableMouseCapture,
+        DisableBracketedPaste,
         LeaveAlternateScreen,
         ratatui::crossterm::cursor::Show
     );
@@ -187,12 +197,13 @@ pub fn enter(terminal: &mut DefaultTerminal, flags: &TerminalFlags) {
         // modifyOtherKeys mode itself. Return the host to the board's ordinary key path.
         let _ = out.write_all(b"\x1b[?9001l\x1b[>4;0m\x1b[?7h");
     }
-    // herdr resets these when it exits, but not when its window is cut off over SSH.
+    // herdr resets these when it exits, but not when its window is cut off over SSH. The
+    // board takes pastes whole (the new-intent box keeps their line breaks).
     let _ = execute!(
         out,
         DisableMouseCapture,
-        DisableBracketedPaste,
         DisableFocusChange,
+        EnableBracketedPaste,
         EnterAlternateScreen,
         ratatui::crossterm::cursor::Hide
     );
@@ -229,6 +240,9 @@ pub fn run(
         ));
     }
     if !out.ok() {
+        if workspace_gone(&out) {
+            return Outcome::Closed;
+        }
         return Outcome::Failed(format!(
             "herdr couldn't open {}: {}",
             jump.label,
@@ -499,6 +513,23 @@ mod tests {
             choose_via(&machine(None), Some("0.9.1"), Some("0.9.3")),
             Via::Local
         );
+    }
+
+    #[test]
+    fn a_closed_workspace_is_told_apart_from_other_failures() {
+        // What herdr 0.9.1 prints for `workspace focus` on a workspace that has closed.
+        let gone = transport::Output {
+            status: Some(1),
+            stdout: r#"{"error":{"code":"workspace_not_found","message":"workspace w1 not found"},"id":"cli:workspace:focus"}"#.into(),
+            ..Default::default()
+        };
+        assert!(workspace_gone(&gone));
+        let other = transport::Output {
+            status: Some(1),
+            stderr: "error: couldn't connect to the herdr server".into(),
+            ..Default::default()
+        };
+        assert!(!workspace_gone(&other));
     }
 
     #[cfg(unix)]

@@ -13,17 +13,41 @@ use crate::poll::{Conn, Event};
 
 #[path = "controls.rs"]
 mod controls;
+#[cfg(test)]
+pub(crate) use controls::waiting_work;
 
+/// A new intent in Andrew's own words. The agent that writes it up fills in everything else:
+/// its title, who it's for, its project and its triage.
 #[derive(Clone, Debug, Default)]
-pub struct IntentForm {
-    pub title: String,
+pub struct Draft {
     pub words: String,
-    pub organization: String,
-    pub tenant: String,
-    pub project: String,
     pub machine: usize,
     pub session: String,
-    pub field: usize,
+}
+
+/// One new intent as sent: its id lets the adapter tell a resend of the same words from new
+/// work. It's reused only for the same words to the same place, and only until an answer
+/// names the record (or says plainly that nothing was made, when no earlier send went unheard).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Submission {
+    pub id: String,
+    pub words: String,
+    pub machine: usize,
+    pub session: String,
+    /// An earlier send of it got no answer, so it may have been made.
+    pub unknown: bool,
+}
+
+/// One line of the filter list: an owner (organization or tenant), or one of its projects.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FilterRow {
+    pub label: String,
+    pub kind: String,
+    pub depth: u8,
+    pub owner: Option<String>,
+    pub project: Option<String>,
+    pub open: usize,
+    pub backlog: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -73,9 +97,16 @@ pub struct Search {
 pub enum Mode {
     Palette {
         back: Box<Mode>,
+        /// The card the menu opened on: its card keys act on that card or on none.
+        target: Option<String>,
     },
     Compose {
-        form: IntentForm,
+        draft: Draft,
+        back: Box<Mode>,
+    },
+    Filter {
+        query: String,
+        sel: usize,
         back: Box<Mode>,
     },
     Confirm {
@@ -111,8 +142,9 @@ fn misc_selection(mode: &Mode) -> Option<usize> {
     match mode {
         Mode::Misc { sel } => Some(*sel),
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => misc_selection(back),
         _ => None,
     }
@@ -122,8 +154,9 @@ fn set_misc_selection(mode: &mut Mode, selected: usize) {
     match mode {
         Mode::Misc { sel } => *sel = selected,
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => set_misc_selection(back, selected),
         _ => {}
     }
@@ -133,8 +166,9 @@ fn backlog_selection(mode: &Mode) -> Option<usize> {
     match mode {
         Mode::Backlog { sel } => Some(*sel),
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => backlog_selection(back),
         _ => None,
     }
@@ -144,8 +178,9 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
     match mode {
         Mode::Backlog { sel } => *sel = selected,
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => set_backlog_selection(back, selected),
         _ => {}
     }
@@ -154,9 +189,10 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
 fn holds_peek(mode: &Mode) -> bool {
     match mode {
         Mode::Peek { .. } => true,
-        Mode::Palette { back } | Mode::Compose { back, .. } | Mode::Confirm { back, .. } => {
-            holds_peek(back)
-        }
+        Mode::Palette { back, .. }
+        | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
+        | Mode::Confirm { back, .. } => holds_peek(back),
         _ => false,
     }
 }
@@ -199,6 +235,15 @@ pub struct Selection {
     pub key: Option<String>,
 }
 
+/// A card to jump into as soon as its machine answers, and what to call it if the card is gone
+/// by then.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingJump {
+    pub key: String,
+    pub workspace: String,
+    pub machine: String,
+}
+
 pub struct App {
     pub cfg: Config,
     pub machines: Vec<MachineState>,
@@ -213,12 +258,18 @@ pub struct App {
     pub wont_do: bool,
     pub busy: bool,
     pub count: String,
+    /// Words typed into the new-intent box and not sent yet, kept for the next time it opens.
+    pub draft: String,
+    /// The new intent last sent, while its answer is still owed or unknown.
+    pub submission: Option<Submission>,
+    /// The intent just created here, selected in the backlog as soon as its card arrives.
+    pub new_intent_id: Option<(usize, String)>,
     backlog_focus: Option<String>,
     pub sel: Selection,
     pub mode: Mode,
     pub message: Option<(String, Tone, Instant)>,
     /// A card to jump into as soon as its machine answers.
-    pub pending_jump: Option<String>,
+    pub pending_jump: Option<PendingJump>,
     pub width: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
@@ -243,6 +294,9 @@ impl App {
             wont_do: false,
             busy: false,
             count: String::new(),
+            draft: String::new(),
+            new_intent_id: None,
+            submission: None,
             backlog_focus: None,
             sel: Selection::default(),
             mode: Mode::Board,
@@ -293,7 +347,7 @@ impl App {
             match data.feed.take() {
                 Some(Ok(feed)) => {
                     m.feed = Some(feed);
-                    m.feed_error = None;
+                    m.feed_error = data.feed_failed_after.take();
                 }
                 Some(Err(e)) => m.feed_error = Some(e),
                 None => {}
@@ -354,6 +408,16 @@ impl App {
             return;
         }
         self.fix_selection();
+        // Only once its card is in the backlog as shown: a filter may hide it for now.
+        if let Some((machine, id)) = self.new_intent_id.clone()
+            && let Some(&i) = self.backlog_cards().iter().find(|&&i| {
+                let c = &self.board.cards[i];
+                c.machine_index == machine && c.detail.as_ref().is_some_and(|d| d.id == id)
+            })
+        {
+            self.backlog_focus = Some(self.board.cards[i].key.clone());
+            self.new_intent_id = None;
+        }
         if let Some(sel) = backlog_selection(&self.mode) {
             let items = self.backlog_cards();
             let found = self
@@ -573,8 +637,9 @@ impl App {
         Some(key)
     }
 
-    /// The next card that needs you after `key`, skipping it: for jumping straight on.
-    pub fn next_needs_you_after(&self, key: &str) -> Option<String> {
+    /// The next card that needs you after `key`, skipping it and any in `skip` (workspaces found
+    /// closed on the way): for jumping straight on.
+    pub fn next_needs_you_after(&self, key: &str, skip: &[String]) -> Option<String> {
         let order = self.needs_you_order();
         let pos = order.iter().position(|o| o == key);
         let candidates: Vec<&String> = match pos {
@@ -583,8 +648,48 @@ impl App {
         };
         candidates
             .into_iter()
+            .filter(|k| !skip.contains(k))
             .find(|k| self.card(k).is_some_and(|c| c.is_open_workspace()))
             .cloned()
+    }
+
+    /// Waits for this card's machine to answer, then jumps in.
+    pub fn wait_to_jump(&mut self, card: &Card) {
+        self.pending_jump = Some(PendingJump {
+            key: card.key.clone(),
+            workspace: card.workspace_name(),
+            machine: card.machine.clone(),
+        });
+    }
+
+    /// The waiting jump, once its machine answers: the card to jump into now. None while it still
+    /// waits, or once Kerdr has said why it can't: the workspace closed while the machine was
+    /// away.
+    pub fn pending_jump_ready(&mut self) -> Option<String> {
+        let pending = self.pending_jump.clone()?;
+        let open = match self.card(&pending.key) {
+            Some(c) if !self.machines[c.machine_index].conn.is_live() => return None,
+            Some(c) => Some(c.is_open_workspace()),
+            None => None,
+        };
+        self.pending_jump = None;
+        let PendingJump {
+            key,
+            workspace,
+            machine,
+        } = pending;
+        match open {
+            Some(true) => return Some(key),
+            Some(false) => self.say(
+                format!("{workspace} closed while {machine} was away."),
+                Tone::Warn,
+            ),
+            None => self.say(
+                format!("{workspace} closed while {machine} was away; it's off the board now."),
+                Tone::Warn,
+            ),
+        }
+        None
     }
 
     fn set_tab(&mut self, tab: usize) {
@@ -686,7 +791,10 @@ impl App {
             Mode::Machines { sel } => self.machines_key(key, sel),
             Mode::Backlog { sel } => self.backlog_key(key, sel),
             Mode::Misc { sel } => self.misc_key(key, sel),
-            Mode::Palette { .. } | Mode::Compose { .. } | Mode::Confirm { .. } => Action::None,
+            Mode::Palette { .. }
+            | Mode::Compose { .. }
+            | Mode::Filter { .. }
+            | Mode::Confirm { .. } => Action::None,
         }
     }
 
@@ -1169,6 +1277,8 @@ impl App {
     }
 
     fn backlog_key(&mut self, key: KeyEvent, sel: usize) -> Action {
+        // Moving on your own ends the wait to select a just-made intent.
+        self.new_intent_id = None;
         let items = self.backlog_cards();
         let n = items.len();
         match key.code {
@@ -1471,7 +1581,7 @@ mod tests {
     fn misc_menu_and_peek_preserve_selection_across_poll_and_filters() {
         let mut app = demo_app();
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        press(&mut app, 'm');
+        press(&mut app, 'i');
         assert!(matches!(app.mode, Mode::Misc { .. }));
         let original = app.selected().unwrap().clone();
         press(&mut app, 'm');
@@ -1524,7 +1634,7 @@ mod tests {
         press(&mut app, 'i');
         let original = app.selected().unwrap().key.clone();
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        press(&mut app, 'n');
+        press(&mut app, 'c');
         assert!(matches!(app.mode, Mode::Compose { .. }));
         app.rebuild();
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
@@ -1592,7 +1702,9 @@ mod tests {
     fn dispatch_confirmation_cancels_without_action_and_only_yes_overrides() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        let request = serde_json::json!({"action":"dispatch","id":"0041"});
+        let (key, id) = waiting_backlog_card(&app);
+        let home = app.card(&key).unwrap().machine_index;
+        let request = serde_json::json!({"action":"dispatch","id":id});
         let response = crate::actions::Response {
             ok: false,
             message: "3 of 3 slots used".into(),
@@ -1600,21 +1712,21 @@ mod tests {
             used: Some(3),
             limit: Some(3),
             session: Some("web".into()),
-            id: Some("0041".into()),
+            id: Some(id.clone()),
         };
-        app.finish_action(0, request.clone(), Ok(response.clone()));
+        app.finish_action(home, request.clone(), Ok(response.clone()));
         assert!(matches!(app.mode, Mode::Confirm { .. }));
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
             Action::None
         );
         assert!(!matches!(app.mode, Mode::Confirm { .. }));
-        app.finish_action(0, request, Ok(response));
+        app.finish_action(home, request, Ok(response));
         let Action::Mutate { machine, request } = press(&mut app, 'y') else {
             panic!("expected action")
         };
-        assert_eq!(machine, 0);
-        assert_eq!(request["id"], "0041");
+        assert_eq!(machine, home);
+        assert_eq!(request["id"], id.as_str());
         assert_eq!(request["override"], true);
     }
 
@@ -1626,7 +1738,7 @@ mod tests {
         let i = app.backlog_cards()[0];
         let id = app.board.cards[i].detail.as_ref().unwrap().id.clone();
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
-        let Action::Mutate { request, .. } = press(&mut app, 'f') else {
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
             panic!("expected affirmation")
         };
         assert_eq!(request["action"], "refresh");
@@ -1699,7 +1811,7 @@ mod tests {
             }
         }
         app.rebuild();
-        let Action::Mutate { request, .. } = press(&mut app, 'f') else {
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
             panic!("expected affirmation")
         };
         assert_eq!(request["id"], id);
@@ -1888,5 +2000,576 @@ mod tests {
         let (a, b) = match_range("move", "İstanbul office move").unwrap();
         assert!(a <= b);
         assert!(score("move", "İstanbul office move").is_some());
+    }
+
+    /// The build box answers again, without this card's workspace.
+    fn build_box_back_without(app: &mut App, card: &Card) {
+        let mi = card.machine_index;
+        let ws = card.workspace_id.clone().unwrap();
+        let session = card.session.clone().unwrap();
+        let mut data = app.machines[mi].data.clone().unwrap();
+        if let Some(Ok(snap)) = data.snapshots.get_mut(&session) {
+            snap.workspaces.retain(|w| w.workspace_id != ws);
+            snap.agents.retain(|a| a.workspace_id != ws);
+        }
+        app.apply(Event {
+            machine: mi,
+            conn: Conn::Live {
+                latency: Duration::from_millis(9),
+            },
+            data: Some(data),
+            at: Local::now(),
+        });
+    }
+
+    fn away_card(app: &App, source: crate::model::Source) -> Card {
+        let mi = app.machine_index("build-box").unwrap();
+        app.board
+            .cards
+            .iter()
+            .find(|c| c.machine_index == mi && c.source == source && c.is_open_workspace())
+            .unwrap()
+            .clone()
+    }
+
+    #[test]
+    fn a_waiting_jump_says_so_when_its_workspace_closed_while_the_machine_was_away() {
+        let mut app = App::new(Config::default(), crate::demo::machines(true));
+        let card = away_card(&app, crate::model::Source::Workspace);
+        app.wait_to_jump(&card);
+        assert_eq!(app.pending_jump_ready(), None);
+        assert!(
+            app.pending_jump.is_some(),
+            "still waiting while build-box is away"
+        );
+        build_box_back_without(&mut app, &card);
+        assert!(app.card(&card.key).is_none());
+        assert_eq!(app.pending_jump_ready(), None);
+        assert!(app.pending_jump.is_none());
+        assert_eq!(
+            app.message(),
+            Some((
+                format!(
+                    "Workspace {} closed while build-box was away; it's off the board now.",
+                    card.reference
+                )
+                .as_str(),
+                Tone::Warn
+            ))
+        );
+    }
+
+    #[test]
+    fn a_waiting_jump_into_an_intent_whose_workspace_closed_says_so_and_keeps_the_card() {
+        let mut app = App::new(Config::default(), crate::demo::machines(true));
+        let card = away_card(&app, crate::model::Source::Feed);
+        app.wait_to_jump(&card);
+        build_box_back_without(&mut app, &card);
+        assert!(app.card(&card.key).is_some_and(|c| !c.is_open_workspace()));
+        assert_eq!(app.pending_jump_ready(), None);
+        assert!(app.pending_jump.is_none());
+        let (text, _) = app.message().unwrap();
+        assert_eq!(
+            text,
+            format!(
+                "{}'s workspace closed while build-box was away.",
+                card.reference
+            )
+        );
+    }
+
+    #[test]
+    fn a_waiting_jump_goes_ahead_once_its_machine_answers_with_the_workspace() {
+        let mut app = App::new(Config::default(), crate::demo::machines(true));
+        let card = away_card(&app, crate::model::Source::Workspace);
+        app.wait_to_jump(&card);
+        let mi = card.machine_index;
+        let data = app.machines[mi].data.clone();
+        app.apply(Event {
+            machine: mi,
+            conn: Conn::Live {
+                latency: Duration::from_millis(9),
+            },
+            data,
+            at: Local::now(),
+        });
+        assert_eq!(app.pending_jump_ready(), Some(card.key));
+        assert!(app.pending_jump.is_none());
+    }
+
+    #[test]
+    fn the_next_card_skips_workspaces_found_closed() {
+        let app = demo_app();
+        let open: Vec<String> = app
+            .needs_you_order()
+            .into_iter()
+            .filter(|k| app.card(k).is_some_and(|c| c.is_open_workspace()))
+            .collect();
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert_eq!(
+            app.next_needs_you_after(&open[0], &[]),
+            Some(open[1].clone())
+        );
+        assert_eq!(
+            app.next_needs_you_after(&open[1], &[]),
+            Some(open[0].clone())
+        );
+        assert_eq!(
+            app.next_needs_you_after(&open[0], std::slice::from_ref(&open[1])),
+            None
+        );
+    }
+
+    fn waiting_backlog_card(app: &App) -> (String, String) {
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                c.stage == Stage::Backlog
+                    && !c.dismissed()
+                    && !c.is_open_workspace()
+                    && c.state.as_deref() != Some("shelved")
+            })
+            .expect("a waiting backlog card in the demo");
+        (card.key.clone(), card.detail.as_ref().unwrap().id.clone())
+    }
+
+    #[test]
+    fn card_keys_work_on_the_board_with_the_same_letters_as_the_backlog() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        assert_eq!(
+            app.backlog_card_for_keys().map(|c| c.key.clone()),
+            Some(key)
+        );
+        for (c, action) in [
+            ('y', "refresh"),
+            ('d', "dispatch"),
+            ('t', "move"),
+            ('J', "move"),
+        ] {
+            let Action::Mutate { request, .. } = press(&mut app, c) else {
+                panic!("{c} did nothing on the board")
+            };
+            assert_eq!(request["action"], action, "{c}");
+            assert_eq!(request["id"], id, "{c}");
+            app.busy = false;
+        }
+        // Digits still pick sessions on the board; counted moves are for the backlog.
+        press(&mut app, '0');
+        assert!(app.count.is_empty());
+        assert!(matches!(press(&mut app, 'x'), Action::None));
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+    }
+
+    #[test]
+    fn card_keys_on_work_under_way_say_what_they_are_for() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Build && c.detail.is_some())
+            .unwrap()
+            .clone();
+        app.sel = Selection {
+            col: card.stage.index(),
+            key: Some(card.key.clone()),
+        };
+        assert!(app.backlog_card_for_keys().is_none());
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        let (text, _) = app.message().unwrap();
+        assert!(
+            text.contains(&card.reference) && text.contains("backlog work"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_new_intent_is_prose_sent_with_enter_and_kept_on_escape() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        for c in "Fix the wifi".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::ALT));
+        app.on_paste("after sleep.\r\nIt bites \"every\" morning.");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(
+            app.draft,
+            "Fix the wifi\n\nafter sleep.\nIt bites \"every\" morning."
+        );
+        // The kept words come back, and Enter sends them with the session in view.
+        press(&mut app, 'c');
+        let Action::Mutate { request, machine } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request["action"], "create");
+        assert_eq!(request["words"], app.draft.trim());
+        assert_eq!(request["session"], "default");
+        assert!(request.get("title").is_none() && request.get("tenant").is_none());
+        // It worked: the words are gone and the new intent is picked out in the backlog.
+        app.finish_action(
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: "Saved as #9001.".into(),
+                confirmation: false,
+                used: None,
+                limit: None,
+                session: Some("default".into()),
+                id: Some("9001".into()),
+            }),
+        );
+        assert!(app.draft.is_empty());
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+        assert_eq!(app.new_intent_id, Some((0, "9001".to_string())));
+    }
+
+    #[test]
+    fn a_new_intent_saved_but_not_published_is_never_sent_twice() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.draft = "Make the dock wake the screens".into();
+        press(&mut app, 'c');
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        app.finish_action(
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "Saved as #9002 on this machine only; it couldn't be pushed.".into(),
+                confirmation: false,
+                used: None,
+                limit: None,
+                session: None,
+                id: Some("9002".into()),
+            }),
+        );
+        assert!(app.draft.is_empty());
+        assert!(!matches!(app.mode, Mode::Compose { .. }));
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    fn answer(ok: bool, id: Option<&str>) -> Result<crate::actions::Response, String> {
+        Ok(crate::actions::Response {
+            ok,
+            message: if ok { "Saved." } else { "The store is locked" }.into(),
+            confirmation: false,
+            used: None,
+            limit: None,
+            session: None,
+            id: id.map(str::to_string),
+        })
+    }
+
+    fn send_words(app: &mut App, words: &str) -> serde_json::Value {
+        app.busy = false;
+        app.draft = words.into();
+        app.mode = Mode::Board;
+        press(app, 'c');
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        request
+    }
+
+    #[test]
+    fn a_resend_after_a_lost_answer_names_the_same_submission() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let first = send_words(&mut app, "Back up the NAS");
+        let id = first["submission"].as_str().unwrap().to_string();
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && id.len() <= 64);
+        // No answer (a timeout): it may have been made, so the same words keep the same id,
+        // even past a later refusal, which can't say what the first send did.
+        app.finish_action(0, first, Err("timed out; the result is unknown".into()));
+        let second = send_words(&mut app, "Back up the NAS");
+        assert_eq!(second["submission"], id.as_str());
+        app.finish_action(0, second, answer(false, None));
+        let third = send_words(&mut app, "Back up the NAS");
+        assert_eq!(third["submission"], id.as_str());
+        // The answer names the record: settled, and the next words are new work.
+        app.finish_action(0, third, answer(true, Some("9003")));
+        let fourth = send_words(&mut app, "Back up the NAS");
+        assert_ne!(fourth["submission"], id.as_str());
+    }
+
+    #[test]
+    fn changed_words_after_a_lost_answer_are_new_work() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let first = send_words(&mut app, "Back up the NAS");
+        let id = first["submission"].as_str().unwrap().to_string();
+        app.finish_action(0, first, Err("timed out".into()));
+        let edited = send_words(&mut app, "Back up the NAS and the laptop");
+        assert_ne!(edited["submission"], id.as_str());
+        // A refusal of a send nobody lost settles it.
+        let edited_id = edited["submission"].as_str().unwrap().to_string();
+        app.finish_action(0, edited, answer(false, None));
+        let again = send_words(&mut app, "Back up the NAS and the laptop");
+        assert_ne!(again["submission"], edited_id.as_str());
+    }
+
+    #[test]
+    fn an_empty_new_intent_sends_nothing() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        press(&mut app, ' ');
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+    }
+
+    #[test]
+    fn the_menu_uses_the_direct_letters_and_n_is_not_new() {
+        let mut app = demo_app();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Palette { .. }), "n left the menu");
+        press(&mut app, 'c');
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 'f');
+        assert!(matches!(app.mode, Mode::Filter { .. }));
+    }
+
+    #[test]
+    fn the_filter_list_picks_an_owner_and_f_shows_everything_again() {
+        let mut app = demo_app();
+        press(&mut app, 'f');
+        let rows = app.filter_rows();
+        assert_eq!(rows[0].label, "All work");
+        assert_eq!(rows[0].owner, None);
+        let pick = rows
+            .iter()
+            .position(|r| r.owner.is_some() && r.project.is_none())
+            .expect("an owner row");
+        let owner = rows[pick].owner.clone();
+        for _ in 0..pick {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(app.owner, owner);
+        assert!(
+            app.board
+                .cards
+                .iter()
+                .filter(|c| app.card_visible(c))
+                .all(|c| Some(c.owner_key()) == owner)
+        );
+        // Typing narrows the list rather than moving through it.
+        press(&mut app, 'f');
+        press(&mut app, 'j');
+        let Mode::Filter { query, .. } = &app.mode else {
+            panic!("not in the filter list")
+        };
+        assert_eq!(query, "j");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.owner, owner, "Esc changed the filter");
+        app.provider = Some("codex".into());
+        press(&mut app, 'F');
+        assert_eq!(
+            (app.owner.clone(), app.project.clone(), app.provider.clone()),
+            (None, None, None)
+        );
+    }
+
+    #[test]
+    fn a_new_intent_is_selected_once_its_card_arrives() {
+        let mut app = demo_app();
+        let (key, id) = waiting_backlog_card(&app);
+        let machine = app.card(&key).unwrap().machine_index;
+        app.enter_backlog(false);
+        // Another machine's record with the same id is someone else's.
+        app.new_intent_id = Some((machine + 1, id.clone()));
+        app.rebuild();
+        assert!(app.new_intent_id.is_some());
+        app.new_intent_id = Some((machine, id));
+        app.rebuild();
+        assert!(app.new_intent_id.is_none());
+        let Mode::Backlog { sel } = app.mode else {
+            panic!("not in the backlog")
+        };
+        assert_eq!(app.board.cards[app.backlog_cards()[sel]].key, key);
+    }
+
+    #[test]
+    fn a_menu_opened_on_a_card_never_acts_on_another_after_a_refresh() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.mode = Mode::Backlog { sel: 0 };
+        let first = app.backlog_cards()[0];
+        let id = app.board.cards[first].detail.as_ref().unwrap().id.clone();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        // The card it opened on starts while the menu is open, and leaves the backlog.
+        for machine in &mut app.machines {
+            if let Some(feed) = &mut machine.feed {
+                for card in &mut feed.cards {
+                    if card.id == id {
+                        card.stage = Some("build".into());
+                        card.state = Some("active".into());
+                    }
+                }
+            }
+        }
+        app.rebuild();
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn card_keys_refuse_finished_work_whatever_its_state_says() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].stage = Stage::Maintain;
+        app.board.cards[i].state = None;
+        app.sel = Selection {
+            col: Stage::Maintain.index(),
+            key: Some(key),
+        };
+        assert!(app.backlog_card_for_keys().is_none());
+        for c in ['d', 'y', 'x', 't', 'J', 'u'] {
+            assert_eq!(
+                press(&mut app, c),
+                Action::None,
+                "{c} acted on finished work"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_word_never_splits_a_character() {
+        let mut app = demo_app();
+        for (words, left) in [
+            ("one\u{2003}two", "one\u{2003}"),
+            ("one\u{a0}two", "one\u{a0}"),
+            ("ünïcödé wörds  ", "ünïcödé "),
+            ("lone", ""),
+        ] {
+            app.draft = words.into();
+            app.mode = Mode::Board;
+            press(&mut app, 'c');
+            app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+            let Mode::Compose { draft, .. } = &app.mode else {
+                panic!("left the box")
+            };
+            assert_eq!(draft.words, left, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn the_filter_list_applies_the_row_it_highlights() {
+        let mut app = demo_app();
+        press(&mut app, 'f');
+        let rows = app.filter_rows();
+        app.mode = Mode::Filter {
+            query: String::new(),
+            sel: rows.len() + 5,
+            back: Box::new(Mode::Board),
+        };
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Mode::Filter { sel, .. } = app.mode else {
+            panic!("left the list")
+        };
+        let shown = app.filter_matches("");
+        assert_eq!(sel, shown.len() - 1);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.owner, shown[sel].owner);
+        assert_eq!(app.project, shown[sel].project);
+    }
+
+    #[test]
+    fn a_paste_reaches_the_keys_list_search() {
+        let mut app = demo_app();
+        app.mode = Mode::Keys {
+            filter: String::new(),
+            typing: true,
+            scroll: 7,
+        };
+        app.on_paste("machine\nnow");
+        let Mode::Keys { filter, scroll, .. } = &app.mode else {
+            panic!("left the keys list")
+        };
+        assert_eq!((filter.as_str(), *scroll), ("machine now", 0));
+    }
+
+    #[test]
+    fn a_menu_opened_on_no_card_acts_on_none_that_arrives_later() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.sel = Selection::default();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, Mode::Palette { target: None, .. }));
+        // A card turns up selected while the menu is open.
+        let (key, _) = waiting_backlog_card(&app);
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key),
+        };
+        assert_eq!(press(&mut app, 'd'), Action::None);
+    }
+
+    #[test]
+    fn a_confirmation_rechecks_its_intent_before_sending() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        // It starts elsewhere while the question is open.
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].stage = Stage::Build;
+        app.board.cards[i].state = Some("active".into());
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        // Still waiting: yes sends it.
+        app.board.cards[i].stage = Stage::Backlog;
+        app.board.cards[i].state = Some("queued".into());
+        press(&mut app, 'x');
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(
+            (request["action"].as_str(), request["id"].as_str()),
+            (Some("dismiss"), Some(id.as_str()))
+        );
     }
 }

@@ -146,6 +146,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         snapshots: [("web".to_string(), Ok(laptop_snap))].into_iter().collect(),
         keys: true,
         feed: None,
+        feed_failed_after: None,
     });
 
     // The build box: the API and the background lane.
@@ -208,6 +209,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         .collect(),
         keys: true,
         feed: None,
+        feed_failed_after: None,
     });
 
     gpu.conn = Conn::HostKey {

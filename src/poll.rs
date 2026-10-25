@@ -3,9 +3,10 @@
 //! card feed. Failures move the machine through the connection states the board shows.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender, SyncSender, TrySendError};
+use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Local};
 
@@ -106,6 +107,8 @@ pub struct MachineData {
     pub keys: bool,
     /// None when the feed wasn't due this time; the last one still stands.
     pub feed: Option<Result<Feed, String>>,
+    /// A feed read that failed after the good one above, when two reads were merged into one.
+    pub feed_failed_after: Option<String>,
 }
 
 #[derive(Debug)]
@@ -113,7 +116,121 @@ pub struct Event {
     pub machine: usize,
     pub conn: Conn,
     pub data: Option<MachineData>,
+    /// When `data` was read.
     pub at: DateTime<Local>,
+}
+
+/// A newer read in place of one the board hasn't applied yet. It keeps the older read's feed
+/// when it brought none, and the older read's data when it brought none (a dropped connection),
+/// so the board ends up where applying both in turn would have left it.
+fn replace(old: Event, mut new: Event) -> Event {
+    match (&mut new.data, old.data) {
+        (Some(data), Some(old_data)) => match (data.feed.take(), old_data.feed) {
+            // No feed this time: the older read's stands, with any failure that followed it.
+            (None, old_feed) => {
+                data.feed = old_feed;
+                data.feed_failed_after = old_data.feed_failed_after;
+            }
+            // A failure after good cards keeps the cards and says it failed, as applying the
+            // two reads in turn would have.
+            (Some(Err(e)), Some(Ok(feed))) => {
+                data.feed = Some(Ok(feed));
+                data.feed_failed_after = Some(e);
+            }
+            (new_feed, _) => data.feed = new_feed,
+        },
+        (None, Some(old_data)) => {
+            new.data = Some(old_data);
+            new.at = old.at;
+        }
+        _ => {}
+    }
+    new
+}
+
+/// Each machine's newest read that the board hasn't applied yet. While you're inside herdr
+/// nobody applies them, so a newer read takes the place of an older one: coming back, the board
+/// gets each machine as it is now, never a queue of what it was, and nothing new is dropped.
+#[derive(Default)]
+pub struct Inbox {
+    /// Per machine, under one lock so a reader can't be retired between its check and its read
+    /// landing.
+    slots: Mutex<Vec<Slot>>,
+    arrived: Condvar,
+}
+
+#[derive(Default)]
+struct Slot {
+    /// Which reader's reads count. A reader that was stopped (a machine hidden, then shown
+    /// again) may still be mid-read; what it finds is older than its replacement's.
+    reader: u64,
+    /// The read, and when it began.
+    read: Option<(Event, Instant)>,
+}
+
+impl Inbox {
+    fn slots(&self, i: usize) -> MutexGuard<'_, Vec<Slot>> {
+        // A reader that panicked can only have left whole reads behind.
+        let mut slots = self.slots.lock().unwrap_or_else(|e| e.into_inner());
+        if slots.len() <= i {
+            slots.resize_with(i + 1, Slot::default);
+        }
+        slots
+    }
+
+    /// A new reader for machine `i`: from now on only its reads count, and an older reader's
+    /// unread one is dropped. Also called when a reader stops, so nothing it was still reading
+    /// lands.
+    pub fn next_reader(&self, i: usize) -> u64 {
+        let mut slots = self.slots(i);
+        slots[i].reader += 1;
+        slots[i].read = None;
+        slots[i].reader
+    }
+
+    /// A read that began at `started`, from reader `reader` (see `next_reader`).
+    pub fn put(&self, ev: Event, started: Instant, reader: u64) {
+        let i = ev.machine;
+        let mut slots = self.slots(i);
+        if slots[i].reader != reader {
+            return;
+        }
+        let ev = match slots[i].read.take() {
+            Some((old, _)) => replace(old, ev),
+            None => ev,
+        };
+        slots[i].read = Some((ev, started));
+        self.arrived.notify_all();
+    }
+
+    /// Every read waiting, in machine order.
+    pub fn take(&self) -> Vec<Event> {
+        self.slots(0)
+            .iter_mut()
+            .filter_map(|s| s.read.take().map(|(ev, _)| ev))
+            .collect()
+    }
+
+    /// Waits until each of `machines` has a read waiting that began at `since` or later, or
+    /// `timeout` passes. Says whether they all came.
+    pub fn wait_since(&self, machines: &[usize], since: Instant, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut slots = self.slots(0);
+        loop {
+            let fresh = machines.iter().all(|&i| {
+                matches!(slots.get(i).and_then(|s| s.read.as_ref()), Some((_, started)) if *started >= since)
+            });
+            let left = deadline.saturating_duration_since(Instant::now());
+            if fresh || left.is_zero() {
+                return fresh;
+            }
+            slots = self
+                .arrived
+                .wait_timeout(slots, left)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
+        }
+    }
 }
 
 pub enum Wake {
@@ -131,13 +248,26 @@ pub struct Timing {
     pub feed_every: Duration,
 }
 
+/// The longest wait between tries once a connection drops, so a laptop back from sleep has its
+/// machines on the board again within seconds.
+pub const RETRY_CAP: Duration = Duration::from_secs(15);
+
+/// A machine whose SSH needs you (a host key, a password) waits longer: only a person fixes it.
+const NEEDS_YOU_WAIT: Duration = Duration::from_secs(120);
+
 pub fn backoff(attempt: u32) -> Duration {
-    Duration::from_secs((2u64 << attempt.min(6)).min(120))
+    Duration::from_secs(2u64 << attempt.min(3)).min(RETRY_CAP)
 }
 
 const GIVE_UP_AFTER: i64 = 120;
 
-pub fn spawn(index: usize, machine: Machine, timing: Timing, tx: SyncSender<Event>) -> Poller {
+pub fn spawn(
+    index: usize,
+    machine: Machine,
+    timing: Timing,
+    inbox: Arc<Inbox>,
+    reader: u64,
+) -> Poller {
     let (wake_tx, wake_rx) = mpsc::channel();
     thread::spawn(move || {
         let target = match &machine.ssh {
@@ -151,6 +281,7 @@ pub fn spawn(index: usize, machine: Machine, timing: Timing, tx: SyncSender<Even
         loop {
             let feed_due = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
+            let started = Instant::now();
             let out = collect(&machine, feed_due);
             let now = Local::now();
             let (conn, data, wait) = match read(&target, &out, feed_due) {
@@ -158,12 +289,13 @@ pub fn spawn(index: usize, machine: Machine, timing: Timing, tx: SyncSender<Even
                     attempt = 0;
                     first_failure = None;
                     ever_live = true;
+                    // The inbox keeps this feed even if a newer read takes this one's place.
                     if feed_due {
-                        last_feed = Some(std::time::Instant::now());
+                        last_feed = Some(Instant::now());
                     }
                     (Conn::Live { latency: out.took }, Some(data), timing.every)
                 }
-                Err(Failure::Herdr(conn)) => (conn, None, Duration::from_secs(120)),
+                Err(Failure::Herdr(conn)) => (conn, None, RETRY_CAP),
                 Err(Failure::Ssh(problem)) => {
                     attempt += 1;
                     let since = *first_failure.get_or_insert(now);
@@ -191,23 +323,23 @@ pub fn spawn(index: usize, machine: Machine, timing: Timing, tx: SyncSender<Even
                         },
                     };
                     let wait = if conn.needs_you() {
-                        Duration::from_secs(120)
+                        NEEDS_YOU_WAIT
                     } else {
                         wait
                     };
                     (conn, None, wait)
                 }
             };
-            // A full queue means the board is busy elsewhere (you're inside herdr): this read is
-            // dropped rather than piling up, and the next one brings it up to date.
-            if let Err(TrySendError::Disconnected(_)) = tx.try_send(Event {
-                machine: index,
-                conn,
-                data,
-                at: now,
-            }) {
-                return;
-            }
+            inbox.put(
+                Event {
+                    machine: index,
+                    conn,
+                    data,
+                    at: now,
+                },
+                started,
+                reader,
+            );
             match wake_rx.recv_timeout(wait) {
                 Ok(Wake::Feed) => {
                     last_feed = None;
@@ -364,6 +496,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         snapshots,
         keys: sections.keys.unwrap_or(false),
         feed,
+        feed_failed_after: None,
     })
 }
 
@@ -406,9 +539,166 @@ mod tests {
     use super::*;
 
     #[test]
-    fn backoff_grows_to_two_minutes() {
+    fn backoff_grows_to_fifteen_seconds() {
         let secs: Vec<u64> = (0..9).map(|a| backoff(a).as_secs()).collect();
-        assert_eq!(secs, [2, 4, 8, 16, 32, 64, 120, 120, 120]);
+        assert_eq!(secs, [2, 4, 8, 15, 15, 15, 15, 15, 15]);
+        assert!((0..100).chain([u32::MAX]).all(|a| backoff(a) <= RETRY_CAP));
+    }
+
+    fn live() -> Conn {
+        Conn::Live {
+            latency: Duration::from_millis(5),
+        }
+    }
+
+    fn read_of(machine: usize, conn: Conn, host: Option<&str>, feed: bool) -> Event {
+        Event {
+            machine,
+            conn,
+            data: host.map(|h| MachineData {
+                host: Some(h.into()),
+                feed: feed.then(|| Ok(Feed::default())),
+                ..Default::default()
+            }),
+            at: Local::now(),
+        }
+    }
+
+    fn host(ev: &Event) -> Option<&str> {
+        ev.data.as_ref().and_then(|d| d.host.as_deref())
+    }
+
+    #[test]
+    fn a_newer_read_takes_the_place_of_an_unread_older_one() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        inbox.put(read_of(1, live(), Some("before you went in"), false), t, 0);
+        inbox.put(read_of(0, live(), Some("another machine"), false), t, 0);
+        inbox.put(read_of(1, live(), Some("now"), false), t, 0);
+        let reads = inbox.take();
+        assert_eq!(reads.len(), 2);
+        assert_eq!(
+            (reads[0].machine, host(&reads[0])),
+            (0, Some("another machine"))
+        );
+        assert_eq!((reads[1].machine, host(&reads[1])), (1, Some("now")));
+        assert!(inbox.take().is_empty());
+    }
+
+    #[test]
+    fn a_feed_is_never_lost_to_a_newer_read_without_one() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        inbox.put(read_of(0, live(), Some("with the feed"), true), t, 0);
+        inbox.put(read_of(0, live(), Some("without"), false), t, 0);
+        let ev = inbox.take().pop().unwrap();
+        assert_eq!(host(&ev), Some("without"));
+        assert!(matches!(ev.data.unwrap().feed, Some(Ok(_))));
+    }
+
+    #[test]
+    fn a_failed_feed_read_never_hides_the_good_one_before_it() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        inbox.put(read_of(0, live(), Some("good cards"), true), t, 0);
+        let mut failed = read_of(0, live(), Some("feed failed"), false);
+        failed.data.as_mut().unwrap().feed = Some(Err("feed timed out".into()));
+        inbox.put(failed, t, 0);
+        inbox.put(read_of(0, live(), Some("feed not due"), false), t, 0);
+        let ev = inbox.take().pop().unwrap();
+        assert_eq!(host(&ev), Some("feed not due"));
+        let data = ev.data.unwrap();
+        assert!(matches!(data.feed, Some(Ok(_))));
+        assert_eq!(data.feed_failed_after.as_deref(), Some("feed timed out"));
+    }
+
+    #[test]
+    fn a_retired_reader_can_never_land_a_read() {
+        let inbox = Arc::new(Inbox::default());
+        for _ in 0..200 {
+            let old = inbox.next_reader(0);
+            inbox.put(
+                read_of(0, live(), Some("old, unread"), false),
+                Instant::now(),
+                old,
+            );
+            let writer = {
+                let inbox = inbox.clone();
+                std::thread::spawn(move || {
+                    inbox.put(
+                        read_of(0, live(), Some("old, late"), false),
+                        Instant::now(),
+                        old,
+                    )
+                })
+            };
+            let new = inbox.next_reader(0);
+            writer.join().unwrap();
+            inbox.put(read_of(0, live(), Some("new"), false), Instant::now(), new);
+            let reads = inbox.take();
+            assert_eq!(reads.len(), 1);
+            assert_eq!(host(&reads[0]), Some("new"));
+        }
+    }
+
+    #[test]
+    fn a_stopped_reader_never_overwrites_its_replacement() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        let first = inbox.next_reader(0);
+        let second = inbox.next_reader(0);
+        inbox.put(read_of(0, live(), Some("new reader"), false), t, second);
+        inbox.put(
+            read_of(0, live(), Some("old reader, late"), false),
+            t,
+            first,
+        );
+        let ev = inbox.take().pop().unwrap();
+        assert_eq!(host(&ev), Some("new reader"));
+        // Stopping a reader retires it too.
+        inbox.next_reader(0);
+        inbox.put(read_of(0, live(), Some("stopped"), false), t, second);
+        assert!(inbox.take().is_empty());
+    }
+
+    #[test]
+    fn a_dropped_connection_keeps_the_newer_data_it_replaced() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        let good = read_of(0, live(), Some("last good"), true);
+        let at = good.at;
+        inbox.put(good, t, 0);
+        let dropped = Conn::Reconnecting {
+            since: Local::now(),
+            attempt: 1,
+            retry_at: Local::now(),
+            detail: "Connection timed out".into(),
+        };
+        inbox.put(read_of(0, dropped, None, false), t, 0);
+        let ev = inbox.take().pop().unwrap();
+        assert!(matches!(ev.conn, Conn::Reconnecting { .. }));
+        assert_eq!(host(&ev), Some("last good"));
+        assert_eq!(ev.at, at);
+        assert!(matches!(ev.data.unwrap().feed, Some(Ok(_))));
+    }
+
+    #[test]
+    fn waiting_for_fresh_reads_ends_when_they_come_or_time_runs_out() {
+        let inbox = Arc::new(Inbox::default());
+        let old = Instant::now();
+        let since = old + Duration::from_millis(1);
+        inbox.put(read_of(0, live(), Some("from before"), false), old, 0);
+        assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
+        let reader = {
+            let inbox = inbox.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                inbox.put(read_of(0, live(), Some("fresh"), false), Instant::now(), 0);
+            })
+        };
+        assert!(inbox.wait_since(&[0], since, Duration::from_secs(5)));
+        reader.join().unwrap();
+        assert_eq!(host(&inbox.take()[0]), Some("fresh"));
     }
 
     #[test]

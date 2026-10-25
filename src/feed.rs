@@ -51,6 +51,10 @@ pub struct FeedCard {
     pub backlog_rank: Option<i64>,
     #[serde(default)]
     pub disposition: Option<String>,
+    /// `pending` while an agent writes up an intent from the words it was made with, `failed`
+    /// when none could; absent once it's written up.
+    #[serde(default)]
+    pub intake: Option<String>,
     #[serde(default, rename = "ref")]
     pub reference: Option<String>,
     pub title: String,
