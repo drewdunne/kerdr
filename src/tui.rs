@@ -45,11 +45,13 @@ impl Live {
     fn start(&mut self, app: &App, i: usize) {
         let m = app.machines[i].machine.clone();
         let timing = Self::timing(app, &m);
-        self.pollers[i] = Some(poll::spawn(i, m, timing, self.inbox.clone()));
+        let reader = self.inbox.next_reader(i);
+        self.pollers[i] = Some(poll::spawn(i, m, timing, self.inbox.clone(), reader));
     }
 
     fn stop(&mut self, i: usize) {
         if let Some(p) = self.pollers[i].take() {
+            self.inbox.next_reader(i);
             let _ = p.wake.send(Wake::Stop);
         }
     }

@@ -71,7 +71,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             dim_behind(f);
             peek(f, area, app, *scroll);
         }
-        Mode::Palette { back } => {
+        Mode::Palette { back, .. } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
             palette(f, area, app);
@@ -1590,28 +1590,36 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
 type MenuGroup<'a> = (&'a str, String, &'a [(&'a str, &'a str)]);
 
 fn palette(f: &mut Frame, area: Rect, app: &App) {
-    let rect = if area.width >= 116 {
+    // Three columns with a line under each heading on a wide screen; two compact columns on an
+    // ordinary one (80×24); one when even that won't fit.
+    let wide = area.width >= 116;
+    let one_column = !wide && area.width.saturating_sub(2).min(76) < 70;
+    let rect = if wide {
         centered(area, 112, 16, Some(6))
     } else {
-        centered(area, 60, 28, Some(1))
+        centered(area, 76, if one_column { 24 } else { 16 }, Some(1))
     };
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
-    let buf = f.buffer_mut();
-    put_lr(
-        buf,
-        inner,
-        inner.y,
-        vec![
-            Span::styled("CTRL+SPACE", bold(CYAN)),
-            Span::styled("   press a key", fg(FG2)),
-        ],
-        vec![Span::styled("esc close", fg(DIM))],
-    );
     let card = app.backlog_card_for_keys();
     let this_card = card
         .map(|c| format!("{} {}", c.reference, c.title))
         .unwrap_or_else(|| "select a backlog card first".into());
+    let buf = f.buffer_mut();
+    let mut title = vec![
+        Span::styled("CTRL+SPACE", bold(CYAN)),
+        Span::styled("   press a key", fg(FG2)),
+    ];
+    if !wide {
+        title.push(Span::styled(format!("   {this_card}"), fg(DIM)));
+    }
+    put_lr(
+        buf,
+        inner,
+        inner.y,
+        title,
+        vec![Span::styled("esc close", fg(DIM))],
+    );
     let restore = card.is_some_and(|c| c.dismissed());
     let card_keys: &[(&str, &str)] = if restore {
         &[("u", "bring it back")]
@@ -1641,21 +1649,30 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
             ],
         ),
     ];
-    // Three columns side by side, or one under another when the window is narrow.
-    let wide = inner.width >= 100;
-    let col_w = if wide {
-        inner.width.saturating_sub(8) / 3
+    let columns: u16 = if wide {
+        3
+    } else if one_column {
+        1
     } else {
-        inner.width
+        2
     };
-    let mut y = inner.y + 2;
+    let col_w = inner.width.saturating_sub(4 * (columns - 1)) / columns;
+    let top = inner.y + 2;
+    let mut y = top;
     for (n, (name, sub, keys)) in groups.iter().enumerate() {
-        let x = if wide {
-            y = inner.y + 2;
-            inner.x + n as u16 * (col_w + 4)
-        } else {
-            inner.x
+        // Wide: a column each. Two columns: THIS CARD and NEW share the first.
+        let col = match columns {
+            3 => n as u16,
+            2 => u16::from(n == 2),
+            _ => 0,
         };
+        if (columns == 3) || (columns == 2 && n != 1) {
+            y = top;
+        } else if n > 0 {
+            y += 1;
+        }
+        let x = inner.x + col * (col_w + 4);
+        let faint = card.is_none() && n == 0;
         put(
             buf,
             x,
@@ -1664,17 +1681,19 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
             vec![Span::styled(name.to_string(), bold(FG2))],
         );
         y += 1;
-        put(
-            buf,
-            x,
-            y,
-            col_w,
-            vec![Span::styled(
-                trunc(sub, col_w as usize),
-                fg(if card.is_none() && n == 0 { FAINT } else { DIM }),
-            )],
-        );
-        y += 2;
+        if wide {
+            put(
+                buf,
+                x,
+                y,
+                col_w,
+                vec![Span::styled(
+                    trunc(sub, col_w as usize),
+                    fg(if faint { FAINT } else { DIM }),
+                )],
+            );
+            y += 2;
+        }
         for (key, what) in keys.iter() {
             put(
                 buf,
@@ -1683,15 +1702,9 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
                 col_w,
                 vec![
                     Span::styled(format!("{key:<5}"), bold(CYAN)),
-                    Span::styled(
-                        what.to_string(),
-                        fg(if card.is_none() && n == 0 { FAINT } else { FG }),
-                    ),
+                    Span::styled(what.to_string(), fg(if faint { FAINT } else { FG })),
                 ],
             );
-            y += 1;
-        }
-        if !wide {
             y += 1;
         }
     }
@@ -1700,10 +1713,17 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
         inner.x,
         inner.bottom().saturating_sub(1),
         inner.width,
-        vec![Span::styled(
-            "Every letter here also works on its own, without Ctrl+Space. The menu is the list of them.",
-            fg(DIM),
-        )],
+        fit(
+            vec![Span::styled(
+                if inner.width >= 62 {
+                    "Every letter here also works on its own, without Ctrl+Space."
+                } else {
+                    "Each letter works without Ctrl+Space too."
+                },
+                fg(DIM),
+            )],
+            inner.width as usize,
+        ),
     );
 }
 
@@ -3470,6 +3490,7 @@ mod tests {
             Mode::Misc { sel: 99 },
             Mode::Palette {
                 back: Box::new(Mode::Backlog { sel: 0 }),
+                target: None,
             },
             Mode::Compose {
                 draft: Draft {
@@ -3677,6 +3698,7 @@ mod tests {
             assert!(text.contains("showing Codex"), "provider hidden at {width}");
             a.mode = Mode::Palette {
                 back: Box::new(Mode::Board),
+                target: None,
             };
             let text = rendered(&a, width, 30);
             assert!(
@@ -3711,6 +3733,31 @@ mod tests {
             !first.contains("●2"),
             "unmatched provider attention leaked: {first}"
         );
+    }
+
+    #[test]
+    fn the_menu_shows_every_command_in_an_ordinary_window() {
+        let mut a = demo(false);
+        a.mode = Mode::Palette {
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        for (w, h) in [(80, 24), (100, 30), (60, 30), (176, 44)] {
+            let text = rendered(&a, w, h);
+            for expected in [
+                "start it",
+                "move to the top",
+                "new intent",
+                "the backlog",
+                "filter by who or project",
+                "agents: all, Claude, Codex",
+                "machines",
+                "every key",
+                "without Ctrl+Space",
+            ] {
+                assert!(text.contains(expected), "{expected} missing at {w}x{h}");
+            }
+        }
     }
 
     #[test]

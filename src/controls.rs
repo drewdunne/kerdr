@@ -9,6 +9,28 @@ use serde_json::{Value, json};
 /// The most the new-intent box holds, kept under the actions' 64 KiB request limit.
 const MAX_WORDS: usize = 48_000;
 
+/// Work waiting to start: the only cards d, y, x, J, K and t change, so the bottom line, the
+/// menu and the keys themselves agree.
+pub(crate) fn waiting_work(card: &Card) -> bool {
+    card.detail.is_some()
+        && !card.dismissed()
+        && card.stage == Stage::Backlog
+        && !card.is_open_workspace()
+        && !matches!(
+            card.state.as_deref(),
+            Some("closed" | "active" | "background")
+        )
+}
+
+/// An id for one new intent's words, so an adapter can tell a resend from new work.
+fn new_submission() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    format!("kerdr-{nanos:x}-{:x}", std::process::id())
+}
+
 impl App {
     pub fn owner_label(&self) -> String {
         match self.owner.as_deref() {
@@ -296,7 +318,12 @@ impl App {
             }
             KeyCode::Enter => {
                 self.mode = *back;
-                if let Some(row) = self.filter_matches(&query).into_iter().nth(sel) {
+                // The row drawn highlighted: the list may have shrunk since it was picked.
+                if let Some(row) = self
+                    .filter_matches(&query)
+                    .into_iter()
+                    .nth(sel.min(n.saturating_sub(1)))
+                {
                     self.set_filter(row.owner, row.project);
                 }
                 return Action::None;
@@ -320,6 +347,8 @@ impl App {
             }
             _ => {}
         }
+        let n = self.filter_matches(&query).len();
+        let sel = sel.min(n.saturating_sub(1));
         self.mode = Mode::Filter { query, sel, back };
         Action::None
     }
@@ -328,23 +357,14 @@ impl App {
     /// set aside as won't do. The bottom line and the menu name its keys.
     pub fn backlog_card_for_keys(&self) -> Option<&Card> {
         let card = match &self.mode {
-            Mode::Palette { back } if matches!(**back, Mode::Backlog { .. }) => {
-                self.backlog_focus.as_ref().and_then(|k| self.card(k))
-            }
+            Mode::Palette { target, .. } => target.as_ref().and_then(|k| self.card(k)),
             Mode::Backlog { sel } => self
                 .backlog_cards()
                 .get(*sel)
                 .and_then(|&i| self.board.cards.get(i)),
             _ => self.selected(),
         }?;
-        let waiting = card.dismissed()
-            || (card.stage == Stage::Backlog
-                && !card.is_open_workspace()
-                && !matches!(
-                    card.state.as_deref(),
-                    Some("closed" | "active" | "background")
-                ));
-        (card.detail.is_some() && waiting).then_some(card)
+        (card.dismissed() || waiting_work(card)).then_some(card)
     }
 
     fn selected_for_control(&self) -> Option<&Card> {
@@ -406,13 +426,17 @@ impl App {
             return Action::None;
         };
         self.backlog_focus = Some(card.key.clone());
-        if !card.dismissed()
-            && (card.is_open_workspace()
-                || matches!(
-                    card.state.as_deref(),
-                    Some("closed" | "active" | "background")
-                ))
-        {
+        if action == "restore" && !card.dismissed() {
+            self.say(
+                format!(
+                    "u brings back work from won't do; {} isn't there.",
+                    card.reference
+                ),
+                Tone::Info,
+            );
+            return Action::None;
+        }
+        if !card.dismissed() && !waiting_work(&card) {
             self.say(
                 format!(
                     "{} is already under way or done. d, y, x, J, K and t change backlog work.",
@@ -493,19 +517,17 @@ impl App {
 
     /// Ctrl+Space: the same letters as the direct keys, listed, so the menu is a reminder and
     /// never a second set of keys to learn.
-    fn palette_key(&mut self, key: KeyEvent, back: Box<Mode>) -> Action {
-        let pending_backlog = backlog_selection(&back).is_some();
-        let lost_target = pending_backlog
-            && self
-                .backlog_focus
-                .as_ref()
-                .is_some_and(|key| !self.card(key).is_some_and(|c| self.card_visible(c)));
+    fn palette_key(&mut self, key: KeyEvent, back: Box<Mode>, target: Option<String>) -> Action {
         self.mode = (*back).clone();
-        if lost_target
-            && matches!(
-                key.code,
-                KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K')
-            )
+        let card_key = matches!(
+            key.code,
+            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K')
+        );
+        // A refresh while the menu was open may have moved or removed the card it opened on;
+        // its keys then act on nothing rather than on whatever took its place.
+        if card_key
+            && target.is_some()
+            && self.backlog_card_for_keys().map(|c| &c.key) != target.as_ref()
         {
             self.say("The selected intent changed while the menu was open. Select it again before changing it.", Tone::Warn);
             return Action::None;
@@ -530,7 +552,7 @@ impl App {
                     scroll: 0,
                 }
             }
-            _ => self.mode = Mode::Palette { back },
+            _ => self.mode = Mode::Palette { back, target },
         }
         Action::None
     }
@@ -580,7 +602,8 @@ impl App {
                 if draft.words.trim().is_empty() {
                     self.say("Write what you want first.", Tone::Info);
                 } else {
-                    let request = json!({"action":"create","words":draft.words.trim(),"session":draft.session});
+                    let submission = self.submission.get_or_insert_with(new_submission).clone();
+                    let request = json!({"action":"create","words":draft.words.trim(),"session":draft.session,"submission":submission});
                     let machine = draft.machine;
                     self.mode = Mode::Compose { draft, back };
                     return self.emit_mutation(machine, request);
@@ -593,7 +616,12 @@ impl App {
             KeyCode::Char('w') if ctrl => {
                 let kept = draft.words.trim_end().len();
                 draft.words.truncate(kept);
-                let cut = draft.words.rfind(char::is_whitespace).map_or(0, |i| i + 1);
+                let cut = draft
+                    .words
+                    .char_indices()
+                    .rev()
+                    .find(|(_, c)| c.is_whitespace())
+                    .map_or(0, |(i, c)| i + c.len_utf8());
                 draft.words.truncate(cut);
             }
             KeyCode::Char(c) if !ctrl && room => draft.words.push(c),
@@ -623,6 +651,14 @@ impl App {
             Mode::Filter { query, sel, .. } => {
                 query.push_str(&text.replace('\n', " "));
                 *sel = 0;
+            }
+            Mode::Keys {
+                filter,
+                typing: true,
+                scroll,
+            } => {
+                filter.push_str(&text.replace('\n', " "));
+                *scroll = 0;
             }
             _ => {}
         }
@@ -655,7 +691,7 @@ impl App {
                 }
                 return Some(Action::None);
             }
-            Mode::Palette { back } => return Some(self.palette_key(key, back)),
+            Mode::Palette { back, target } => return Some(self.palette_key(key, back, target)),
             _ => {}
         }
         let leader = key.code == KeyCode::Null
@@ -667,11 +703,13 @@ impl App {
                 Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
             )
         {
-            if let Some(card) = self.selected_for_control() {
-                self.backlog_focus = Some(card.key.clone());
+            let target = self.backlog_card_for_keys().map(|c| c.key.clone());
+            if let Some(key) = &target {
+                self.backlog_focus = Some(key.clone());
             }
             self.mode = Mode::Palette {
                 back: Box::new(self.mode.clone()),
+                target,
             };
             return Some(Action::None);
         }
@@ -796,17 +834,24 @@ impl App {
                 };
             }
             Ok(response) => {
+                let mut message = response.message.clone();
+                if request["action"] == "create" {
+                    // Answered either way: the next words get an id of their own.
+                    self.submission = None;
+                }
                 // A failure that names an intent still made one (saved here but not pushed,
                 // say), so its words must not be sent again.
                 if request["action"] == "create" && (response.ok || response.id.is_some()) {
                     self.draft.clear();
-                    self.new_intent_id = response.id.clone();
+                    self.new_intent_id = response.id.clone().map(|id| (machine, id));
                     self.enter_backlog(false);
+                    if self.owner.is_some() || self.project.is_some() || self.provider.is_some() {
+                        message.push_str(
+                            " A filter may hide it until it's written up: F shows everything.",
+                        );
+                    }
                 }
-                self.say(
-                    response.message,
-                    if response.ok { Tone::Good } else { Tone::Warn },
-                );
+                self.say(message, if response.ok { Tone::Good } else { Tone::Warn });
             }
             Err(error) => self.say(error, Tone::Warn),
         }

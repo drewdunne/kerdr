@@ -114,11 +114,15 @@ additional fields that operation needs:
 ```
 
 The action names are `create`, `dispatch`, `refresh`, `dismiss`, `restore` and `move`.
-`create` carries the user's own words and the session they were looking at, nothing else:
+`create` carries the user's own words, the session they were looking at, and an id for this
+submission, nothing else:
 
 ```json
-{"action":"create","words":"The laptop's Wi-Fi drops after sleep.\nMake it reconnect on its own.","session":"default"}
+{"action":"create","words":"The laptop's Wi-Fi drops after sleep.\nMake it reconnect on its own.","session":"default","submission":"kerdr-18f2c3a9d0e1-4d2"}
 ```
+
+Kerdr sends the same `submission` again only when it never got an answer (a timeout, say).
+When a record already exists for it, answer with that record's `id` instead of making another.
 
 Write the record up from the words however your system does (a person, a script, an agent),
 and answer with its `id` as soon as it's saved, before any slow write-up. While it's being
@@ -128,7 +132,7 @@ same words again.
 `refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
 the active backlog and `restore` brings it back. `move` changes backlog order.
 
-Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project` and `session` (strings),
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session` and `submission` (strings),
 `override` and `top` (booleans), and `delta` (a signed integer). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
 exactly one JSON response to standard output. Send diagnostic output to standard error.

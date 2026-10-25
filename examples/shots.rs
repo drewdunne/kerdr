@@ -290,6 +290,7 @@ fn main() {
     select(&mut palette, "#21");
     palette.mode = Mode::Palette {
         back: Box::new(Mode::Board),
+        target: palette.sel.key.clone(),
     };
     rasterize(&render(&palette), &fonts, &out.join("commands.png"));
 

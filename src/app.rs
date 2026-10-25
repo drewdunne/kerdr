@@ -82,6 +82,8 @@ pub struct Search {
 pub enum Mode {
     Palette {
         back: Box<Mode>,
+        /// The card the menu opened on: its card keys act on that card or on none.
+        target: Option<String>,
     },
     Compose {
         draft: Draft,
@@ -125,7 +127,7 @@ fn misc_selection(mode: &Mode) -> Option<usize> {
     match mode {
         Mode::Misc { sel } => Some(*sel),
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => misc_selection(back),
@@ -137,7 +139,7 @@ fn set_misc_selection(mode: &mut Mode, selected: usize) {
     match mode {
         Mode::Misc { sel } => *sel = selected,
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => set_misc_selection(back, selected),
@@ -149,7 +151,7 @@ fn backlog_selection(mode: &Mode) -> Option<usize> {
     match mode {
         Mode::Backlog { sel } => Some(*sel),
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => backlog_selection(back),
@@ -161,7 +163,7 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
     match mode {
         Mode::Backlog { sel } => *sel = selected,
         Mode::Peek { back, .. }
-        | Mode::Palette { back }
+        | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => set_backlog_selection(back, selected),
@@ -172,7 +174,7 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
 fn holds_peek(mode: &Mode) -> bool {
     match mode {
         Mode::Peek { .. } => true,
-        Mode::Palette { back }
+        Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Confirm { back, .. } => holds_peek(back),
@@ -243,8 +245,11 @@ pub struct App {
     pub count: String,
     /// Words typed into the new-intent box and not sent yet, kept for the next time it opens.
     pub draft: String,
+    /// The id sent with a new intent whose answer never came, so sending it again finds the
+    /// one already made instead of making a second.
+    pub submission: Option<String>,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
-    pub new_intent_id: Option<String>,
+    pub new_intent_id: Option<(usize, String)>,
     backlog_focus: Option<String>,
     pub sel: Selection,
     pub mode: Mode,
@@ -277,6 +282,7 @@ impl App {
             count: String::new(),
             draft: String::new(),
             new_intent_id: None,
+            submission: None,
             backlog_focus: None,
             sel: Selection::default(),
             mode: Mode::Board,
@@ -388,14 +394,14 @@ impl App {
             return;
         }
         self.fix_selection();
-        if let Some(id) = self.new_intent_id.clone()
-            && let Some(card) = self
-                .board
-                .cards
-                .iter()
-                .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+        // Only once its card is in the backlog as shown: a filter may hide it for now.
+        if let Some((machine, id)) = self.new_intent_id.clone()
+            && let Some(&i) = self.backlog_cards().iter().find(|&&i| {
+                let c = &self.board.cards[i];
+                c.machine_index == machine && c.detail.as_ref().is_some_and(|d| d.id == id)
+            })
         {
-            self.backlog_focus = Some(card.key.clone());
+            self.backlog_focus = Some(self.board.cards[i].key.clone());
             self.new_intent_id = None;
         }
         if let Some(sel) = backlog_selection(&self.mode) {
@@ -1257,6 +1263,8 @@ impl App {
     }
 
     fn backlog_key(&mut self, key: KeyEvent, sel: usize) -> Action {
+        // Moving on your own ends the wait to select a just-made intent.
+        self.new_intent_id = None;
         let items = self.backlog_cards();
         let n = items.len();
         match key.code {
@@ -2214,7 +2222,7 @@ mod tests {
         );
         assert!(app.draft.is_empty());
         assert!(matches!(app.mode, Mode::Backlog { .. }));
-        assert_eq!(app.new_intent_id.as_deref(), Some("9001"));
+        assert_eq!(app.new_intent_id, Some((0, "9001".to_string())));
     }
 
     #[test]
@@ -2244,6 +2252,47 @@ mod tests {
         assert!(app.draft.is_empty());
         assert!(!matches!(app.mode, Mode::Compose { .. }));
         assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn a_resend_after_a_lost_answer_names_the_same_submission() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.draft = "Back up the NAS".into();
+        press(&mut app, 'c');
+        let send = |app: &mut App| {
+            app.busy = false;
+            let Action::Mutate { request, .. } =
+                app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            else {
+                panic!("Enter didn't send")
+            };
+            request
+        };
+        let first = send(&mut app);
+        let id = first["submission"].as_str().unwrap().to_string();
+        assert!(id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') && id.len() <= 64);
+        // No answer (a timeout): the same words go again under the same id.
+        app.finish_action(0, first, Err("timed out; the result is unknown".into()));
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        let second = send(&mut app);
+        assert_eq!(second["submission"], id.as_str());
+        // A plain refusal made nothing, so the next try is new work.
+        app.finish_action(
+            0,
+            second,
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "The store is locked".into(),
+                confirmation: false,
+                used: None,
+                limit: None,
+                session: None,
+                id: None,
+            }),
+        );
+        let third = send(&mut app);
+        assert_ne!(third["submission"], id.as_str());
     }
 
     #[test]
@@ -2319,13 +2368,120 @@ mod tests {
     fn a_new_intent_is_selected_once_its_card_arrives() {
         let mut app = demo_app();
         let (key, id) = waiting_backlog_card(&app);
+        let machine = app.card(&key).unwrap().machine_index;
         app.enter_backlog(false);
-        app.new_intent_id = Some(id);
+        // Another machine's record with the same id is someone else's.
+        app.new_intent_id = Some((machine + 1, id.clone()));
+        app.rebuild();
+        assert!(app.new_intent_id.is_some());
+        app.new_intent_id = Some((machine, id));
         app.rebuild();
         assert!(app.new_intent_id.is_none());
         let Mode::Backlog { sel } = app.mode else {
             panic!("not in the backlog")
         };
         assert_eq!(app.board.cards[app.backlog_cards()[sel]].key, key);
+    }
+
+    #[test]
+    fn a_menu_opened_on_a_card_never_acts_on_another_after_a_refresh() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.mode = Mode::Backlog { sel: 0 };
+        let first = app.backlog_cards()[0];
+        let id = app.board.cards[first].detail.as_ref().unwrap().id.clone();
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        // The card it opened on starts while the menu is open, and leaves the backlog.
+        for machine in &mut app.machines {
+            if let Some(feed) = &mut machine.feed {
+                for card in &mut feed.cards {
+                    if card.id == id {
+                        card.stage = Some("build".into());
+                        card.state = Some("active".into());
+                    }
+                }
+            }
+        }
+        app.rebuild();
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn card_keys_refuse_finished_work_whatever_its_state_says() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].stage = Stage::Maintain;
+        app.board.cards[i].state = None;
+        app.sel = Selection {
+            col: Stage::Maintain.index(),
+            key: Some(key),
+        };
+        assert!(app.backlog_card_for_keys().is_none());
+        for c in ['d', 'y', 'x', 't', 'J', 'u'] {
+            assert_eq!(
+                press(&mut app, c),
+                Action::None,
+                "{c} acted on finished work"
+            );
+        }
+    }
+
+    #[test]
+    fn deleting_a_word_never_splits_a_character() {
+        let mut app = demo_app();
+        for (words, left) in [
+            ("one\u{2003}two", "one\u{2003}"),
+            ("one\u{a0}two", "one\u{a0}"),
+            ("ünïcödé wörds  ", "ünïcödé "),
+            ("lone", ""),
+        ] {
+            app.draft = words.into();
+            app.mode = Mode::Board;
+            press(&mut app, 'c');
+            app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+            let Mode::Compose { draft, .. } = &app.mode else {
+                panic!("left the box")
+            };
+            assert_eq!(draft.words, left, "{words:?}");
+        }
+    }
+
+    #[test]
+    fn the_filter_list_applies_the_row_it_highlights() {
+        let mut app = demo_app();
+        press(&mut app, 'f');
+        let rows = app.filter_rows();
+        app.mode = Mode::Filter {
+            query: String::new(),
+            sel: rows.len() + 5,
+            back: Box::new(Mode::Board),
+        };
+        app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        let Mode::Filter { sel, .. } = app.mode else {
+            panic!("left the list")
+        };
+        let shown = app.filter_matches("");
+        assert_eq!(sel, shown.len() - 1);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.owner, shown[sel].owner);
+        assert_eq!(app.project, shown[sel].project);
+    }
+
+    #[test]
+    fn a_paste_reaches_the_keys_list_search() {
+        let mut app = demo_app();
+        app.mode = Mode::Keys {
+            filter: String::new(),
+            typing: true,
+            scroll: 7,
+        };
+        app.on_paste("machine\nnow");
+        let Mode::Keys { filter, scroll, .. } = &app.mode else {
+            panic!("left the keys list")
+        };
+        assert_eq!((filter.as_str(), *scroll), ("machine now", 0));
     }
 }

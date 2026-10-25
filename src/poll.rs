@@ -124,7 +124,11 @@ pub struct Event {
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
         (Some(data), Some(old_data)) => {
-            if data.feed.is_none() {
+            // A failed feed read after a good one keeps the good cards: the board keeps an
+            // older feed on an error anyway, and the next feed read reports the error again.
+            let keep_old = data.feed.is_none()
+                || (matches!(data.feed, Some(Err(_))) && matches!(old_data.feed, Some(Ok(_))));
+            if keep_old {
                 data.feed = old_data.feed;
             }
         }
@@ -144,6 +148,9 @@ fn replace(old: Event, mut new: Event) -> Event {
 pub struct Inbox {
     /// Per machine: the read, and when it began.
     slots: Mutex<Vec<Option<(Event, Instant)>>>,
+    /// Per machine: which reader's reads count. A reader that was stopped (a machine hidden,
+    /// then shown again) may still be mid-read; what it finds is older than its replacement's.
+    readers: Mutex<Vec<u64>>,
     arrived: Condvar,
 }
 
@@ -153,8 +160,26 @@ impl Inbox {
         self.slots.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A read that began at `started`.
-    pub fn put(&self, ev: Event, started: Instant) {
+    fn readers(&self) -> MutexGuard<'_, Vec<u64>> {
+        self.readers.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A new reader for machine `i`: from now on only its reads count. Also called when a
+    /// reader stops, so nothing it was still reading lands.
+    pub fn next_reader(&self, i: usize) -> u64 {
+        let mut readers = self.readers();
+        if readers.len() <= i {
+            readers.resize(i + 1, 0);
+        }
+        readers[i] += 1;
+        readers[i]
+    }
+
+    /// A read that began at `started`, from reader `reader` (see `next_reader`).
+    pub fn put(&self, ev: Event, started: Instant, reader: u64) {
+        if self.readers().get(ev.machine).copied().unwrap_or(0) != reader {
+            return;
+        }
         let mut slots = self.slots();
         let i = ev.machine;
         if slots.len() <= i {
@@ -226,7 +251,13 @@ pub fn backoff(attempt: u32) -> Duration {
 
 const GIVE_UP_AFTER: i64 = 120;
 
-pub fn spawn(index: usize, machine: Machine, timing: Timing, inbox: Arc<Inbox>) -> Poller {
+pub fn spawn(
+    index: usize,
+    machine: Machine,
+    timing: Timing,
+    inbox: Arc<Inbox>,
+    reader: u64,
+) -> Poller {
     let (wake_tx, wake_rx) = mpsc::channel();
     thread::spawn(move || {
         let target = match &machine.ssh {
@@ -297,6 +328,7 @@ pub fn spawn(index: usize, machine: Machine, timing: Timing, inbox: Arc<Inbox>) 
                     at: now,
                 },
                 started,
+                reader,
             );
             match wake_rx.recv_timeout(wait) {
                 Ok(Wake::Feed) => {
@@ -529,9 +561,9 @@ mod tests {
     fn a_newer_read_takes_the_place_of_an_unread_older_one() {
         let inbox = Inbox::default();
         let t = Instant::now();
-        inbox.put(read_of(1, live(), Some("before you went in"), false), t);
-        inbox.put(read_of(0, live(), Some("another machine"), false), t);
-        inbox.put(read_of(1, live(), Some("now"), false), t);
+        inbox.put(read_of(1, live(), Some("before you went in"), false), t, 0);
+        inbox.put(read_of(0, live(), Some("another machine"), false), t, 0);
+        inbox.put(read_of(1, live(), Some("now"), false), t, 0);
         let reads = inbox.take();
         assert_eq!(reads.len(), 2);
         assert_eq!(
@@ -546,11 +578,45 @@ mod tests {
     fn a_feed_is_never_lost_to_a_newer_read_without_one() {
         let inbox = Inbox::default();
         let t = Instant::now();
-        inbox.put(read_of(0, live(), Some("with the feed"), true), t);
-        inbox.put(read_of(0, live(), Some("without"), false), t);
+        inbox.put(read_of(0, live(), Some("with the feed"), true), t, 0);
+        inbox.put(read_of(0, live(), Some("without"), false), t, 0);
         let ev = inbox.take().pop().unwrap();
         assert_eq!(host(&ev), Some("without"));
         assert!(matches!(ev.data.unwrap().feed, Some(Ok(_))));
+    }
+
+    #[test]
+    fn a_failed_feed_read_never_hides_the_good_one_before_it() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        inbox.put(read_of(0, live(), Some("good cards"), true), t, 0);
+        let mut failed = read_of(0, live(), Some("feed failed"), false);
+        failed.data.as_mut().unwrap().feed = Some(Err("feed timed out".into()));
+        inbox.put(failed, t, 0);
+        inbox.put(read_of(0, live(), Some("feed not due"), false), t, 0);
+        let ev = inbox.take().pop().unwrap();
+        assert_eq!(host(&ev), Some("feed not due"));
+        assert!(matches!(ev.data.unwrap().feed, Some(Ok(_))));
+    }
+
+    #[test]
+    fn a_stopped_reader_never_overwrites_its_replacement() {
+        let inbox = Inbox::default();
+        let t = Instant::now();
+        let first = inbox.next_reader(0);
+        let second = inbox.next_reader(0);
+        inbox.put(read_of(0, live(), Some("new reader"), false), t, second);
+        inbox.put(
+            read_of(0, live(), Some("old reader, late"), false),
+            t,
+            first,
+        );
+        let ev = inbox.take().pop().unwrap();
+        assert_eq!(host(&ev), Some("new reader"));
+        // Stopping a reader retires it too.
+        inbox.next_reader(0);
+        inbox.put(read_of(0, live(), Some("stopped"), false), t, second);
+        assert!(inbox.take().is_empty());
     }
 
     #[test]
@@ -559,14 +625,14 @@ mod tests {
         let t = Instant::now();
         let good = read_of(0, live(), Some("last good"), true);
         let at = good.at;
-        inbox.put(good, t);
+        inbox.put(good, t, 0);
         let dropped = Conn::Reconnecting {
             since: Local::now(),
             attempt: 1,
             retry_at: Local::now(),
             detail: "Connection timed out".into(),
         };
-        inbox.put(read_of(0, dropped, None, false), t);
+        inbox.put(read_of(0, dropped, None, false), t, 0);
         let ev = inbox.take().pop().unwrap();
         assert!(matches!(ev.conn, Conn::Reconnecting { .. }));
         assert_eq!(host(&ev), Some("last good"));
@@ -579,13 +645,13 @@ mod tests {
         let inbox = Arc::new(Inbox::default());
         let old = Instant::now();
         let since = old + Duration::from_millis(1);
-        inbox.put(read_of(0, live(), Some("from before"), false), old);
+        inbox.put(read_of(0, live(), Some("from before"), false), old, 0);
         assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
         let reader = {
             let inbox = inbox.clone();
             thread::spawn(move || {
                 thread::sleep(Duration::from_millis(20));
-                inbox.put(read_of(0, live(), Some("fresh"), false), Instant::now());
+                inbox.put(read_of(0, live(), Some("fresh"), false), Instant::now(), 0);
             })
         };
         assert!(inbox.wait_since(&[0], since, Duration::from_secs(5)));
