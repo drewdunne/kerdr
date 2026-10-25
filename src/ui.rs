@@ -1570,7 +1570,19 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         inner.width,
         vec![Span::styled("─".repeat(w), fg(BORDER))],
     );
-    let mut hints = vec![("⏎", "jump in"), ("n N", "next that needs you")];
+    // Waiting work has nothing to jump into: its line names the keys that start or change it.
+    let mut hints = match app.backlog_card_for_keys() {
+        Some(c) if c.dismissed() => vec![("u", "bring it back")],
+        Some(_) => vec![
+            ("d", "start it in its session"),
+            ("y", "still want it"),
+            ("x", "won’t do"),
+            ("J K", "move down / up"),
+            ("t", "to the top"),
+        ],
+        None => vec![("⏎", "jump in")],
+    };
+    hints.push(("n N", "next that needs you"));
     if max_scroll > 0 {
         hints.push(("j k", "scroll"));
     }
@@ -3758,6 +3770,30 @@ mod tests {
                 assert!(text.contains(expected), "{expected} missing at {w}x{h}");
             }
         }
+    }
+
+    #[test]
+    fn a_peek_at_waiting_work_names_the_key_that_starts_it() {
+        let mut a = demo(false);
+        let key = a
+            .board
+            .cards
+            .iter()
+            .find(|c| crate::app::waiting_work(c))
+            .unwrap()
+            .key
+            .clone();
+        a.sel = crate::app::Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key),
+        };
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("d start it in its session"), "{text}");
+        assert!(!text.contains("⏎ jump in"));
     }
 
     #[test]

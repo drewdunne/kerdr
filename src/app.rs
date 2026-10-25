@@ -13,6 +13,8 @@ use crate::poll::{Conn, Event};
 
 #[path = "controls.rs"]
 mod controls;
+#[cfg(test)]
+pub(crate) use controls::waiting_work;
 
 /// A new intent in Andrew's own words. The agent that writes it up fills in everything else:
 /// its title, who it's for, its project and its triage.
