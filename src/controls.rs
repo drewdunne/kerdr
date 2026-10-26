@@ -85,6 +85,14 @@ impl App {
         }
     }
 
+    /// Whether f's filters (owner, project, agents or background) hide any work.
+    pub(crate) fn filtering(&self) -> bool {
+        self.owner.is_some()
+            || self.project.is_some()
+            || self.provider.is_some()
+            || self.background != Background::All
+    }
+
     /// Metadata filters without the selected tab, so other session badges stay meaningful.
     pub(crate) fn card_matches_filters(&self, card: &Card) -> bool {
         self.owner.as_ref().is_none_or(|o| *o == card.owner_key())
@@ -334,10 +342,7 @@ impl App {
 
     /// F: every owner, project, agent and background card again.
     pub(super) fn clear_filters(&mut self) {
-        let filtered = self.owner.is_some()
-            || self.project.is_some()
-            || self.provider.is_some()
-            || self.background != Background::All;
+        let filtered = self.filtering();
         self.provider = None;
         self.background = Background::All;
         self.set_filter(None, None);
@@ -418,6 +423,11 @@ impl App {
         }
         let n = self.filter_matches(&query).len();
         let sel = sel.min(n.saturating_sub(1));
+        // b, a and F reset the backlog's selection in the screen behind this one: keep that.
+        let back = match &self.mode {
+            Mode::Filter { back, .. } => back.clone(),
+            _ => back,
+        };
         self.mode = Mode::Filter {
             query,
             sel,
@@ -1297,7 +1307,7 @@ impl App {
                     self.draft_images.clear();
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
                     self.enter_backlog(false);
-                    if self.owner.is_some() || self.project.is_some() || self.provider.is_some() {
+                    if self.filtering() {
                         message.push_str(
                             " A filter may hide it until it's written up: F shows everything.",
                         );

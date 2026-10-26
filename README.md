@@ -235,7 +235,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `/` | search |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
-| `f` / `F` | show only one owner or project / show everything |
+| `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
 | `A` / `S` / `s` | accounts / viewed session’s ordered models / move selected agent |
 | `a` | cycle provider: All, Claude, Codex, and detected providers |
 | `b` | backlog |

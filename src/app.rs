@@ -1269,7 +1269,7 @@ impl App {
                     continue;
                 }
                 // Shown when any card on it is: its own, or one for work in one of its tabs.
-                if (self.owner.is_some() || self.project.is_some() || self.provider.is_some())
+                if self.filtering()
                     && !self.board.cards.iter().any(|c| {
                         c.machine == w.machine
                             && c.session.as_deref() == Some(w.session.as_str())
@@ -1293,7 +1293,7 @@ impl App {
                 if !self.scope().contains_session(r) {
                     continue;
                 }
-                if (self.owner.is_some() || self.project.is_some() || self.provider.is_some())
+                if self.filtering()
                     && !self.board.cards.iter().any(|c| {
                         c.machine == r.machine
                             && c.session.as_deref() == Some(r.session.as_str())
@@ -2893,6 +2893,53 @@ mod tests {
         assert_eq!(app.background, Background::Only);
         press(&mut app, 'F');
         assert_eq!(app.background, Background::All);
+    }
+
+    #[test]
+    fn closing_the_filters_after_b_leaves_the_backlog_on_a_card_it_shows() {
+        let mut app = demo_app();
+        app.enter_backlog(false);
+        let len = app.backlog_cards().len();
+        assert!(len > 2, "the demo's backlog is too short for this test");
+        for _ in 0..len {
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        }
+        assert!(matches!(app.mode, Mode::Backlog { sel } if sel == len - 1));
+        for close in [KeyCode::Esc, KeyCode::Char('f')] {
+            press(&mut app, 'f');
+            press(&mut app, 'b');
+            app.on_key(KeyEvent::new(close, KeyModifiers::NONE));
+            let Mode::Backlog { sel } = app.mode else {
+                panic!("closing the filters left the backlog")
+            };
+            assert!(
+                sel < app.backlog_cards().len().max(1),
+                "row {sel} of {}",
+                app.backlog_cards().len()
+            );
+        }
+    }
+
+    #[test]
+    fn search_leaves_out_workspaces_and_sessions_the_background_filter_hides() {
+        let mut app = demo_app();
+        let everything = |app: &App, filter| {
+            app.search_hits(&Search {
+                query: String::new(),
+                filter,
+                sel: 0,
+            })
+            .len()
+        };
+        for filter in [SearchFilter::Workspaces, SearchFilter::Sessions] {
+            let all = everything(&app, filter);
+            app.background = Background::Only;
+            let only = everything(&app, filter);
+            app.background = Background::Hide;
+            let hide = everything(&app, filter);
+            app.background = Background::All;
+            assert!(only < all && hide < all, "{filter:?}: {all} {only} {hide}");
+        }
     }
 
     #[test]
