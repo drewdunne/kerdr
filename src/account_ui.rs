@@ -53,7 +53,16 @@ pub(super) fn new_intents(app: &App) -> Vec<Span<'static>> {
     if let Scope::Session(machine, session) = app.scope()
         && let Some(mi) = app.machine_index(machine)
         && let Some(owner) = app.account_owner(mi, session)
-        && let Some(first) = owner.models.first()
+        && let Some(feed) = app.account_feed(mi)
+        && let Some(first) = owner
+            .models
+            .iter()
+            .find(|code| {
+                feed.accounts
+                    .iter()
+                    .any(|a| &a.code == *code && a.status == "ready")
+            })
+            .or_else(|| owner.models.first())
     {
         let provider = app
             .account_feed(mi)

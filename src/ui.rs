@@ -3794,6 +3794,27 @@ mod tests {
     }
 
     #[test]
+    fn new_intents_footer_skips_unavailable_accounts_then_falls_back_to_first() {
+        let mut a = demo(false);
+        a.machine = Some(a.this_machine());
+        a.rebuild();
+        a.tab = a
+            .tabs
+            .iter()
+            .position(|scope| matches!(scope, Scope::Session(_, session) if session == "web"))
+            .unwrap();
+        let mi = a.machine_index(&a.this_machine()).unwrap();
+        for owner in &mut a.machines[mi].feed.as_mut().unwrap().owners {
+            owner.models = vec!["KBZ".into(), "ARK".into()];
+        }
+        assert!(rendered(&a, 176, 44).contains("new in web: Claude ARK"));
+        for account in &mut a.machines[mi].feed.as_mut().unwrap().accounts {
+            account.status = "out".into();
+        }
+        assert!(rendered(&a, 176, 44).contains("new in web: Claude KBZ"));
+    }
+
+    #[test]
     fn overview_header_explains_machine_and_session_keys() {
         let mut a = demo(false);
         for m in &mut a.machines {
