@@ -240,6 +240,7 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         console.write("A")
         expect("NEW INTENTS")
         assert "✕" in "".join(transcript), "Windows account usage must use the text X fallback"
+        assert "⏸" not in "".join(transcript), "Windows must not draw an emoji pause"
         discard()
         console.write("\x1b")
         expect("MAINTAIN")

@@ -1496,6 +1496,9 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             fg(FG2),
             None,
         ));
+        if let Some(problem) = agent.problem.as_deref().filter(|p| !p.trim().is_empty()) {
+            lines.extend(wrapped(problem, w, fg(RED), None));
+        }
         lines.push(line_for_account_keys());
     }
     if let Some(story) = c.detail.as_ref().and_then(|d| d.story.clone()) {

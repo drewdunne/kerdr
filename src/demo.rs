@@ -603,6 +603,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
                         conversation: format!("demo-{session}-{}", agent.pane_id),
                         account: if waiting { "KBZ" } else { "ARK" }.into(),
                         how: "list".into(),
+                        problem: None,
                         waiting: waiting.then(|| crate::accounts::Waiting {
                             why: "usage".into(),
                             until: Some("2026-10-22T09:00:00-05:00".into()),
@@ -657,6 +658,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             machine: 0,
             code: "ARK".into(),
             token: Default::default(),
+            submit: false,
         },
         S::Models {
             machine: 0,

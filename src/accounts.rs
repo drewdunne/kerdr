@@ -72,6 +72,7 @@ pub struct AccountAgent {
     #[serde(deserialize_with = "null_default")]
     pub how: String,
     pub waiting: Option<Waiting>,
+    pub problem: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

@@ -240,7 +240,9 @@ fn main() {
         "sign-in-again",
     ];
     let mut account_app = app(false);
-    for (name, mode) in names.into_iter().zip(demo::account_screens(&account_app)) {
+    let screens = demo::account_screens(&account_app);
+    assert_eq!(names.len(), screens.len());
+    for (name, mode) in names.into_iter().zip(screens) {
         account_app.mode = mode;
         rasterize(
             &render(&account_app),

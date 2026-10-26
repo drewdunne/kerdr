@@ -191,6 +191,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 ),
                 Line::raw(""),
             ];
+            let selected_line = lines.len() + *sel;
             for (i, code) in choices.iter().enumerate() {
                 let text = if code == "list" {
                     "follow the list".into()
@@ -216,6 +217,15 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 lines.push(selected(text, i == *sel));
             }
             lines.push(Line::raw(""));
+            if let Some(problem) = target
+                .agent
+                .problem
+                .as_deref()
+                .filter(|p| !p.trim().is_empty())
+            {
+                lines.extend(wrapped(problem, 68, fg(RED), None));
+                lines.push(Line::raw(""));
+            }
             lines.extend(wrapped("The session restarts on the chosen account and stays there until moved again or it runs out. Another program starts a fresh agent from the intent's log.",68,fg(FG2),None));
             modal(
                 f,
@@ -223,7 +233,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 &format!("Move {} to another account", target.reference),
                 lines,
                 "⏎ move    j k choose    esc cancel",
-                sel + 3,
+                selected_line,
                 CYAN,
             );
         }

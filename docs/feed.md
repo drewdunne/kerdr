@@ -261,7 +261,7 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
   "machine_owner":"studio",
   "unowned_sessions":[],
   "agents":[{"pane":"w1:p1","session":"web","conversation":"conversation-id",
-    "account":"KBZ","how":"list","waiting":{"why":"usage","until":"2026-10-22T09:00:00-05:00"}}]
+    "account":"KBZ","how":"list","problem":null,"waiting":{"why":"usage","until":"2026-10-22T09:00:00-05:00"}}]
 }
 ```
 
@@ -276,7 +276,9 @@ Unowned sessions are marked on the accounts screen. `owners_source: "mock"` is s
 Cards join their herdr agents to the feed’s agents by **machine, session, and pane**, including
 child cards that name a tab. `how` is `list`, `manual`, `next`, or `handed_over`. A usage wait
 suppresses the ordinary “turn ended” attention for that card. Conversation IDs bind a move
-confirmation; backend checks must also reject stale generations and enforce authorization.
+and its confirmation; backend checks must also reject stale generations and enforce authorization.
+An optional `problem` string reports a failed move. It draws attention to the card and appears
+in its account details and move picker; explicit questions and blockers keep their priority.
 No credential or token belongs in the feed.
 
 ### Account actions
@@ -287,7 +289,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
 |---|---|---|
-| `account-move` | `pane`, `session`, `to` (code or `list`), optional `confirm` | success, or the question below |
+| `account-move` | `pane`, `session`, `conversation`, `to` (code or `list`), optional `confirm` | queued, stale, or the question below |
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` | adds, or renames the existing code |
@@ -304,8 +306,14 @@ saved successfully. Unreachable machines are reported rather than silently claim
 
 For account moves, `confirmation` is the question text (ordinary card actions keep their
 boolean field). Kerdr shows it only after selection, waits for a fresh `y`, then resends the
-original machine, pane, session and target with `confirm`. It does **not** add `override`,
+original machine, pane, session, conversation and target with `confirm`. It does **not** add `override`,
 `when_idle`, or `end_jobs`: the backend’s opaque token covers exactly what was asked.
+
+Moves send the feed's `agents[].conversation`. A changed conversation answers
+`{"ok":true,"state":"stale","message":"the conversation changed"}`. An accepted move answers
+`{"ok":true,"state":"queued","account":"ARK","message":"moving to ARK"}` promptly, then restarts
+in a detached worker. Kerdr displays the message; the feed changes the account badge when the
+move finishes. An unavailable target answers `ok: false` before stopping anything.
 
 ### Signing in
 
@@ -323,7 +331,10 @@ Continue on that same machine:
 {"action":"account-signin","ticket":"opaque-ticket","step":"cancel"}
 ```
 
-Responses have `status: "waiting"`, `"done"`, or `"failed"`. Kerdr polls every two seconds
+Responses have `status: "waiting"`, `"done"`, or `"failed"`; cancel answers `"cancelled"` with
+`ok: true`, including an already finished or unknown valid ticket. A new start cancels an
+unfinished sign-in for that code. A failed finish may report an account identity mismatch,
+which Kerdr shows without advancing to another machine. Kerdr polls every two seconds
 while the dialog remains open, pauses while a page code is being entered, and stops on unknown results.
 A retry cancels any known previous ticket before starting another. Escape cancels a known ticket;
 a ticket returned after Escape is also cancelled, without opening a browser. After `done`,
@@ -331,6 +342,7 @@ adding an account proceeds to the next selected machine with a **new** start and
 A `paste` step instead sends `code` and a `token` string, and answers `done` or a refusal.
 The token never enters the result queue or saved settings. The backend must not echo it and
 must own its secure storage. Kerdr also removes submitted credential text from adapter output.
+Adapter output is captured in temporary files before parsing, so backends must never echo credentials.
 Only HTTPS URLs can be opened; URL data is passed directly to the OS opener, never a shell.
 
 The start action must return promptly. On Unix, Kerdr cleans up the adapter's process group

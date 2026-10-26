@@ -205,6 +205,7 @@ fn running_title(w: &WsRef) -> Option<String> {
 /// Decides what a card needs from you, from what the feed says and what herdr sees.
 pub struct Signals<'a> {
     pub usage_waiting: bool,
+    pub account_problem: Option<&'a str>,
     pub closed: bool,
     pub token: Option<&'a str>,
     pub herdr: Option<&'a str>,
@@ -244,6 +245,9 @@ pub fn attention(s: &Signals) -> (Attention, String) {
             s.blocker.unwrap_or("blocked").to_string(),
         );
     }
+    if let Some(problem) = s.account_problem.filter(|p| !p.trim().is_empty()) {
+        return (Attention::NeedsYou, problem.into());
+    }
     if s.herdr == Some("working") {
         let why = s.running_title.or(s.feed_status).unwrap_or("working");
         return (Attention::Running, why.to_string());
@@ -277,6 +281,16 @@ fn usage_waiting(machine: &MachineState, workspace: &WsRef) -> bool {
                 a.pane == agent.pane_id && a.session == workspace.session && a.waiting_for_usage()
             })
         })
+    })
+}
+
+fn account_problem<'a>(machine: &'a MachineState, workspace: &WsRef) -> Option<&'a str> {
+    machine.feed.as_ref()?.agents.iter().find_map(|a| {
+        (a.session == workspace.session
+            && workspace.agents.iter().any(|agent| a.pane == agent.pane_id))
+        .then_some(a.problem.as_deref())
+        .flatten()
+        .filter(|p| !p.trim().is_empty())
     })
 }
 
@@ -498,6 +512,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         let (att, why) = attention(&Signals {
             closed,
             usage_waiting: ws.is_some_and(|w| usage_waiting(&machines[w.mi], w)),
+            account_problem: ws.and_then(|w| account_problem(&machines[w.mi], w)),
             token,
             herdr: herdr.as_deref(),
             feed: fc.attention.as_deref().and_then(Attention::parse),
@@ -560,6 +575,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         let (att, why) = attention(&Signals {
             closed: reported_stage == Some(Stage::Maintain),
             usage_waiting: usage_waiting(m, w),
+            account_problem: account_problem(m, w),
             token,
             herdr: herdr.as_deref(),
             feed: None,
@@ -1025,6 +1041,7 @@ mod tests {
     fn the_silent_wait_needs_you() {
         let (att, why) = attention(&Signals {
             usage_waiting: false,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("done"),
@@ -1043,6 +1060,7 @@ mod tests {
     fn usage_wait_suppresses_only_silence_and_never_an_explicit_question() {
         let mut signals = Signals {
             usage_waiting: true,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("done"),
@@ -1073,6 +1091,7 @@ mod tests {
     fn waiting_on_a_review_is_not_needing_you() {
         let (att, why) = attention(&Signals {
             usage_waiting: false,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("idle"),
@@ -1091,6 +1110,7 @@ mod tests {
     fn an_agent_asking_always_needs_you() {
         let (att, _) = attention(&Signals {
             usage_waiting: false,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("blocked"),

@@ -51,6 +51,7 @@ pub enum AccountScreen {
         machine: usize,
         code: String,
         token: Secret,
+        submit: bool,
     },
     List {
         machine: usize,
@@ -129,11 +130,11 @@ impl App {
         }
     }
 
-    fn saved_models(&mut self, request: &Value) {
+    fn saved_models(&mut self, machine: usize, request: &Value) {
         let id = request["owner"].as_str().unwrap_or("");
-        for feed in self.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+        if let Some(feed) = self.machines.get_mut(machine).and_then(|m| m.feed.as_mut()) {
             let Some(index) = feed.owners.iter().position(|o| o.id == id) else {
-                continue;
+                return;
             };
             let inherit = request["inherit"] == true;
             let models: Vec<String> = if inherit {
@@ -288,6 +289,18 @@ impl App {
 
     fn send_account(&mut self, machine: usize, request: Value) -> Action {
         if !self.can_write(machine) {
+            if request["action"] == "account-signin"
+                && let Mode::Accounts {
+                    screen: AccountScreen::Signin(s),
+                    ..
+                } = &mut self.mode
+            {
+                s.failed = true;
+                s.restart = false;
+                s.message =
+                    "This machine is not answering. Reconnect, then press r to try sign-in again."
+                        .into();
+            }
             return Action::None;
         }
         self.account_pending = Some(Pending {
@@ -433,6 +446,17 @@ impl App {
         }
         // Keep sign-in input responsive while a background poll finishes.
         if self.busy {
+            if let AccountScreen::PasteToken { submit, .. } = &mut screen
+                && self
+                    .account_pending
+                    .as_ref()
+                    .is_some_and(|p| p.request["step"] == "cancel")
+                && key.code == KeyCode::Enter
+            {
+                *submit = true;
+                self.mode = Mode::Accounts { screen, back };
+                return Action::None;
+            }
             let typing_poll = self
                 .account_pending
                 .as_ref()
@@ -468,6 +492,7 @@ impl App {
                 machine,
                 code,
                 token,
+                ..
             } => match key.code {
                 KeyCode::Backspace => {
                     token.0.pop();
@@ -478,7 +503,8 @@ impl App {
                     token.0.push(c)
                 }
                 KeyCode::Enter if !token.0.trim().is_empty() => {
-                    let request = json!({"action":"account-signin","code":code,"step":"paste","token":std::mem::take(&mut token.0)});
+                    let request = json!({"action":"account-signin","code":code,"step":"paste","token":token.0.trim()});
+                    token.0.clear();
                     let machine = *machine;
                     self.mode = *back;
                     if let Mode::Accounts {
@@ -669,7 +695,7 @@ impl App {
                         if let Some(to) = choices.get(*sel) {
                             request = Some((
                                 target.machine,
-                                json!({"action":"account-move","pane":target.agent.pane,"session":target.agent.session,"to":to}),
+                                json!({"action":"account-move","pane":target.agent.pane,"session":target.agent.session,"conversation":target.agent.conversation,"to":to}),
                             ));
                         }
                     } else {
@@ -721,7 +747,7 @@ impl App {
                         });
                         return Action::None;
                     }
-                    KeyCode::Backspace if owner.parent.is_some() => {
+                    KeyCode::Backspace if owner.parent.is_some() && owner.own => {
                         self.push_account_screen(AccountScreen::Confirm {
                         machine: *machine,
                         request: json!({"action":"account-models","owner":owner.id,"inherit":true}),
@@ -732,7 +758,7 @@ impl App {
                         return Action::None;
                     }
                     KeyCode::Enter if !models.is_empty() => {
-                        if *models == owner.models && owner.own {
+                        if *models == owner.models && (owner.own || owner.parent.is_none()) {
                             self.say("Model list unchanged.", Tone::Info);
                             if *move_waiting {
                                 self.queue_waiting_moves(&owner.id);
@@ -862,7 +888,7 @@ impl App {
                     return Action::None;
                 };
                 match key.code {
-                    KeyCode::Tab => s.editing = !s.editing,
+                    KeyCode::Tab if s.needs_code => s.editing = !s.editing,
                     KeyCode::Char('p') if !s.editing => {
                         if let Some(ticket) = &s.ticket {
                             self.account_queue.push_back((
@@ -880,6 +906,7 @@ impl App {
                             machine,
                             code,
                             token: Secret::default(),
+                            submit: false,
                         });
                         return Action::None;
                     }
@@ -1042,6 +1069,16 @@ impl App {
             return Action::None;
         }
         if let Mode::Accounts {
+            screen: AccountScreen::PasteToken { submit, .. },
+            ..
+        } = &mut self.mode
+            && std::mem::take(submit)
+        {
+            return self
+                .account_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+                .unwrap_or(Action::None);
+        }
+        if let Mode::Accounts {
             screen: AccountScreen::Signin(s),
             ..
         } = &mut self.mode
@@ -1088,7 +1125,6 @@ impl App {
             ..
         } = &mut self.mode
             && !s.failed
-            && !s.editing
             && s.page_code.is_empty()
             && Instant::now() >= s.poll_at
             && let (Some(&mi), Some(ticket)) = (s.machines.get(s.current), s.ticket.clone())
@@ -1145,7 +1181,7 @@ impl App {
         };
         let action = request["action"].as_str().unwrap_or("");
         if action == "account-models" && response.ok {
-            self.saved_models(&request);
+            self.saved_models(machine, &request);
         }
         if action == "account-move-waiting" {
             self.account_batch_messages.push(format!(
@@ -1181,6 +1217,13 @@ impl App {
                     }
                 }
                 if !response.ok {
+                    if let Mode::Accounts {
+                        screen: AccountScreen::PasteToken { submit, .. },
+                        ..
+                    } = &mut self.mode
+                    {
+                        *submit = false;
+                    }
                     self.say(
                         format!("Could not cancel sign-in: {}", response.message),
                         Tone::Warn,
@@ -1330,7 +1373,6 @@ impl App {
                         && self.account_queue.is_empty()
                         && !self.account_batch_messages.is_empty()
                     {
-                        self.say(self.account_batch_messages.join("; "), Tone::Warn);
                         return;
                     }
                 }
@@ -1458,7 +1500,7 @@ mod tests {
         complete(
             &mut a,
             cancel,
-            json!({"ok":true,"message":"cancelled","status":"done"}),
+            json!({"ok":true,"message":"cancelled","status":"cancelled"}),
         );
         let secret = "fixture-only-private-value";
         a.on_paste(secret);
@@ -1531,7 +1573,7 @@ mod tests {
         assert_eq!(mi, 1);
         assert_eq!(
             r,
-            json!({"action":"account-move","pane":"w1:p1","session":"api","to":"ARK"})
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK"})
         );
         complete(
             &mut a,
@@ -1543,7 +1585,7 @@ mod tests {
         let (_, r) = sent(press(&mut a, 'y'));
         assert_eq!(
             r,
-            json!({"action":"account-move","pane":"w1:p1","session":"api","to":"ARK","confirm":"opaque-ticket"})
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK","confirm":"opaque-ticket"})
         );
         assert!(r.get("override").is_none());
     }
@@ -1741,7 +1783,7 @@ mod tests {
         complete(
             &mut a,
             cancel,
-            json!({"ok":true,"status":"done","message":"cancelled"}),
+            json!({"ok":true,"status":"cancelled","message":"cancelled"}),
         );
         let (_, request) = sent(a.account_tick());
         assert_eq!(request["step"], "start");
@@ -1892,5 +1934,177 @@ mod tests {
         assert!(agent.waiting_for_usage());
         assert_eq!(card.attention, Attention::Waiting);
         assert!(!card.needs_you());
+    }
+
+    #[test]
+    fn queued_and_stale_moves_leave_the_account_to_the_feed() {
+        for (state, message) in [
+            ("queued", "moving to ARK"),
+            ("stale", "the conversation changed"),
+        ] {
+            let mut a = app();
+            pick(&mut a);
+            press(&mut a, 's');
+            let action = key(&mut a, KeyCode::Enter);
+            complete(
+                &mut a,
+                action,
+                json!({"ok":true,"state":state,"account":"ARK","message":message}),
+            );
+            assert_eq!(
+                a.account_agent(a.selected().unwrap()).unwrap().account,
+                "KBZ"
+            );
+            assert_eq!(a.message().unwrap().0, message);
+        }
+    }
+
+    #[test]
+    fn a_move_problem_needs_attention_and_is_shown_in_the_picker() {
+        let mut a = app();
+        let problem = "restart on ARK failed; retry the move";
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|a| a.session == "api" && a.pane == "w1:p1")
+            .unwrap()
+            .problem = Some(problem.into());
+        a.rebuild();
+        pick(&mut a);
+        assert!(a.selected().unwrap().needs_you());
+        assert_eq!(a.selected().unwrap().why, problem);
+        press(&mut a, 's');
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &a)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect();
+        assert!(text.contains(problem));
+    }
+
+    #[test]
+    fn offline_retry_and_token_submission_stay_retryable() {
+        let mut a = app();
+        a.machines[0].conn = crate::poll::Conn::Connecting;
+        assert_eq!(signin(&mut a), Action::None);
+        assert_eq!(press(&mut a, 'r'), Action::None);
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed && s.message.contains("not answering"))
+        );
+        press(&mut a, 'p');
+        a.on_paste("fixture-private-value");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed)
+        );
+        assert!(!format!("{:?}", a.mode).contains("fixture-private-value"));
+        a.machines[0].conn = crate::poll::Conn::Live {
+            latency: Duration::ZERO,
+        };
+        assert_eq!(sent(press(&mut a, 'r')).1["step"], "start");
+    }
+
+    #[test]
+    fn tab_cannot_pause_a_signin_without_a_code_field() {
+        let mut a = app();
+        let action = signin(&mut a);
+        let mut response = started();
+        response["needs_code"] = json!(false);
+        complete(&mut a, action, response);
+        key(&mut a, KeyCode::Tab);
+        press(&mut a, 'z');
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            assert!(!s.editing);
+            assert!(s.page_code.is_empty());
+            s.poll_at = Instant::now() - Duration::from_secs(1);
+        }
+        assert_eq!(sent(a.account_tick()).1["step"], "poll");
+    }
+
+    #[test]
+    fn token_enter_during_cancel_is_deferred_and_trims_the_paste() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        press(&mut a, 'p');
+        let cancel = a.account_tick();
+        a.busy = true;
+        a.on_paste("  fixture-private-value  ");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        complete(
+            &mut a,
+            cancel,
+            json!({"ok":true,"status":"cancelled","message":"cancelled"}),
+        );
+        let (_, request) = sent(a.account_tick());
+        assert_eq!(request["token"], "fixture-private-value");
+        assert!(!format!("{:?}", a.mode).contains("fixture-private-value"));
+    }
+
+    #[test]
+    fn identity_mismatch_and_refused_cancel_do_not_advance_signin() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        a.on_paste("page-code");
+        let action = key(&mut a, KeyCode::Enter);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"status":"failed","message":"that signed in as X, not KBZ's Y"}),
+        );
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed && s.current == 0 && s.message.contains("not KBZ"))
+        );
+        let cancel = press(&mut a, 'r');
+        complete(
+            &mut a,
+            cancel,
+            json!({"ok":false,"message":"cancel refused"}),
+        );
+        assert!(a.account_queue.is_empty());
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed && s.ticket.is_some() && s.message.contains("cancel refused"))
+        );
+        key(&mut a, KeyCode::Esc);
+        assert!(!matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Signin(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn unchanged_organization_does_not_write_and_saved_lists_do_not_rewrite_other_feeds() {
+        let mut a = app();
+        let mut owner = a.account_feed(0).unwrap().owners[0].clone();
+        owner.own = false;
+        a.push_account_screen(AccountScreen::Models {
+            machine: 0,
+            models: owner.models.clone(),
+            owner,
+            sel: 0,
+            move_waiting: false,
+        });
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert!(a.account_pending.is_none());
+        let other = a.account_feed(1).unwrap().owners.clone();
+        a.saved_models(0, &json!({"owner":"studio","models":["KBZ"]}));
+        assert_eq!(a.account_feed(0).unwrap().owners[0].models, ["KBZ"]);
+        assert_eq!(a.account_feed(1).unwrap().owners, other);
     }
 }

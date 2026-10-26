@@ -122,6 +122,9 @@ fn redact_credentials(text: &str, request: &Value) -> String {
         for field in ["token", "page_code"] {
             if let Some(secret) = request[field].as_str().filter(|s| !s.is_empty()) {
                 text = text.replace(secret, "[redacted]");
+                if secret != secret.trim() && !secret.trim().is_empty() {
+                    text = text.replace(secret.trim(), "[redacted]");
+                }
             }
         }
     }
@@ -220,7 +223,7 @@ mod tests {
             "account-test",
             "account-remove",
         ] {
-            let response=run(&machine(),&command,&json!({"action":action,"code":"EXAMPLE","pane":"w1:p1","to":"EXAMPLE","owner":"studio","models":["EXAMPLE"]})).unwrap();
+            let response=run(&machine(),&command,&json!({"action":action,"code":"EXAMPLE","pane":"w1:p1","session":"web","conversation":"fixture-conversation","to":"EXAMPLE","owner":"studio","models":["EXAMPLE"]})).unwrap();
             if action == "account-move" {
                 assert!(response.confirmation);
                 assert_eq!(response.confirm.as_deref(), Some("fixture-confirm"));
@@ -229,15 +232,37 @@ mod tests {
                 assert!(response.ok, "{action}: {response:?}");
             }
         }
+        for (conversation, message) in [
+            ("fixture-conversation", "moving to ARK"),
+            ("stale-conversation", "the conversation changed"),
+        ] {
+            let response = run(&machine(), &command, &json!({"action":"account-move","pane":"w1:p1","session":"web","conversation":conversation,"to":"ARK","confirm":"fixture-confirm"})).unwrap();
+            assert!(response.ok && !response.confirmation);
+            assert_eq!(response.message, message);
+        }
         for step in ["start", "poll", "finish", "cancel", "paste"] {
             let response=run(&machine(),&command,&json!({"action":"account-signin","step":step,"code":"EXAMPLE","ticket":"fixture-ticket","page_code":"page-code"})).unwrap();
             assert!(response.ok);
             assert!(response.status.is_some());
+            if step == "cancel" {
+                assert_eq!(response.status.as_deref(), Some("cancelled"));
+            }
             if step == "start" {
                 assert!(response.needs_code);
                 assert_eq!(response.ticket.as_deref(), Some("fixture-ticket"));
             }
         }
+    }
+
+    #[test]
+    fn redaction_covers_trimmed_credential_echoes() {
+        assert_eq!(
+            redact_credentials(
+                "echo: fixture-private-value",
+                &json!({"action":"account-signin","token":"  fixture-private-value  "})
+            ),
+            "echo: [redacted]"
+        );
     }
 
     #[test]
