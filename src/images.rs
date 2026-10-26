@@ -441,14 +441,22 @@ fn copied_files(uri_list: &str) -> Result<Vec<Loaded>, String> {
     images.into_iter().map(|p| from_file(p)).collect()
 }
 
+/// A private folder for a reader to write the clipboard's image into, and the path it writes:
+/// a path nobody has open, since Windows won't let another program write a file Kerdr holds.
+#[cfg(any(target_os = "macos", windows))]
+fn scratch() -> Result<(tempfile::TempDir, PathBuf), String> {
+    let dir = tempfile::Builder::new()
+        .prefix("kerdr-clipboard-")
+        .tempdir()
+        .map_err(|e| format!("Couldn't make a folder to read the clipboard into: {e}."))?;
+    let file = dir.path().join("clipboard.png");
+    Ok((dir, file))
+}
+
 #[cfg(target_os = "macos")]
 fn macos_clipboard() -> Result<Vec<Loaded>, String> {
-    let file = tempfile::Builder::new()
-        .prefix("kerdr-clipboard-")
-        .suffix(".png")
-        .tempfile()
-        .map_err(|e| format!("Couldn't make a file to read the clipboard into: {e}."))?;
-    let path = file.path().to_string_lossy().into_owned();
+    let (_dir, file) = scratch()?;
+    let path = file.to_string_lossy().into_owned();
     // The path goes in as an argument, never as script source.
     let script = [
         "on run argv",
@@ -470,7 +478,7 @@ fn macos_clipboard() -> Result<Vec<Loaded>, String> {
     let got = capture(cmd, 4096, READ_DEADLINE)
         .map_err(|e| format!("Couldn't read the clipboard with osascript: {e}."))?;
     if got.status == Some(0) {
-        return from_file(file.path()).map(|l| vec![l]);
+        return from_file(&file).map(|l| vec![l]);
     }
     // A file copied in Finder.
     let mut cmd = Command::new("osascript");
@@ -489,12 +497,8 @@ fn macos_clipboard() -> Result<Vec<Loaded>, String> {
 #[cfg(windows)]
 fn windows_clipboard() -> Result<Vec<Loaded>, String> {
     use base64::Engine;
-    let file = tempfile::Builder::new()
-        .prefix("kerdr-clipboard-")
-        .suffix(".png")
-        .tempfile()
-        .map_err(|e| format!("Couldn't make a file to read the clipboard into: {e}."))?;
-    let path = file.path().to_string_lossy().into_owned();
+    let (_dir, file) = scratch()?;
+    let path = file.to_string_lossy().into_owned();
     // Exit 0: the image is saved; 4: copied files, one per line; 3: text only; 2: nothing; 5: an
     // error, its message on standard error as plain text rather than PowerShell's CLIXML.
     let script = format!(
@@ -527,7 +531,7 @@ fn windows_clipboard() -> Result<Vec<Loaded>, String> {
     let got = capture(cmd, 1024 * 1024, READ_DEADLINE * 3)
         .map_err(|e| format!("Couldn't read the clipboard with PowerShell: {e}."))?;
     match got.status {
-        Some(0) => from_file(file.path()).map(|l| vec![l]),
+        Some(0) => from_file(&file).map(|l| vec![l]),
         Some(4) => {
             let listed: String = String::from_utf8_lossy(&got.stdout)
                 .lines()
