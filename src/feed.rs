@@ -134,6 +134,10 @@ pub struct FeedWorkspace {
     pub id: Option<String>,
     #[serde(default)]
     pub label: Option<String>,
+    /// The herdr tab the work runs in, when it's one tab of a workspace other work shares (a
+    /// helper in a tab of the workspace that started it). Enter lands on that tab.
+    #[serde(default)]
+    pub tab: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -259,6 +263,17 @@ mod tests {
                 .resume
                 .is_none()
         );
+    }
+
+    #[test]
+    fn reads_the_tab_a_cards_work_runs_in_when_it_names_one() {
+        let feed = parse(r#"{"kerdr_feed":1,"cards":[
+            {"id":"41","title":"t","workspace":{"session":"web","id":"w4","label":"41-checkout","tab":"w4:t2"}},
+            {"id":"42","title":"t","workspace":{"session":"web","id":"w5","label":"42-search"}}]}"#)
+        .unwrap();
+        let tab = |i: usize| feed.cards[i].workspace.as_ref().unwrap().tab.clone();
+        assert_eq!(tab(0).as_deref(), Some("w4:t2"));
+        assert_eq!(tab(1), None);
     }
 
     #[test]

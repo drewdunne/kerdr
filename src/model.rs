@@ -194,6 +194,8 @@ pub struct Card {
     pub session: Option<String>,
     pub workspace_id: Option<String>,
     pub workspace_label: Option<String>,
+    /// The tab in that workspace the work runs in, when its feed names one: Enter focuses it.
+    pub tab_id: Option<String>,
     pub priority: Priority,
     pub background: bool,
     /// Set when the card's machine isn't answering: the moment its data was last fresh.

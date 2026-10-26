@@ -299,6 +299,8 @@ fn cards() -> anyhow::Result<()> {
                 "session": c.session,
                 "workspace": c.workspace_id,
                 "workspace_label": c.workspace_label,
+                "tab": c.tab_id,
+                "agents": c.agents.iter().map(|a| &a.pane_id).collect::<Vec<_>>(),
                 "cached": c.cached_at.is_some(),
                 "owner": c.owner_label(),
                 "project": c.project(),

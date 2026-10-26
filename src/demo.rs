@@ -54,6 +54,7 @@ fn card(c: C) -> FeedCard {
             session: Some(c.session.into()),
             id: Some(id.into()),
             label: Some(label.into()),
+            tab: None,
         }),
         ..Default::default()
     }
