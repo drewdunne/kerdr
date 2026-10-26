@@ -741,6 +741,7 @@ fn agent_infos(w: &WsRef) -> Vec<AgentInfo> {
             status: a.agent_status.clone().unwrap_or_else(|| "unknown".into()),
             pane_id: a.pane_id.clone(),
             title: a.title.as_deref().map(herdr::clean_title),
+            conversation: a.agent_session.as_ref().and_then(|s| s.value.clone()),
         })
         .collect()
 }

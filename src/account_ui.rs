@@ -253,10 +253,14 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             let mut lines = vec![
                 line(
                     format!(
-                        "{} › {} · on {}",
+                        "{} › {} · {}",
                         app.machines[target.machine].name(),
                         target.agent.session,
-                        target.agent.account
+                        if target.agent.account.is_empty() {
+                            "no account recorded yet".to_string()
+                        } else {
+                            format!("on {}", target.agent.account)
+                        }
                     ),
                     DIM,
                 ),

@@ -77,6 +77,15 @@ pub struct Agent {
     pub terminal_title_stripped: Option<String>,
     #[serde(default)]
     pub focused: bool,
+    /// The conversation herdr sees in the pane (`agent_session.value`), when it knows it.
+    #[serde(default)]
+    pub agent_session: Option<AgentSession>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct AgentSession {
+    #[serde(default)]
+    pub value: Option<String>,
 }
 
 impl Snapshot {

@@ -187,6 +187,8 @@ The tick sends a separate move request to every reachable configured feed machin
 `s` opens the selected agent’s move picker. Choosing an account sends the request to that
 agent’s machine and session. If its backend asks about a step or background job in progress,
 a separate question appears. A confirmation applies only to that same conversation.
+A Claude Code agent the feed has no record of yet can be moved too: Kerdr sends its pane with
+an empty `conversation`, and the backend takes the conversation from herdr and records it.
 The backend owns fallback and resuming: same program, same conversation; another program,
 a fresh agent from the work’s log; nothing left, wait for an account to return.
 
