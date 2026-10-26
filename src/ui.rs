@@ -40,6 +40,14 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn action_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.busy
+        && app
+            .account_pending
+            .as_ref()
+            .is_some_and(|p| p.request["action"] == "account-signin")
+    {
+        return;
+    }
     let (text, color) = if app.busy {
         ("Action in progress · navigation stays available", BLUE)
     } else if let Some((text, tone)) = app.message() {

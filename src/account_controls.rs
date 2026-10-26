@@ -241,7 +241,15 @@ impl App {
             machine,
             request: crate::actions::request_metadata(&request),
             screen: match &self.mode {
-                Mode::Accounts { screen, .. } => Some(screen.clone()),
+                Mode::Accounts { screen, .. } => {
+                    let mut snapshot = screen.clone();
+                    match &mut snapshot {
+                        AccountScreen::PasteToken { token, .. } => token.0.clear(),
+                        AccountScreen::Signin(s) => s.page_code.clear(),
+                        _ => {}
+                    }
+                    Some(snapshot)
+                }
                 _ => None,
             },
         });
@@ -878,12 +886,17 @@ impl App {
     }
 
     pub(super) fn account_paste(&mut self, text: &str) -> bool {
+        let can_type = !self.busy
+            || self
+                .account_pending
+                .as_ref()
+                .is_some_and(|p| matches!(p.request["step"].as_str(), Some("poll" | "cancel")));
         if let Mode::Accounts {
             screen: AccountScreen::PasteToken { token, .. },
             ..
         } = &mut self.mode
         {
-            if !self.busy {
+            if can_type {
                 token.0 = text
                     .chars()
                     .filter(|c| !c.is_control())
@@ -897,7 +910,7 @@ impl App {
             ..
         } = &mut self.mode
         {
-            if !self.busy && s.needs_code {
+            if can_type && s.needs_code {
                 s.page_code = text
                     .chars()
                     .filter(|c| !c.is_control())
@@ -923,6 +936,15 @@ impl App {
                 continue;
             }
             let action = self.send_account(mi, request.clone());
+            if action == Action::None && request["action"] == "account-move-waiting" {
+                self.account_batch_messages.push(format!(
+                    "{}: disconnected, not moved",
+                    self.machines[mi].name()
+                ));
+                if self.account_queue.is_empty() {
+                    self.say(self.account_batch_messages.join("; "), Tone::Warn);
+                }
+            }
             if action == Action::None
                 && request["action"] == "account-signin"
                 && request["step"] == "start"
@@ -974,6 +996,14 @@ impl App {
         let response = match result {
             Ok(r) => r,
             Err(e) => {
+                if request["action"] == "account-move-waiting" {
+                    self.account_batch_messages
+                        .push(format!("{}: {e}", self.machines[machine].name()));
+                    if self.account_queue.is_empty() {
+                        self.say(self.account_batch_messages.join("; "), Tone::Warn);
+                    }
+                    return;
+                }
                 if let Mode::Accounts {
                     screen: AccountScreen::Signin(s),
                     ..

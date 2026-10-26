@@ -450,7 +450,9 @@ fn start_action(
     };
     let tx = tx.clone();
     app.busy = true;
-    app.say(app.working_on(&request), Tone::Info);
+    if request["action"] != "account-signin" {
+        app.say(app.working_on(&request), Tone::Info);
+    }
     std::thread::spawn(move || {
         let result = crate::actions::run(&target, &command, &request);
         let metadata = crate::actions::request_metadata(&request);
