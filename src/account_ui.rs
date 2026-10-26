@@ -394,6 +394,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                     ("c", "copy link"),
                     ("o", "open it again"),
                 ])));
+                if let Some(url) = &s.url {
+                    lines.extend(wrapped(url, 68, fg(DIM), None));
+                }
                 if s.needs_code {
                     lines.push(Line::raw(""));
                     lines.push(selected(
@@ -544,7 +547,18 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                 if let Some(o) = feed.owners.iter().find(|o| &o.id == id) {
                     let prefix = if o.parent.is_some() { "  " } else { "" };
                     let models = if o.own || o.parent.is_none() {
-                        o.models.join(" → ")
+                        o.models
+                            .iter()
+                            .enumerate()
+                            .map(|(index, code)| {
+                                if i == sel && index == model {
+                                    format!("[{code}]")
+                                } else {
+                                    code.clone()
+                                }
+                            })
+                            .collect::<Vec<_>>()
+                            .join(" → ")
                     } else {
                         format!(
                             "as {}",

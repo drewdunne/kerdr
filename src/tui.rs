@@ -133,9 +133,10 @@ fn event_loop(
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     loop {
         while let Ok((machine, request, result)) = action_rx.try_recv() {
-            let succeeded = result
-                .as_ref()
-                .is_ok_and(|r: &crate::actions::Response| r.ok);
+            let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
+                r.ok && !(request["action"] == "account-signin"
+                    && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
+            });
             app.finish_action(machine, request, result);
             if succeeded && let Some(l) = live.as_deref() {
                 for poller in l.pollers.iter().flatten() {

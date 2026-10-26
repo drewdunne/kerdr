@@ -21,6 +21,8 @@ pub struct MoveTarget {
 
 #[derive(Clone, Debug)]
 pub struct Signin {
+    pub deferred: Option<KeyCode>,
+    pub restart: bool,
     pub code: String,
     pub machines: Vec<usize>,
     pub current: usize,
@@ -106,6 +108,57 @@ pub struct Pending {
 }
 
 impl App {
+    fn queue_waiting_moves(&mut self, owner: &str) {
+        self.account_batch_messages.clear();
+        for (mi, m) in self
+            .machines
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.is_shown() && m.machine.feed.is_some())
+        {
+            if m.conn.is_live() {
+                self.account_queue
+                    .push_back((mi, json!({"action":"account-move-waiting","owner":owner})));
+            } else {
+                self.account_batch_messages
+                    .push(format!("{}: offline, not moved", m.name()));
+            }
+        }
+        if self.account_queue.is_empty() && !self.account_batch_messages.is_empty() {
+            self.say(self.account_batch_messages.join("; "), Tone::Warn);
+        }
+    }
+
+    fn saved_models(&mut self, request: &Value) {
+        let id = request["owner"].as_str().unwrap_or("");
+        for feed in self.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+            let Some(index) = feed.owners.iter().position(|o| o.id == id) else {
+                continue;
+            };
+            let inherit = request["inherit"] == true;
+            let models: Vec<String> = if inherit {
+                feed.owners
+                    .iter()
+                    .find(|o| Some(&o.id) == feed.owners[index].parent.as_ref())
+                    .map(|o| o.models.clone())
+                    .unwrap_or_default()
+            } else {
+                request["models"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect()
+            };
+            feed.owners[index].models = models.clone();
+            feed.owners[index].own = !inherit;
+            for owner in &mut feed.owners {
+                if !owner.own && owner.parent.as_deref() == Some(id) {
+                    owner.models = models.clone();
+                }
+            }
+        }
+    }
     pub fn account_feed(&self, machine: usize) -> Option<&Feed> {
         self.machines.get(machine)?.feed.as_ref()
     }
@@ -260,10 +313,9 @@ impl App {
         let Some(&machine) = machines.first() else {
             return Action::None;
         };
-        if !self.can_write(machine) {
-            return Action::None;
-        }
         self.push_account_screen(AccountScreen::Signin(Signin {
+            deferred: None,
+            restart: false,
             code: code.clone(),
             machines,
             current: 0,
@@ -276,10 +328,22 @@ impl App {
             failed: false,
             message: "Starting sign-in…".into(),
         }));
-        self.send_account(
+        let action = self.send_account(
             machine,
             json!({"action":"account-signin","code":code,"step":"start"}),
-        )
+        );
+        if action == Action::None
+            && let Mode::Accounts {
+                screen: AccountScreen::Signin(s),
+                ..
+            } = &mut self.mode
+        {
+            s.failed = true;
+            s.message =
+                "This machine is not answering. Reconnect, then press r to try sign-in again."
+                    .into();
+        }
+        action
     }
 
     pub(super) fn account_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -367,14 +431,23 @@ impl App {
             self.mode = *back;
             return Action::None;
         }
-        // Never repeat mutations from a held key; movement remains available while writing.
+        // Keep sign-in input responsive while a background poll finishes.
         if self.busy {
             let typing_poll = self
                 .account_pending
                 .as_ref()
                 .is_some_and(|p| p.request["step"] == "poll")
                 && matches!(&screen, AccountScreen::Signin(_));
-            if !typing_poll || matches!(key.code, KeyCode::Enter | KeyCode::Char('p' | 'r')) {
+            if typing_poll
+                && let AccountScreen::Signin(s) = &mut screen
+                && (key.code == KeyCode::Enter
+                    || (!s.editing && matches!(key.code, KeyCode::Char('p' | 'r'))))
+            {
+                s.deferred = Some(key.code);
+                self.mode = Mode::Accounts { screen, back };
+                return Action::None;
+            }
+            if !typing_poll {
                 return Action::None;
             }
         }
@@ -546,42 +619,32 @@ impl App {
                                             }
                                             return Action::None;
                                         }
-                                        KeyCode::Backspace if owner.parent.is_some() => {
-                                            request = Some((
-                                                *machine,
-                                                json!({"action":"account-models","owner":id,"inherit":true}),
-                                            ))
-                                        }
-                                        KeyCode::Enter | KeyCode::Char('J' | 'K' | 'd')
-                                            if !models.is_empty() =>
-                                        {
-                                            match key.code {
-                                                KeyCode::Enter => {
-                                                    let code = models.remove(*model);
-                                                    models.insert(0, code);
-                                                    *model = 0;
-                                                }
-                                                KeyCode::Char('d') => {
-                                                    models.remove(*model);
-                                                }
-                                                KeyCode::Char('J') if *model + 1 < models.len() => {
-                                                    models.swap(*model, *model + 1);
-                                                    *model += 1;
-                                                }
-                                                KeyCode::Char('K') if *model > 0 => {
-                                                    models.swap(*model, *model - 1);
-                                                    *model -= 1;
-                                                }
-                                                _ => {}
+                                        KeyCode::Backspace
+                                        | KeyCode::Enter
+                                        | KeyCode::Char('J' | 'K' | 'd') => {
+                                            let key = key.code;
+                                            // Edit a visible draft; no central write until Save.
+                                            if key == KeyCode::Enter && *model < models.len() {
+                                                let code = models.remove(*model);
+                                                models.insert(0, code);
+                                                *model = 0;
                                             }
-                                            if models.is_empty() {
-                                                self.say("Keep one model, or Backspace to follow the parent.",Tone::Info);
-                                            } else {
-                                                request = Some((
-                                                    *machine,
-                                                    json!({"action":"account-models","owner":id,"models":models}),
-                                                ));
+                                            self.push_account_screen(AccountScreen::Models {
+                                                machine: *machine,
+                                                owner,
+                                                models,
+                                                sel: *model,
+                                                move_waiting: false,
+                                            });
+                                            if key != KeyCode::Enter {
+                                                return self
+                                                    .account_key(KeyEvent::new(
+                                                        key,
+                                                        KeyModifiers::NONE,
+                                                    ))
+                                                    .unwrap_or(Action::None);
                                             }
+                                            return Action::None;
                                         }
                                         _ => {}
                                     }
@@ -624,53 +687,70 @@ impl App {
                 models,
                 sel,
                 move_waiting,
-            } => match key.code {
-                KeyCode::Down | KeyCode::Char('j') => {
-                    *sel = (*sel + 1).min(models.len().saturating_sub(1))
-                }
-                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
-                KeyCode::Char('J') if *sel + 1 < models.len() => {
-                    models.swap(*sel, *sel + 1);
-                    *sel += 1;
-                }
-                KeyCode::Char('K') if *sel > 0 && *sel < models.len() => {
-                    models.swap(*sel, *sel - 1);
-                    *sel -= 1;
-                }
-                KeyCode::Char('d') if models.len() > 1 && *sel < models.len() => {
-                    models.remove(*sel);
-                    *sel = (*sel).min(models.len() - 1);
-                }
-                KeyCode::Char(' ') => *move_waiting = !*move_waiting,
-                KeyCode::Char('a') => {
-                    let choices = self
-                        .account_feed(*machine)
-                        .into_iter()
-                        .flat_map(|f| &f.accounts)
-                        .filter(|a| !models.contains(&a.code))
-                        .map(|a| a.code.clone())
-                        .collect();
-                    self.push_account_screen(AccountScreen::AddModel {
+            } => {
+                match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        *sel = (*sel + 1).min(models.len().saturating_sub(1))
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                    KeyCode::Char('J') if *sel + 1 < models.len() => {
+                        models.swap(*sel, *sel + 1);
+                        *sel += 1;
+                    }
+                    KeyCode::Char('K') if *sel > 0 && *sel < models.len() => {
+                        models.swap(*sel, *sel - 1);
+                        *sel -= 1;
+                    }
+                    KeyCode::Char('d') if models.len() > 1 && *sel < models.len() => {
+                        models.remove(*sel);
+                        *sel = (*sel).min(models.len() - 1);
+                    }
+                    KeyCode::Char(' ') => *move_waiting = !*move_waiting,
+                    KeyCode::Char('a') => {
+                        let choices = self
+                            .account_feed(*machine)
+                            .into_iter()
+                            .flat_map(|f| &f.accounts)
+                            .filter(|a| !models.contains(&a.code))
+                            .map(|a| a.code.clone())
+                            .collect();
+                        self.push_account_screen(AccountScreen::AddModel {
+                            machine: *machine,
+                            choices,
+                            sel: 0,
+                        });
+                        return Action::None;
+                    }
+                    KeyCode::Backspace if owner.parent.is_some() => {
+                        self.push_account_screen(AccountScreen::Confirm {
                         machine: *machine,
-                        choices,
-                        sel: 0,
+                        request: json!({"action":"account-models","owner":owner.id,"inherit":true}),
+                        message: format!("Make {} follow its organization's model list?", owner.name),
+                        yes: "follow organization".into(), no: "keep this list".into(), target: None,
+                        ready_at: Instant::now() + Duration::from_millis(500),
                     });
-                    return Action::None;
+                        return Action::None;
+                    }
+                    KeyCode::Enter if !models.is_empty() => {
+                        if *models == owner.models && owner.own {
+                            self.say("Model list unchanged.", Tone::Info);
+                            if *move_waiting {
+                                self.queue_waiting_moves(&owner.id);
+                            }
+                            self.mode = *back;
+                            return Action::None;
+                        }
+                        let value =
+                            if *models == owner.models && !owner.own && owner.parent.is_some() {
+                                json!({"action":"account-models","owner":owner.id,"inherit":true})
+                            } else {
+                                json!({"action":"account-models","owner":owner.id,"models":models})
+                            };
+                        request = Some((*machine, value));
+                    }
+                    _ => {}
                 }
-                KeyCode::Backspace if owner.parent.is_some() => {
-                    request = Some((
-                        *machine,
-                        json!({"action":"account-models","owner":owner.id,"inherit":true}),
-                    ))
-                }
-                KeyCode::Enter if !models.is_empty() => {
-                    request = Some((
-                        *machine,
-                        json!({"action":"account-models","owner":owner.id,"models":models}),
-                    ))
-                }
-                _ => {}
-            },
+            }
             AccountScreen::AddModel { choices, sel, .. } => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *sel = (*sel + 1).min(choices.len().saturating_sub(1))
@@ -724,14 +804,12 @@ impl App {
                     }
                     KeyCode::Enter => {
                         if code.is_empty()
-                            || code.len() > 12
-                            || !code
-                                .chars()
-                                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+                            || !(2..=4).contains(&code.len())
+                            || !code.chars().all(|c| c.is_ascii_uppercase())
                             || name.trim().is_empty()
                             || !chosen.contains(&true)
                         {
-                            self.say("Use a code of 1–12 uppercase letters, digits or _, a name, and at least one machine.",Tone::Warn);
+                            self.say("Use a code of 2–4 uppercase letters, a name, and at least one machine.",Tone::Warn);
                         } else if self
                             .machines
                             .iter()
@@ -786,7 +864,7 @@ impl App {
                 match key.code {
                     KeyCode::Tab => s.editing = !s.editing,
                     KeyCode::Char('p') if !s.editing => {
-                        if let Some(ticket) = s.ticket.take() {
+                        if let Some(ticket) = &s.ticket {
                             self.account_queue.push_back((
                                 machine,
                                 json!({"action":"account-signin","step":"cancel","ticket":ticket}),
@@ -813,12 +891,22 @@ impl App {
                     }
                     KeyCode::Char('r') if !s.editing && s.failed => {
                         s.failed = false;
-                        s.ticket = None;
                         s.url = None;
-                        request = Some((
-                            machine,
-                            json!({"action":"account-signin","code":s.code,"step":"start"}),
-                        ));
+                        s.page_code.clear();
+                        s.needs_code = false;
+                        if let Some(ticket) = &s.ticket {
+                            s.restart = true;
+                            s.message = "Stopping the previous sign-in…".into();
+                            request = Some((
+                                machine,
+                                json!({"action":"account-signin","step":"cancel","ticket":ticket}),
+                            ));
+                        } else {
+                            request = Some((
+                                machine,
+                                json!({"action":"account-signin","code":s.code,"step":"start"}),
+                            ));
+                        }
                     }
                     KeyCode::Backspace if s.editing => {
                         s.page_code.pop();
@@ -891,6 +979,31 @@ impl App {
                 .account_pending
                 .as_ref()
                 .is_some_and(|p| matches!(p.request["step"].as_str(), Some("poll" | "cancel")));
+        if can_type && let Mode::Accounts { screen, .. } = &mut self.mode {
+            let clean = || {
+                text.chars()
+                    .filter(|c| !c.is_control())
+                    .take(80)
+                    .collect::<String>()
+            };
+            match screen {
+                AccountScreen::Add {
+                    code, name, field, ..
+                } if *field < 2 => {
+                    if *field == 0 {
+                        *code = clean();
+                    } else {
+                        *name = clean();
+                    }
+                    return true;
+                }
+                AccountScreen::Rename { name, .. } => {
+                    *name = clean();
+                    return true;
+                }
+                _ => {}
+            }
+        }
         if let Mode::Accounts {
             screen: AccountScreen::PasteToken { token, .. },
             ..
@@ -927,6 +1040,16 @@ impl App {
     pub fn account_tick(&mut self) -> Action {
         if self.busy {
             return Action::None;
+        }
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut self.mode
+            && let Some(key) = s.deferred.take()
+        {
+            return self
+                .account_key(KeyEvent::new(key, KeyModifiers::NONE))
+                .unwrap_or(Action::None);
         }
         while let Some((mi, request)) = self.account_queue.pop_front() {
             if request["action"] == "account-signin"
@@ -965,6 +1088,8 @@ impl App {
             ..
         } = &mut self.mode
             && !s.failed
+            && !s.editing
+            && s.page_code.is_empty()
             && Instant::now() >= s.poll_at
             && let (Some(&mi), Some(ticket)) = (s.machines.get(s.current), s.ticket.clone())
         {
@@ -1004,12 +1129,14 @@ impl App {
                     }
                     return;
                 }
-                if let Mode::Accounts {
-                    screen: AccountScreen::Signin(s),
-                    ..
-                } = &mut self.mode
+                if visible
+                    && let Mode::Accounts {
+                        screen: AccountScreen::Signin(s),
+                        ..
+                    } = &mut self.mode
                 {
                     s.failed = true;
+                    s.editing = false;
                     s.message = e.clone();
                 }
                 self.say(e, Tone::Warn);
@@ -1017,6 +1144,9 @@ impl App {
             }
         };
         let action = request["action"].as_str().unwrap_or("");
+        if action == "account-models" && response.ok {
+            self.saved_models(&request);
+        }
         if action == "account-move-waiting" {
             self.account_batch_messages.push(format!(
                 "{}: {}",
@@ -1030,10 +1160,35 @@ impl App {
         }
         if action == "account-signin" {
             if request["step"] == "cancel" {
+                if visible
+                    && let Mode::Accounts {
+                        screen: AccountScreen::Signin(s),
+                        ..
+                    } = &mut self.mode
+                    && s.restart
+                {
+                    s.restart = false;
+                    if response.ok {
+                        s.ticket = None;
+                        s.failed = false;
+                        self.account_queue.push_back((
+                            machine,
+                            json!({"action":"account-signin","code":s.code,"step":"start"}),
+                        ));
+                    } else {
+                        s.failed = true;
+                        s.message = format!("Could not cancel sign-in: {}", response.message);
+                    }
+                }
                 if !response.ok {
                     self.say(
                         format!("Could not cancel sign-in: {}", response.message),
                         Tone::Warn,
+                    );
+                } else {
+                    clear_cancelled_ticket(
+                        &mut self.mode,
+                        request["ticket"].as_str().unwrap_or(""),
                     );
                 }
                 return;
@@ -1058,12 +1213,18 @@ impl App {
                 s.message = response.message.clone();
                 if !response.ok || !matches!(response.status.as_deref(), Some("waiting" | "done")) {
                     s.failed = true;
+                    s.editing = false;
+                    if request["step"] == "start" && response.ticket.is_some() {
+                        s.ticket = response.ticket;
+                    }
                 } else if response.status.as_deref() == Some("done") {
+                    s.deferred = None;
                     s.current += 1;
                     s.ticket = None;
                     s.url = None;
                     s.page_code.clear();
                     s.editing = false;
+                    s.needs_code = false;
                     if let Some(&mi) = s.machines.get(s.current) {
                         self.account_queue.push_back((
                             mi,
@@ -1096,6 +1257,13 @@ impl App {
             }
             return;
         }
+        if action == "account-move" && response.confirmation && !visible {
+            self.say(
+                "That move needs confirmation. Open the move picker again to review it.",
+                Tone::Warn,
+            );
+            return;
+        }
         if action == "account-move" && response.confirmation && visible {
             if let (
                 Some(token),
@@ -1105,6 +1273,10 @@ impl App {
                 },
             ) = (response.confirm, &self.mode)
             {
+                if request["confirm"].as_str() == Some(&token) {
+                    self.say("The backend repeated the same move question. Refresh the account state before trying again.", Tone::Warn);
+                    return;
+                }
                 let target = target.clone();
                 if self.target_current(&target) {
                     let mut request = request;
@@ -1149,26 +1321,17 @@ impl App {
                     ..
                 }) if action == "account-models" => {
                     if move_waiting {
-                        self.account_batch_messages.clear();
-                        for (mi, m) in self
-                            .machines
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, m)| m.is_shown() && m.machine.feed.is_some())
-                        {
-                            if m.conn.is_live() {
-                                self.account_queue.push_back((
-                                    mi,
-                                    json!({"action":"account-move-waiting","owner":owner.id}),
-                                ));
-                            } else {
-                                self.account_batch_messages
-                                    .push(format!("{}: offline, not moved", m.name()));
-                            }
-                        }
+                        self.queue_waiting_moves(&owner.id);
                     }
                     if let Mode::Accounts { back, .. } = self.mode.clone() {
                         self.mode = *back;
+                    }
+                    if move_waiting
+                        && self.account_queue.is_empty()
+                        && !self.account_batch_messages.is_empty()
+                    {
+                        self.say(self.account_batch_messages.join("; "), Tone::Warn);
+                        return;
                     }
                 }
                 Some(AccountScreen::Rename { .. }) => {
@@ -1188,6 +1351,17 @@ impl App {
             response.message,
             if response.ok { Tone::Good } else { Tone::Warn },
         );
+    }
+}
+
+fn clear_cancelled_ticket(mode: &mut Mode, ticket: &str) {
+    if let Mode::Accounts { screen, back } = mode {
+        if let AccountScreen::Signin(s) = screen
+            && s.ticket.as_deref() == Some(ticket)
+        {
+            s.ticket = None;
+        }
+        clear_cancelled_ticket(back, ticket);
     }
 }
 
@@ -1463,7 +1637,7 @@ mod tests {
         let owner = a.account_feed(0).unwrap().owners[0].clone();
         a.push_account_screen(AccountScreen::Models {
             machine: 0,
-            models: owner.models.clone(),
+            models: vec!["KBZ".into()],
             owner,
             sel: 0,
             move_waiting: true,
@@ -1471,6 +1645,134 @@ mod tests {
         let action = key(&mut a, KeyCode::Enter);
         complete(&mut a, action, json!({"ok":false,"message":"write failed"}));
         assert!(a.account_queue.is_empty());
+    }
+
+    #[test]
+    fn unchanged_inherited_models_stay_inherited_when_moving_waiters() {
+        let mut a = app();
+        let owner = a
+            .account_feed(0)
+            .unwrap()
+            .owners
+            .iter()
+            .find(|o| o.id == "shop")
+            .unwrap()
+            .clone();
+        assert!(!owner.own);
+        a.push_account_screen(AccountScreen::Models {
+            machine: 0,
+            models: owner.models.clone(),
+            owner,
+            sel: 0,
+            move_waiting: true,
+        });
+        let action = key(&mut a, KeyCode::Enter);
+        let (_, request) = sent(action.clone());
+        assert_eq!(
+            request,
+            json!({"action":"account-models","owner":"shop","inherit":true})
+        );
+        complete(&mut a, action, json!({"ok":true,"message":"unchanged"}));
+        assert_eq!(a.account_queue.len(), 2);
+        assert!(
+            !a.account_feed(0)
+                .unwrap()
+                .owners
+                .iter()
+                .find(|o| o.id == "shop")
+                .unwrap()
+                .own
+        );
+    }
+
+    #[test]
+    fn owner_row_reorders_and_drops_edit_one_draft_before_saving() {
+        let mut a = app();
+        a.open_accounts();
+        if let Mode::Accounts {
+            screen: AccountScreen::List { sel, rows, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = rows
+                .iter()
+                .position(|r| *r == Row::Owner("studio".into()))
+                .unwrap();
+        }
+        assert_eq!(press(&mut a, 'J'), Action::None);
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Models { models, sel: 1, .. }, .. } if models == &["KBZ", "ARK"])
+        );
+        assert_eq!(press(&mut a, 'd'), Action::None);
+        let (_, request) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(request["models"], json!(["KBZ"]));
+    }
+
+    #[test]
+    fn account_screen_preserves_a_misc_peek_across_refresh() {
+        let mut a = app();
+        press(&mut a, 'i');
+        key(&mut a, KeyCode::Char(' '));
+        assert!(matches!(a.mode, Mode::Peek { .. }));
+        let target = a.sel.key.clone();
+        a.open_accounts();
+        a.rebuild();
+        key(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Peek { .. }));
+        assert_eq!(a.sel.key, target);
+    }
+
+    #[test]
+    fn retry_cancels_the_existing_ticket_before_starting_again() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        let poll = key(&mut a, KeyCode::Enter);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":false,"status":"failed","message":"wrong code"}),
+        );
+        let cancel = press(&mut a, 'r');
+        let (_, request) = sent(cancel.clone());
+        assert_eq!(request["step"], "cancel");
+        assert_eq!(request["ticket"], "login-ticket");
+        assert!(a.account_queue.is_empty());
+        complete(
+            &mut a,
+            cancel,
+            json!({"ok":true,"status":"done","message":"cancelled"}),
+        );
+        let (_, request) = sent(a.account_tick());
+        assert_eq!(request["step"], "start");
+    }
+
+    #[test]
+    fn enter_during_poll_is_sent_after_the_poll_and_typing_suspends_polling() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        let poll = key(&mut a, KeyCode::Enter);
+        a.busy = true;
+        a.on_paste("page-code");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"waiting","message":"waiting"}),
+        );
+        let (_, request) = sent(a.account_tick());
+        assert_eq!(request["step"], "finish");
+        assert_eq!(request["page_code"], "page-code");
+        a.on_paste("another-code");
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now() - Duration::from_secs(1);
+        }
+        assert_eq!(a.account_tick(), Action::None);
     }
     #[test]
     fn add_model_edits_the_draft_and_escape_sends_nothing() {

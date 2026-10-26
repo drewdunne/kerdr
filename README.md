@@ -160,13 +160,14 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 
 With an account-aware feed, each card shows its account at the bottom left and one status
 at the top right: yellow ▲ needs you, red ⏸︎ waits for usage, blue ● running, grey ■ idle.
-The bottom line names the first account for new work in the session you are viewing.
+The bottom line names the first ready account for new work in the session you are viewing.
 Older feeds retain the original board layout.
 
 `A` opens accounts and each organization’s and tenant’s ordered model list. `Tab` changes
 the machine whose sign-in status you are viewing. Tenants can follow their organization or
 keep their own order. Select an owner with `j k`, choose a model with `h l`, then Enter makes
-it first, `J K` reorders, `a d` adds or drops, and Backspace follows the parent. `S` opens the
+it first, `J K` reorders, and `a d` adds or drops in a draft that Enter saves. Backspace asks
+before following the parent. `S` opens the
 viewed session’s list as a draft: reorder, optionally tick “move waiting sessions,” then save.
 The tick sends a separate move request to every reachable configured feed machine.
 
@@ -178,10 +179,10 @@ a separate question appears. A confirmation applies only to that same conversati
 The backend owns fallback and resuming: same program, same conversation; another program,
 a fresh agent from the work’s log; nothing left, wait for an account to return.
 
-`A` then `+` adds a Claude account: code, name, and machines, then a separate browser sign-in
+`A` then `+` adds a Claude account: a code of 2–4 capital letters, name, and machines, then a separate browser sign-in
 on each machine. Enter on an existing account signs it in again on the selected machine;
 `e` renames, `t` tests, and `x` removes after a question. The browser opens using the system’s
-URL handler. `c` copies the link through the terminal clipboard and `o` opens it again.
+URL handler. `c` copies the visible link through the terminal clipboard and `o` opens it again.
 Tab focuses the optional page-code field; paste or type the code and press Enter. `p` opens
 a masked token field instead. Tokens are sent only to that machine, removed from UI and
 result state on submission, and never written to Kerdr’s logs or settings. Escape cancels

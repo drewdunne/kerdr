@@ -240,12 +240,12 @@ fn main() {
         "sign-in-again",
     ];
     let mut account_app = app(false);
-    for (index, mode) in demo::account_screens(&account_app).into_iter().enumerate() {
+    for (name, mode) in names.into_iter().zip(demo::account_screens(&account_app)) {
         account_app.mode = mode;
         rasterize(
             &render(&account_app),
             &fonts,
-            &out.join(format!("{}.png", names[index])),
+            &out.join(format!("{name}.png")),
         );
     }
     let board = app(false);

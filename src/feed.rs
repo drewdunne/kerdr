@@ -22,16 +22,20 @@ pub struct Feed {
     pub warnings: Vec<String>,
     /// Absent on older feeds. Account state is local to this feed's machine.
     #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
     pub accounts: Vec<crate::accounts::Account>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
     pub owners: Vec<crate::accounts::Owner>,
     #[serde(default)]
     pub owners_source: Option<String>,
     #[serde(default)]
     pub machine_owner: Option<String>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
     pub unowned_sessions: Vec<String>,
     #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
     pub agents: Vec<crate::accounts::AccountAgent>,
 }
 
@@ -236,6 +240,14 @@ mod tests {
         let old = parse(r#"{"kerdr_feed":1,"cards":[]}"#).unwrap();
         assert!(old.accounts.is_empty());
         assert!(old.agents.is_empty());
+        let nullable = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"still visible"}],"accounts":[{"code":"KBZ","name":null}],"owners":[{"id":"shop","own":null,"models":null}],"agents":[{"conversation":null,"pane":null}],"unowned_sessions":null}"#).unwrap();
+        assert_eq!(nullable.cards.len(), 1);
+        assert!(nullable.accounts[0].name.is_empty());
+        assert!(!nullable.owners[0].own);
+        assert!(nullable.agents[0].conversation.is_empty());
+        let empty =
+            parse(r#"{"kerdr_feed":1,"accounts":null,"owners":null,"agents":null}"#).unwrap();
+        assert!(empty.accounts.is_empty() && empty.owners.is_empty() && empty.agents.is_empty());
     }
 
     #[test]

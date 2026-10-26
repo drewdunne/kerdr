@@ -324,13 +324,20 @@ Continue on that same machine:
 ```
 
 Responses have `status: "waiting"`, `"done"`, or `"failed"`. Kerdr polls every two seconds
-while the dialog remains open and stops on unknown results. Escape cancels a known ticket;
+while the dialog remains open, pauses while a page code is being entered, and stops on unknown results.
+A retry cancels any known previous ticket before starting another. Escape cancels a known ticket;
 a ticket returned after Escape is also cancelled, without opening a browser. After `done`,
 adding an account proceeds to the next selected machine with a **new** start and ticket.
 A `paste` step instead sends `code` and a `token` string, and answers `done` or a refusal.
 The token never enters the result queue or saved settings. The backend must not echo it and
 must own its secure storage. Kerdr also removes submitted credential text from adapter output.
 Only HTTPS URLs can be opened; URL data is passed directly to the OS opener, never a shell.
+
+The start action must return promptly. On Unix, Kerdr cleans up the adapter's process group
+after each call, so a persistent sign-in helper must start a new session (`setsid` or
+`start_new_session=True`) and own its stdin, stdout and stderr. Return only the ticket and URL;
+poll, finish and cancel reach that detached helper. Requests, including credentials, use an
+in-memory pipe rather than a temporary input file.
 
 The synthetic POSIX and PowerShell adapters in `tests/fixtures/accounts.sh` and
 `tests/fixtures/accounts.ps1` exercise every account action and sign-in step in CI.

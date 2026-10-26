@@ -1,15 +1,29 @@
-//! Optional account data supplied by the action backend. Kerdr never holds credentials.
+//! Optional account data supplied by the action backend. Credentials are never part of a feed.
 
 use serde::{Deserialize, Serialize};
+
+pub(crate) fn null_default<'de, D, T>(d: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
+}
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Account {
+    #[serde(deserialize_with = "null_default")]
     pub code: String,
+    #[serde(deserialize_with = "null_default")]
     pub name: String,
+    #[serde(deserialize_with = "null_default")]
     pub provider: String,
+    #[serde(deserialize_with = "null_default")]
     pub kind: String,
+    #[serde(deserialize_with = "null_default")]
     pub runs: String,
+    #[serde(deserialize_with = "null_default")]
     pub status: String,
     pub until: Option<String>,
     pub pool: Option<String>,
@@ -29,22 +43,33 @@ pub struct Usage {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Owner {
+    #[serde(deserialize_with = "null_default")]
     pub id: String,
+    #[serde(deserialize_with = "null_default")]
     pub kind: String,
+    #[serde(deserialize_with = "null_default")]
     pub name: String,
     pub parent: Option<String>,
+    #[serde(deserialize_with = "null_default")]
     pub models: Vec<String>,
+    #[serde(deserialize_with = "null_default")]
     pub own: bool,
+    #[serde(deserialize_with = "null_default")]
     pub sessions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct AccountAgent {
+    #[serde(deserialize_with = "null_default")]
     pub pane: String,
+    #[serde(deserialize_with = "null_default")]
     pub session: String,
+    #[serde(deserialize_with = "null_default")]
     pub conversation: String,
+    #[serde(deserialize_with = "null_default")]
     pub account: String,
+    #[serde(deserialize_with = "null_default")]
     pub how: String,
     pub waiting: Option<Waiting>,
 }
@@ -52,6 +77,7 @@ pub struct AccountAgent {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Waiting {
+    #[serde(deserialize_with = "null_default")]
     pub why: String,
     pub until: Option<String>,
 }

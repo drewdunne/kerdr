@@ -160,6 +160,7 @@ fn misc_selection(mode: &Mode) -> Option<usize> {
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
         | Mode::Confirm { back, .. } => misc_selection(back),
         _ => None,
     }
@@ -172,6 +173,7 @@ fn set_misc_selection(mode: &mut Mode, selected: usize) {
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
         | Mode::Confirm { back, .. } => set_misc_selection(back, selected),
         _ => {}
     }
@@ -184,6 +186,7 @@ fn backlog_selection(mode: &Mode) -> Option<usize> {
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
         | Mode::Confirm { back, .. } => backlog_selection(back),
         _ => None,
     }
@@ -196,6 +199,7 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
         | Mode::Confirm { back, .. } => set_backlog_selection(back, selected),
         _ => {}
     }
@@ -207,6 +211,7 @@ fn holds_peek(mode: &Mode) -> bool {
         Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
         | Mode::Confirm { back, .. } => holds_peek(back),
         _ => false,
     }
@@ -863,7 +868,7 @@ impl App {
             if matches!(
                 self.mode,
                 Mode::Accounts {
-                    screen: AccountScreen::Signin(_),
+                    screen: AccountScreen::Signin(_) | AccountScreen::PasteToken { .. },
                     ..
                 }
             ) {

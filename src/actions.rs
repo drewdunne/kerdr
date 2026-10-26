@@ -91,16 +91,8 @@ fn run_with_deadline(
         None => Target::Local,
     };
     // The configured command is source; user data is JSON on stdin, never source.
-    let mut output = transport::run_adapter(&target, command, Some(&json), deadline);
-    // A backend error must not accidentally echo a pasted credential into the UI.
-    if request["action"] == "account-signin" {
-        for field in ["token", "page_code"] {
-            if let Some(secret) = request[field].as_str().filter(|s| !s.is_empty()) {
-                output.stdout = output.stdout.replace(secret, "[redacted]");
-                output.stderr = output.stderr.replace(secret, "[redacted]");
-            }
-        }
-    }
+    let output = transport::run_adapter(&target, command, Some(&json), deadline);
+    let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
         return Err("the action timed out; its result is unknown. Check the canonical record before trying again. Do not retry automatically.".into());
     }
@@ -109,12 +101,31 @@ fn run_with_deadline(
     }
     // A backend can request confirmation with a nonzero exit code. Its JSON is the contract,
     // so parse it before interpreting process status.
-    parse_response(&output.stdout).map_err(|error| {
+    parse_response(&output.stdout).map(|mut response| {
+        response.message = redact(&response.message);
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label].into_iter().flatten() {
+            *text = redact(text);
+        }
+        response
+    }).map_err(|error| {
         let status = output.status.map_or_else(|| "no exit status".into(), |s| format!("exit {s}"));
-        let detail: String = output.stderr.trim().chars().take(1024).collect();
+        let detail: String = redact(output.stderr.trim()).chars().take(1024).collect();
         let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+        let error = redact(&error.to_string());
         format!("the action's JSON response is invalid ({status}): {error}{detail}. Its result is unknown. Do not retry automatically.")
     })
+}
+
+fn redact_credentials(text: &str, request: &Value) -> String {
+    let mut text = text.to_string();
+    if request["action"] == "account-signin" {
+        for field in ["token", "page_code"] {
+            if let Some(secret) = request[field].as_str().filter(|s| !s.is_empty()) {
+                text = text.replace(secret, "[redacted]");
+            }
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -158,6 +169,35 @@ mod tests {
         let response = run(&machine(), &command, &request).unwrap();
         assert!(!response.message.contains(secret));
         assert!(response.message.contains("[redacted]"));
+    }
+
+    #[test]
+    fn short_and_json_escaped_credentials_do_not_corrupt_response_structure() {
+        for secret in ["ok", "true", "a", "quote\"and\\slash"] {
+            let dir = tempfile::tempdir().unwrap();
+            let reply =
+                json!({"ok":true,"status":"done","message":format!("echo {secret}")}).to_string();
+            let command = fixture(
+                dir.path(),
+                &format!(
+                    "cat >/dev/null\nprintf '%s' {}\n",
+                    crate::transport::quote(&reply)
+                ),
+                &format!(
+                    "[Console]::In.ReadToEnd() | Out-Null; Write-Output '{}'",
+                    reply.replace('\'', "''")
+                ),
+            );
+            let response = run(
+                &machine(),
+                &command,
+                &json!({"action":"account-signin","step":"finish","page_code":secret}),
+            )
+            .unwrap();
+            assert!(response.ok);
+            assert_eq!(response.status.as_deref(), Some("done"));
+            assert!(response.message.contains("[redacted]"));
+        }
     }
 
     #[test]

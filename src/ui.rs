@@ -308,9 +308,9 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let message = app.message();
     let filter_line = filtered(app);
     let accounts = app
-        .account_machine()
-        .and_then(|mi| app.account_feed(mi))
-        .is_some_and(|f| !f.accounts.is_empty());
+        .machines
+        .iter()
+        .any(|m| m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty()));
     let rows = Layout::vertical([
         Constraint::Length(1 + u16::from(filter_line)),
         Constraint::Length(u16::from(banner.is_some())),
@@ -560,16 +560,39 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
         Span::raw(" "),
     ];
     let fixed: usize = left.iter().map(|s| width(&s.content)).sum();
-    let usage_w: usize = app
-        .account_machine()
-        .map(|mi| {
-            account_ui::usage(app, mi)
-                .iter()
-                .map(|s| width(&s.content))
-                .sum::<usize>()
-                + 9
+    let usage_machine = app
+        .machine
+        .as_ref()
+        .and_then(|name| app.machine_index(name))
+        .or_else(|| {
+            app.machines.iter().position(|m| {
+                m.is_shown()
+                    && m.machine.is_local()
+                    && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+            })
         })
-        .unwrap_or(0);
+        .or_else(|| {
+            app.machines.iter().position(|m| {
+                m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+            })
+        });
+    let mut usage = usage_machine
+        .map(|mi| account_ui::usage(app, mi))
+        .unwrap_or_default();
+    if app.machine.is_none()
+        && !usage.is_empty()
+        && let Some(mi) = usage_machine
+    {
+        usage.insert(
+            0,
+            Span::styled(format!("{} ", app.machines[mi].name()), fg(DIM)),
+        );
+    }
+    let usage_w = if usage.is_empty() {
+        0
+    } else {
+        usage.iter().map(|s| width(&s.content)).sum::<usize>() + 9
+    };
     let reserve = if rect.width as usize > fixed + usage_w + 18 {
         usage_w
     } else {
@@ -605,12 +628,9 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
     if end < tabs.len() {
         left.push(Span::styled("›", fg(DIM)));
     }
-    let mut right = app
-        .account_machine()
-        .map(|mi| account_ui::usage(app, mi))
-        .unwrap_or_default();
+    let mut right = usage;
     if right.is_empty() {
-        right.push(Span::styled("{ } machine · [ ] session · ", fg(DIM)));
+        right.push(Span::styled("{ } machine · [ ] session", fg(DIM)));
     }
     right.push(Span::styled(format!(" · {}", clock(app.now())), fg(DIM)));
     let lw: usize = left.iter().map(|s| width(&s.content)).sum();
@@ -1145,7 +1165,7 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         .is_some_and(|f| !f.accounts.is_empty());
     let full = format!("{} {}", c.attention.glyph(), c.attention.label());
     let label = if modern {
-        if account.is_some_and(|a| a.waiting_for_usage()) {
+        if c.attention == Attention::Waiting && c.why == "waiting for usage" {
             crate::accounts::pause_glyph()
         } else {
             match c.attention {
@@ -1161,7 +1181,7 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
     } else {
         c.attention.glyph().to_string()
     };
-    let color = if modern && account.is_some_and(|a| a.waiting_for_usage()) {
+    let color = if modern && c.attention == Attention::Waiting && c.why == "waiting for usage" {
         RED
     } else if modern && c.attention == Attention::NeedsYou {
         YELLOW
@@ -1271,7 +1291,7 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
         let cached = c.cached_at.is_some();
         let border = if is_sel {
             CYAN
-        } else if app.account_agent(c).is_some_and(|a| a.waiting_for_usage()) && !cached {
+        } else if (c.attention == Attention::Waiting && c.why == "waiting for usage") && !cached {
             RED
         } else if c.attention == Attention::NeedsYou && !cached {
             YELLOW
@@ -3823,6 +3843,17 @@ mod tests {
             }
         }
         let text = rendered(&a, 176, 44);
+        let mut terminal = Terminal::new(TestBackend::new(176, 44)).unwrap();
+        terminal.draw(|f| draw(f, &a)).unwrap();
+        let header: String = (0..176)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            header
+                .trim_end()
+                .ends_with(&format!("{{ }} machine · [ ] session · {}", clock(a.now()))),
+            "{header}"
+        );
         assert!(
             text.contains("ctrl+space menu"),
             "the menu must be discoverable"

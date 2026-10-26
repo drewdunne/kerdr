@@ -204,6 +204,7 @@ fn running_title(w: &WsRef) -> Option<String> {
 
 /// Decides what a card needs from you, from what the feed says and what herdr sees.
 pub struct Signals<'a> {
+    pub usage_waiting: bool,
     pub closed: bool,
     pub token: Option<&'a str>,
     pub herdr: Option<&'a str>,
@@ -250,6 +251,9 @@ pub fn attention(s: &Signals) -> (Attention, String) {
     if s.feed == Some(Attention::Waiting) {
         return (Attention::Waiting, status_or("waiting"));
     }
+    if s.usage_waiting && matches!(s.herdr, Some("done" | "idle")) {
+        return (Attention::Waiting, "waiting for usage".into());
+    }
     match s.herdr {
         // The silent wait: the agent stopped, and nothing it wrote says what for.
         Some("done") | Some("idle") if s.from_feed => (
@@ -264,6 +268,16 @@ pub fn attention(s: &Signals) -> (Attention, String) {
             None => (Attention::Idle, status_or("idle")),
         },
     }
+}
+
+fn usage_waiting(machine: &MachineState, workspace: &WsRef) -> bool {
+    machine.feed.as_ref().is_some_and(|feed| {
+        workspace.agents.iter().any(|agent| {
+            feed.agents.iter().any(|a| {
+                a.pane == agent.pane_id && a.session == workspace.session && a.waiting_for_usage()
+            })
+        })
+    })
 }
 
 fn parse_time(s: &str) -> Option<DateTime<Local>> {
@@ -483,6 +497,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             .map(String::as_str);
         let (att, why) = attention(&Signals {
             closed,
+            usage_waiting: ws.is_some_and(|w| usage_waiting(&machines[w.mi], w)),
             token,
             herdr: herdr.as_deref(),
             feed: fc.attention.as_deref().and_then(Attention::parse),
@@ -544,6 +559,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         let note = w.ws.tokens.get("kerdr_note").map(String::as_str);
         let (att, why) = attention(&Signals {
             closed: reported_stage == Some(Stage::Maintain),
+            usage_waiting: usage_waiting(m, w),
             token,
             herdr: herdr.as_deref(),
             feed: None,
@@ -599,23 +615,6 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         });
     }
 
-    for card in &mut cards {
-        if card.attention == Attention::Done {
-            continue;
-        }
-        if let Some(feed) = machines[card.machine_index].feed.as_ref()
-            && card.agents.iter().any(|a| {
-                feed.agents.iter().any(|f| {
-                    f.pane == a.pane_id
-                        && Some(f.session.as_str()) == card.session.as_deref()
-                        && f.waiting_for_usage()
-                })
-            })
-        {
-            card.attention = Attention::Waiting;
-            card.why = "waiting for usage".into();
-        }
-    }
     sort_cards(&mut cards);
 
     // Sessions and their slots: the feed's count when it gives one, else Kerdr's own.
@@ -1025,6 +1024,7 @@ mod tests {
     #[test]
     fn the_silent_wait_needs_you() {
         let (att, why) = attention(&Signals {
+            usage_waiting: false,
             closed: false,
             token: None,
             herdr: Some("done"),
@@ -1040,8 +1040,39 @@ mod tests {
     }
 
     #[test]
+    fn usage_wait_suppresses_only_silence_and_never_an_explicit_question() {
+        let mut signals = Signals {
+            usage_waiting: true,
+            closed: false,
+            token: None,
+            herdr: Some("done"),
+            feed: None,
+            feed_status: None,
+            needs: None,
+            blocker: None,
+            running_title: None,
+            from_feed: true,
+        };
+        assert_eq!(attention(&signals).0, Attention::Waiting);
+        signals.herdr = Some("blocked");
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.herdr = Some("done");
+        signals.token = Some("needs_you");
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.token = None;
+        signals.feed = Some(Attention::NeedsYou);
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.feed = Some(Attention::Blocked);
+        assert_eq!(attention(&signals).0, Attention::Blocked);
+        signals.feed = None;
+        signals.herdr = Some("working");
+        assert_eq!(attention(&signals).0, Attention::Running);
+    }
+
+    #[test]
     fn waiting_on_a_review_is_not_needing_you() {
         let (att, why) = attention(&Signals {
+            usage_waiting: false,
             closed: false,
             token: None,
             herdr: Some("idle"),
@@ -1059,6 +1090,7 @@ mod tests {
     #[test]
     fn an_agent_asking_always_needs_you() {
         let (att, _) = attention(&Signals {
+            usage_waiting: false,
             closed: false,
             token: None,
             herdr: Some("blocked"),

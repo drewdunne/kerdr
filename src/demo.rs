@@ -160,7 +160,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
             ws("w3", "38-backup-restore"),
         ],
         agents: vec![
-            agent("w1", "working", "Token buckets per API key"),
+            agent("w1", "done", "Token buckets per API key"),
             agent("w2", "idle", "Login test"),
             agent("w3", "idle", "Restore drill"),
         ],
@@ -684,6 +684,8 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             name: "Studio".into(),
         },
         S::Signin(Signin {
+            deferred: None,
+            restart: false,
             code: "ARK".into(),
             machines: vec![0, 1],
             current: 1,
@@ -697,6 +699,8 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             message: "Authorize in the browser window that just opened.".into(),
         }),
         S::Signin(Signin {
+            deferred: None,
+            restart: false,
             code: "KBZ".into(),
             machines: vec![1],
             current: 0,
