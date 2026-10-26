@@ -147,7 +147,15 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
             herdr("workspace", "report-metadata", wid, "--source", "kerdr",
                   "--token", "kerdr_stage=test", "--token", "kerdr_status=needs_you",
                   "--token", "kerdr_note=Windows live check")
-        feed = {"kerdr_feed": 1, "source": "windows-live", "cards": [
+        feed = {"kerdr_feed": 1, "source": "windows-live",
+            "accounts": [
+                {"code": "KBZ", "name": "Personal", "provider": "claude", "kind": "login",
+                 "status": "out", "usage": {"five": 86, "week": 100}},
+                {"code": "ARK", "name": "Studio", "provider": "claude", "kind": "token",
+                 "status": "ready", "usage": {"five": 12, "week": 30}}],
+            "owners": [{"id": "studio", "name": "Example Studio", "kind": "organization",
+                        "models": ["ARK", "KBZ"], "own": True, "sessions": [session]}],
+            "machine_owner": "studio", "owners_source": "fixture", "cards": [
             {"id": str(index + 1), "ref": f"0{index + 1}-windows", "title": f"Windows card {index + 1}",
              "stage": "test", "state": "active", "attention": "needs_you",
              "story": "Native café 🦀", "workspace": {"session": session, "id": wid}}
@@ -228,6 +236,15 @@ with tempfile.TemporaryDirectory(prefix="kerdr windows café ") as temp:
         expect("Windows card 1")
         time.sleep(0.3)
         board_modes = state()["modes"]
+        discard()
+        console.write("A")
+        expect("NEW INTENTS")
+        assert "✕" in "".join(transcript), "Windows account usage must use the text X fallback"
+        discard()
+        console.write("\x1b")
+        expect("MAINTAIN")
+        assert state()["modes"] == board_modes
+        print("PASS native accounts page, model list and text X fallback", flush=True)
         def enter():
             discard()
             print("Entering Herdr", flush=True)
