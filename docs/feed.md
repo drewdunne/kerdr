@@ -317,7 +317,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
 |---|---|---|
-| `account-move` | `pane`, `session`, `conversation`, `to` (code or `list`), optional `confirm` | queued, stale, or the question below |
+| `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, or the question below |
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` | adds, or renames the existing code |

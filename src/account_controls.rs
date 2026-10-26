@@ -216,6 +216,25 @@ impl App {
         })
     }
 
+    /// The agent s moves: the one the feed records on this card, or else the card's Claude Code
+    /// agent with nothing recorded yet. The engine moves that by its pane, takes its conversation
+    /// from herdr and records it from then on; moving is how an account gets set (intent 0264).
+    pub fn move_agent(&self, card: &Card) -> Option<AccountAgent> {
+        if let Some(agent) = self.account_agent(card) {
+            return Some(agent.clone());
+        }
+        self.account_feed(card.machine_index)?;
+        let session = card.session.clone()?;
+        card.agents
+            .iter()
+            .find(|a| a.agent == "claude" && !a.pane_id.is_empty())
+            .map(|a| AccountAgent {
+                pane: a.pane_id.clone(),
+                session,
+                ..AccountAgent::default()
+            })
+    }
+
     pub fn account_owner(&self, machine: usize, session: &str) -> Option<&Owner> {
         let f = self.account_feed(machine)?;
         f.owners
@@ -323,7 +342,7 @@ impl App {
     fn target_current(&self, target: &MoveTarget) -> bool {
         self.card(&target.key)
             .filter(|c| c.machine_index == target.machine)
-            .and_then(|c| self.account_agent(c))
+            .and_then(|c| self.move_agent(c))
             .is_some_and(|a| {
                 a.pane == target.agent.pane
                     && a.session == target.agent.session
@@ -445,7 +464,7 @@ impl App {
             }
             KeyCode::Char('s') => {
                 if let Some(card) = self.selected().cloned() {
-                    if let Some(agent) = self.account_agent(&card).cloned() {
+                    if let Some(agent) = self.move_agent(&card) {
                         let machine = card.machine_index;
                         let mut choices: Vec<String> = self
                             .account_feed(machine)
@@ -465,8 +484,18 @@ impl App {
                             choices,
                             sel: 0,
                         });
+                    } else if card.agents.is_empty() {
+                        self.say("This card has no agent running to move.", Tone::Info);
+                    } else if self.account_feed(card.machine_index).is_none() {
+                        self.say(
+                            "This card's machine hasn't sent its accounts yet.",
+                            Tone::Info,
+                        );
                     } else {
-                        self.say("This card has no recorded account yet.", Tone::Info);
+                        self.say(
+                            "s moves Claude Code agents; this card has none.",
+                            Tone::Info,
+                        );
                     }
                 }
             }
@@ -1664,6 +1693,50 @@ mod tests {
             .conversation = "replacement".into();
         assert_eq!(press(&mut a, 'y'), Action::None);
         assert!(a.message().unwrap().0.contains("conversation changed"));
+    }
+    #[test]
+    fn s_moves_an_agent_with_no_recorded_account() {
+        let mut a = app();
+        pick(&mut a);
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .retain(|a| !(a.session == "api" && a.pane == "w1:p1"));
+        press(&mut a, 's');
+        assert!(matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Move { .. },
+                ..
+            }
+        ));
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["action"], "account-move");
+        assert_eq!(r["pane"], "w1:p1");
+        assert_eq!(r["session"], "api");
+        assert_eq!(r["conversation"], "");
+    }
+    #[test]
+    fn s_says_why_when_a_card_has_no_claude_agent() {
+        let mut a = app();
+        pick(&mut a);
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .retain(|a| !(a.session == "api" && a.pane == "w1:p1"));
+        let key = a.sel.key.clone().unwrap();
+        for c in a.board.cards.iter_mut().filter(|c| c.key == key) {
+            for g in &mut c.agents {
+                g.agent = "codex".into();
+            }
+        }
+        press(&mut a, 's');
+        assert!(matches!(a.mode, Mode::Board));
+        assert!(a.message().unwrap().0.contains("Claude Code"));
     }
     #[test]
     fn escaping_a_move_ignores_its_late_question() {
