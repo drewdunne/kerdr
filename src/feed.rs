@@ -20,6 +20,23 @@ pub struct Feed {
     pub cards: Vec<FeedCard>,
     #[serde(default)]
     pub warnings: Vec<String>,
+    /// Absent on older feeds. Account state is local to this feed's machine.
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub accounts: Vec<crate::accounts::Account>,
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub owners: Vec<crate::accounts::Owner>,
+    #[serde(default)]
+    pub owners_source: Option<String>,
+    #[serde(default)]
+    pub machine_owner: Option<String>,
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub unowned_sessions: Vec<String>,
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub agents: Vec<crate::accounts::AccountAgent>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -213,6 +230,25 @@ pub fn parse(text: &str) -> Result<Feed, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_account_fields_accept_future_providers_and_null_usage() {
+        let f=parse(r#"{"kerdr_feed":1,"accounts":[{"code":"LOCAL","provider":"local","kind":"endpoint","status":"ready","usage":null}],"owners":[{"id":"studio","kind":"organization","parent":null,"models":["LOCAL"]}],"agents":[{"pane":"w1:p1","session":"web","account":"LOCAL","waiting":null}],"owners_source":"mock","machine_owner":"studio","unowned_sessions":["stray"]}"#).unwrap();
+        assert_eq!(f.accounts[0].numbers(), "—│—");
+        assert_eq!(f.owners[0].models, ["LOCAL"]);
+        assert!(!f.agents[0].waiting_for_usage());
+        let old = parse(r#"{"kerdr_feed":1,"cards":[]}"#).unwrap();
+        assert!(old.accounts.is_empty());
+        assert!(old.agents.is_empty());
+        let nullable = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"still visible"}],"accounts":[{"code":"KBZ","name":null}],"owners":[{"id":"shop","own":null,"models":null}],"agents":[{"conversation":null,"pane":null}],"unowned_sessions":null}"#).unwrap();
+        assert_eq!(nullable.cards.len(), 1);
+        assert!(nullable.accounts[0].name.is_empty());
+        assert!(!nullable.owners[0].own);
+        assert!(nullable.agents[0].conversation.is_empty());
+        let empty =
+            parse(r#"{"kerdr_feed":1,"accounts":null,"owners":null,"agents":null}"#).unwrap();
+        assert!(empty.accounts.is_empty() && empty.owners.is_empty() && empty.agents.is_empty());
+    }
 
     #[test]
     fn reads_a_minimal_feed() {

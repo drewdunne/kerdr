@@ -133,15 +133,24 @@ fn event_loop(
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     loop {
         while let Ok((machine, request, result)) = action_rx.try_recv() {
-            let succeeded = result
-                .as_ref()
-                .is_ok_and(|r: &crate::actions::Response| r.ok);
+            let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
+                r.ok && !(request["action"] == "account-signin"
+                    && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
+            });
             app.finish_action(machine, request, result);
             if succeeded && let Some(l) = live.as_deref() {
                 for poller in l.pollers.iter().flatten() {
                     let _ = poller.wake.send(Wake::Feed);
                 }
             }
+        }
+        if let Some(url) = app.signin_open.take() {
+            open_signin(app, &url);
+        }
+        if !app.demo
+            && let Action::Mutate { machine, request } = app.account_tick()
+        {
+            start_action(app, &action_tx, machine, request);
         }
         // A reopen answered with its workspace while you're still on its card: go in, and on
         // ctrl+space space carry on to the next card that needs you, as from any other.
@@ -212,8 +221,23 @@ fn event_loop(
         };
         match app.on_key(key) {
             Action::None => {}
+            Action::CopyLink(url) => {
+                if crate::accounts::valid_signin_url(&url) {
+                    use base64::Engine;
+                    use std::io::Write;
+                    let encoded = base64::engine::general_purpose::STANDARD.encode(url.as_bytes());
+                    let mut out = stdout();
+                    if write!(out, "\x1b]52;c;{encoded}\x07")
+                        .and_then(|_| out.flush())
+                        .is_ok()
+                    {
+                        app.say("Sign-in link sent to the terminal clipboard.", Tone::Info);
+                    }
+                }
+            }
+            Action::OpenLink(url) => open_signin(app, &url),
             Action::Quit => {
-                if app.busy {
+                if app.busy || !app.account_queue.is_empty() {
                     app.say(
                         "An intent change is still running. Wait for its result before quitting.",
                         Tone::Warn,
@@ -427,10 +451,14 @@ fn start_action(
     };
     let tx = tx.clone();
     app.busy = true;
-    app.say(app.working_on(&request), Tone::Info);
+    if request["action"] != "account-signin" {
+        app.say(app.working_on(&request), Tone::Info);
+    }
     std::thread::spawn(move || {
         let result = crate::actions::run(&target, &command, &request);
-        let _ = tx.send((machine, request, result));
+        let metadata = crate::actions::request_metadata(&request);
+        drop(request);
+        let _ = tx.send((machine, metadata, result));
     });
 }
 
@@ -643,4 +671,18 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
 /// What the board says when herdr finds that a workspace has closed.
 fn closed(workspace: &str) -> String {
     format!("{workspace} has closed since the board last read it.")
+}
+
+fn open_signin(app: &mut App, url: &str) {
+    if app.demo {
+        app.say("Demo sign-in: no browser opened.", Tone::Info);
+        return;
+    }
+    match crate::accounts::open_signin_url(url) {
+        Ok(()) => {}
+        Err(error) => app.say(
+            format!("Could not open the browser: {error}. Press c to copy the link."),
+            Tone::Warn,
+        ),
+    }
 }

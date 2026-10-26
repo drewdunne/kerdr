@@ -1,8 +1,12 @@
 //! Running commands on a machine: this one directly, others over SSH. Every SSH command shares
 //! one connection per machine (OpenSSH's ControlMaster), never prompts, and has a deadline.
 
-use std::io::{Read, Seek, Write};
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -203,36 +207,63 @@ pub fn run_adapter(
             input.is_none(),
         );
     }
-    let script = format!(
-        "{PATH_PREFIX}\nunset {}\nprintf '%s' {} | {command}\n",
-        HERDR_VARS.join(" "),
-        quote(input.unwrap_or_default())
-    );
-    run_script(target, &script, deadline)
+    // JSON stays on stdin, separate from shell source and process arguments, including tokens.
+    let script = format!("{PATH_PREFIX}\nunset {}\n{command}\n", HERDR_VARS.join(" "));
+    if input.is_none() {
+        return run_script(target, &script, deadline);
+    }
+    let mut cmd = match target {
+        Target::Local => {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&script);
+            clean_herdr_env(&mut c);
+            c
+        }
+        Target::Ssh(host) => {
+            let mut c = Command::new("ssh");
+            c.args(ssh_args())
+                .arg("--")
+                .arg(host)
+                .arg(remote_adapter_command(&script));
+            c
+        }
+    };
+    run(
+        &mut cmd,
+        input.map(str::as_bytes),
+        deadline,
+        input.is_none(),
+    )
+}
+
+fn remote_adapter_command(script: &str) -> String {
+    // The remote login shell sees one line even if it is csh/tcsh. POSIX sh decodes
+    // the configured source; the request still travels separately on stdin.
+    let octal: String = script.bytes().map(|b| format!("\\0{b:03o}")).collect();
+    format!(
+        "sh -c {}",
+        quote(&format!("eval \"$(printf '%b' {})\"", quote(&octal)))
+    )
 }
 
 fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: bool) -> Output {
     let started = Instant::now();
-    // A temporary input stream avoids an unbounded writer thread when an action leaves a
-    // persistent descendant holding stdin open. Adapters still receive exactly their JSON.
+    // Input stays in memory, including credentials. The writer below is cancellable even
+    // when a persistent descendant retains stdin without reading it.
     let captures = (|| -> std::io::Result<_> {
-        let stdin = if let Some(input) = input {
-            let mut file = tempfile::tempfile()?;
-            file.write_all(input)?;
-            file.rewind()?;
-            Stdio::from(file)
-        } else {
-            Stdio::null()
-        };
         // Independent reader handles avoid moving an inherited writer's file position.
         // Unlinking a temporary capture leaves persistent children with writable handles.
         let stdout = tempfile::NamedTempFile::new()?;
         let stderr = tempfile::NamedTempFile::new()?;
         let out_reader = std::fs::File::open(stdout.path())?;
         let err_reader = std::fs::File::open(stderr.path())?;
-        cmd.stdin(stdin)
-            .stdout(Stdio::from(stdout.as_file().try_clone()?))
-            .stderr(Stdio::from(stderr.as_file().try_clone()?));
+        cmd.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::from(stdout.as_file().try_clone()?))
+        .stderr(Stdio::from(stderr.as_file().try_clone()?));
         Ok((stdout, stderr, out_reader, err_reader))
     })();
     let (stdout_file, stderr_file, out_reader, err_reader) = match captures {
@@ -292,6 +323,40 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     } else {
         None
     };
+    let stop_input = Arc::new(AtomicBool::new(false));
+    let writer = input.and_then(|input| {
+        child.stdin.take().map(|mut stdin| {
+            let input = input.to_vec();
+            let stop = stop_input.clone();
+            thread::spawn(move || {
+                #[cfg(unix)]
+                {
+                    use std::os::fd::AsRawFd;
+                    // SAFETY: stdin owns this pipe; only this thread writes or changes its flags.
+                    unsafe {
+                        let fd = stdin.as_raw_fd();
+                        let flags = libc::fcntl(fd, libc::F_GETFL);
+                        if flags < 0 || libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0
+                        {
+                            return;
+                        }
+                    }
+                }
+                let mut left = input.as_slice();
+                while !left.is_empty() && !stop.load(Ordering::Acquire) {
+                    match stdin.write(&left[..left.len().min(4096)]) {
+                        Ok(0) => break,
+                        Ok(n) => left = &left[n..],
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(5))
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(_) => break,
+                    }
+                }
+            })
+        })
+    });
     let mut timed_out = false;
     let mut overflow = false;
     let status = loop {
@@ -328,6 +393,21 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
     }
     #[cfg(windows)]
     drop(_job);
+    stop_input.store(true, Ordering::Release);
+    if let Some(writer) = writer {
+        #[cfg(windows)]
+        {
+            use std::os::windows::io::AsRawHandle;
+            while !writer.is_finished() {
+                // SAFETY: the join handle remains live; only its blocked pipe write is cancelled.
+                unsafe {
+                    windows_sys::Win32::System::IO::CancelSynchronousIo(writer.as_raw_handle());
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        }
+        let _ = writer.join();
+    }
     let capture = |reader: std::fs::File| {
         let mut data = Vec::new();
         let _ = reader.take(MAX_CAPTURE + 1).read_to_end(&mut data);
@@ -444,6 +524,38 @@ pub fn classify(target: &Target, out: &Output) -> Option<Problem> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_adapter_that_never_reads_stdin_cannot_trap_the_writer() {
+        let input = "x".repeat(128 * 1024);
+        let out = run_adapter(
+            &Target::Local,
+            if cfg!(windows) {
+                "Start-Sleep 5"
+            } else {
+                "sleep 5"
+            },
+            Some(&input),
+            Duration::from_millis(200),
+        );
+        assert!(out.timed_out);
+        assert!(out.took < Duration::from_secs(3));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn remote_adapter_source_is_one_line_and_request_remains_separate() {
+        let command = remote_adapter_command(
+            "# a multiline adapter\nread -r value\nprintf '%s' \"$value\"\n",
+        );
+        assert!(!command.contains('\n'));
+        let mut child = Command::new("sh");
+        child.arg("-c").arg(command);
+        let request = br#"{"value":"literal $(touch should-never-exist) and 'quotes'"}"#;
+        let out = run(&mut child, Some(request), Duration::from_secs(5), true);
+        assert!(out.ok(), "{}", out.stderr);
+        assert_eq!(out.stdout.as_bytes(), request);
+    }
 
     fn failed(stderr: &str) -> Output {
         Output {

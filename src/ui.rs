@@ -15,6 +15,9 @@ use crate::model::{Attention, Card, Priority, Stage, Verdict};
 use crate::poll::Conn;
 use crate::theme::*;
 
+#[path = "account_ui.rs"]
+mod account_ui;
+
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
@@ -37,6 +40,14 @@ pub fn draw(f: &mut Frame, app: &App) {
 }
 
 fn action_status(f: &mut Frame, area: Rect, app: &App) {
+    if app.busy
+        && app
+            .account_pending
+            .as_ref()
+            .is_some_and(|p| p.request["action"] == "account-signin")
+    {
+        return;
+    }
     let (text, color) = if app.busy {
         ("Action in progress · navigation stays available", BLUE)
     } else if let Some((text, tone)) = app.message() {
@@ -66,6 +77,11 @@ fn action_status(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
     match mode {
+        Mode::Accounts { screen, back } => {
+            draw_mode(f, area, app, back);
+            dim_behind(f);
+            account_ui::draw(f, area, app, screen);
+        }
         Mode::Peek { back, scroll } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
@@ -291,10 +307,14 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let pending = pending_line(app);
     let message = app.message();
     let filter_line = filtered(app);
+    let accounts = app
+        .machines
+        .iter()
+        .any(|m| m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty()));
     let rows = Layout::vertical([
         Constraint::Length(1 + u16::from(filter_line)),
         Constraint::Length(u16::from(banner.is_some())),
-        Constraint::Length(3),
+        Constraint::Length(if accounts { 1 } else { 3 }),
         Constraint::Min(4),
         Constraint::Length(u16::from(pending.is_some() || message.is_some())),
         Constraint::Length(1),
@@ -322,7 +342,9 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     if let Some((left, right)) = banner {
         put_lr(f.buffer_mut(), rows[1], rows[1].y, left, right);
     }
-    strip(f, rows[2], app);
+    if !accounts {
+        strip(f, rows[2], app);
+    }
     columns(f, rows[3], app);
     if app
         .columns()
@@ -373,7 +395,22 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             vec![Span::styled(text.to_string(), fg(color))],
         );
     }
-    let mut hints = card_hints(app);
+    let backlog_hints = card_hints(app);
+    let mut hints = if accounts {
+        let mut h = account_ui::new_intents(app);
+        h.extend(key_hints(&[
+            ("s", "move"),
+            ("A", "accounts"),
+            ("S", "models"),
+        ]));
+        h
+    } else {
+        card_hints(app)
+    };
+    if accounts {
+        hints.push(Span::raw("   "));
+        hints.extend(backlog_hints);
+    }
     // With a backlog card's keys in front, the rest gives up what the menu already lists.
     hints.extend(key_hints(if hints.is_empty() {
         &[
@@ -523,7 +560,45 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
         Span::raw(" "),
     ];
     let fixed: usize = left.iter().map(|s| width(&s.content)).sum();
-    let avail = (rect.width as usize).saturating_sub(fixed);
+    let usage_machine = app
+        .machine
+        .as_ref()
+        .and_then(|name| app.machine_index(name))
+        .or_else(|| {
+            app.machines.iter().position(|m| {
+                m.is_shown()
+                    && m.machine.is_local()
+                    && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+            })
+        })
+        .or_else(|| {
+            app.machines.iter().position(|m| {
+                m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+            })
+        });
+    let mut usage = usage_machine
+        .map(|mi| account_ui::usage(app, mi))
+        .unwrap_or_default();
+    if app.machine.is_none()
+        && !usage.is_empty()
+        && let Some(mi) = usage_machine
+    {
+        usage.insert(
+            0,
+            Span::styled(format!("{} ", app.machines[mi].name()), fg(DIM)),
+        );
+    }
+    let usage_w = if usage.is_empty() {
+        0
+    } else {
+        usage.iter().map(|s| width(&s.content)).sum::<usize>() + 9
+    };
+    let reserve = if rect.width as usize > fixed + usage_w + 18 {
+        usage_w
+    } else {
+        0
+    };
+    let avail = (rect.width as usize).saturating_sub(fixed + reserve);
     let tabs: Vec<_> = app
         .tabs
         .iter()
@@ -553,10 +628,11 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
     if end < tabs.len() {
         left.push(Span::styled("›", fg(DIM)));
     }
-    let right = vec![Span::styled(
-        format!("{{ }} machine · [ ] session · {}", clock(app.now())),
-        fg(DIM),
-    )];
+    let mut right = usage;
+    if right.is_empty() {
+        right.push(Span::styled("{ } machine · [ ] session", fg(DIM)));
+    }
+    right.push(Span::styled(format!(" · {}", clock(app.now())), fg(DIM)));
     let lw: usize = left.iter().map(|s| width(&s.content)).sum();
     let rw: usize = right.iter().map(|s| width(&s.content)).sum();
     if lw + rw + 2 <= rect.width as usize {
@@ -1083,11 +1159,34 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         attention_color(c.attention)
     };
     let head_w: usize = head.iter().map(|s| width(&s.content)).sum();
+    let account = app.account_agent(c);
+    let modern = app
+        .account_feed(c.machine_index)
+        .is_some_and(|f| !f.accounts.is_empty());
     let full = format!("{} {}", c.attention.glyph(), c.attention.label());
-    let label = if head_w + 1 + width(&full) <= inner_w {
+    let label = if modern {
+        if c.attention == Attention::Waiting && c.why == "waiting for usage" {
+            crate::accounts::pause_glyph()
+        } else {
+            match c.attention {
+                Attention::NeedsYou => "▲",
+                Attention::Running => "●",
+                Attention::Blocked => "✕",
+                _ => "■",
+            }
+        }
+        .to_string()
+    } else if head_w + 1 + width(&full) <= inner_w {
         full
     } else {
         c.attention.glyph().to_string()
+    };
+    let color = if modern && c.attention == Attention::Waiting && c.why == "waiting for usage" {
+        RED
+    } else if modern && c.attention == Attention::NeedsYou {
+        YELLOW
+    } else {
+        color
     };
     let badge = vec![Span::styled(
         label,
@@ -1109,6 +1208,9 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         note.push_str(" · ");
     }
     note.push_str(&c.why);
+    if modern {
+        note = account.map(|a| a.account.clone()).unwrap_or_default();
+    }
     // A record that gives only a date says nothing about the hour, so it shows as a day.
     let date_only = c
         .detail
@@ -1189,8 +1291,17 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
         let cached = c.cached_at.is_some();
         let border = if is_sel {
             CYAN
+        } else if (c.attention == Attention::Waiting && c.why == "waiting for usage") && !cached {
+            RED
         } else if c.attention == Attention::NeedsYou && !cached {
-            ORANGE
+            YELLOW
+        } else if c.attention == Attention::Running
+            && !cached
+            && app
+                .account_feed(c.machine_index)
+                .is_some_and(|f| !f.accounts.is_empty())
+        {
+            BLUE
         } else if c.attention == Attention::Blocked && !cached {
             RED
         } else {
@@ -1274,6 +1385,14 @@ fn wrapped(
         .collect()
 }
 
+fn line_for_account_keys() -> Line<'static> {
+    Line::from(key_hints(&[
+        ("s", "move account"),
+        ("S", "models"),
+        ("A", "accounts"),
+    ]))
+}
+
 fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     let Some(c) = app.selected() else { return };
     let now = app.now();
@@ -1346,6 +1465,42 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     }
     lines.extend(wrapped(&facts.join(" · "), w, fg(DIM), None));
 
+    if let Some(agent) = app.account_agent(c) {
+        lines.push(Line::raw(""));
+        lines.push(section("ACCOUNT"));
+        let account = app
+            .account_feed(c.machine_index)
+            .and_then(|f| f.accounts.iter().find(|a| a.code == agent.account));
+        let state = account
+            .map(|a| {
+                format!(
+                    "{} · {} · {}",
+                    crate::accounts::provider_name(&a.provider),
+                    a.numbers(),
+                    a.status_label()
+                )
+            })
+            .unwrap_or_default();
+        lines.extend(wrapped(
+            &format!(
+                "{}  {state} · {}",
+                agent.account,
+                match agent.how.as_str() {
+                    "manual" => "moved by hand",
+                    "next" => "next in the list",
+                    "handed_over" => "handed over to a fresh agent",
+                    _ => "follows the list",
+                }
+            ),
+            w,
+            fg(FG2),
+            None,
+        ));
+        if let Some(problem) = agent.problem.as_deref().filter(|p| !p.trim().is_empty()) {
+            lines.extend(wrapped(problem, w, fg(RED), None));
+        }
+        lines.push(line_for_account_keys());
+    }
     if let Some(story) = c.detail.as_ref().and_then(|d| d.story.clone()) {
         lines.push(Line::raw(""));
         lines.extend(wrapped(&story, w, fg(FG2), None));
@@ -2385,6 +2540,26 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
 
 /// The right-hand column: making and changing work, what the board shows, and the menu.
 pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
+    (
+        "ACCOUNTS",
+        &[
+            (
+                "A",
+                "accounts and tenant model lists",
+                "tab changes machine",
+            ),
+            (
+                "s",
+                "move the selected agent to another account",
+                "asks only when needed",
+            ),
+            (
+                "S",
+                "the viewed session’s ordered models",
+                "space moves waiting sessions",
+            ),
+        ],
+    ),
     (
         "WORK · the same keys on the board, the backlog and a peek",
         &[
@@ -3506,7 +3681,7 @@ mod tests {
     }
 
     fn modes(a: &App) -> Vec<Mode> {
-        vec![
+        let mut modes = vec![
             Mode::Board,
             Mode::Peek {
                 scroll: 0,
@@ -3567,7 +3742,9 @@ mod tests {
                 queue: false,
                 ready_at: None,
             },
-        ]
+        ];
+        modes.extend(crate::demo::account_screens(a));
+        modes
     }
 
     #[test]
@@ -3640,9 +3817,46 @@ mod tests {
     }
 
     #[test]
+    fn new_intents_footer_skips_unavailable_accounts_then_falls_back_to_first() {
+        let mut a = demo(false);
+        a.machine = Some(a.this_machine());
+        a.rebuild();
+        a.tab = a
+            .tabs
+            .iter()
+            .position(|scope| matches!(scope, Scope::Session(_, session) if session == "web"))
+            .unwrap();
+        let mi = a.machine_index(&a.this_machine()).unwrap();
+        for owner in &mut a.machines[mi].feed.as_mut().unwrap().owners {
+            owner.models = vec!["KBZ".into(), "ARK".into()];
+        }
+        assert!(rendered(&a, 176, 44).contains("new in web: Claude ARK"));
+        for account in &mut a.machines[mi].feed.as_mut().unwrap().accounts {
+            account.status = "out".into();
+        }
+        assert!(rendered(&a, 176, 44).contains("new in web: Claude KBZ"));
+    }
+
+    #[test]
     fn overview_header_explains_machine_and_session_keys() {
-        let a = demo(false);
+        let mut a = demo(false);
+        for m in &mut a.machines {
+            if let Some(f) = &mut m.feed {
+                f.accounts.clear();
+            }
+        }
         let text = rendered(&a, 176, 44);
+        let mut terminal = Terminal::new(TestBackend::new(176, 44)).unwrap();
+        terminal.draw(|f| draw(f, &a)).unwrap();
+        let header: String = (0..176)
+            .map(|x| terminal.backend().buffer()[(x, 0)].symbol())
+            .collect();
+        assert!(
+            header
+                .trim_end()
+                .ends_with(&format!("{{ }} machine · [ ] session · {}", clock(a.now()))),
+            "{header}"
+        );
         assert!(
             text.contains("ctrl+space menu"),
             "the menu must be discoverable"

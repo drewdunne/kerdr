@@ -204,6 +204,8 @@ fn running_title(w: &WsRef) -> Option<String> {
 
 /// Decides what a card needs from you, from what the feed says and what herdr sees.
 pub struct Signals<'a> {
+    pub usage_waiting: bool,
+    pub account_problem: Option<&'a str>,
     pub closed: bool,
     pub token: Option<&'a str>,
     pub herdr: Option<&'a str>,
@@ -243,12 +245,18 @@ pub fn attention(s: &Signals) -> (Attention, String) {
             s.blocker.unwrap_or("blocked").to_string(),
         );
     }
+    if let Some(problem) = s.account_problem.filter(|p| !p.trim().is_empty()) {
+        return (Attention::NeedsYou, problem.into());
+    }
     if s.herdr == Some("working") {
         let why = s.running_title.or(s.feed_status).unwrap_or("working");
         return (Attention::Running, why.to_string());
     }
     if s.feed == Some(Attention::Waiting) {
         return (Attention::Waiting, status_or("waiting"));
+    }
+    if s.usage_waiting && matches!(s.herdr, Some("done" | "idle")) {
+        return (Attention::Waiting, "waiting for usage".into());
     }
     match s.herdr {
         // The silent wait: the agent stopped, and nothing it wrote says what for.
@@ -264,6 +272,26 @@ pub fn attention(s: &Signals) -> (Attention, String) {
             None => (Attention::Idle, status_or("idle")),
         },
     }
+}
+
+fn usage_waiting(machine: &MachineState, workspace: &WsRef) -> bool {
+    machine.feed.as_ref().is_some_and(|feed| {
+        workspace.agents.iter().any(|agent| {
+            feed.agents.iter().any(|a| {
+                a.pane == agent.pane_id && a.session == workspace.session && a.waiting_for_usage()
+            })
+        })
+    })
+}
+
+fn account_problem<'a>(machine: &'a MachineState, workspace: &WsRef) -> Option<&'a str> {
+    machine.feed.as_ref()?.agents.iter().find_map(|a| {
+        (a.session == workspace.session
+            && workspace.agents.iter().any(|agent| a.pane == agent.pane_id))
+        .then_some(a.problem.as_deref())
+        .flatten()
+        .filter(|p| !p.trim().is_empty())
+    })
 }
 
 fn parse_time(s: &str) -> Option<DateTime<Local>> {
@@ -483,6 +511,8 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             .map(String::as_str);
         let (att, why) = attention(&Signals {
             closed,
+            usage_waiting: ws.is_some_and(|w| usage_waiting(&machines[w.mi], w)),
+            account_problem: ws.and_then(|w| account_problem(&machines[w.mi], w)),
             token,
             herdr: herdr.as_deref(),
             feed: fc.attention.as_deref().and_then(Attention::parse),
@@ -544,6 +574,8 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         let note = w.ws.tokens.get("kerdr_note").map(String::as_str);
         let (att, why) = attention(&Signals {
             closed: reported_stage == Some(Stage::Maintain),
+            usage_waiting: usage_waiting(m, w),
+            account_problem: account_problem(m, w),
             token,
             herdr: herdr.as_deref(),
             feed: None,
@@ -583,7 +615,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             workspace_label: Some(label),
             tab_id: None,
             priority: Priority::Normal,
-            background: cfg.board.unlimited.iter().any(|u| u == &w.session),
+            background: cfg.board.is_unlimited(&w.session),
             cached_at: m.cached_at(),
             updated: None,
             stale_days: None,
@@ -612,7 +644,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         machine_order.push(name.clone());
         let Some(data) = &m.data else { continue };
         for info in data.sessions.iter().filter(|s| cfg.board.wants(&s.name)) {
-            let unlimited = cfg.board.unlimited.iter().any(|u| u == &info.name);
+            let unlimited = cfg.board.is_unlimited(&info.name);
             let feed_slots = m.feed.as_ref().and_then(|f| f.sessions.get(&info.name));
             let used_by_agents = all_ws
                 .iter()
@@ -974,8 +1006,42 @@ mod tests {
     }
 
     #[test]
+    fn tenant_background_sessions_have_unlimited_slots_and_background_cards() {
+        let mut cfg = Config::default();
+        cfg.board.unlimited = vec!["*-bg".into(), "background".into()];
+        let sessions = ["pick4me-bg", "arknet-bg", "pick4me"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    Snapshot {
+                        workspaces: vec![ws("w1", name)],
+                        agents: vec![agent("w1", "working")],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let board = build(&[live(machine("laptop", true), sessions, None)], &cfg);
+        for name in ["pick4me-bg", "arknet-bg", "pick4me"] {
+            let background = name.ends_with("-bg");
+            let session = board.sessions.iter().find(|s| s.session == name).unwrap();
+            assert_eq!(session.slots.limit, if background { None } else { Some(3) });
+            assert_eq!(session.slots.used, 1);
+            let card = board
+                .cards
+                .iter()
+                .find(|c| c.session.as_deref() == Some(name))
+                .unwrap();
+            assert_eq!(card.background, background);
+        }
+    }
+
+    #[test]
     fn the_silent_wait_needs_you() {
         let (att, why) = attention(&Signals {
+            usage_waiting: false,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("done"),
@@ -991,8 +1057,41 @@ mod tests {
     }
 
     #[test]
+    fn usage_wait_suppresses_only_silence_and_never_an_explicit_question() {
+        let mut signals = Signals {
+            usage_waiting: true,
+            account_problem: None,
+            closed: false,
+            token: None,
+            herdr: Some("done"),
+            feed: None,
+            feed_status: None,
+            needs: None,
+            blocker: None,
+            running_title: None,
+            from_feed: true,
+        };
+        assert_eq!(attention(&signals).0, Attention::Waiting);
+        signals.herdr = Some("blocked");
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.herdr = Some("done");
+        signals.token = Some("needs_you");
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.token = None;
+        signals.feed = Some(Attention::NeedsYou);
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.feed = Some(Attention::Blocked);
+        assert_eq!(attention(&signals).0, Attention::Blocked);
+        signals.feed = None;
+        signals.herdr = Some("working");
+        assert_eq!(attention(&signals).0, Attention::Running);
+    }
+
+    #[test]
     fn waiting_on_a_review_is_not_needing_you() {
         let (att, why) = attention(&Signals {
+            usage_waiting: false,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("idle"),
@@ -1010,6 +1109,8 @@ mod tests {
     #[test]
     fn an_agent_asking_always_needs_you() {
         let (att, _) = attention(&Signals {
+            usage_waiting: false,
+            account_problem: None,
             closed: false,
             token: None,
             herdr: Some("blocked"),

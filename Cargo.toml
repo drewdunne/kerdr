@@ -1,6 +1,6 @@
 [package]
 name = "kerdr"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2024"
 description = "An opinionated kanban cockpit for driving herdr sessions"
 license = "MIT"
@@ -27,7 +27,7 @@ toml_edit = "0.25.17"
 unicode-width = "0.2.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp"] }
+windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]
 fontdue = "0.9.5"

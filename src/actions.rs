@@ -15,7 +15,16 @@ pub struct Response {
     pub ok: bool,
     pub message: String,
     #[serde(default)]
+    #[serde(deserialize_with = "confirmation")]
     pub confirmation: bool,
+    pub yes: Option<String>,
+    pub no: Option<String>,
+    pub status: Option<String>,
+    pub url: Option<String>,
+    pub ticket: Option<String>,
+    #[serde(default)]
+    pub needs_code: bool,
+
     pub used: Option<u32>,
     pub limit: Option<u32>,
     pub session: Option<String>,
@@ -27,6 +36,37 @@ pub struct Response {
     pub label: Option<String>,
     /// With a confirmation: a token of what it asked about, sent back with the yes.
     pub confirm: Option<String>,
+}
+
+fn confirmation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    let value = Value::deserialize(d)?;
+    match value {
+        Value::Bool(b) => Ok(b),
+        Value::String(s) => Ok(!s.is_empty()),
+        _ => Err(serde::de::Error::custom(
+            "confirmation must be boolean or question text",
+        )),
+    }
+}
+
+pub fn parse_response(text: &str) -> Result<Response, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(text)?;
+    if let Some(question) = value["confirmation"].as_str().map(str::to_string) {
+        value["message"] = Value::String(question);
+    }
+    serde_json::from_value(value)
+}
+
+/// Metadata returned to the UI after sending; credentials never enter its result queue.
+pub fn request_metadata(request: &Value) -> Value {
+    let mut value = request.clone();
+    if value["action"] == "account-signin"
+        && let Some(fields) = value.as_object_mut()
+    {
+        fields.remove("token");
+        fields.remove("page_code");
+    }
+    value
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
@@ -52,6 +92,7 @@ fn run_with_deadline(
     };
     // The configured command is source; user data is JSON on stdin, never source.
     let output = transport::run_adapter(&target, command, Some(&json), deadline);
+    let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
         return Err("the action timed out; its result is unknown. Check the canonical record before trying again. Do not retry automatically.".into());
     }
@@ -60,12 +101,34 @@ fn run_with_deadline(
     }
     // A backend can request confirmation with a nonzero exit code. Its JSON is the contract,
     // so parse it before interpreting process status.
-    serde_json::from_str(&output.stdout).map_err(|error| {
+    parse_response(&output.stdout).map(|mut response| {
+        response.message = redact(&response.message);
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label].into_iter().flatten() {
+            *text = redact(text);
+        }
+        response
+    }).map_err(|error| {
         let status = output.status.map_or_else(|| "no exit status".into(), |s| format!("exit {s}"));
-        let detail: String = output.stderr.trim().chars().take(1024).collect();
+        let detail: String = redact(output.stderr.trim()).chars().take(1024).collect();
         let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
+        let error = redact(&error.to_string());
         format!("the action's JSON response is invalid ({status}): {error}{detail}. Its result is unknown. Do not retry automatically.")
     })
+}
+
+fn redact_credentials(text: &str, request: &Value) -> String {
+    let mut text = text.to_string();
+    if request["action"] == "account-signin" {
+        for field in ["token", "page_code"] {
+            if let Some(secret) = request[field].as_str().filter(|s| !s.is_empty()) {
+                text = text.replace(secret, "[redacted]");
+                if secret != secret.trim() && !secret.trim().is_empty() {
+                    text = text.replace(secret.trim(), "[redacted]");
+                }
+            }
+        }
+    }
+    text
 }
 
 #[cfg(test)]
@@ -93,6 +156,113 @@ mod tests {
         } else {
             format!("sh {}", quote(path.to_str().unwrap()))
         }
+    }
+
+    #[test]
+    fn a_backend_cannot_echo_the_submitted_token_into_a_result_or_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = "fixture-private-credential";
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\nprintf '%s' '{\"ok\":false,\"message\":\"fixture-private-credential refused\"}'\n",
+            "[Console]::In.ReadToEnd() | Out-Null; Write-Output '{\"ok\":false,\"message\":\"fixture-private-credential refused\"}'",
+        );
+        let request =
+            json!({"action":"account-signin","step":"paste","code":"EXAMPLE","token":secret});
+        let response = run(&machine(), &command, &request).unwrap();
+        assert!(!response.message.contains(secret));
+        assert!(response.message.contains("[redacted]"));
+    }
+
+    #[test]
+    fn short_and_json_escaped_credentials_do_not_corrupt_response_structure() {
+        for secret in ["ok", "true", "a", "quote\"and\\slash"] {
+            let dir = tempfile::tempdir().unwrap();
+            let reply =
+                json!({"ok":true,"status":"done","message":format!("echo {secret}")}).to_string();
+            let command = fixture(
+                dir.path(),
+                &format!(
+                    "cat >/dev/null\nprintf '%s' {}\n",
+                    crate::transport::quote(&reply)
+                ),
+                &format!(
+                    "[Console]::In.ReadToEnd() | Out-Null; Write-Output '{}'",
+                    reply.replace('\'', "''")
+                ),
+            );
+            let response = run(
+                &machine(),
+                &command,
+                &json!({"action":"account-signin","step":"finish","page_code":secret}),
+            )
+            .unwrap();
+            assert!(response.ok);
+            assert_eq!(response.status.as_deref(), Some("done"));
+            assert!(response.message.contains("[redacted]"));
+        }
+    }
+
+    #[test]
+    fn every_account_action_uses_the_platform_adapter_contract() {
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(if cfg!(windows) {
+            "tests/fixtures/accounts.ps1"
+        } else {
+            "tests/fixtures/accounts.sh"
+        });
+        let command = if cfg!(windows) {
+            format!("& {}", transport::powershell_quote(file.to_str().unwrap()))
+        } else {
+            format!("sh {}", quote(file.to_str().unwrap()))
+        };
+        for action in [
+            "account-move",
+            "account-move-waiting",
+            "account-models",
+            "account-add",
+            "account-test",
+            "account-remove",
+        ] {
+            let response=run(&machine(),&command,&json!({"action":action,"code":"EXAMPLE","pane":"w1:p1","session":"web","conversation":"fixture-conversation","to":"EXAMPLE","owner":"studio","models":["EXAMPLE"]})).unwrap();
+            if action == "account-move" {
+                assert!(response.confirmation);
+                assert_eq!(response.confirm.as_deref(), Some("fixture-confirm"));
+                assert!(response.message.starts_with("Mid-step"));
+            } else {
+                assert!(response.ok, "{action}: {response:?}");
+            }
+        }
+        for (conversation, message) in [
+            ("fixture-conversation", "moving to ARK"),
+            ("stale-conversation", "the conversation changed"),
+        ] {
+            let response = run(&machine(), &command, &json!({"action":"account-move","pane":"w1:p1","session":"web","conversation":conversation,"to":"ARK","confirm":"fixture-confirm"})).unwrap();
+            assert!(response.ok && !response.confirmation);
+            assert_eq!(response.message, message);
+        }
+        for step in ["start", "poll", "finish", "cancel", "paste"] {
+            let response=run(&machine(),&command,&json!({"action":"account-signin","step":step,"code":"EXAMPLE","ticket":"fixture-ticket","page_code":"page-code"})).unwrap();
+            assert!(response.ok);
+            assert!(response.status.is_some());
+            if step == "cancel" {
+                assert_eq!(response.status.as_deref(), Some("cancelled"));
+            }
+            if step == "start" {
+                assert!(response.needs_code);
+                assert_eq!(response.ticket.as_deref(), Some("fixture-ticket"));
+            }
+        }
+    }
+
+    #[test]
+    fn redaction_covers_trimmed_credential_echoes() {
+        assert_eq!(
+            redact_credentials(
+                "echo: fixture-private-value",
+                &json!({"action":"account-signin","token":"  fixture-private-value  "})
+            ),
+            "echo: [redacted]"
+        );
     }
 
     #[test]
