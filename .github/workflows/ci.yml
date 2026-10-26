@@ -59,3 +59,35 @@ jobs:
         with:
           name: windows-console-evidence
           path: test-results/
+
+  # The new-intent box reads images from the real clipboard on every platform Kerdr ships.
+  clipboard:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked --lib --no-run
+      - name: Install X11 and Wayland clipboard tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y xvfb xclip sway wl-clipboard
+      - name: Images from a real clipboard
+        if: runner.os != 'Windows'
+        run: tests/live-clipboard.sh docs/screenshots/new-intent.png
+      - name: Images from a real Windows clipboard
+        if: runner.os == 'Windows'
+        shell: powershell
+        run: |
+          $ErrorActionPreference = 'Stop'
+          Add-Type -AssemblyName System.Windows.Forms
+          Add-Type -AssemblyName System.Drawing
+          $image = (Resolve-Path docs/screenshots/new-intent.png).Path
+          [System.Windows.Forms.Clipboard]::SetImage([System.Drawing.Image]::FromFile($image))
+          $env:KERDR_LIVE_CLIPBOARD_IMAGE = $image
+          cargo test --locked --lib -- --ignored --exact images::tests::live_clipboard
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

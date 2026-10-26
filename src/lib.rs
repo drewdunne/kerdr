@@ -9,6 +9,7 @@ pub mod demo;
 pub mod feed;
 pub mod herdr;
 pub mod herdr_keys;
+pub mod images;
 pub mod jump;
 pub mod model;
 pub mod poll;

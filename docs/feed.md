@@ -108,8 +108,8 @@ be available on each machine where you use actions.
 
 The command receives one JSON object on standard input. User text is JSON data, including quotes,
 newlines and shell punctuation. It is never appended to the configured command as shell source.
-Requests are limited to 64 KiB. The `action` field names the operation; the backend defines which
-additional fields that operation needs:
+Requests are limited to 64 KiB, beyond the images a `create` carries. The `action` field names the
+operation; the backend defines which additional fields that operation needs:
 
 ```json
 {"action":"dispatch","id":"0041","session":"web","override":false}
@@ -123,10 +123,22 @@ submission, nothing else:
 {"action":"create","words":"The laptop's Wi-Fi drops after sleep.\nMake it reconnect on its own.","session":"default","submission":"kerdr-18f2c3a9d0e1-4d2"}
 ```
 
-Kerdr sends the same `submission` again only for the same words to the same session, and only
-while an earlier send of them never got an answer (a timeout, say). When a record already exists
-for it, answer with that record's `id` instead of making another. Changed words are new work
-with a new `submission`.
+Images pasted into the box come as `images`, one entry for each `[Image #N]` tag still in the
+words: `tag` (N, a positive integer), `type` (`image/png`, `image/jpeg`, `image/gif` or
+`image/webp`, from the image's own bytes) and `data` (its bytes in standard base64). Each is at most
+10 MB, and one request carries at most 20 of them and 20 MB in all, so a request with images may be
+that much larger than 64 KiB. Keep them with the record, readable by exactly whoever can read it,
+and say there which file each tag is. A request without images has no `images` field. A backend
+that ignores the field drops the images, so update it before its users get a Kerdr that sends them.
+
+```json
+{"action":"create","words":"Moving it failed: [Image #1]","session":"default","submission":"kerdr-18f2c3a9d0e1-4d3","images":[{"tag":1,"type":"image/png","data":"iVBORw0KGgoAAAANSUhEUg…"}]}
+```
+
+Kerdr sends the same `submission` again only for the same words and images to the same session,
+and only while an earlier send of them never got an answer (a timeout, say). When a record already
+exists for it, answer with that record's `id` instead of making another. Changed words or images
+are new work with a new `submission`.
 
 Write the record up from the words however your system does (a person, a script, an agent),
 and answer with its `id` as soon as it's saved, before any slow write-up. While it's being
@@ -138,7 +150,8 @@ the active backlog and `restore` brings it back. `move` changes backlog order. `
 described below.
 
 Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `submission` and `confirm` (strings),
-`override`, `top` and `queue` (booleans), and `delta` (a signed integer). Omit fields that do not apply.
+`override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
+`create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
 exactly one JSON response to standard output. Send diagnostic output to standard error.
 

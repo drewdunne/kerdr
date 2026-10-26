@@ -211,16 +211,14 @@ fn event_loop(
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let key = match event::read()? {
-            Event::Key(key) => key,
-            Event::Paste(text) => {
-                app.on_paste(&text);
-                continue;
-            }
+        let action = match event::read()? {
+            Event::Key(key) => app.on_key(key),
+            Event::Paste(text) => app.on_paste(&text),
             _ => continue,
         };
-        match app.on_key(key) {
+        match action {
             Action::None => {}
+            Action::PasteImage => app.attach_images(crate::images::from_clipboard()),
             Action::CopyLink(url) => {
                 if crate::accounts::valid_signin_url(&url) {
                     use base64::Engine;

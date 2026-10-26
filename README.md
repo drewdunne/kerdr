@@ -52,7 +52,8 @@ question, something stuck. Everything else keeps running without you.
   Kerdr calls it full (change it in the config). A lane for background agents has no limit.
 - **One workspace, one piece of work, one card.**
 - **New work in your own words.** `c` opens one box: write what you want, the way you'd say it
-  to an agent, and your record system's adapter writes it up.
+  to an agent, and your record system's adapter writes it up. Ctrl+V adds a screenshot as an
+  `[Image #1]` tag, as Claude Code does.
 - **The same key does the same thing everywhere.** The keys that change a backlog card work on
   the board, in the backlog and in a peek, and the bottom line names them for the card you're
   on. Ctrl+Space lists them, with the same letters. Inside herdr, its own prefix and key
@@ -146,6 +147,16 @@ keeps your words for the next time you open it. The adapter files it in the back
 session you're looking at and writes it up (see [docs/feed.md](docs/feed.md#actions)); Kerdr
 shows it as being written up until that's done, and creating it never starts an agent by itself.
 
+Ctrl+V in the box attaches the image on your clipboard, as Claude Code does: it goes in at the end
+of your words as an `[Image #1]` tag, numbered within that intent, and travels with them to the
+adapter. Pasting or dropping an image file's path attaches that file, and a file copied in a file
+manager attaches too. Backspace right after a tag takes it out, with its image; only images whose
+tags are still in your words are sent. Kerdr attaches PNG, JPEG, GIF and WebP, up to 10 MB each and
+20 images or 20 MB in one intent, and says which limit an image is past. It reads the clipboard
+with `wl-paste` (from wl-clipboard) under Wayland, `xclip` under X11, `osascript` on macOS and
+PowerShell on Windows; where there's no desktop clipboard (over SSH, say), it says so, and a
+pasted path still works.
+
 `f` lists every owner (organization or tenant) and its projects, with how much of each is under
 way and waiting; type to narrow the list and Enter to show only that one. `F` shows everything
 again. `a` cycles the provider herdr reports: All, Claude, Codex, and additional detected
@@ -208,7 +219,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
 | `/` | search |
-| `c` | new intent, in your own words |
+| `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
 | `f` / `F` | show only one owner or project / show everything |
 | `A` / `S` / `s` | accounts / viewed session’s ordered models / move selected agent |
