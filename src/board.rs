@@ -526,6 +526,12 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             .map(|w| w.session.clone())
             .or_else(|| fc.workspace.as_ref().and_then(|w| w.session.clone()))
             .or(p.home_session.clone());
+        // Background work: its lane says so, or it runs in a session with no limit.
+        let background = fc.lane.as_deref() == Some("background")
+            || p.state == "background"
+            || session
+                .as_deref()
+                .is_some_and(|s| cfg.board.is_unlimited(s));
         cards.push(Card {
             key: p.key.clone(),
             reference: fc.reference(),
@@ -544,7 +550,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 .as_deref()
                 .map(Priority::parse)
                 .unwrap_or_default(),
-            background: fc.lane.as_deref() == Some("background") || p.state == "background",
+            background,
             cached_at: machines[card_mi].cached_at(),
             updated: fc.updated.as_deref().and_then(parse_time),
             stale_days: fc.stale_days,
@@ -1036,6 +1042,40 @@ mod tests {
                 .unwrap();
             assert_eq!(card.background, background);
         }
+    }
+
+    #[test]
+    fn feed_cards_are_background_work_by_their_lane_or_a_session_with_no_limit() {
+        let mut cfg = Config::default();
+        cfg.board.unlimited = vec!["*-Background".into()];
+        let mut lane = feed_card("0001", "build", "active");
+        lane.lane = Some("background".into());
+        let mut queued = feed_card("0002", "backlog", "queued");
+        queued.home = Some(Home {
+            machine: Some("build-box".into()),
+            session: Some("ARK-Background".into()),
+        });
+        let mine = feed_card("0003", "build", "active");
+        let feed = Feed {
+            kerdr_feed: 1,
+            cards: vec![lane, queued, mine],
+            ..Default::default()
+        };
+        let board = build(
+            &[live(machine("build-box", true), vec![], Some(feed))],
+            &cfg,
+        );
+        let background = |reference: &str| {
+            board
+                .cards
+                .iter()
+                .find(|c| c.reference == reference)
+                .unwrap()
+                .background
+        };
+        assert!(background("#1"), "its lane is background");
+        assert!(background("#2"), "its home session has no limit");
+        assert!(!background("#3"));
     }
 
     #[test]

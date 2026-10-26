@@ -85,6 +85,14 @@ impl App {
         }
     }
 
+    /// Whether f's filters (owner, project, agents or background) hide any work.
+    pub(crate) fn filtering(&self) -> bool {
+        self.owner.is_some()
+            || self.project.is_some()
+            || self.provider.is_some()
+            || self.background != Background::All
+    }
+
     /// Metadata filters without the selected tab, so other session badges stay meaningful.
     pub(crate) fn card_matches_filters(&self, card: &Card) -> bool {
         self.owner.as_ref().is_none_or(|o| *o == card.owner_key())
@@ -93,6 +101,7 @@ impl App {
                 .provider
                 .as_ref()
                 .is_none_or(|provider| card.agents.iter().any(|a| &a.agent == provider))
+            && self.background.shows(card.background)
             && card.dismissed() == self.wont_do
     }
 
@@ -145,8 +154,8 @@ impl App {
     }
 
     /// The filter list (f): every owner on the board, each with its projects, and how much of
-    /// each is under way or waiting. Counts ignore the owner and project filters, so they say
-    /// what picking a row would show.
+    /// each is under way or waiting. Counts ignore the owner and project filters but follow the
+    /// agents and background ones, so they say what picking a row would show.
     pub fn filter_rows(&self) -> Vec<FilterRow> {
         let cards: Vec<&Card> = self
             .board
@@ -160,6 +169,7 @@ impl App {
                         .provider
                         .as_ref()
                         .is_none_or(|p| c.agents.iter().any(|a| &a.agent == p))
+                    && self.background.shows(c.background)
             })
             .collect();
         let row = |label: String,
@@ -298,16 +308,28 @@ impl App {
     }
 
     pub(super) fn enter_filter(&mut self) {
-        let sel = self
-            .filter_rows()
-            .iter()
-            .position(|r| r.owner == self.owner && r.project == self.project)
-            .unwrap_or(0);
         self.mode = Mode::Filter {
             query: String::new(),
-            sel,
+            sel: self.filter_row_shown(),
+            typing: false,
             back: Box::new(self.mode.clone()),
         };
+    }
+
+    /// The filter list's row for what the board shows now.
+    fn filter_row_shown(&self) -> usize {
+        self.filter_rows()
+            .iter()
+            .position(|r| r.owner == self.owner && r.project == self.project)
+            .unwrap_or(0)
+    }
+
+    /// b in the filter screen: every card, only background work, none of it, then every card.
+    fn cycle_background(&mut self) {
+        self.background = self.background.next();
+        self.backlog_focus = None;
+        set_backlog_selection(&mut self.mode, 0);
+        self.fix_selection();
     }
 
     fn set_filter(&mut self, owner: Option<String>, project: Option<String>) {
@@ -318,10 +340,11 @@ impl App {
         self.fix_selection();
     }
 
-    /// F: every owner, project and agent again.
+    /// F: every owner, project, agent and background card again.
     pub(super) fn clear_filters(&mut self) {
-        let filtered = self.owner.is_some() || self.project.is_some() || self.provider.is_some();
+        let filtered = self.filtering();
         self.provider = None;
+        self.background = Background::All;
         self.set_filter(None, None);
         if filtered {
             self.say("Showing everything.", Tone::Info);
@@ -333,12 +356,23 @@ impl App {
         key: KeyEvent,
         mut query: String,
         mut sel: usize,
+        mut typing: bool,
         back: Box<Mode>,
     ) -> Action {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let n = self.filter_matches(&query).len();
         match key.code {
+            // Esc stops a search, then closes.
+            KeyCode::Esc if typing => {
+                typing = false;
+                query.clear();
+                sel = self.filter_row_shown();
+            }
             KeyCode::Esc => {
+                self.mode = *back;
+                return Action::None;
+            }
+            KeyCode::Char('f') if !typing && !ctrl => {
                 self.mode = *back;
                 return Action::None;
             }
@@ -363,19 +397,43 @@ impl App {
                 sel = 0;
             }
             KeyCode::Tab => self.cycle_provider(),
+            KeyCode::Backspace if typing && query.is_empty() => typing = false,
             KeyCode::Backspace => {
                 query.pop();
                 sel = 0;
             }
-            KeyCode::Char(c) if !ctrl && query.len() < 64 => {
-                query.push(c);
+            KeyCode::Char(c) if typing && !ctrl => {
+                if query.len() < 64 {
+                    query.push(c);
+                    sel = 0;
+                }
+            }
+            // Not searching, letters are the screen's keys.
+            KeyCode::Char('/') if !ctrl => typing = true,
+            KeyCode::Char('j') if !ctrl => sel = (sel + 1).min(n.saturating_sub(1)),
+            KeyCode::Char('k') if !ctrl => sel = sel.saturating_sub(1),
+            KeyCode::Char('a') if !ctrl => self.cycle_provider(),
+            KeyCode::Char('b') if !ctrl => self.cycle_background(),
+            KeyCode::Char('F') if !ctrl => {
+                self.clear_filters();
+                query.clear();
                 sel = 0;
             }
             _ => {}
         }
         let n = self.filter_matches(&query).len();
         let sel = sel.min(n.saturating_sub(1));
-        self.mode = Mode::Filter { query, sel, back };
+        // b, a and F reset the backlog's selection in the screen behind this one: keep that.
+        let back = match &self.mode {
+            Mode::Filter { back, .. } => back.clone(),
+            _ => back,
+        };
+        self.mode = Mode::Filter {
+            query,
+            sel,
+            typing,
+            back,
+        };
         Action::None
     }
 
@@ -843,9 +901,12 @@ impl App {
                 s.query.push_str(&text.replace('\n', " "));
                 s.sel = 0;
             }
-            Mode::Filter { query, sel, .. } => {
+            Mode::Filter {
+                query, sel, typing, ..
+            } => {
                 query.push_str(&text.replace('\n', " "));
                 *sel = 0;
+                *typing = true;
             }
             Mode::Keys {
                 filter,
@@ -969,8 +1030,13 @@ impl App {
     pub(super) fn control_key(&mut self, key: KeyEvent) -> Option<Action> {
         match self.mode.clone() {
             Mode::Compose { draft, back } => return Some(self.compose_key(key, draft, back)),
-            Mode::Filter { query, sel, back } => {
-                return Some(self.filter_key(key, query, sel, back));
+            Mode::Filter {
+                query,
+                sel,
+                typing,
+                back,
+            } => {
+                return Some(self.filter_key(key, query, sel, typing, back));
             }
             Mode::Confirm {
                 machine,
@@ -1241,7 +1307,7 @@ impl App {
                     self.draft_images.clear();
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
                     self.enter_backlog(false);
-                    if self.owner.is_some() || self.project.is_some() || self.provider.is_some() {
+                    if self.filtering() {
                         message.push_str(
                             " A filter may hide it until it's written up: F shows everything.",
                         );

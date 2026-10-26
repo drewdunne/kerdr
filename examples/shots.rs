@@ -268,6 +268,7 @@ fn main() {
     filter.mode = Mode::Filter {
         query: String::new(),
         sel: 0,
+        typing: false,
         back: Box::new(Mode::Board),
     };
     rasterize(&render(&filter), &fonts, &out.join("filter.png"));

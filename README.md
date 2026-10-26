@@ -157,12 +157,16 @@ with `wl-paste` (from wl-clipboard) under Wayland, `xclip` under X11, `osascript
 PowerShell on Windows; where there's no desktop clipboard (over SSH, say), it says so, and a
 pasted path still works.
 
-`f` lists every owner (organization or tenant) and its projects, with how much of each is under
-way and waiting; type to narrow the list and Enter to show only that one. `F` shows everything
-again. `a` cycles the provider herdr reports: All, Claude, Codex, and additional detected
-providers. Cards with no reported agent appear in All. These filters combine with machine and
-session selection, and the top of the board names them while one is on. Organization work stays
-distinct from tenant work.
+`f` opens the filters. Its list is every owner (organization or tenant) and its projects, with
+how much of each is under way and waiting; `j`/`k` or the arrows move, `/` searches the list, and
+Enter shows only that one. `a` (or Tab there) cycles the provider herdr reports: All, Claude,
+Codex, and additional detected providers; cards with no reported agent appear in All. `b` there
+cycles background work: every card, only cards marked `bg` (their intent's lane is background, or
+they run in a session `[board] unlimited` names), or none of them. `F` shows everything again.
+These filters combine with machine and session selection, and the top of the board names them
+while one is on. Organization work stays distinct from tenant work.
+
+![The filters: who it's for, agents and background work](docs/screenshots/filter.png)
 
 Controls are optional: [the action adapter contract](docs/feed.md#actions) lets your
 own record system validate and persist changes. Without an adapter, Kerdr remains a reader.
@@ -231,7 +235,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `/` | search |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
-| `f` / `F` | show only one owner or project / show everything |
+| `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
 | `A` / `S` / `s` | accounts / viewed session’s ordered models / move selected agent |
 | `a` | cycle provider: All, Claude, Codex, and detected providers |
 | `b` | backlog |
