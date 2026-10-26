@@ -444,11 +444,19 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             CYAN,
         ),
         AccountScreen::Signin(s) => {
+            let done = s.current >= s.machines.len();
             let mut lines = match &s.copy {
+                // Esc only undoes a sign-in that hasn't finished; once done, the copy has changed.
                 Some((_, label)) => wrapped(
-                    &format!(
-                        "Only the {label} copy changes. The other copies stay as they are, and esc leaves this one as it was."
-                    ),
+                    &if done {
+                        format!(
+                            "The {label} copy is signed in. The other copies stayed as they were."
+                        )
+                    } else {
+                        format!(
+                            "Only the {label} copy changes. The other copies stay as they are, and esc before it finishes leaves this one as it was."
+                        )
+                    },
                     68,
                     fg(DIM),
                     None,
@@ -522,7 +530,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 area,
                 &title,
                 lines,
-                if s.current >= s.machines.len() {
+                if done && s.copy.is_some() {
+                    "Signed in.    esc accounts"
+                } else if done {
                     "All selected machines signed in.    esc accounts"
                 } else if s.failed {
                     "r try again    p paste token    esc later"

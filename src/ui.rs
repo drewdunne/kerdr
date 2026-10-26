@@ -3885,6 +3885,24 @@ mod tests {
         let text = rendered(&a, 176, 44);
         assert!(text.contains("Sign ARK in on build-box: Tenants"), "{text}");
         assert!(text.contains("Only the Tenants copy changes."));
+        assert!(text.contains("esc before it finishes leaves this one as it was"));
+        // Once it has finished, Esc only closes: the dialog no longer says it would undo anything.
+        if let Mode::Accounts {
+            screen: crate::app::account_controls::AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.current = 1;
+            s.ticket = None;
+        }
+        for (w, h) in [(1, 1), (30, 8), (80, 24), (176, 44)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| draw(f, &a)).unwrap();
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("The Tenants copy is signed in."), "{text}");
+        assert!(text.contains("Signed in.    esc accounts"));
+        assert!(!text.contains("leaves this one as it was"));
     }
 
     fn rendered(a: &App, w: u16, h: u16) -> String {

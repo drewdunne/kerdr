@@ -367,7 +367,7 @@ Continue on that same machine:
 
 Responses have `status: "waiting"`, `"done"`, or `"failed"`; cancel answers `"cancelled"` with
 `ok: true`, including an already finished or unknown valid ticket. A new start cancels an
-unfinished sign-in for that code. A failed finish may report an account identity mismatch,
+unfinished sign-in for that code and copy on that machine only; another copy's sign-in carries on. A failed finish may report an account identity mismatch,
 which Kerdr shows without advancing to another machine. Kerdr polls every two seconds
 while the dialog remains open, pauses while a page code is being entered, and stops on unknown results.
 A retry cancels any known previous ticket before starting another. Escape cancels a known ticket;
