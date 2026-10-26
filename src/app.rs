@@ -2020,6 +2020,7 @@ mod tests {
                     status: "working".into(),
                     pane_id: format!("p{i}"),
                     title: None,
+                    conversation: None,
                 })
                 .collect();
             card

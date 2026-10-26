@@ -231,6 +231,7 @@ impl App {
             .map(|a| AccountAgent {
                 pane: a.pane_id.clone(),
                 session,
+                conversation: a.conversation.clone().unwrap_or_default(),
                 ..AccountAgent::default()
             })
     }
@@ -1704,6 +1705,7 @@ mod tests {
             .unwrap()
             .agents
             .retain(|a| !(a.session == "api" && a.pane == "w1:p1"));
+        set_conversation(&mut a, "c-one");
         press(&mut a, 's');
         assert!(matches!(
             a.mode,
@@ -1716,7 +1718,31 @@ mod tests {
         assert_eq!(r["action"], "account-move");
         assert_eq!(r["pane"], "w1:p1");
         assert_eq!(r["session"], "api");
-        assert_eq!(r["conversation"], "");
+        assert_eq!(r["conversation"], "c-one");
+    }
+    fn set_conversation(a: &mut App, conv: &str) {
+        let key = a.sel.key.clone().unwrap();
+        for c in a.board.cards.iter_mut().filter(|c| c.key == key) {
+            for g in c.agents.iter_mut().filter(|g| g.pane_id == "w1:p1") {
+                g.conversation = Some(conv.into());
+            }
+        }
+    }
+    #[test]
+    fn an_unrecorded_agent_replaced_in_its_pane_is_not_moved() {
+        let mut a = app();
+        pick(&mut a);
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .retain(|a| !(a.session == "api" && a.pane == "w1:p1"));
+        set_conversation(&mut a, "c-one");
+        press(&mut a, 's');
+        set_conversation(&mut a, "c-two");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert!(a.message().unwrap().0.contains("conversation changed"));
     }
     #[test]
     fn s_says_why_when_a_card_has_no_claude_agent() {

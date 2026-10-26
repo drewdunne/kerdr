@@ -166,6 +166,9 @@ pub struct AgentInfo {
     pub status: String,
     pub pane_id: String,
     pub title: Option<String>,
+    /// herdr's conversation id for the pane, so a move of an agent no feed records still names
+    /// the conversation it was asked for.
+    pub conversation: Option<String>,
 }
 
 /// Where a card came from: a feed (a record of work, such as a ticket), or a herdr
