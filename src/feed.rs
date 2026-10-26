@@ -234,7 +234,10 @@ mod tests {
     #[test]
     fn optional_account_fields_accept_future_providers_and_null_usage() {
         let f=parse(r#"{"kerdr_feed":1,"accounts":[{"code":"LOCAL","provider":"local","kind":"endpoint","status":"ready","usage":null}],"owners":[{"id":"studio","kind":"organization","parent":null,"models":["LOCAL"]}],"agents":[{"pane":"w1:p1","session":"web","account":"LOCAL","waiting":null}],"owners_source":"mock","machine_owner":"studio","unowned_sessions":["stray"]}"#).unwrap();
-        assert_eq!(f.accounts[0].numbers(), "—│—");
+        assert_eq!(
+            crate::accounts::numbers(f.accounts[0].usage.as_ref(), chrono::Local::now()),
+            "—│—"
+        );
         assert_eq!(f.owners[0].models, ["LOCAL"]);
         assert!(!f.agents[0].waiting_for_usage());
         let old = parse(r#"{"kerdr_feed":1,"cards":[]}"#).unwrap();

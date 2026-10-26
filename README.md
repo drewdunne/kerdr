@@ -28,7 +28,8 @@ Kerdr answers those questions in one look:
 - **How close to done is each thing?** Its column, its lifecycle rail, and its done-when
   criteria when the work records have them.
 - **Should I take on more?** Session tabs show the slots each session has left. With account data,
-  the top right shows each provider’s five-hour and weekly usage, such as `KBZ 86│100`.
+  the top right shows each provider’s five-hour and weekly usage, such as `KBZ 86│100`: each
+  account's newest reading from any machine, whichever machine you're looking at.
 
 ## Human on the loop
 

@@ -34,7 +34,7 @@ pub(super) fn usage(app: &App, mi: usize) -> Vec<Span<'static>> {
             if matches!(a.status.as_str(), "sign_in" | "missing") {
                 "✕ sign in".into()
             } else {
-                a.numbers()
+                app.account_numbers(a)
             },
             fg(if a.status == "ready" {
                 FG2
@@ -290,7 +290,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                         "{:<8} {:<16} {}  {}{}",
                         a.code,
                         a.name,
-                        a.numbers(),
+                        app.account_numbers(a),
                         a.status_label(),
                         if a.code == target.agent.account {
                             " (now)"
@@ -350,7 +350,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 let numbers = app
                     .account_feed(*machine)
                     .and_then(|f| f.accounts.iter().find(|a| &a.code == code))
-                    .map(|a| a.numbers())
+                    .map(|a| app.account_numbers(a))
                     .unwrap_or_default();
                 lines.push(selected(format!("{:<8} {numbers}", code), i == *sel));
             }
@@ -604,9 +604,26 @@ fn account_line(a: &Account, yes: bool) -> Line<'static> {
         yes,
     )
 }
-fn status_line(a: &Account) -> Line<'static> {
+fn status_line(app: &App, a: &Account) -> Line<'static> {
+    let reset = app
+        .account_usage(a)
+        .map(|u| u.reset_since(app.now()))
+        .unwrap_or_default();
+    let note = if reset.is_empty() {
+        String::new()
+    } else {
+        let windows: Vec<_> = reset
+            .iter()
+            .map(|(window, at)| format!("{window} reset {at}"))
+            .collect();
+        format!(" · {}, no reading since", windows.join(", "))
+    };
     line(
-        format!("         {}  {}", a.numbers(), a.status_label()),
+        format!(
+            "         {}  {}{note}",
+            app.account_numbers(a),
+            a.status_label()
+        ),
         account_color(a),
     )
 }
@@ -667,7 +684,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                 {
                     if a.shown_copies().first().map(|c| &c.id) == Some(id) {
                         lines.push(table_row(account_line(a, false), tw));
-                        lines.push(table_row(status_line(a), tw));
+                        lines.push(table_row(status_line(app, a), tw));
                     }
                     if i == sel {
                         selected_line = lines.len();
@@ -678,7 +695,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
             Row::Account(code) => {
                 if let Some(a) = feed.accounts.iter().find(|a| &a.code == code) {
                     lines.push(table_row(account_line(a, i == sel), tw));
-                    lines.push(table_row(status_line(a), tw));
+                    lines.push(table_row(status_line(app, a), tw));
                 }
             }
             Row::Owner(id) => {
