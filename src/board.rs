@@ -316,6 +316,8 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         home_mi: Option<usize>,
         home_session: Option<String>,
         ws: Option<usize>,
+        /// The tab of that workspace the feed says the work runs in.
+        tab: Option<String>,
     }
     let ws_key = |w: &WsRef| (w.mi, w.session.clone(), w.ws.workspace_id.clone());
     let mut pending: Vec<Pending> = Vec::new();
@@ -341,13 +343,14 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                     .iter()
                     .position(|m| m.is_shown() && m.answers_to(h))
             });
-        let mut ws = None;
+        let (mut ws, mut tab) = (None, None);
         if let Some(fw) = &fc.workspace
             && let (Some(session), Some(id)) = (&fw.session, &fw.id)
         {
             ws = all_ws
                 .iter()
                 .position(|w| w.mi == *mi && &w.session == session && &w.ws.workspace_id == id);
+            tab = ws.and(fw.tab.clone()).filter(|t| !t.trim().is_empty());
         }
         if let Some(i) = ws {
             claimed.insert(ws_key(&all_ws[i]));
@@ -361,6 +364,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             home_mi,
             home_session: fc.home.as_ref().and_then(|h| h.session.clone()),
             ws,
+            tab,
         });
     }
 
@@ -424,14 +428,42 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         }
     }
 
+    // A card whose work runs in one tab of a shared workspace reads only that tab's agents, and
+    // the card the workspace belongs to leaves out the tabs other cards claim, so one agent's
+    // question shows on one card.
+    let tabbed: HashSet<(usize, &str)> = pending
+        .iter()
+        .filter_map(|p| Some((p.ws?, p.tab.as_deref()?)))
+        .collect();
     for p in &pending {
         let fc = p.fc;
         let closed = p.state == "closed";
-        let ws: Option<&WsRef> = p.ws.map(|i| &all_ws[i]);
+        let own = p.ws.map(|i| {
+            let w = &all_ws[i];
+            let agents = w
+                .agents
+                .iter()
+                .copied()
+                .filter(|a| match (&p.tab, a.tab_id.as_deref()) {
+                    (Some(tab), at) => at == Some(tab.as_str()),
+                    (None, Some(at)) => !tabbed.contains(&(i, at)),
+                    (None, None) => true,
+                })
+                .collect();
+            WsRef {
+                mi: w.mi,
+                session: w.session.clone(),
+                ws: w.ws,
+                agents,
+            }
+        });
+        let ws: Option<&WsRef> = own.as_ref();
         let card_mi = ws.map(|w| w.mi).or(p.home_mi).unwrap_or(p.mi);
         let herdr = ws.and_then(herdr_status);
         let title = ws.and_then(running_title);
+        // What an agent reported for the workspace is the card's it belongs to, not a tab's.
         let token = ws
+            .filter(|_| p.tab.is_none())
             .and_then(|w| w.ws.tokens.get("kerdr_status"))
             .map(String::as_str);
         let (att, why) = attention(&Signals {
@@ -461,6 +493,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             session,
             workspace_id: ws.map(|w| w.ws.workspace_id.clone()),
             workspace_label: ws.map(|w| w.ws.label.clone()),
+            tab_id: p.tab.clone(),
             priority: fc
                 .priority
                 .as_deref()
@@ -531,6 +564,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             session: Some(w.session.clone()),
             workspace_id: Some(w.ws.workspace_id.clone()),
             workspace_label: Some(label),
+            tab_id: None,
             priority: Priority::Normal,
             background: cfg.board.unlimited.iter().any(|u| u == &w.session),
             cached_at: m.cached_at(),
@@ -1089,6 +1123,87 @@ mod tests {
     }
 
     #[test]
+    fn a_card_in_a_tab_reads_that_tabs_agents_and_the_workspaces_card_the_rest() {
+        let in_w1 = |tab: Option<&str>| FeedWorkspace {
+            session: Some("default".into()),
+            id: Some("w1".into()),
+            label: None,
+            tab: tab.map(Into::into),
+        };
+        let mut parent = feed_card("0237", "build", "active");
+        parent.workspace = Some(in_w1(None));
+        let mut child = feed_card("0246", "build", "active");
+        child.workspace = Some(in_w1(Some("w1:t2")));
+        // A card whose workspace isn't open has no tab to land on either.
+        let mut gone = feed_card("0247", "build", "active");
+        gone.workspace = Some(FeedWorkspace {
+            id: Some("w9".into()),
+            ..in_w1(Some("w9:t2"))
+        });
+        let board = |parent_status: &str, child_status: &str, token: Option<&str>| {
+            let mut w1 = ws("w1", "37-parent");
+            if let Some(t) = token {
+                w1.tokens.insert("kerdr_status".into(), t.into());
+            }
+            let in_tab = |tab: &str, pane: &str, status: &str| Agent {
+                pane_id: pane.into(),
+                tab_id: Some(tab.into()),
+                ..agent("w1", status)
+            };
+            let snap = Snapshot {
+                workspaces: vec![w1],
+                agents: vec![
+                    in_tab("w1:t1", "w1:p1", parent_status),
+                    in_tab("w1:t2", "w1:p2", child_status),
+                ],
+                ..Default::default()
+            };
+            let feed = Feed {
+                kerdr_feed: 1,
+                cards: vec![parent.clone(), child.clone(), gone.clone()],
+                ..Default::default()
+            };
+            build(
+                &[live(
+                    machine("build-box", true),
+                    vec![("default", snap)],
+                    Some(feed),
+                )],
+                &Config::default(),
+            )
+        };
+        let card = |b: &Board, r: &str| b.cards.iter().find(|c| c.reference == r).unwrap().clone();
+        let panes = |c: &Card| {
+            c.agents
+                .iter()
+                .map(|a| a.pane_id.clone())
+                .collect::<Vec<_>>()
+        };
+
+        // The child's agent asks: only the child's card needs you, and Enter lands on its tab.
+        let b = board("working", "blocked", None);
+        let (p, c) = (card(&b, "#237"), card(&b, "#246"));
+        assert_eq!(c.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(c.tab_id.as_deref(), Some("w1:t2"));
+        assert_eq!(panes(&c), ["w1:p2"]);
+        assert_eq!(c.attention, Attention::NeedsYou);
+        assert_eq!(p.workspace_id.as_deref(), Some("w1"));
+        assert_eq!(p.tab_id, None);
+        assert_eq!(panes(&p), ["w1:p1"]);
+        assert_ne!(p.attention, Attention::NeedsYou);
+        assert_eq!(card(&b, "#247").tab_id, None);
+        assert!(
+            b.cards.iter().all(|c| c.reference != "37-parent"),
+            "the shared workspace isn't a card of its own"
+        );
+
+        // What an agent reported for the workspace is the workspace card's, not the tab's.
+        let b = board("working", "working", Some("needs_you"));
+        assert_eq!(card(&b, "#237").attention, Attention::NeedsYou);
+        assert_ne!(card(&b, "#246").attention, Attention::NeedsYou);
+    }
+
+    #[test]
     fn the_home_machines_copy_of_a_card_wins() {
         let mut far = feed_card("0125", "build", "active");
         far.home = Some(Home {
@@ -1102,6 +1217,7 @@ mod tests {
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
+            tab: None,
         });
         let server = live(
             machine("build-box", true),

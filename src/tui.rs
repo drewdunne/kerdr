@@ -470,6 +470,7 @@ fn jump_workspace(
         machine: app.machines[mi].machine.clone(),
         session,
         workspace: id,
+        tab: None,
         label,
         others: app.needs_you_order().len(),
         via,
@@ -561,6 +562,7 @@ fn jump_cards(
             machine: app.machines[mi].machine.clone(),
             session,
             workspace,
+            tab: card.tab_id.clone(),
             label: card
                 .workspace_label
                 .clone()

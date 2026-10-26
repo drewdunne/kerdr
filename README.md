@@ -71,7 +71,8 @@ you, its done-when criteria, the agent's last update, and the latest lines of it
 ### Jump in, step out, keep going
 
 - `Enter` focuses the card's herdr workspace and opens herdr full screen, with herdr's sidebar
-  hidden, since the board does that job now.
+  hidden, since the board does that job now. A card whose feed names a tab, for work running in
+  one tab of a shared workspace, lands on that tab.
 - `prefix q` is herdr's own detach. Inside Kerdr it brings you back to the board.
 - `prefix Space` jumps straight to the next card that needs you, without stopping at the board,
   so you can answer several agents in a row.

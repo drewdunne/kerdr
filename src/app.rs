@@ -1617,6 +1617,7 @@ mod tests {
                 session: Some(session),
                 id: misc.workspace_id.clone(),
                 label: None,
+                tab: None,
             }),
             ..Default::default()
         };

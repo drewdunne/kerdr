@@ -29,6 +29,8 @@ pub struct Jump {
     pub machine: Machine,
     pub session: String,
     pub workspace: String,
+    /// The tab in that workspace to land on, when the card's work runs in one tab of it.
+    pub tab: Option<String>,
     pub label: String,
     /// How many other cards need you, for the hint shown inside herdr.
     pub others: usize,
@@ -161,6 +163,52 @@ fn first_line(out: &transport::Output) -> String {
         .to_string()
 }
 
+/// The workspace herdr says a tab it focused is in, from `tab focus`'s answer.
+fn tab_workspace(text: &str) -> Option<String> {
+    let start = text.find('{')?;
+    let v: serde_json::Value = serde_json::from_str(&text[start..]).ok()?;
+    v.pointer("/result/tab/workspace_id")?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Focuses the card's workspace, then its tab when it names one; `run` runs one herdr command.
+/// None when herdr is ready to attach. A tab herdr can't focus (it has closed) leaves the
+/// workspace focused on its own, and one herdr finds in another workspace, which takes herdr
+/// there, sends it back to the card's workspace.
+fn focus(
+    t: &Target,
+    jump: &Jump,
+    mut run: impl FnMut(&[String]) -> transport::Output,
+) -> Option<Outcome> {
+    let workspace = herdr_args(&jump.session, &["workspace", "focus", &jump.workspace]);
+    let out = run(&workspace);
+    if let Some(problem) = transport::classify(t, &out) {
+        return Some(Outcome::Failed(format!(
+            "Couldn't reach {}: {}",
+            jump.machine.name,
+            problem.detail()
+        )));
+    }
+    if !out.ok() {
+        if workspace_gone(&out) {
+            return Some(Outcome::Closed);
+        }
+        return Some(Outcome::Failed(format!(
+            "herdr couldn't open {}: {}",
+            jump.label,
+            first_line(&out)
+        )));
+    }
+    if let Some(tab) = &jump.tab {
+        let out = run(&herdr_args(&jump.session, &["tab", "focus", tab]));
+        if out.ok() && tab_workspace(&out.stdout).is_some_and(|w| w != jump.workspace) {
+            run(&workspace);
+        }
+    }
+    None
+}
+
 /// Whether herdr refused because the workspace no longer exists.
 fn workspace_gone(out: &transport::Output) -> bool {
     [&out.stdout, &out.stderr]
@@ -228,26 +276,13 @@ pub fn run(
     let t = target(&jump.machine);
     let herdr_bin = jump.machine.herdr.clone();
 
-    // A newly attached herdr window opens on the session's focused workspace.
-    let args = herdr_args(&jump.session, &["workspace", "focus", &jump.workspace]);
-    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let out = transport::run_herdr(&t, &herdr_bin, &arg_refs, Duration::from_secs(12));
-    if let Some(problem) = transport::classify(&t, &out) {
-        return Outcome::Failed(format!(
-            "Couldn't reach {}: {}",
-            jump.machine.name,
-            problem.detail()
-        ));
-    }
-    if !out.ok() {
-        if workspace_gone(&out) {
-            return Outcome::Closed;
-        }
-        return Outcome::Failed(format!(
-            "herdr couldn't open {}: {}",
-            jump.label,
-            first_line(&out)
-        ));
+    // A newly attached herdr window opens on the session's focused workspace, on its active tab.
+    let focused = focus(&t, jump, |args| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
+    });
+    if let Some(outcome) = focused {
+        return outcome;
     }
 
     let session_args: Vec<&str> = if jump.session == "default" {
@@ -530,6 +565,112 @@ mod tests {
             ..Default::default()
         };
         assert!(!workspace_gone(&other));
+    }
+
+    fn jump(tab: Option<&str>) -> Jump {
+        Jump {
+            machine: machine(None),
+            session: "web".into(),
+            workspace: "w4".into(),
+            tab: tab.map(Into::into),
+            label: "41-checkout".into(),
+            others: 0,
+            via: Via::Local,
+            prefix: "ctrl+b".into(),
+            keys: false,
+        }
+    }
+
+    /// Runs `focus` against a stand-in herdr that answers each command from `answer` (exit code
+    /// and stdout), and returns the outcome and the commands it was given.
+    fn focus_with(
+        jump: &Jump,
+        answer: impl Fn(&str) -> (i32, &'static str),
+    ) -> (Option<Outcome>, Vec<String>) {
+        let mut calls = Vec::new();
+        let outcome = focus(&Target::Local, jump, |args| {
+            let line = args.join(" ");
+            let (status, stdout) = answer(&line);
+            calls.push(line);
+            transport::Output {
+                status: Some(status),
+                stdout: stdout.into(),
+                ..Default::default()
+            }
+        });
+        (outcome, calls)
+    }
+
+    // What herdr 0.9.1 prints for each command.
+    const WORKSPACE_FOCUSED: &str = r#"{"id":"cli:workspace:focus","result":{"type":"workspace_info","workspace":{"active_tab_id":"w4:t1","focused":true,"workspace_id":"w4"}}}"#;
+    const TAB_FOCUSED: &str = r#"{"id":"cli:tab:focus","result":{"tab":{"focused":true,"label":"child","tab_id":"w4:t2","workspace_id":"w4"},"type":"tab_info"}}"#;
+    const TAB_GONE: &str = r#"{"error":{"code":"tab_not_found","message":"tab w4:t2 not found"},"id":"cli:tab:focus"}"#;
+    const TAB_ELSEWHERE: &str = r#"{"id":"cli:tab:focus","result":{"tab":{"focused":true,"label":"1","tab_id":"w4:t2","workspace_id":"w7"},"type":"tab_info"}}"#;
+    const WORKSPACE_GONE: &str = r#"{"error":{"code":"workspace_not_found","message":"workspace w4 not found"},"id":"cli:workspace:focus"}"#;
+    const FOCUS_W4: &str = "--session web workspace focus w4";
+    const FOCUS_T2: &str = "--session web tab focus w4:t2";
+
+    #[test]
+    fn a_card_without_a_tab_focuses_only_its_workspace() {
+        let (outcome, calls) = focus_with(&jump(None), |_| (0, WORKSPACE_FOCUSED));
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4]);
+    }
+
+    #[test]
+    fn a_card_with_a_tab_focuses_it_after_its_workspace() {
+        let answer = |c: &str| {
+            (
+                0,
+                if c == FOCUS_T2 {
+                    TAB_FOCUSED
+                } else {
+                    WORKSPACE_FOCUSED
+                },
+            )
+        };
+        let (outcome, calls) = focus_with(&jump(Some("w4:t2")), answer);
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2]);
+    }
+
+    #[test]
+    fn a_tab_that_has_closed_leaves_the_workspace_without_an_error() {
+        let answer = |c: &str| {
+            if c == FOCUS_T2 {
+                (1, TAB_GONE)
+            } else {
+                (0, WORKSPACE_FOCUSED)
+            }
+        };
+        let (outcome, calls) = focus_with(&jump(Some("w4:t2")), answer);
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2]);
+    }
+
+    #[test]
+    fn a_tab_in_another_workspace_goes_back_to_the_cards_workspace() {
+        // herdr focuses a tab of another workspace by moving to that workspace.
+        let answer = |c: &str| {
+            (
+                0,
+                if c == FOCUS_T2 {
+                    TAB_ELSEWHERE
+                } else {
+                    WORKSPACE_FOCUSED
+                },
+            )
+        };
+        let (outcome, calls) = focus_with(&jump(Some("w4:t2")), answer);
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2, FOCUS_W4]);
+    }
+
+    #[test]
+    fn a_closed_workspace_is_reported_before_any_tab_is_tried() {
+        let (outcome, calls) = focus_with(&jump(Some("w4:t2")), |_| (1, WORKSPACE_GONE));
+        assert_eq!(outcome, Some(Outcome::Closed));
+        assert_eq!(calls, [FOCUS_W4]);
     }
 
     #[cfg(unix)]
