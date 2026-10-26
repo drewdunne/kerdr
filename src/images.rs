@@ -495,16 +495,19 @@ fn windows_clipboard() -> Result<Vec<Loaded>, String> {
         .tempfile()
         .map_err(|e| format!("Couldn't make a file to read the clipboard into: {e}."))?;
     let path = file.path().to_string_lossy().into_owned();
-    // Exit 0: the image is saved; 4: copied files, one per line; 3: text only; 2: nothing.
+    // Exit 0: the image is saved; 4: copied files, one per line; 3: text only; 2: nothing; 5: an
+    // error, its message on standard error as plain text rather than PowerShell's CLIXML.
     let script = format!(
         "$ProgressPreference = 'SilentlyContinue'; $ErrorActionPreference = 'Stop'; \
+         try {{ \
          [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; \
          Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
          if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{ \
            [System.Windows.Forms.Clipboard]::GetImage().Save({}, [System.Drawing.Imaging.ImageFormat]::Png); exit 0 }}; \
          $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); \
          if ($files.Count -gt 0) {{ [Console]::Out.Write(($files -join \"`n\")); exit 4 }}; \
-         if ([System.Windows.Forms.Clipboard]::ContainsText()) {{ exit 3 }}; exit 2",
+         if ([System.Windows.Forms.Clipboard]::ContainsText()) {{ exit 3 }}; exit 2 \
+         }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 5 }}",
         crate::transport::powershell_quote(&path)
     );
     let encoded: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -520,7 +523,8 @@ fn windows_clipboard() -> Result<Vec<Loaded>, String> {
         "-EncodedCommand",
         &base64::engine::general_purpose::STANDARD.encode(encoded),
     ]);
-    let got = capture(cmd, 1024 * 1024, Duration::from_secs(15))
+    // PowerShell takes a few seconds to start on a cold machine.
+    let got = capture(cmd, 1024 * 1024, READ_DEADLINE * 3)
         .map_err(|e| format!("Couldn't read the clipboard with PowerShell: {e}."))?;
     match got.status {
         Some(0) => from_file(file.path()).map(|l| vec![l]),
