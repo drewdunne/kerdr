@@ -57,7 +57,8 @@ pub fn parse_response(text: &str) -> Result<Response, serde_json::Error> {
     serde_json::from_value(value)
 }
 
-/// Metadata returned to the UI after sending; credentials never enter its result queue.
+/// Metadata returned to the UI after sending; credentials never enter its result queue, and a
+/// new intent's images are only counted there.
 pub fn request_metadata(request: &Value) -> Value {
     let mut value = request.clone();
     if value["action"] == "account-signin"
@@ -66,7 +67,19 @@ pub fn request_metadata(request: &Value) -> Value {
         fields.remove("token");
         fields.remove("page_code");
     }
+    if let Some(images) = value["images"].as_array().map(Vec::len) {
+        value["images"] = Value::from(images);
+    }
     value
+}
+
+/// The most a request may be: 64 KiB, and room for the images a new intent may carry.
+fn most_bytes(request: &Value) -> usize {
+    if request["action"] == "create" && request["images"].is_array() {
+        MAX_JSON_BYTES + crate::images::REQUEST_ALLOWANCE
+    } else {
+        MAX_JSON_BYTES
+    }
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
@@ -83,8 +96,15 @@ fn run_with_deadline(
         return Err("actions are disabled; configure [actions] command".into());
     }
     let json = serde_json::to_string(request).map_err(|e| format!("the action request: {e}"))?;
-    if json.len() > MAX_JSON_BYTES {
-        return Err("the action request is too large (maximum 64 KiB)".into());
+    if json.len() > most_bytes(request) {
+        return Err(if most_bytes(request) > MAX_JSON_BYTES {
+            format!(
+                "the action request is too large (maximum 64 KiB, and {} of images)",
+                crate::images::size(crate::images::MAX_IMAGES_BYTES)
+            )
+        } else {
+            "the action request is too large (maximum 64 KiB)".into()
+        });
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -344,6 +364,46 @@ mod tests {
         assert!(error.contains("timed out"), "{error}");
         assert!(error.contains("result is unknown"), "{error}");
         assert!(error.contains("Do not retry automatically"), "{error}");
+    }
+
+    #[test]
+    fn a_new_intent_carries_its_images_on_stdin_and_only_counts_them_afterwards() {
+        use base64::Engine;
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("captured.json");
+        // A screenshot's worth of bytes: far past the 64 KiB words limit, within the images'.
+        let data = base64::engine::general_purpose::STANDARD.encode(vec![7u8; 3_000_000]);
+        let request = json!({"action":"create","words":"see [Image #1]","session":"default",
+            "images":[{"tag":1,"type":"image/png","data":data}]});
+        let command = fixture(
+            dir.path(),
+            &format!(
+                "cat > {}\nprintf '%s' '{{\"ok\":true,\"message\":\"created\",\"id\":\"0004\"}}'\n",
+                quote(captured.to_str().unwrap())
+            ),
+            &format!(
+                "[IO.File]::WriteAllText({}, [Console]::In.ReadToEnd(), (New-Object Text.UTF8Encoding $false)); Write-Output '{{\"ok\":true,\"message\":\"created\",\"id\":\"0004\"}}'",
+                transport::powershell_quote(captured.to_str().unwrap())
+            ),
+        );
+        let response = run(&machine(), &command, &request).unwrap();
+        assert!(response.ok);
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(captured).unwrap()).unwrap(),
+            request
+        );
+        assert_eq!(request_metadata(&request)["images"], 1);
+        // Images beyond what a new intent may carry are still refused before anything runs.
+        let sentinel = dir.path().join("ran");
+        let too_many = "x".repeat(crate::images::REQUEST_ALLOWANCE + MAX_JSON_BYTES);
+        let error = run(
+            &machine(),
+            &format!("touch {}", quote(sentinel.to_str().unwrap())),
+            &json!({"action":"create","words":"x","images":[{"data":too_many}]}),
+        )
+        .unwrap_err();
+        assert!(error.contains("20 MB of images"), "{error}");
+        assert!(!sentinel.exists());
     }
 
     #[test]

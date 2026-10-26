@@ -1934,6 +1934,27 @@ fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) ->
     lines
 }
 
+/// One line of the new-intent box, its attached images' tags set apart from the words.
+fn tagged(line: String, tags: &[String]) -> Line<'static> {
+    let mut spans = vec![];
+    let mut rest = line.as_str();
+    while let Some((at, tag)) = tags
+        .iter()
+        .filter_map(|t| rest.find(t.as_str()).map(|at| (at, t)))
+        .min_by_key(|(at, _)| *at)
+    {
+        if at > 0 {
+            spans.push(Span::styled(rest[..at].to_string(), fg(FG)));
+        }
+        spans.push(Span::styled(tag.clone(), bold(CYAN)));
+        rest = &rest[at + tag.len()..];
+    }
+    if !rest.is_empty() {
+        spans.push(Span::styled(rest.to_string(), fg(FG)));
+    }
+    Line::from(spans)
+}
+
 fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
     let rect = centered(area, 100, 24, Some(4));
     dialog(f, rect, CYAN);
@@ -1977,9 +1998,14 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
             ),
         ])]
     } else {
+        let tags: Vec<String> = draft
+            .images
+            .iter()
+            .map(|i| crate::images::tag(i.tag))
+            .collect();
         field_lines(&draft.words, text.width.max(1) as usize, rows, !app.busy)
             .into_iter()
-            .map(|l| Line::styled(l, fg(FG)))
+            .map(|l| tagged(l, &tags))
             .collect()
     };
     f.render_widget(Paragraph::new(lines), text);
@@ -2023,8 +2049,9 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
         key_hints(&[
             ("⏎", "send"),
             ("shift+⏎ / alt+⏎", "new line"),
+            ("ctrl+v", "image"),
             ("ctrl+u", "clear"),
-            ("esc", "cancel, your words kept for next time"),
+            ("esc", "keep for later"),
         ])
     };
     put(
@@ -3876,6 +3903,7 @@ mod tests {
                 words: "Show trade-offs before choosing".into(),
                 machine: 0,
                 session: "web".into(),
+                ..Default::default()
             },
             back: Box::new(Mode::Board),
         };

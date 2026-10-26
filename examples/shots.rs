@@ -320,9 +320,14 @@ fn main() {
     let mut compose = app(false);
     compose.mode = Mode::Compose {
         draft: Draft {
-            words: "Show each game’s trade-offs before choosing one, so I can pick without opening every store page.\n\nNot urgent.".into(),
+            words: "Show each game’s trade-offs before choosing one, so I can pick without opening every store page. Like this one: [Image #1] \n\nNot urgent.".into(),
             machine: 0,
             session: "web".into(),
+            images: vec![kerdr::images::Image {
+                tag: 1,
+                media_type: "image/png",
+                bytes: std::sync::Arc::new(vec![]),
+            }],
         },
         back: Box::new(Mode::Board),
     };

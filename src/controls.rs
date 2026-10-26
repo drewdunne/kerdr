@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::actions::Response;
+use crate::images;
 use crate::model::{CardSnapshot, Summary};
 use serde_json::{Value, json};
 
@@ -20,6 +21,31 @@ pub(crate) fn waiting_work(card: &Card) -> bool {
             card.state.as_deref(),
             Some("closed" | "active" | "background")
         )
+}
+
+/// Takes the `[Image #N]` tag the words end with out of them, and its image with it: at the
+/// very end for Backspace, or before trailing spaces for Ctrl+W. False when they don't end
+/// with an attached image's tag.
+fn take_tag(draft: &mut Draft, past_spaces: bool) -> bool {
+    let end = if past_spaces {
+        draft.words.trim_end().len()
+    } else {
+        draft.words.len()
+    };
+    let Some(i) = draft
+        .images
+        .iter()
+        .position(|i| draft.words[..end].ends_with(&images::tag(i.tag)))
+    else {
+        return false;
+    };
+    let tag = images::tag(draft.images[i].tag);
+    draft.words.truncate(end - tag.len());
+    // The same tag typed twice is one image: it goes only with the last of them.
+    if !draft.words.contains(&tag) {
+        draft.images.remove(i);
+    }
+    true
 }
 
 /// An id for one new intent's words, so an adapter can tell a resend from new work.
@@ -622,6 +648,7 @@ impl App {
                 words: self.draft.clone(),
                 machine,
                 session,
+                images: self.draft_images.clone(),
             },
             back: Box::new(self.mode.clone()),
         };
@@ -681,10 +708,13 @@ impl App {
     }
 
     /// The new-intent box: Andrew's own words, nothing else. Enter sends them; Shift+Enter,
-    /// Alt+Enter or Ctrl+J starts a new line; Esc keeps them for the next time it opens.
+    /// Alt+Enter or Ctrl+J starts a new line; Ctrl+V attaches the clipboard's image as an
+    /// `[Image #N]` tag, as Claude Code does; Esc keeps them for the next time it opens.
     fn compose_key(&mut self, key: KeyEvent, mut draft: Draft, back: Box<Mode>) -> Action {
         if key.code == KeyCode::Esc {
             self.draft = draft.words;
+            self.draft_images = draft.images;
+            self.image_load = None;
             self.mode = *back;
             return Action::None;
         }
@@ -710,31 +740,60 @@ impl App {
             KeyCode::Enter => {
                 if draft.words.trim().is_empty() {
                     self.say("Write what you want first.", Tone::Info);
+                } else if self.image_load.is_some() {
+                    self.say(
+                        "An image is still being read; send once it's in.",
+                        Tone::Info,
+                    );
                 } else {
                     let words = draft.words.trim().to_string();
+                    // Only the images whose tags are still in the words go with them.
+                    let images: Vec<_> = draft
+                        .images
+                        .iter()
+                        .filter(|i| words.contains(&images::tag(i.tag)))
+                        .cloned()
+                        .collect();
                     let same = self.submission.as_ref().is_some_and(|s| {
-                        s.words == words && s.machine == draft.machine && s.session == draft.session
+                        s.words == words
+                            && s.images == images
+                            && s.machine == draft.machine
+                            && s.session == draft.session
                     });
                     if !same {
                         self.submission = Some(Submission {
                             id: new_submission(),
                             words: words.clone(),
+                            images: images.clone(),
                             machine: draft.machine,
                             session: draft.session.clone(),
                             unknown: false,
                         });
                     }
                     let id = self.submission.as_ref().map(|s| s.id.clone());
-                    let request = json!({"action":"create","words":words,"session":draft.session,"submission":id});
+                    let mut request = json!({"action":"create","words":words,"session":draft.session,"submission":id});
+                    if !images.is_empty() {
+                        request["images"] = Value::Array(images::request_images(&words, &images));
+                    }
                     let machine = draft.machine;
                     self.mode = Mode::Compose { draft, back };
                     return self.emit_mutation(machine, request);
                 }
             }
+            KeyCode::Char('v') if ctrl => {
+                self.mode = Mode::Compose { draft, back };
+                return Action::LoadImages(images::Source::Clipboard);
+            }
+            // A tag goes as one, and its image with it.
+            KeyCode::Backspace if take_tag(&mut draft, false) => {}
             KeyCode::Backspace => {
                 draft.words.pop();
             }
-            KeyCode::Char('u') if ctrl => draft.words.clear(),
+            KeyCode::Char('u') if ctrl => {
+                draft.words.clear();
+                draft.images.clear();
+            }
+            KeyCode::Char('w') if ctrl && take_tag(&mut draft, true) => {}
             KeyCode::Char('w') if ctrl => {
                 let kept = draft.words.trim_end().len();
                 draft.words.truncate(kept);
@@ -754,12 +813,23 @@ impl App {
     }
 
     /// Pasted text arrives whole, line breaks and all, so a pasted paragraph never sends itself.
-    pub fn on_paste(&mut self, text: &str) {
+    /// In the new-intent box, a paste that is only an image file's path attaches that image,
+    /// and an empty one (a terminal pasting a clipboard that holds only an image) looks for one.
+    pub fn on_paste(&mut self, text: &str) -> Action {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.account_paste(&text) {
-            return;
+            return Action::None;
         }
         let busy = self.busy;
+        if matches!(self.mode, Mode::Compose { .. }) && !busy {
+            // Spaces and blank lines are words; only a paste with nothing in it means an image.
+            if text.is_empty() {
+                return Action::LoadImages(images::Source::Clipboard);
+            }
+            if let Some(paths) = images::paths_in_paste(&text) {
+                return Action::LoadImages(images::Source::Files(paths));
+            }
+        }
         match &mut self.mode {
             Mode::Compose { draft, .. } if !busy => {
                 let room = MAX_WORDS.saturating_sub(draft.words.len());
@@ -787,6 +857,113 @@ impl App {
             }
             _ => {}
         }
+        Action::None
+    }
+
+    /// Starts reading images for the new-intent box: the read's number and the room its draft
+    /// has left, or None (saying why) when there's no box to read them into.
+    pub fn begin_image_load(&mut self, source: &images::Source) -> Option<(u64, images::Room)> {
+        let Mode::Compose { draft, .. } = &self.mode else {
+            return None;
+        };
+        if self.busy {
+            return None;
+        }
+        if self.image_load.is_some() {
+            self.say("Still reading the last image.", Tone::Info);
+            return None;
+        }
+        let room = images::Room::left(&draft.images);
+        self.image_at = draft.words.len();
+        self.image_loads += 1;
+        self.image_load = Some(self.image_loads);
+        let what = match source {
+            images::Source::Clipboard => "Reading the clipboard…",
+            images::Source::Files(_) => "Reading the image…",
+        };
+        self.say(what, Tone::Info);
+        Some((self.image_loads, room))
+    }
+
+    /// A read started by begin_image_load has ended: its images go in, unless the box it was
+    /// for has closed since.
+    pub fn images_loaded(&mut self, id: u64, loading: images::Loading) {
+        if self.image_load != Some(id) {
+            return;
+        }
+        self.image_load = None;
+        self.attach_images_at(loading, Some(self.image_at));
+    }
+
+    /// Puts images read from the clipboard or a pasted path into the new-intent box, each as
+    /// the next `[Image #N]` tag at the end of the words, and says what went in and why
+    /// anything didn't.
+    pub fn attach_images(&mut self, got: images::Loading) {
+        self.attach_images_at(got, None);
+    }
+
+    /// As attach_images, with the tags at `at` in the words (where they ended when the read
+    /// began), or at the end when the words have since been cut shorter than that.
+    fn attach_images_at(&mut self, got: images::Loading, at: Option<usize>) {
+        let busy = self.busy;
+        let Mode::Compose { draft, .. } = &mut self.mode else {
+            return;
+        };
+        if busy {
+            return;
+        }
+        let mut at = at
+            .filter(|&a| a <= draft.words.len() && draft.words.is_char_boundary(a))
+            .unwrap_or(draft.words.len());
+        let mut said = vec![];
+        for image in got.images {
+            if draft.images.len() >= images::MAX_IMAGES {
+                said.push(images::too_many());
+                break;
+            }
+            let total: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
+            if total + image.bytes.len() > images::MAX_IMAGES_BYTES {
+                said.push(images::too_much());
+                break;
+            }
+            let n = draft.images.iter().map(|i| i.tag).max().unwrap_or(0) + 1;
+            let tag = images::tag(n);
+            if draft.words.len() + tag.len() + 2 > MAX_WORDS {
+                said.push("The box is full; there's no room for another image's tag.".into());
+                break;
+            }
+            // A space either side keeps the tag apart from the words around it.
+            let mut piece = String::new();
+            if draft.words[..at]
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_whitespace())
+            {
+                piece.push(' ');
+            }
+            piece.push_str(&tag);
+            if !draft.words[at..].starts_with(char::is_whitespace) {
+                piece.push(' ');
+            }
+            draft.words.insert_str(at, &piece);
+            at += piece.len();
+            said.push(format!(
+                "Attached {tag}: a {} image, {}.",
+                images::kind_name(image.media_type),
+                images::size(image.bytes.len())
+            ));
+            draft.images.push(images::Image {
+                tag: n,
+                media_type: image.media_type,
+                bytes: std::sync::Arc::new(image.bytes),
+            });
+        }
+        said.extend(got.why);
+        if said.is_empty() {
+            return;
+        }
+        let good = said.iter().all(|s| s.starts_with("Attached"));
+        self.say(said.join(" "), if good { Tone::Good } else { Tone::Warn });
     }
 
     pub(super) fn control_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -1061,6 +1238,7 @@ impl App {
                 // say), so its words must not be sent again.
                 if request["action"] == "create" && (response.ok || response.id.is_some()) {
                     self.draft.clear();
+                    self.draft_images.clear();
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
                     self.enter_backlog(false);
                     if self.owner.is_some() || self.project.is_some() || self.provider.is_some() {

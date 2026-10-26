@@ -26,6 +26,8 @@ pub struct Draft {
     pub words: String,
     pub machine: usize,
     pub session: String,
+    /// Images pasted into it, each standing in the words as its `[Image #N]` tag.
+    pub images: Vec<crate::images::Image>,
 }
 
 /// One new intent as sent: its id lets the adapter tell a resend of the same words from new
@@ -35,6 +37,7 @@ pub struct Draft {
 pub struct Submission {
     pub id: String,
     pub words: String,
+    pub images: Vec<crate::images::Image>,
     pub machine: usize,
     pub session: String,
     /// An earlier send of it got no answer, so it may have been made.
@@ -223,6 +226,8 @@ pub enum Action {
         machine: usize,
         request: serde_json::Value,
     },
+    /// Read images into the new-intent box, away from the board's own thread.
+    LoadImages(crate::images::Source),
     None,
     CopyLink(String),
     OpenLink(String),
@@ -294,6 +299,15 @@ pub struct App {
     pub count: String,
     /// Words typed into the new-intent box and not sent yet, kept for the next time it opens.
     pub draft: String,
+    /// The images pasted with those words.
+    pub draft_images: Vec<crate::images::Image>,
+    /// The images being read for the new-intent box, by the number of that read; a read whose
+    /// box closed meanwhile is dropped when it ends.
+    pub image_load: Option<u64>,
+    image_loads: u64,
+    /// Where in the words that read's tags go: where the words ended when it began, so words
+    /// typed while it reads come after them.
+    image_at: usize,
     /// The new intent last sent, while its answer is still owed or unknown.
     pub submission: Option<Submission>,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
@@ -340,6 +354,10 @@ impl App {
             busy: false,
             count: String::new(),
             draft: String::new(),
+            draft_images: vec![],
+            image_load: None,
+            image_loads: 0,
+            image_at: 0,
             new_intent_id: None,
             submission: None,
             backlog_focus: None,
@@ -2401,6 +2419,196 @@ mod tests {
         assert!(app.draft.is_empty());
         assert!(matches!(app.mode, Mode::Backlog { .. }));
         assert_eq!(app.new_intent_id, Some((0, "9001".to_string())));
+    }
+
+    #[test]
+    fn images_go_in_as_tags_like_claude_code_and_travel_with_the_words() {
+        use base64::Engine;
+        let png = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec();
+        let dir = tempfile::tempdir().unwrap();
+        let shot = dir.path().join("error shot.png");
+        std::fs::write(&shot, &png).unwrap();
+        let loaded = || crate::images::Loading {
+            images: vec![crate::images::Loaded {
+                media_type: "image/png",
+                bytes: png.clone(),
+            }],
+            why: None,
+        };
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        for c in "Moving failed:".chars() {
+            press(&mut app, c);
+        }
+        let draft = |app: &App| match &app.mode {
+            Mode::Compose { draft, .. } => draft.clone(),
+            _ => panic!("the box closed"),
+        };
+        // Ctrl+V asks for the clipboard's image, read away from the board's thread; what it
+        // finds goes in at the end as a tag.
+        use crate::images::Source;
+        let ctrl_v = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key(ctrl_v), Action::LoadImages(Source::Clipboard));
+        let (id, room) = app.begin_image_load(&Source::Clipboard).unwrap();
+        assert_eq!(room, crate::images::Room::left(&[]));
+        assert_eq!(app.message().unwrap().0, "Reading the clipboard…");
+        // While it reads, Enter waits for it, and a second read waits its turn.
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(app.message().unwrap().0.contains("still being read"));
+        assert!(app.begin_image_load(&Source::Clipboard).is_none());
+        // Words typed while it reads come after the tag, where it was pasted.
+        for c in " again".chars() {
+            press(&mut app, c);
+        }
+        app.images_loaded(id, loaded());
+        assert_eq!(draft(&app).words, "Moving failed: [Image #1] again");
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.words.truncate("Moving failed: [Image #1] ".len());
+        }
+        assert_eq!(draft(&app).words, "Moving failed: [Image #1] ");
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("Attached [Image #1]: a PNG image")
+        );
+        // A pasted (or dropped) image file's path attaches that file; an empty paste looks at
+        // the clipboard; other text, blank lines and spaces too, stays words.
+        let source = app.on_paste(&format!("'{}'", shot.display()));
+        assert_eq!(
+            source,
+            Action::LoadImages(Source::Files(vec![shot.clone()]))
+        );
+        let Action::LoadImages(source) = source else {
+            unreachable!()
+        };
+        let (id, room) = app.begin_image_load(&source).unwrap();
+        app.images_loaded(id, source.load(room));
+        assert_eq!(draft(&app).words, "Moving failed: [Image #1] [Image #2] ");
+        assert_eq!(app.on_paste(""), Action::LoadImages(Source::Clipboard));
+        assert_eq!(app.on_paste("  \n"), Action::None);
+        assert_eq!(
+            draft(&app).words,
+            "Moving failed: [Image #1] [Image #2]   \n"
+        );
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.words.truncate(draft.words.len() - 3);
+        }
+        app.on_paste("and");
+        app.attach_images(crate::images::Loading::refused(
+            "There's no image on the clipboard.",
+        ));
+        assert_eq!(app.message().unwrap().1, Tone::Warn);
+        app.attach_images(loaded());
+        assert_eq!(draft(&app).images.len(), 3);
+        // Backspace right after a tag takes the whole tag and its image out.
+        let backspace = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        app.on_key(backspace);
+        app.on_key(backspace);
+        assert_eq!(
+            draft(&app).words,
+            "Moving failed: [Image #1] [Image #2] and "
+        );
+        assert_eq!(draft(&app).images.len(), 2);
+        // Ctrl+W takes a tag whole too, and a tag deleted any other way leaves its image unsent.
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        app.on_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL));
+        assert_eq!(draft(&app).words, "Moving failed: [Image #1] ");
+        assert_eq!(draft(&app).images.len(), 1);
+        app.attach_images(loaded());
+        assert_eq!(draft(&app).words, "Moving failed: [Image #1] [Image #2] ");
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.words = draft.words.replace("[Image #1]", "image one");
+        }
+        // A tag typed twice keeps its image until the last of them goes.
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.words.push_str("[Image #2]");
+        }
+        app.on_key(backspace);
+        assert_eq!(draft(&app).images.len(), 2);
+        // Esc keeps the images with the words for next time, and drops a read still going.
+        let (late, room) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(app.draft_images.len(), 2);
+        press(&mut app, 'c');
+        app.images_loaded(late, Source::Files(vec![shot.clone()]).load(room));
+        assert_eq!(
+            draft(&app).images.len(),
+            2,
+            "a read for a closed box went in"
+        );
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        assert_eq!(request["words"], "Moving failed: image one [Image #2]");
+        let sent = request["images"].as_array().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["tag"], 2);
+        assert_eq!(sent[0]["type"], "image/png");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(sent[0]["data"].as_str().unwrap())
+                .unwrap(),
+            png
+        );
+        // A different image is new work: it gets a submission of its own.
+        let first = request["submission"].clone();
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.images[1].bytes = std::sync::Arc::new([png.clone(), vec![1]].concat());
+        }
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        assert_ne!(request["submission"], first);
+        app.finish_action(
+            0,
+            crate::actions::request_metadata(&request),
+            Ok(crate::actions::Response {
+                ok: true,
+                message: "Saved as #9003.".into(),
+                id: Some("9003".into()),
+                ..Default::default()
+            }),
+        );
+        settle(&mut app);
+        assert!(app.draft.is_empty() && app.draft_images.is_empty());
+    }
+
+    #[test]
+    fn images_past_the_limits_are_refused_by_name() {
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        let image = |n: usize| crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; n]].concat(),
+        };
+        let some = |images| crate::images::Loading { images, why: None };
+        app.attach_images(some(vec![
+            image(9_000_000),
+            image(9_000_000),
+            image(3_000_000),
+        ]));
+        let (text, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(text.contains("past 20 MB together"), "{text}");
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("the box closed")
+        };
+        assert_eq!(draft.images.len(), 2);
+        app.attach_images(some((0..30).map(|_| image(10)).collect()));
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("the box closed")
+        };
+        assert_eq!(draft.images.len(), crate::images::MAX_IMAGES);
+        assert!(app.message().unwrap().0.contains("at most 20 images"));
     }
 
     #[test]
