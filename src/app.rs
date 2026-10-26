@@ -3303,7 +3303,7 @@ mod tests {
         assert!(card.can_reopen_done() && card.reopenable() && !card.can_reopen());
         // Without actions there's no one to ask: it says how to get there, and sends nothing.
         assert_eq!(enter(&mut app), Action::None);
-        let said = app.message().unwrap().0.clone();
+        let said = app.message().unwrap().0.to_string();
         assert!(
             said.contains("is done") && said.contains("[actions]"),
             "{said}"
