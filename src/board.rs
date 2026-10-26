@@ -527,15 +527,14 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     }
 
     // Every other workspace with an agent, or with a stage an agent reported, is a card too. One
-    // that only cards for its tabs claim is a card for the agents in its other tabs, if any.
+    // that only cards for its tabs claim is a card for the agents in its other tabs.
     for (i, w) in all_ws.iter().enumerate() {
         if claimed.contains(&ws_key(w)) {
             continue;
         }
-        let shared = tabbed.iter().any(|(j, _)| *j == i);
         let w = &untabbed(i);
         let reported_stage = w.ws.tokens.get("kerdr_stage").and_then(|s| Stage::parse(s));
-        if w.agents.is_empty() && (shared || reported_stage.is_none()) {
+        if w.agents.is_empty() && reported_stage.is_none() {
             continue;
         }
         let m = &machines[w.mi];
@@ -1292,6 +1291,44 @@ mod tests {
         assert!(b.cards.iter().all(|c| c.reference != "37-parent"));
         let row = b.workspaces.iter().find(|w| w.id == "w1").unwrap();
         assert_eq!(row.card.as_deref(), Some(p.key.as_str()));
+
+        // What was reported for a workspace whose own agent has gone stays on its card, and the
+        // card for the tab still left doesn't take it on.
+        let mut w1 = ws("w1", "37-parent");
+        for (k, v) in [("kerdr_stage", "test"), ("kerdr_status", "needs_you")] {
+            w1.tokens.insert(k.into(), v.into());
+        }
+        let mut child = feed_card("0246", "build", "active");
+        child.workspace = Some(FeedWorkspace {
+            session: Some("default".into()),
+            id: Some("w1".into()),
+            label: None,
+            tab: Some("w1:t2".into()),
+        });
+        let b = build(
+            &[live(
+                machine("build-box", true),
+                vec![(
+                    "default",
+                    Snapshot {
+                        workspaces: vec![w1],
+                        agents: vec![in_tab(Some("w1:t2"), "w1:p2", "working")],
+                        ..Default::default()
+                    },
+                )],
+                Some(Feed {
+                    kerdr_feed: 1,
+                    cards: vec![child],
+                    ..Default::default()
+                }),
+            )],
+            &Config::default(),
+        );
+        let reported = b.cards.iter().find(|c| c.reference == "37-parent").unwrap();
+        assert!(reported.agents.is_empty());
+        assert_eq!(reported.attention, Attention::NeedsYou);
+        let c = b.cards.iter().find(|c| c.reference == "#246").unwrap();
+        assert_ne!(c.attention, Attention::NeedsYou);
     }
 
     #[test]
