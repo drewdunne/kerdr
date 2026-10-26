@@ -11,8 +11,11 @@ use crate::config::Config;
 use crate::model::{Attention, Card, CardSnapshot, Stage};
 use crate::poll::{Conn, Event};
 
+#[path = "account_controls.rs"]
+pub mod account_controls;
 #[path = "controls.rs"]
 mod controls;
+use account_controls::AccountScreen;
 #[cfg(test)]
 pub(crate) use controls::waiting_work;
 
@@ -95,6 +98,10 @@ pub struct Search {
 
 #[derive(Clone, Debug)]
 pub enum Mode {
+    Accounts {
+        screen: AccountScreen,
+        back: Box<Mode>,
+    },
     Palette {
         back: Box<Mode>,
         /// The card the menu opened on: its card keys act on that card or on none.
@@ -212,6 +219,8 @@ pub enum Action {
         request: serde_json::Value,
     },
     None,
+    CopyLink(String),
+    OpenLink(String),
     Quit,
     /// Open herdr full screen on this card's workspace.
     Jump(String),
@@ -304,6 +313,10 @@ pub struct App {
     /// herdr's prefix, for the keys Kerdr names inside herdr.
     pub prefix: String,
     first_selection_done: bool,
+    pub account_queue: std::collections::VecDeque<(usize, serde_json::Value)>,
+    pub signin_open: Option<String>,
+    pub account_batch_messages: Vec<String>,
+    pub account_pending: Option<account_controls::Pending>,
 }
 
 impl App {
@@ -337,6 +350,10 @@ impl App {
             fixed_now: None,
             prefix: "ctrl+b".to_string(),
             first_selection_done: false,
+            account_queue: Default::default(),
+            signin_open: None,
+            account_batch_messages: vec![],
+            account_pending: None,
         };
         app.rebuild();
         app
@@ -389,6 +406,7 @@ impl App {
     }
 
     pub fn rebuild(&mut self) {
+        self.refresh_accounts();
         let current = self.scope().clone();
         self.board = board::build(&self.machines, &self.cfg);
         let mut tabs = vec![Scope::All];
@@ -842,7 +860,21 @@ impl App {
 
     fn handle_key(&mut self, key: KeyEvent) -> Action {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if matches!(
+                self.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::Signin(_),
+                    ..
+                }
+            ) {
+                return self
+                    .account_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+                    .unwrap_or(Action::None);
+            }
             return Action::Quit;
+        }
+        if let Some(action) = self.account_key(key) {
+            return action;
         }
         if let Some(action) = self.control_key(key) {
             return action;
@@ -859,7 +891,8 @@ impl App {
             Mode::Machines { sel } => self.machines_key(key, sel),
             Mode::Backlog { sel } => self.backlog_key(key, sel),
             Mode::Misc { sel } => self.misc_key(key, sel),
-            Mode::Palette { .. }
+            Mode::Accounts { .. }
+            | Mode::Palette { .. }
             | Mode::Compose { .. }
             | Mode::Filter { .. }
             | Mode::Confirm { .. } => Action::None,

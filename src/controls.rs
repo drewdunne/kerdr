@@ -377,7 +377,7 @@ impl App {
         }
     }
 
-    fn can_write(&mut self, machine: usize) -> bool {
+    pub(super) fn can_write(&mut self, machine: usize) -> bool {
         if self.busy {
             self.say(
                 "An action is still running. Wait for its result before another change.",
@@ -408,7 +408,7 @@ impl App {
         true
     }
 
-    fn emit_mutation(&mut self, machine: usize, request: Value) -> Action {
+    pub(super) fn emit_mutation(&mut self, machine: usize, request: Value) -> Action {
         if self.can_write(machine) {
             Action::Mutate { machine, request }
         } else {
@@ -504,6 +504,16 @@ impl App {
 
     /// What the board says while an action runs.
     pub fn working_on(&self, request: &Value) -> String {
+        if request["action"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("account-"))
+        {
+            return if request["action"] == "account-signin" {
+                "Signing in…".into()
+            } else {
+                "Updating accounts…".into()
+            };
+        }
         if request["action"] == "reopen" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Reopening {}…", self.reference_for(id))
@@ -746,6 +756,9 @@ impl App {
     /// Pasted text arrives whole, line breaks and all, so a pasted paragraph never sends itself.
     pub fn on_paste(&mut self, text: &str) {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if self.account_paste(&text) {
+            return;
+        }
         let busy = self.busy;
         match &mut self.mode {
             Mode::Compose { draft, .. } if !busy => {
@@ -956,6 +969,13 @@ impl App {
         result: Result<Response, String>,
     ) {
         self.busy = false;
+        if request["action"]
+            .as_str()
+            .is_some_and(|a| a.starts_with("account-"))
+        {
+            self.finish_account_action(machine, request, result);
+            return;
+        }
         let from = self.action_from.take();
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {

@@ -27,9 +27,8 @@ Kerdr answers those questions in one look:
   first, and `n` jumps to the next one.
 - **How close to done is each thing?** Its column, its lifecycle rail, and its done-when
   criteria when the work records have them.
-- **Should I take on more?** A strip across the top counts what needs you, what's running and
-  the slots each session has left, and gives a verdict: *Finish first*, *Room for one more*,
-  or *Full*.
+- **Should I take on more?** Session tabs show the slots each session has left. With account data,
+  the top right shows each provider’s five-hour and weekly usage, such as `KBZ 86│100`.
 
 ## Human on the loop
 
@@ -48,7 +47,7 @@ question, something stuck. Everything else keeps running without you.
   [AI-native SDLC playbook](https://claude.com/resources/articles/the-ai-native-sdlc-playbook):
   Plan, Design, Build, Test, Deploy and Maintain, with a Backlog in front for work that hasn't
   started. Finished work lands in Maintain.
-- **What needs you comes first,** in every column and in the summary strip.
+- **What needs you comes first,** in every column.
 - **Work-in-progress limits.** Each herdr session holds three workspaces with an agent before
   Kerdr calls it full (change it in the config). A lane for background agents has no limit.
 - **One workspace, one piece of work, one card.**
@@ -157,6 +156,41 @@ distinct from tenant work.
 Controls are optional: [the action adapter contract](docs/feed.md#actions) lets your
 own record system validate and persist changes. Without an adapter, Kerdr remains a reader.
 
+### Accounts and ordered models
+
+With an account-aware feed, each card shows its account at the bottom left and one status
+at the top right: yellow ▲ needs you, red ⏸︎ waits for usage, blue ● running, grey ■ idle.
+The bottom line names the first account for new work in the session you are viewing.
+Older feeds retain the original board layout.
+
+`A` opens accounts and each organization’s and tenant’s ordered model list. `Tab` changes
+the machine whose sign-in status you are viewing. Tenants can follow their organization or
+keep their own order. Select an owner with `j k`, choose a model with `h l`, then Enter makes
+it first, `J K` reorders, `a d` adds or drops, and Backspace follows the parent. `S` opens the
+viewed session’s list as a draft: reorder, optionally tick “move waiting sessions,” then save.
+The tick sends a separate move request to every reachable configured feed machine.
+
+![Accounts and tenant model lists](docs/screenshots/accounts.png)
+
+`s` opens the selected agent’s move picker. Choosing an account sends the request to that
+agent’s machine and session. If its backend asks about a step or background job in progress,
+a separate question appears. A confirmation applies only to that same conversation.
+The backend owns fallback and resuming: same program, same conversation; another program,
+a fresh agent from the work’s log; nothing left, wait for an account to return.
+
+`A` then `+` adds a Claude account: code, name, and machines, then a separate browser sign-in
+on each machine. Enter on an existing account signs it in again on the selected machine;
+`e` renames, `t` tests, and `x` removes after a question. The browser opens using the system’s
+URL handler. `c` copies the link through the terminal clipboard and `o` opens it again.
+Tab focuses the optional page-code field; paste or type the code and press Enter. `p` opens
+a masked token field instead. Tokens are sent only to that machine, removed from UI and
+result state on submission, and never written to Kerdr’s logs or settings. Escape cancels
+the current browser sign-in. No sign-in or action runs from the demo.
+
+Windows uses a red ✕ for usage waits to avoid emoji rendering. Other terminals use U+23F8
+with its text-presentation selector; `KERDR_PAUSE_GLYPH=x` selects the same fallback.
+Account features work through the optional [feed and action contract](docs/feed.md#accounts).
+
 ### Keys
 
 `?` lists every key, with a filter.
@@ -176,6 +210,7 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 | `c` | new intent, in your own words |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
 | `f` / `F` | show only one owner or project / show everything |
+| `A` / `S` / `s` | accounts / viewed session’s ordered models / move selected agent |
 | `a` | cycle provider: All, Claude, Codex, and detected providers |
 | `b` | backlog |
 | `w` | toggle Won't do view |

@@ -227,6 +227,27 @@ fn main() {
     };
     std::fs::create_dir_all(&out).unwrap();
 
+    let names = [
+        "accounts",
+        "move-account",
+        "move-confirmation",
+        "paste-token",
+        "default-accounts",
+        "add-model",
+        "add-account",
+        "rename-account",
+        "sign-in",
+        "sign-in-again",
+    ];
+    let mut account_app = app(false);
+    for (index, mode) in demo::account_screens(&account_app).into_iter().enumerate() {
+        account_app.mode = mode;
+        rasterize(
+            &render(&account_app),
+            &fonts,
+            &out.join(format!("{}.png", names[index])),
+        );
+    }
     let board = app(false);
     rasterize(&render(&board), &fonts, &out.join("board.png"));
 

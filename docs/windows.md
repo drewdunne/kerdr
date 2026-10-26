@@ -76,3 +76,8 @@ or modifies an existing user's Herdr config. Release jobs test and package nativ
 The hosted Windows runner has no route to a private Linux host. CI checks the POSIX collector
 against real Linux/macOS Herdr servers and checks the native Windows OpenSSH options, while
 the interactive Windows-to-Linux SSH handoff remains outside this suite's verified coverage.
+
+
+The accounts screens and every account action run in the three-system CI matrix. Windows
+uses its native URL handler for sign-in links (no command interpreter), OSC 52 for copying
+a link in Windows Terminal, and a red ✕ for usage waits instead of an emoji pause glyph.

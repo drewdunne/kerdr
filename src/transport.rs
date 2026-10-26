@@ -203,12 +203,30 @@ pub fn run_adapter(
             input.is_none(),
         );
     }
-    let script = format!(
-        "{PATH_PREFIX}\nunset {}\nprintf '%s' {} | {command}\n",
-        HERDR_VARS.join(" "),
-        quote(input.unwrap_or_default())
-    );
-    run_script(target, &script, deadline)
+    // JSON stays on stdin, separate from shell source and process arguments, including tokens.
+    let script = format!("{PATH_PREFIX}\nunset {}\n{command}\n", HERDR_VARS.join(" "));
+    let mut cmd = match target {
+        Target::Local => {
+            let mut c = Command::new("sh");
+            c.arg("-c").arg(&script);
+            clean_herdr_env(&mut c);
+            c
+        }
+        Target::Ssh(host) => {
+            let mut c = Command::new("ssh");
+            c.args(ssh_args())
+                .arg("--")
+                .arg(host)
+                .arg(format!("sh -c {}", quote(&script)));
+            c
+        }
+    };
+    run(
+        &mut cmd,
+        input.map(str::as_bytes),
+        deadline,
+        input.is_none(),
+    )
 }
 
 fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: bool) -> Output {

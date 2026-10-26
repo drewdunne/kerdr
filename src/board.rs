@@ -599,6 +599,23 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         });
     }
 
+    for card in &mut cards {
+        if card.attention == Attention::Done {
+            continue;
+        }
+        if let Some(feed) = machines[card.machine_index].feed.as_ref()
+            && card.agents.iter().any(|a| {
+                feed.agents.iter().any(|f| {
+                    f.pane == a.pane_id
+                        && Some(f.session.as_str()) == card.session.as_deref()
+                        && f.waiting_for_usage()
+                })
+            })
+        {
+            card.attention = Attention::Waiting;
+            card.why = "waiting for usage".into();
+        }
+    }
     sort_cards(&mut cards);
 
     // Sessions and their slots: the feed's count when it gives one, else Kerdr's own.

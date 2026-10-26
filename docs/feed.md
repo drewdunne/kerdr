@@ -241,3 +241,96 @@ Persistent action backends must give their workers their own log files or a disc
 The adapter's stdout carries its single JSON response. Kerdr bounds response capture to
 32 MiB per stream (action JSON remains limited to 64 KiB); it preserves inherited handles
 while the backend takes ownership, and persistent log storage belongs to the backend.
+
+
+## Accounts
+
+All account fields are optional additions to format 1. Older feeds need no changes and older
+Kerdr ignores these fields. Each feed reports only that machine’s account state:
+
+```json
+{
+  "accounts": [{"code":"KBZ","name":"Personal","provider":"claude","kind":"login",
+    "runs":"claude","status":"out","until":"2026-10-22T09:00:00-05:00","pool":"week",
+    "usage":{"five":86,"five_at":null,"week":100,"week_at":"2026-10-22T09:00:00-05:00","seen":"2026-10-21T17:46:00-05:00"}}],
+  "owners": [{"id":"studio","kind":"organization","name":"Studio","parent":null,
+    "models":["KBZ"],"own":true,"sessions":["default"]},
+    {"id":"shop","kind":"tenant","name":"Shop","parent":"studio",
+    "models":["KBZ"],"own":false,"sessions":["web","shop-bg"]}],
+  "owners_source":"mock",
+  "machine_owner":"studio",
+  "unowned_sessions":[],
+  "agents":[{"pane":"w1:p1","session":"web","conversation":"conversation-id",
+    "account":"KBZ","how":"list","waiting":{"why":"usage","until":"2026-10-22T09:00:00-05:00"}}]
+}
+```
+
+Account status is `ready`, `out`, `sign_in`, or `missing`. Usage values are percentages;
+missing or null usage displays as unknown. Providers, kinds, and runner names are strings
+so other programs and local endpoints can be represented. Creating accounts currently uses
+`provider: "claude"` and `kind: "token"`; the engine validates what it supports.
+An owner’s `models` contains its effective ordered list; `own: false` denotes inheritance.
+Sessions are explicitly assigned to owners, with `default` falling back to `machine_owner`.
+Unowned sessions are marked on the accounts screen. `owners_source: "mock"` is shown as such.
+
+Cards join their herdr agents to the feed’s agents by **machine, session, and pane**, including
+child cards that name a tab. `how` is `list`, `manual`, `next`, or `handed_over`. A usage wait
+suppresses the ordinary “turn ended” attention for that card. Conversation IDs bind a move
+confirmation; backend checks must also reject stale generations and enforce authorization.
+No credential or token belongs in the feed.
+
+### Account actions
+
+These use the existing JSON-on-stdin adapter and `ok`/`message` response. Account actions run
+on the selected account’s machine; a move runs on the agent’s machine, not its record’s home.
+Model lists and account metadata have one canonical writer owned by the backend.
+
+| Action | Request fields | Result |
+|---|---|---|
+| `account-move` | `pane`, `session`, `to` (code or `list`), optional `confirm` | success, or the question below |
+| `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
+| `account-move-waiting` | `owner` | moves waiting sessions on this machine |
+| `account-add` | `code`, `name`, `provider`, `kind` | adds, or renames the existing code |
+| `account-test` | `code` | status and message |
+| `account-remove` | `code` | removes after Kerdr’s local confirmation |
+
+The `S` tick runs `account-move-waiting` on configured feed machines only after the list was
+saved successfully. Unreachable machines are reported rather than silently claimed as moved.
+
+```json
+{"ok":false,"confirmation":"This agent is mid-step. Move when it next stops? Restarting ends its background job.",
+ "yes":"move when it stops","no":"leave it","confirm":"opaque-ticket","message":"Move needs a decision"}
+```
+
+For account moves, `confirmation` is the question text (ordinary card actions keep their
+boolean field). Kerdr shows it only after selection, waits for a fresh `y`, then resends the
+original machine, pane, session and target with `confirm`. It does **not** add `override`,
+`when_idle`, or `end_jobs`: the backend’s opaque token covers exactly what was asked.
+
+### Signing in
+
+```json
+{"action":"account-signin","code":"ARK","step":"start"}
+{"ok":true,"message":"Authorize in your browser","status":"waiting","ticket":"opaque-ticket",
+ "url":"https://example.com/authorize","needs_code":true}
+```
+
+Continue on that same machine:
+
+```json
+{"action":"account-signin","ticket":"opaque-ticket","step":"poll"}
+{"action":"account-signin","ticket":"opaque-ticket","step":"finish","page_code":"page-code"}
+{"action":"account-signin","ticket":"opaque-ticket","step":"cancel"}
+```
+
+Responses have `status: "waiting"`, `"done"`, or `"failed"`. Kerdr polls every two seconds
+while the dialog remains open and stops on unknown results. Escape cancels a known ticket;
+a ticket returned after Escape is also cancelled, without opening a browser. After `done`,
+adding an account proceeds to the next selected machine with a **new** start and ticket.
+A `paste` step instead sends `code` and a `token` string, and answers `done` or a refusal.
+The token never enters the result queue or saved settings. The backend must not echo it and
+must own its secure storage. Kerdr also removes submitted credential text from adapter output.
+Only HTTPS URLs can be opened; URL data is passed directly to the OS opener, never a shell.
+
+The synthetic POSIX and PowerShell adapters in `tests/fixtures/accounts.sh` and
+`tests/fixtures/accounts.ps1` exercise every account action and sign-in step in CI.

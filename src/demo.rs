@@ -580,5 +580,140 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         cards: box_cards,
         ..Default::default()
     });
+    for m in [&mut laptop, &mut build_box] {
+        let f = m.feed.as_mut().unwrap();
+        f.accounts=serde_json::from_value(serde_json::json!([
+            {"code":"KBZ","name":"Personal","provider":"claude","kind":"login","runs":"claude","status":"out","until":"2026-10-22T09:00:00-05:00","pool":"week","usage":{"five":86,"week":100}},
+            {"code":"ARK","name":"Studio","provider":"claude","kind":"token","runs":"claude","status":"ready","usage":{"five":12,"week":30}}
+        ])).unwrap();
+        f.owners=serde_json::from_value(serde_json::json!([
+            {"id":"studio","kind":"organization","name":"Example Studio","models":["ARK","KBZ"],"own":true,"sessions":["default"]},
+            {"id":"shop","kind":"tenant","name":"Shop","parent":"studio","models":["ARK","KBZ"],"own":false,"sessions":["web","shop-bg"]},
+            {"id":"platform","kind":"tenant","name":"Platform","parent":"studio","models":["KBZ","ARK"],"own":true,"sessions":["api","background"]}
+        ])).unwrap();
+        f.owners_source = Some("mock".into());
+        f.machine_owner = Some("studio".into());
+        for (session, snap) in &m.data.as_ref().unwrap().snapshots {
+            if let Ok(snap) = snap {
+                for agent in &snap.agents {
+                    let waiting = session == "api" && agent.pane_id == "w1:p1";
+                    f.agents.push(crate::accounts::AccountAgent {
+                        pane: agent.pane_id.clone(),
+                        session: session.clone(),
+                        conversation: format!("demo-{session}-{}", agent.pane_id),
+                        account: if waiting { "KBZ" } else { "ARK" }.into(),
+                        how: "list".into(),
+                        waiting: waiting.then(|| crate::accounts::Waiting {
+                            why: "usage".into(),
+                            until: Some("2026-10-22T09:00:00-05:00".into()),
+                        }),
+                    });
+                }
+            }
+        }
+    }
     vec![laptop, build_box, gpu, mac]
+}
+
+/// Every account dialog, also used by the all-sizes rendering checks and screenshot generator.
+pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
+    use crate::app::{
+        Mode,
+        account_controls::{AccountScreen as S, MoveTarget, Signin},
+    };
+    let owner = app.machines[0].feed.as_ref().unwrap().owners[0].clone();
+    let card = app
+        .board
+        .cards
+        .iter()
+        .find(|c| !c.agents.is_empty() && app.account_agent(c).is_some())
+        .unwrap();
+    let target = Box::new(MoveTarget {
+        machine: card.machine_index,
+        key: card.key.clone(),
+        reference: card.reference.clone(),
+        agent: app.account_agent(card).unwrap().clone(),
+    });
+    let list = Mode::Accounts {
+        screen: S::List {
+            machine: 0,
+            rows: app.account_rows(0),
+            sel: 3,
+            model: 0,
+        },
+        back: Box::new(Mode::Board),
+    };
+    let move_screen = Mode::Accounts {
+        screen: S::Move {
+            target: target.clone(),
+            choices: vec!["ARK".into(), "KBZ".into(), "list".into()],
+            sel: 0,
+        },
+        back: Box::new(Mode::Board),
+    };
+    let mut result=vec![list.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now()},back:Box::new(move_screen)}];
+    for screen in [
+        S::PasteToken {
+            machine: 0,
+            code: "ARK".into(),
+            token: Default::default(),
+        },
+        S::Models {
+            machine: 0,
+            models: owner.models.clone(),
+            owner,
+            sel: 0,
+            move_waiting: true,
+        },
+        S::AddModel {
+            machine: 0,
+            choices: vec!["ARK".into()],
+            sel: 0,
+        },
+        S::Add {
+            machine: 0,
+            code: "NEW".into(),
+            name: "Studio".into(),
+            field: 0,
+            machines: vec![0, 1],
+            chosen: vec![true, true],
+        },
+        S::Rename {
+            machine: 0,
+            code: "ARK".into(),
+            name: "Studio".into(),
+        },
+        S::Signin(Signin {
+            code: "ARK".into(),
+            machines: vec![0, 1],
+            current: 1,
+            ticket: Some("demo-ticket".into()),
+            url: Some("https://example.com/signin".into()),
+            needs_code: true,
+            page_code: String::new(),
+            editing: false,
+            poll_at: std::time::Instant::now(),
+            failed: false,
+            message: "Authorize in the browser window that just opened.".into(),
+        }),
+        S::Signin(Signin {
+            code: "KBZ".into(),
+            machines: vec![1],
+            current: 0,
+            ticket: Some("demo-ticket".into()),
+            url: Some("https://example.com/signin".into()),
+            needs_code: true,
+            page_code: String::new(),
+            editing: true,
+            poll_at: std::time::Instant::now(),
+            failed: true,
+            message: "The saved sign-in needs you to sign in again.".into(),
+        }),
+    ] {
+        result.push(Mode::Accounts {
+            screen,
+            back: Box::new(list.clone()),
+        });
+    }
+    result
 }
