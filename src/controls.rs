@@ -520,8 +520,9 @@ impl App {
         }
     }
 
-    /// Enter on work under way whose workspace is gone: the action backend on its home machine
-    /// reopens it, resuming its agent's conversation, and Kerdr goes in once it answers.
+    /// Enter on work under way whose workspace is gone, or on done work: the action backend on its
+    /// home machine reopens it, resuming its agent's conversation, and Kerdr goes in once it
+    /// answers. Done work it opens again only after asking, so the yes is Andrew's (intent 0278).
     pub fn reopen_action(&mut self, card: &Card) -> Action {
         let Some(detail) = &card.detail else {
             return Action::None;
@@ -533,9 +534,14 @@ impl App {
             .as_deref()
             .is_none_or(|s| s.trim().is_empty())
         {
+            let what = if card.done() {
+                "is done"
+            } else {
+                "has no herdr workspace open"
+            };
             self.say(
                 format!(
-                    "{} has no herdr workspace open; with [actions] configured, ⏎ reopens it. m peeks at it.",
+                    "{} {what}; with [actions] configured, ⏎ reopens it. m peeks at it.",
                     card.reference
                 ),
                 Tone::Info,
@@ -1371,7 +1377,9 @@ impl App {
                 })
                 && match request["action"].as_str() {
                     Some("restore") => c.dismissed(),
-                    Some("reopen") => c.under_way() && target.is_some_and(|t| t.same_work(c)),
+                    Some("reopen") => {
+                        (c.under_way() || c.done()) && target.is_some_and(|t| t.same_work(c))
+                    }
                     // Started where it was asked: its home hasn't moved since.
                     Some("dispatch") => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
                     _ => waiting_work(c),

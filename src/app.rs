@@ -766,13 +766,14 @@ impl App {
             .cloned()
     }
 
-    /// herdr has just said the workspace you went into, `tried`, has closed: work still under way
-    /// reopens next, even before the board catches up; a card that has meanwhile moved to another
-    /// workspace doesn't. Whether it will.
+    /// herdr has just said the workspace you went into, `tried`, has closed: work still under way,
+    /// or done work, reopens next (done work after a yes), even before the board catches up; a card
+    /// that has meanwhile moved to another workspace doesn't. Whether it will.
     pub fn closed_under_you(&mut self, key: &str, tried: Option<&str>) -> bool {
         let reopen = self.actions_on()
             && self.card(key).is_some_and(|c| {
-                c.under_way() && (c.workspace_id.is_none() || c.workspace_id.as_deref() == tried)
+                (c.under_way() || c.done())
+                    && (c.workspace_id.is_none() || c.workspace_id.as_deref() == tried)
             });
         if reopen {
             self.pending_reopen = Some(key.to_string());
@@ -807,8 +808,8 @@ impl App {
         } = pending;
         match open {
             Some(true) => return Some(key),
-            // Work still under way whose workspace closed meanwhile: reopen it instead.
-            Some(false) if self.card(&key).is_some_and(|c| c.can_reopen()) && self.actions_on() => {
+            // Work still under way, or done, whose workspace closed meanwhile: reopen it instead.
+            Some(false) if self.card(&key).is_some_and(|c| c.reopenable()) && self.actions_on() => {
                 self.pending_reopen = Some(key);
             }
             Some(false) => self.say(
@@ -887,9 +888,17 @@ impl App {
         if card.is_open_workspace() {
             return Action::Jump(key);
         }
-        // Work under way whose workspace closed: reopen it rather than leave a dead end.
-        if card.can_reopen() {
+        // Work under way whose workspace closed, or done work: reopen it rather than leave a dead
+        // end. Done work is opened again only after a yes to the question its backend asks.
+        if card.reopenable() {
             return self.reopen_action(&card);
+        }
+        if card.dismissed() {
+            self.say(
+                format!("{} is in won't do; u brings it back.", card.reference),
+                Tone::Info,
+            );
+            return Action::None;
         }
         let what = match card.stage {
             Stage::Backlog => "it hasn't started",
@@ -1201,7 +1210,7 @@ impl App {
                 if card.is_open_workspace() {
                     self.mode = Mode::Board;
                     Action::Jump(card.key)
-                } else if card.can_reopen() {
+                } else if card.can_reopen() || (card.can_reopen_done() && self.actions_on()) {
                     self.mode = Mode::Board;
                     self.reopen_action(&card)
                 } else {
@@ -3229,19 +3238,18 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_finished_waiting_or_unrecorded_work_still_reopens_nothing() {
+    fn enter_on_waiting_or_unrecorded_work_still_reopens_nothing() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _) = closed_workspace_card(&mut app);
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         for (stage, attention) in [
             (Stage::Backlog, Attention::Idle),
-            (Stage::Maintain, Attention::Done),
             (Stage::Build, Attention::Done),
         ] {
             app.board.cards[i].stage = stage;
             app.board.cards[i].attention = attention;
-            assert!(!app.board.cards[i].can_reopen());
+            assert!(!app.board.cards[i].reopenable());
         }
         app.board.cards[i].stage = Stage::Build;
         app.board.cards[i].attention = Attention::Idle;
@@ -3258,6 +3266,203 @@ mod tests {
         };
         assert_eq!(enter(&mut app), Action::None);
         assert!(app.message().unwrap().0.contains("nothing to jump into"));
+    }
+
+    /// A done card (intent 0278): the same work, in Maintain, its workspace gone with its wrap.
+    fn done_card(app: &mut App) -> (String, String) {
+        let (key, id) = closed_workspace_card(app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.stage = Stage::Maintain;
+        card.attention = Attention::Done;
+        app.sel = Selection {
+            col: Stage::Maintain.index(),
+            key: Some(key.clone()),
+        };
+        (key, id)
+    }
+
+    fn done_question(reference: &str, token: &str) -> Result<crate::actions::Response, String> {
+        Ok(crate::actions::Response {
+            ok: false,
+            message: format!(
+                "{reference} is done: a yes sets it open again and resumes its Codex conversation. Reopen it?"
+            ),
+            confirmation: true,
+            session: Some("web".into()),
+            confirm: Some(token.into()),
+            ..Default::default()
+        })
+    }
+
+    #[test]
+    fn enter_on_a_done_card_asks_first_then_reopens_it_on_a_yes() {
+        let mut app = demo_app();
+        let (key, id) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let card = app.card(&key).unwrap();
+        assert!(card.can_reopen_done() && card.reopenable() && !card.can_reopen());
+        // Without actions there's no one to ask: it says how to get there, and sends nothing.
+        assert_eq!(enter(&mut app), Action::None);
+        let said = app.message().unwrap().0.clone();
+        assert!(
+            said.contains("is done") && said.contains("[actions]"),
+            "{said}"
+        );
+        app.cfg.actions.command = Some("test-adapter".into());
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("Enter on a done card didn't ask to reopen it")
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"], id.as_str());
+        assert!(
+            request.get("override").is_none(),
+            "the first ask is never a yes"
+        );
+        // The backend asks first, saying it's done: that's a question on screen, not a failure.
+        app.busy = true;
+        app.finish_action(0, request, done_question(&reference, "0123456789ab0008"));
+        let Mode::Confirm {
+            title,
+            message,
+            queue,
+            ..
+        } = &app.mode
+        else {
+            panic!("a done card's reopen didn't ask")
+        };
+        assert_eq!(title, &format!("Reopen {reference} in web?"));
+        assert!(message.starts_with(&format!("{reference} is done: a yes sets it open again")));
+        assert!(!*queue);
+        // No: nothing is sent, and the board is as it was.
+        settle(&mut app);
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        assert!(matches!(app.mode, Mode::Board));
+        assert!(app.card(&key).unwrap().can_reopen_done());
+        // Yes, to the question asked again: the yes carries its token.
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(0, request, done_question(&reference, "0123456789ab0008"));
+        settle(&mut app);
+        let Action::Mutate { request: sent, .. } = press(&mut app, 'y') else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(
+            (
+                sent["override"].as_bool(),
+                sent["confirm"].as_str(),
+                sent["session"].as_str()
+            ),
+            (Some(true), Some("0123456789ab0008"), Some("web"))
+        );
+        // Reopened: Kerdr goes in, while you're still on its card.
+        app.busy = true;
+        app.finish_action(0, sent, reopen_reply("web", true, false, ""));
+        assert_eq!(
+            app.open_after.as_ref().map(|o| o.workspace.as_str()),
+            Some("w7")
+        );
+    }
+
+    #[test]
+    fn enter_on_a_done_card_is_refused_plainly_where_it_cant_reopen() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        // Won't do: said by Kerdr itself, and nothing sent.
+        app.board.cards[i].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        assert!(!app.board.cards[i].reopenable());
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(
+            app.message().unwrap().0,
+            format!("{reference} is in won't do; u brings it back.")
+        );
+        app.board.cards[i].detail.as_mut().unwrap().disposition = None;
+        // Still being written up: nothing to reopen.
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("nothing to jump into: it's done")
+        );
+        app.board.cards[i].detail.as_mut().unwrap().intake = None;
+        // Homed on a machine this Kerdr doesn't know: said, and nothing sent.
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some("elsewhere".into()),
+            session: Some("web".into()),
+        });
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("home machine elsewhere is not configured")
+        );
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(app.machines[0].name()),
+            session: Some("web".into()),
+        });
+        // What only its home can tell (another account's, another machine's, one that never ran
+        // there): its refusal is said as it comes, with no question.
+        for refusal in [
+            format!("{reference} belongs to another account; reopen it there."),
+            format!("{reference} belongs on lab; reopen it there."),
+            format!(
+                "{reference} is done, with no record of running on this machine (no home session, no conversation found), so there's nothing to reopen. m peeks at it."
+            ),
+        ] {
+            let request = reopen_by_enter(&mut app);
+            app.finish_action(
+                0,
+                request,
+                Ok(crate::actions::Response {
+                    ok: false,
+                    message: refusal.clone(),
+                    ..Default::default()
+                }),
+            );
+            assert!(matches!(app.mode, Mode::Board), "a refusal asked something");
+            assert_eq!(app.message().unwrap().0, refusal);
+            assert_eq!(app.open_after, None);
+        }
+    }
+
+    #[test]
+    fn a_yes_to_reopen_a_done_card_is_refused_once_it_has_a_workspace_again() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(0, request, done_question(&reference, "0123456789ab0008"));
+        settle(&mut app);
+        // Opened meanwhile, from somewhere else: the yes no longer fits it.
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.workspace_id = Some("w9".into());
+        card.session = Some("web".into());
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("changed while you were deciding")
+        );
+    }
+
+    #[test]
+    fn a_done_cards_workspace_closing_as_you_go_in_asks_to_reopen_it() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = done_card(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.workspace_id = Some("w9".into());
+        card.session = Some("web".into());
+        // Its wrap closed the pane just as you went in.
+        assert!(app.closed_under_you(&key, Some("w9")));
+        assert_eq!(app.pending_reopen.as_deref(), Some(key.as_str()));
     }
 
     #[test]

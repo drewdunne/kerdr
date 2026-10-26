@@ -90,7 +90,7 @@ know rather than guessing.
 | `backlog_rank` | An optional signed integer ordering the backlog, lower numbers first. The action backend writes the canonical order. |
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
 | `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
-| `resume` | For work under way: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
+| `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
 
 ## Actions
 
@@ -211,6 +211,23 @@ card has the same home and conversation and no new workspace.
 When the question says the session is full (it carries `used`), it also offers `w`: the request
 again with `queue: true`, for the backend to queue the work in that session instead, as starting
 new work would be. Without `[actions]`, `Enter` says the card has no workspace and sends nothing.
+
+### Reopening done work
+
+`Enter` on a done card (a record in Maintain that isn't dismissed or still being written up)
+with no workspace open sends the same `reopen` request, so work that wrapped itself before you
+were finished with it is one key away. The backend must ask first, every time: answer the first
+request with a question whose `message` says the work is done and that a yes opens it again, and
+put every other reason in the same question. Only the yes, with its `confirm` token, opens the
+record again and reopens it; a no sends nothing, so nothing changes. Kerdr rechecks before
+sending the yes that the card is still the same work with no new workspace.
+
+Kerdr refuses a dismissed card itself ("u brings it back"), and a card homed on a machine it
+doesn't know. Refuse in the backend, with a plain `message` and no question, whatever only it can
+tell: a record another account owns, one homed on another machine, or one with no record of
+running there. The card's hint line and the peek say `⏎ ask to reopen it`, naming the agent
+from `resume` when the feed gives it. Without `[actions]`, `Enter` says the card is done and sends
+nothing.
 
 ## Agents reporting for themselves
 
