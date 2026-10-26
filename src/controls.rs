@@ -39,9 +39,12 @@ fn take_tag(draft: &mut Draft, past_spaces: bool) -> bool {
     else {
         return false;
     };
-    let cut = end - images::tag(draft.images[i].tag).len();
-    draft.words.truncate(cut);
-    draft.images.remove(i);
+    let tag = images::tag(draft.images[i].tag);
+    draft.words.truncate(end - tag.len());
+    // The same tag typed twice is one image: it goes only with the last of them.
+    if !draft.words.contains(&tag) {
+        draft.images.remove(i);
+    }
     true
 }
 
@@ -711,6 +714,7 @@ impl App {
         if key.code == KeyCode::Esc {
             self.draft = draft.words;
             self.draft_images = draft.images;
+            self.image_load = None;
             self.mode = *back;
             return Action::None;
         }
@@ -736,6 +740,11 @@ impl App {
             KeyCode::Enter => {
                 if draft.words.trim().is_empty() {
                     self.say("Write what you want first.", Tone::Info);
+                } else if self.image_load.is_some() {
+                    self.say(
+                        "An image is still being read; send once it's in.",
+                        Tone::Info,
+                    );
                 } else {
                     let words = draft.words.trim().to_string();
                     // Only the images whose tags are still in the words go with them.
@@ -773,7 +782,7 @@ impl App {
             }
             KeyCode::Char('v') if ctrl => {
                 self.mode = Mode::Compose { draft, back };
-                return Action::PasteImage;
+                return Action::LoadImages(images::Source::Clipboard);
             }
             // A tag goes as one, and its image with it.
             KeyCode::Backspace if take_tag(&mut draft, false) => {}
@@ -813,13 +822,12 @@ impl App {
         }
         let busy = self.busy;
         if matches!(self.mode, Mode::Compose { .. }) && !busy {
-            if text.trim().is_empty() {
-                return Action::PasteImage;
+            // Spaces and blank lines are words; only a paste with nothing in it means an image.
+            if text.is_empty() {
+                return Action::LoadImages(images::Source::Clipboard);
             }
             if let Some(paths) = images::paths_in_paste(&text) {
-                let got = paths.iter().map(|p| images::from_file(p)).collect();
-                self.attach_images(got);
-                return Action::None;
+                return Action::LoadImages(images::Source::Files(paths));
             }
         }
         match &mut self.mode {
@@ -852,9 +860,44 @@ impl App {
         Action::None
     }
 
+    /// Starts reading images for the new-intent box: the read's number and the room its draft
+    /// has left, or None (saying why) when there's no box to read them into.
+    pub fn begin_image_load(&mut self, source: &images::Source) -> Option<(u64, images::Room)> {
+        let Mode::Compose { draft, .. } = &self.mode else {
+            return None;
+        };
+        if self.busy {
+            return None;
+        }
+        if self.image_load.is_some() {
+            self.say("Still reading the last image.", Tone::Info);
+            return None;
+        }
+        let room = images::Room::left(&draft.images);
+        self.image_loads += 1;
+        self.image_load = Some(self.image_loads);
+        let what = match source {
+            images::Source::Clipboard => "Reading the clipboard…",
+            images::Source::Files(_) => "Reading the image…",
+        };
+        self.say(what, Tone::Info);
+        Some((self.image_loads, room))
+    }
+
+    /// A read started by begin_image_load has ended: its images go in, unless the box it was
+    /// for has closed since.
+    pub fn images_loaded(&mut self, id: u64, loading: images::Loading) {
+        if self.image_load != Some(id) {
+            return;
+        }
+        self.image_load = None;
+        self.attach_images(loading);
+    }
+
     /// Puts images read from the clipboard or a pasted path into the new-intent box, each as
-    /// the next `[Image #N]` tag at the end of the words, or says why it can't.
-    pub fn attach_images(&mut self, got: Result<Vec<images::Loaded>, String>) {
+    /// the next `[Image #N]` tag at the end of the words, and says what went in and why
+    /// anything didn't.
+    pub fn attach_images(&mut self, got: images::Loading) {
         let busy = self.busy;
         let Mode::Compose { draft, .. } = &mut self.mode else {
             return;
@@ -862,25 +905,15 @@ impl App {
         if busy {
             return;
         }
-        let loaded = match got {
-            Ok(loaded) => loaded,
-            Err(why) => return self.say(why, Tone::Warn),
-        };
         let mut said = vec![];
-        for image in loaded {
+        for image in got.images {
             if draft.images.len() >= images::MAX_IMAGES {
-                said.push(format!(
-                    "An intent takes at most {} images.",
-                    images::MAX_IMAGES
-                ));
+                said.push(images::too_many());
                 break;
             }
             let total: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
             if total + image.bytes.len() > images::MAX_IMAGES_BYTES {
-                said.push(format!(
-                    "That image would take this intent's images past {} together, the most Kerdr sends.",
-                    images::size(images::MAX_IMAGES_BYTES)
-                ));
+                said.push(images::too_much());
                 break;
             }
             let n = draft.images.iter().map(|i| i.tag).max().unwrap_or(0) + 1;
@@ -909,6 +942,10 @@ impl App {
                 media_type: image.media_type,
                 bytes: std::sync::Arc::new(image.bytes),
             });
+        }
+        said.extend(got.why);
+        if said.is_empty() {
+            return;
         }
         let good = said.iter().all(|s| s.starts_with("Attached"));
         self.say(said.join(" "), if good { Tone::Good } else { Tone::Warn });

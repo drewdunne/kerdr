@@ -131,7 +131,11 @@ fn event_loop(
     client_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
+    let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
     loop {
+        while let Ok((id, loading)) = image_rx.try_recv() {
+            app.images_loaded(id, loading);
+        }
         while let Ok((machine, request, result)) = action_rx.try_recv() {
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
                 r.ok && !(request["action"] == "account-signin"
@@ -218,7 +222,14 @@ fn event_loop(
         };
         match action {
             Action::None => {}
-            Action::PasteImage => app.attach_images(crate::images::from_clipboard()),
+            Action::LoadImages(source) => {
+                if let Some((id, room)) = app.begin_image_load(&source) {
+                    let tx = image_tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send((id, source.load(room)));
+                    });
+                }
+            }
             Action::CopyLink(url) => {
                 if crate::accounts::valid_signin_url(&url) {
                     use base64::Engine;

@@ -39,6 +39,110 @@ pub struct Loaded {
     pub bytes: Vec<u8>,
 }
 
+/// Where the box's next images come from: this machine's clipboard, or files pasted by path.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Source {
+    Clipboard,
+    Files(Vec<PathBuf>),
+}
+
+impl Source {
+    /// Reads them, in the room a draft has left. Slow readers (PowerShell, a network mount)
+    /// run this away from the board's own thread.
+    pub fn load(&self, room: Room) -> Loading {
+        match self {
+            Source::Clipboard => from_clipboard(room),
+            Source::Files(paths) => from_files(paths, room),
+        }
+    }
+}
+
+/// What a clipboard reader found: one image, or files a file manager copied, not read yet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Found {
+    Image(Loaded),
+    Files(Vec<PathBuf>),
+}
+
+/// The images read for the box, and why nothing more was: an empty clipboard, a refused
+/// image, a limit reached.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Loading {
+    pub images: Vec<Loaded>,
+    pub why: Option<String>,
+}
+
+impl Loading {
+    pub fn refused(why: impl Into<String>) -> Loading {
+        Loading {
+            images: vec![],
+            why: Some(why.into()),
+        }
+    }
+
+    fn say(&mut self, why: String) {
+        self.why = Some(match self.why.take() {
+            Some(before) => format!("{before} {why}"),
+            None => why,
+        });
+    }
+}
+
+/// How many more images, and bytes of them, a draft can take.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Room {
+    pub images: usize,
+    pub bytes: usize,
+}
+
+impl Room {
+    pub fn left(images: &[Image]) -> Room {
+        let used: usize = images.iter().map(|i| i.bytes.len()).sum();
+        Room {
+            images: MAX_IMAGES.saturating_sub(images.len()),
+            bytes: MAX_IMAGES_BYTES.saturating_sub(used),
+        }
+    }
+}
+
+/// Why an intent can't take another image: words naming the limit it's at.
+pub fn too_many() -> String {
+    format!("An intent takes at most {MAX_IMAGES} images.")
+}
+
+pub fn too_much() -> String {
+    format!(
+        "That would take this intent's images past {} together, the most Kerdr sends.",
+        size(MAX_IMAGES_BYTES)
+    )
+}
+
+/// Image files read in order while they fit in the room left, each one's size checked before
+/// it's read, so a folder's worth copied at once never fills memory.
+pub fn from_files(paths: &[PathBuf], room: Room) -> Loading {
+    let mut out = Loading::default();
+    let mut used = 0;
+    for path in paths {
+        if out.images.len() >= room.images {
+            out.say(too_many());
+            break;
+        }
+        let len = std::fs::metadata(path).map_or(0, |m| m.len() as usize);
+        if len <= MAX_IMAGE_BYTES && used + len > room.bytes {
+            out.say(too_much());
+            break;
+        }
+        match from_file(path) {
+            Ok(image) => {
+                used += image.bytes.len();
+                out.images.push(image);
+            }
+            Err(why) => out.say(why),
+        }
+    }
+    out
+}
+
 /// The tag that stands for image `n` in the words.
 pub fn tag(n: u32) -> String {
     format!("[Image #{n}]")
@@ -289,32 +393,40 @@ pub struct Captured {
 /// Runs a program as `run` does for a reader, or fails as spawning it would.
 pub type Runner<'a> = &'a dyn Fn(&str, &[&str]) -> std::io::Result<Captured>;
 
-/// What this machine's clipboard holds that Kerdr can attach: one image, or the image files
-/// copied in a file manager. Err is plain words saying why there's nothing to attach.
-pub fn from_clipboard() -> Result<Vec<Loaded>, String> {
+/// What this machine's clipboard holds that Kerdr can attach, in the room a draft has left:
+/// one image, or the image files copied in a file manager, or plain words saying why there's
+/// nothing to attach.
+pub fn from_clipboard(room: Room) -> Loading {
+    if room.images == 0 {
+        return Loading::refused(too_many());
+    }
     #[cfg(target_os = "macos")]
-    {
-        macos_clipboard()
-    }
+    let found = macos_clipboard();
     #[cfg(windows)]
-    {
-        windows_clipboard()
-    }
+    let found = windows_clipboard();
     #[cfg(not(any(target_os = "macos", windows)))]
-    {
+    let found = {
         let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
         unix_clipboard(set("WAYLAND_DISPLAY"), set("DISPLAY"), &|program, args| {
             let mut cmd = Command::new(program);
             cmd.args(args);
             capture(cmd, MAX_IMAGE_BYTES + 1, READ_DEADLINE)
         })
+    };
+    match found {
+        Ok(Found::Image(image)) => Loading {
+            images: vec![image],
+            why: None,
+        },
+        Ok(Found::Files(paths)) => from_files(&paths, room),
+        Err(why) => Loading::refused(why),
     }
 }
 
 const NO_IMAGE: &str = "There's no image on the clipboard. Copy a screenshot or an image first, or paste an image file's path.";
 
 /// Linux and the BSDs: wl-paste under Wayland, xclip under X11.
-pub fn unix_clipboard(wayland: bool, x11: bool, run: Runner) -> Result<Vec<Loaded>, String> {
+pub fn unix_clipboard(wayland: bool, x11: bool, run: Runner) -> Result<Found, String> {
     let mut missing = None;
     if wayland {
         match clipboard_with(run, "wl-paste", &["--list-types"], |t| {
@@ -354,7 +466,7 @@ fn clipboard_with(
     program: &str,
     list: &[&str],
     read: impl Fn(&str) -> Vec<String>,
-) -> Result<Result<Vec<Loaded>, String>, Missing> {
+) -> Result<Result<Found, String>, Missing> {
     let listed = match run(program, list) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(Missing),
         Err(e) => {
@@ -403,9 +515,8 @@ fn clipboard_with(
         }
     };
     if let Some(t) = KINDS.iter().find(|k| types.iter().any(|t| t == *k)) {
-        return Ok(
-            read_type(t).and_then(|bytes| checked(bytes, "The clipboard's image").map(|l| vec![l]))
-        );
+        return Ok(read_type(t)
+            .and_then(|bytes| checked(bytes, "The clipboard's image").map(Found::Image)));
     }
     if types.iter().any(|t| t == "text/uri-list") {
         let listed = match read_type("text/uri-list") {
@@ -423,7 +534,7 @@ fn clipboard_with(
 }
 
 /// The image files a file manager copied, from its list of file:// addresses.
-fn copied_files(uri_list: &str) -> Result<Vec<Loaded>, String> {
+fn copied_files(uri_list: &str) -> Result<Found, String> {
     let paths: Vec<PathBuf> = uri_list
         .lines()
         .map(str::trim)
@@ -438,7 +549,7 @@ fn copied_files(uri_list: &str) -> Result<Vec<Loaded>, String> {
             "The copied file isn't an image Kerdr attaches (PNG, JPEG, GIF or WebP).".into()
         });
     }
-    images.into_iter().map(|p| from_file(p)).collect()
+    Ok(Found::Files(images.into_iter().cloned().collect()))
 }
 
 /// A private folder for a reader to write the clipboard's image into, and the path it writes:
@@ -454,7 +565,7 @@ fn scratch() -> Result<(tempfile::TempDir, PathBuf), String> {
 }
 
 #[cfg(target_os = "macos")]
-fn macos_clipboard() -> Result<Vec<Loaded>, String> {
+fn macos_clipboard() -> Result<Found, String> {
     let (_dir, file) = scratch()?;
     let path = file.to_string_lossy().into_owned();
     // The path goes in as an argument, never as script source.
@@ -478,7 +589,7 @@ fn macos_clipboard() -> Result<Vec<Loaded>, String> {
     let got = capture(cmd, 4096, READ_DEADLINE)
         .map_err(|e| format!("Couldn't read the clipboard with osascript: {e}."))?;
     if got.status == Some(0) {
-        return from_file(&file).map(|l| vec![l]);
+        return from_file(&file).map(Found::Image);
     }
     // A file copied in Finder.
     let mut cmd = Command::new("osascript");
@@ -495,7 +606,7 @@ fn macos_clipboard() -> Result<Vec<Loaded>, String> {
 }
 
 #[cfg(windows)]
-fn windows_clipboard() -> Result<Vec<Loaded>, String> {
+fn windows_clipboard() -> Result<Found, String> {
     use base64::Engine;
     let (_dir, file) = scratch()?;
     let path = file.to_string_lossy().into_owned();
@@ -531,7 +642,7 @@ fn windows_clipboard() -> Result<Vec<Loaded>, String> {
     let got = capture(cmd, 1024 * 1024, READ_DEADLINE * 3)
         .map_err(|e| format!("Couldn't read the clipboard with PowerShell: {e}."))?;
     match got.status {
-        Some(0) => from_file(&file).map(|l| vec![l]),
+        Some(0) => from_file(&file).map(Found::Image),
         Some(4) => {
             let listed: String = String::from_utf8_lossy(&got.stdout)
                 .lines()
@@ -712,6 +823,56 @@ mod tests {
         );
     }
 
+    #[test]
+    fn copied_files_past_the_room_left_are_never_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths: Vec<PathBuf> = (0..5)
+            .map(|n| {
+                let p = dir.path().join(format!("{n}.png"));
+                std::fs::write(&p, PNG).unwrap();
+                p
+            })
+            .collect();
+        // Room for two: the third is named as the limit, and nothing past it is opened.
+        let got = from_files(
+            &paths,
+            Room {
+                images: 2,
+                bytes: MAX_IMAGES_BYTES,
+            },
+        );
+        assert_eq!(got.images.len(), 2);
+        assert_eq!(
+            got.why.as_deref(),
+            Some("An intent takes at most 20 images.")
+        );
+        let big = dir.path().join("big.png");
+        std::fs::write(&big, [PNG, &vec![0; 2000]].concat()).unwrap();
+        let got = from_files(
+            &[paths[0].clone(), big],
+            Room {
+                images: 9,
+                bytes: 1000,
+            },
+        );
+        assert_eq!(got.images.len(), 1);
+        assert!(got.why.unwrap().contains("past 20 MB together"));
+        // A file that can't attach is named, and the rest still come.
+        let notes = dir.path().join("notes.png");
+        std::fs::write(&notes, "hi").unwrap();
+        let got = from_files(&[notes, paths[1].clone()], Room::left(&[]));
+        assert_eq!(got.images.len(), 1);
+        assert!(got.why.unwrap().contains("notes.png isn't a PNG"));
+        assert_eq!(
+            from_clipboard(Room {
+                images: 0,
+                bytes: 1
+            })
+            .why,
+            Some(too_many())
+        );
+    }
+
     /// A stand-in for wl-paste or xclip: answers by the arguments it's given.
     fn fake<'a>(
         calls: &'a RefCell<Vec<String>>,
@@ -743,8 +904,10 @@ mod tests {
                 ok(PNG)
             }
         });
-        let got = unix_clipboard(true, false, &run).unwrap();
-        assert_eq!(got[0].media_type, "image/png");
+        let Ok(Found::Image(got)) = unix_clipboard(true, false, &run) else {
+            panic!("no image")
+        };
+        assert_eq!(got.media_type, "image/png");
         assert_eq!(
             calls.borrow().as_slice(),
             [
@@ -764,8 +927,10 @@ mod tests {
                 ok(PNG)
             }
         });
-        let got = unix_clipboard(false, true, &run).unwrap();
-        assert_eq!(got[0].bytes, PNG);
+        let Ok(Found::Image(got)) = unix_clipboard(false, true, &run) else {
+            panic!("no image")
+        };
+        assert_eq!(got.bytes, PNG);
         assert_eq!(
             calls.borrow()[1],
             "xclip -selection clipboard -o -t image/png"
@@ -851,7 +1016,10 @@ mod tests {
             }
         });
         if !cfg!(windows) {
-            assert_eq!(unix_clipboard(true, false, &run).unwrap()[0].bytes, PNG);
+            assert_eq!(
+                unix_clipboard(true, false, &run),
+                Ok(Found::Files(vec![shot.clone()]))
+            );
             assert!(
                 copied_files(&format!("file://{}", notes.display()))
                     .unwrap_err()
@@ -868,7 +1036,9 @@ mod tests {
     fn live_clipboard() {
         let path = std::env::var("KERDR_LIVE_CLIPBOARD_IMAGE")
             .expect("KERDR_LIVE_CLIPBOARD_IMAGE names the image put on the clipboard");
-        let got = from_clipboard().unwrap_or_else(|why| panic!("{why}"));
+        let got = from_clipboard(Room::left(&[]));
+        assert_eq!(got.why, None);
+        let got = got.images;
         assert_eq!(got.len(), 1);
         let want = std::fs::read(&path).unwrap();
         // Windows hands images over as bitmaps, so it gives back a PNG of the same picture.
