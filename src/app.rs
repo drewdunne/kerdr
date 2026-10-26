@@ -1170,12 +1170,14 @@ impl App {
                 if !in_scope {
                     continue;
                 }
+                // Shown when any card on it is: its own, or one for work in one of its tabs.
                 if (self.owner.is_some() || self.project.is_some() || self.provider.is_some())
-                    && !w
-                        .card
-                        .as_deref()
-                        .and_then(|key| self.card(key))
-                        .is_some_and(|c| self.card_visible(c))
+                    && !self.board.cards.iter().any(|c| {
+                        c.machine == w.machine
+                            && c.session.as_deref() == Some(w.session.as_str())
+                            && c.workspace_id.as_deref() == Some(w.id.as_str())
+                            && self.card_visible(c)
+                    })
                 {
                     continue;
                 }
@@ -1759,9 +1761,9 @@ mod tests {
         let card = &mut app.board.cards[0];
         card.stage = Stage::Backlog;
         let d = card.detail.get_or_insert_with(Default::default);
-        d.tenant = Some("pick4me".into());
+        d.tenant = Some("shopfront".into());
         d.project = Some("website".into());
-        app.owner = Some("tenant:pick4me".into());
+        app.owner = Some("tenant:shopfront".into());
         app.project = Some("website".into());
         assert!(
             app.columns()[0]
@@ -1970,6 +1972,38 @@ mod tests {
         app
     }
 
+    #[test]
+    fn a_workspace_shows_under_a_filter_when_a_card_for_one_of_its_tabs_matches() {
+        let mut app = demo_app();
+        let i = app
+            .board
+            .cards
+            .iter()
+            .position(|c| c.workspace_id.is_some() && !c.agents.is_empty())
+            .unwrap();
+        for a in &mut app.board.cards[i].agents {
+            a.agent = "claude".into();
+        }
+        let mut child = app.board.cards[i].clone();
+        child.key = "child-in-a-tab".into();
+        child.tab_id = Some("t2".into());
+        child.agents[0].agent = "codex".into();
+        child.agents.truncate(1);
+        let ws = child.workspace_id.clone();
+        app.board.cards.push(child);
+        app.provider = Some("codex".into());
+        let hits = app.search_hits(&Search {
+            query: String::new(),
+            filter: SearchFilter::Workspaces,
+            sel: 0,
+        });
+        assert!(
+            hits.iter().any(|(hit, _)| matches!(hit,
+                Hit::Workspace(w) if Some(&app.board.workspaces[*w].id) == ws.as_ref())),
+            "{hits:?}"
+        );
+    }
+
     fn provider_command(app: &mut App) {
         app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
         assert_eq!(press(app, 'a'), Action::None);
@@ -2004,13 +2038,13 @@ mod tests {
         let mut app = provider_app();
         for card in &mut app.board.cards {
             let detail = card.detail.get_or_insert_with(Default::default);
-            detail.tenant = Some("pick4me".into());
+            detail.tenant = Some("shopfront".into());
             detail.project = Some("web".into());
         }
         app.board.cards[2].machine = "build-box".into();
         app.machine = Some("laptop".into());
         app.tabs = vec![Scope::Machine("laptop".into())];
-        app.owner = Some("tenant:pick4me".into());
+        app.owner = Some("tenant:shopfront".into());
         app.project = Some("web".into());
         provider_command(&mut app);
         assert_eq!(visible_ids(&app), vec![0]);
