@@ -305,6 +305,9 @@ pub struct App {
     /// box closed meanwhile is dropped when it ends.
     pub image_load: Option<u64>,
     image_loads: u64,
+    /// Where in the words that read's tags go: where the words ended when it began, so words
+    /// typed while it reads come after them.
+    image_at: usize,
     /// The new intent last sent, while its answer is still owed or unknown.
     pub submission: Option<Submission>,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
@@ -354,6 +357,7 @@ impl App {
             draft_images: vec![],
             image_load: None,
             image_loads: 0,
+            image_at: 0,
             new_intent_id: None,
             submission: None,
             backlog_focus: None,
@@ -2437,6 +2441,10 @@ mod tests {
         for c in "Moving failed:".chars() {
             press(&mut app, c);
         }
+        let draft = |app: &App| match &app.mode {
+            Mode::Compose { draft, .. } => draft.clone(),
+            _ => panic!("the box closed"),
+        };
         // Ctrl+V asks for the clipboard's image, read away from the board's thread; what it
         // finds goes in at the end as a tag.
         use crate::images::Source;
@@ -2452,11 +2460,15 @@ mod tests {
         );
         assert!(app.message().unwrap().0.contains("still being read"));
         assert!(app.begin_image_load(&Source::Clipboard).is_none());
+        // Words typed while it reads come after the tag, where it was pasted.
+        for c in " again".chars() {
+            press(&mut app, c);
+        }
         app.images_loaded(id, loaded());
-        let draft = |app: &App| match &app.mode {
-            Mode::Compose { draft, .. } => draft.clone(),
-            _ => panic!("the box closed"),
-        };
+        assert_eq!(draft(&app).words, "Moving failed: [Image #1] again");
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.words.truncate("Moving failed: [Image #1] ".len());
+        }
         assert_eq!(draft(&app).words, "Moving failed: [Image #1] ");
         assert!(
             app.message()

@@ -874,6 +874,7 @@ impl App {
             return None;
         }
         let room = images::Room::left(&draft.images);
+        self.image_at = draft.words.len();
         self.image_loads += 1;
         self.image_load = Some(self.image_loads);
         let what = match source {
@@ -891,13 +892,19 @@ impl App {
             return;
         }
         self.image_load = None;
-        self.attach_images(loading);
+        self.attach_images_at(loading, Some(self.image_at));
     }
 
     /// Puts images read from the clipboard or a pasted path into the new-intent box, each as
     /// the next `[Image #N]` tag at the end of the words, and says what went in and why
     /// anything didn't.
     pub fn attach_images(&mut self, got: images::Loading) {
+        self.attach_images_at(got, None);
+    }
+
+    /// As attach_images, with the tags at `at` in the words (where they ended when the read
+    /// began), or at the end when the words have since been cut shorter than that.
+    fn attach_images_at(&mut self, got: images::Loading, at: Option<usize>) {
         let busy = self.busy;
         let Mode::Compose { draft, .. } = &mut self.mode else {
             return;
@@ -905,6 +912,9 @@ impl App {
         if busy {
             return;
         }
+        let mut at = at
+            .filter(|&a| a <= draft.words.len() && draft.words.is_char_boundary(a))
+            .unwrap_or(draft.words.len());
         let mut said = vec![];
         for image in got.images {
             if draft.images.len() >= images::MAX_IMAGES {
@@ -918,20 +928,25 @@ impl App {
             }
             let n = draft.images.iter().map(|i| i.tag).max().unwrap_or(0) + 1;
             let tag = images::tag(n);
-            let gap = draft
-                .words
-                .chars()
-                .last()
-                .is_some_and(|c| !c.is_whitespace());
             if draft.words.len() + tag.len() + 2 > MAX_WORDS {
                 said.push("The box is full; there's no room for another image's tag.".into());
                 break;
             }
-            if gap {
-                draft.words.push(' ');
+            // A space either side keeps the tag apart from the words around it.
+            let mut piece = String::new();
+            if draft.words[..at]
+                .chars()
+                .last()
+                .is_some_and(|c| !c.is_whitespace())
+            {
+                piece.push(' ');
             }
-            draft.words.push_str(&tag);
-            draft.words.push(' ');
+            piece.push_str(&tag);
+            if !draft.words[at..].starts_with(char::is_whitespace) {
+                piece.push(' ');
+            }
+            draft.words.insert_str(at, &piece);
+            at += piece.len();
             said.push(format!(
                 "Attached {tag}: a {} image, {}.",
                 images::kind_name(image.media_type),

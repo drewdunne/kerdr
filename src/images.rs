@@ -133,6 +133,11 @@ pub fn from_files(paths: &[PathBuf], room: Room) -> Loading {
             break;
         }
         match from_file(path) {
+            // A file that grew after its size was checked is held to the room by what was read.
+            Ok(image) if used + image.bytes.len() > room.bytes => {
+                out.say(too_much());
+                break;
+            }
             Ok(image) => {
                 used += image.bytes.len();
                 out.images.push(image);
@@ -240,7 +245,9 @@ fn image_name(path: &Path) -> bool {
 
 /// The image files a paste names, when it is nothing but one or more paths to them (as a
 /// terminal pastes a dropped file: quoted, backslash-escaped, or as a file:// address).
-/// None when it is anything else, so it goes in as words.
+/// None when it is anything else, so it goes in as words. It reads the text only, never the
+/// disk, so a path on a mount that doesn't answer can't stop the board; reading the files
+/// says whether they're there.
 pub fn paths_in_paste(text: &str) -> Option<Vec<PathBuf>> {
     let text = text.trim();
     if text.is_empty() {
@@ -248,10 +255,8 @@ pub fn paths_in_paste(text: &str) -> Option<Vec<PathBuf>> {
     }
     let all = |words: Vec<String>| -> Option<Vec<PathBuf>> {
         let paths: Vec<PathBuf> = words.iter().filter_map(|w| local_path(w)).collect();
-        (!paths.is_empty()
-            && paths.len() == words.len()
-            && paths.iter().all(|p| image_name(p) && p.is_file()))
-        .then_some(paths)
+        (!paths.is_empty() && paths.len() == words.len() && paths.iter().all(|p| image_name(p)))
+            .then_some(paths)
     };
     shell_words(text).and_then(all).or_else(|| {
         // One path with spaces that nobody escaped.
@@ -795,9 +800,21 @@ mod tests {
             paths_in_paste(&format!("'{s}' '{p}'")),
             Some(vec![spaced.clone(), plain.clone()])
         );
-        // Words, a missing file, a file that isn't an image, a relative name: all stay words.
+        // Words, a file that isn't an image, a relative name: all stay words. A missing image
+        // is found when it's read, off the board's thread.
         assert_eq!(paths_in_paste(&format!("look at {p}")), None);
-        assert_eq!(paths_in_paste(&format!("{p}.missing.png")), None);
+        let missing = PathBuf::from(format!("{p}.missing.png"));
+        assert_eq!(
+            paths_in_paste(missing.to_str().unwrap()),
+            Some(vec![missing.clone()])
+        );
+        let got = from_files(&[missing], Room::left(&[]));
+        assert!(got.images.is_empty());
+        assert!(
+            got.why
+                .unwrap()
+                .starts_with("Couldn't read plain.PNG.missing.png")
+        );
         assert_eq!(paths_in_paste(text.to_str().unwrap()), None);
         assert_eq!(paths_in_paste("plain.png"), None);
         assert_eq!(paths_in_paste("   "), None);
