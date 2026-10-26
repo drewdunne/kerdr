@@ -1,6 +1,6 @@
 //! Account layouts, using the same Tokyo Night palette and panels as the board.
 use super::*;
-use crate::accounts::{Account, pause_glyph, provider_name};
+use crate::accounts::{Account, AccountCopy, pause_glyph, provider_name};
 use crate::app::account_controls::{AccountScreen, Row};
 
 fn account_color(a: &Account) -> ratatui::style::Color {
@@ -90,6 +90,70 @@ fn selected(text: impl Into<String>, yes: bool) -> Line<'static> {
     )
 }
 
+fn stored_color(c: &AccountCopy) -> ratatui::style::Color {
+    if c.stored { GREEN } else { RED }
+}
+fn works_color(c: &AccountCopy) -> ratatui::style::Color {
+    match c.works {
+        Some(true) => GREEN,
+        Some(false) => RED,
+        None => DIM,
+    }
+}
+
+/// Column widths for copy lines, shared by every account on the screen so they line up.
+#[derive(Clone, Copy)]
+struct CopyColumns {
+    label: usize,
+    works: usize,
+}
+
+impl CopyColumns {
+    fn of(accounts: &[Account]) -> Self {
+        let copies = || accounts.iter().flat_map(|a| a.shown_copies());
+        CopyColumns {
+            label: copies().map(|c| width(c.name())).max().unwrap_or(0).min(20) + 2,
+            works: copies().map(|c| width(&c.works_label())).max().unwrap_or(0) + 2,
+        }
+    }
+}
+
+fn padded(text: &str, w: usize) -> String {
+    let text = trunc(text, w.saturating_sub(2).max(1));
+    format!("{text}{}", " ".repeat(w.saturating_sub(width(&text))))
+}
+
+/// One copy of an account's sign-in: its label, stored or not, works or not (and when), its note.
+fn copy_line(c: &AccountCopy, yes: bool, cols: CopyColumns) -> Line<'static> {
+    let style = |color| {
+        if yes { bold(color).bg(SEL) } else { fg(color) }
+    };
+    // The label lines up with the usage numbers above it.
+    let line = Line::from(vec![
+        Span::styled(format!("{:<9}", if yes { "›" } else { "" }), style(FG)),
+        Span::styled(
+            padded(c.name(), cols.label),
+            style(if yes { FG } else { FG2 }),
+        ),
+        Span::styled(padded(c.stored_label(), 14), style(stored_color(c))),
+        Span::styled(padded(&c.works_label(), cols.works), style(works_color(c))),
+        Span::styled(c.note.clone().unwrap_or_default(), style(DIM)),
+    ]);
+    // Like every selected row, the highlight fills the row's width.
+    if yes {
+        line.style(bold(FG).bg(SEL))
+    } else {
+        line
+    }
+}
+
+fn copy_label(app: &App, machine: usize, code: &str, copy: &str) -> String {
+    app.account_feed(machine)
+        .and_then(|f| f.accounts.iter().find(|a| a.code == code))
+        .and_then(|a| a.copy(copy))
+        .map_or_else(|| copy.to_string(), |c| c.name().to_string())
+}
+
 fn modal(
     f: &mut Frame,
     area: Rect,
@@ -140,12 +204,31 @@ fn modal(
 
 pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen) {
     match screen {
-        AccountScreen::PasteToken { code, token, .. } => modal(
+        AccountScreen::PasteToken {
+            machine,
+            code,
+            copy,
+            token,
+            ..
+        } => modal(
             f,
             area,
-            &format!("Paste a token for {code}"),
+            &match copy {
+                Some(copy) => format!(
+                    "Paste a token for {code}: {}",
+                    copy_label(app, *machine, code, copy)
+                ),
+                None => format!("Paste a token for {code}"),
+            },
             vec![
-                line("Only this machine receives it.", DIM),
+                line(
+                    if copy.is_some() {
+                        "Only this machine and this copy receive it."
+                    } else {
+                        "Only this machine receives it."
+                    },
+                    DIM,
+                ),
                 Line::raw(""),
                 selected(
                     format!("{}▏", "•".repeat(token.0.chars().count().min(48))),
@@ -361,10 +444,27 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             CYAN,
         ),
         AccountScreen::Signin(s) => {
-            let mut lines = vec![
-                line("Each machine makes its own sign-in.", DIM),
-                Line::raw(""),
-            ];
+            let done = s.current >= s.machines.len();
+            let mut lines = match &s.copy {
+                // Esc only undoes a sign-in that hasn't finished; once done, the copy has changed.
+                Some((_, label)) => wrapped(
+                    &if done {
+                        format!(
+                            "The {label} copy is signed in. The other copies stayed as they were."
+                        )
+                    } else {
+                        format!(
+                            "Only the {label} copy changes. The other copies stay as they are, and esc before it finishes leaves this one as it was."
+                        )
+                    },
+                    68,
+                    fg(DIM),
+                    None,
+                ),
+                None => vec![line("Each machine makes its own sign-in.", DIM)],
+            };
+            lines.push(Line::raw(""));
+            let top = lines.len();
             for (i, &mi) in s.machines.iter().enumerate() {
                 lines.push(line(
                     format!(
@@ -419,19 +519,27 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                     ));
                 }
             }
+            let title = match (&s.copy, s.machines.first()) {
+                (Some((_, label)), Some(&mi)) => {
+                    format!("Sign {} in on {}: {label}", s.code, app.machines[mi].name())
+                }
+                _ => format!("Sign {} in on each machine", s.code),
+            };
             modal(
                 f,
                 area,
-                &format!("Sign {} in on each machine", s.code),
+                &title,
                 lines,
-                if s.current >= s.machines.len() {
+                if done && s.copy.is_some() {
+                    "Signed in.    esc accounts"
+                } else if done {
                     "All selected machines signed in.    esc accounts"
                 } else if s.failed {
                     "r try again    p paste token    esc later"
                 } else {
                     "tab code / buttons    ⏎ send code    p token    esc stop"
                 },
-                s.current + 2,
+                s.current + top,
                 if s.failed { RED } else { CYAN },
             );
         }
@@ -474,6 +582,31 @@ fn table_row(mut row: Line<'static>, w: usize) -> Line<'static> {
     row
 }
 
+fn account_line(a: &Account, yes: bool) -> Line<'static> {
+    selected(
+        format!(
+            "{:<6} {:<14} {} · {}",
+            a.code,
+            a.name,
+            provider_name(&a.provider),
+            if a.kind == "login" {
+                "saved sign-in"
+            } else if a.kind == "token" {
+                "token per machine"
+            } else {
+                &a.kind
+            }
+        ),
+        yes,
+    )
+}
+fn status_line(a: &Account) -> Line<'static> {
+    line(
+        format!("         {}  {}", a.numbers(), a.status_label()),
+        account_color(a),
+    )
+}
+
 fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usize, model: usize) {
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(fg(FG).bg(BG)), area);
@@ -507,6 +640,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
     let mut lines = vec![heading("ACCOUNTS"), table_edge(tw, true)];
     let mut owner_section = false;
     let mut selected_line = 0;
+    let cols = CopyColumns::of(&feed.accounts);
     for (i, row) in rows.iter().enumerate() {
         if matches!(row, Row::Owner(_)) && !owner_section {
             lines.extend([
@@ -523,34 +657,24 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
             selected_line = lines.len();
         }
         match row {
+            Row::Copy(code, id) => {
+                if let Some(a) = feed.accounts.iter().find(|a| &a.code == code)
+                    && let Some(c) = a.copy(id)
+                {
+                    if a.shown_copies().first().map(|c| &c.id) == Some(id) {
+                        lines.push(table_row(account_line(a, false), tw));
+                        lines.push(table_row(status_line(a), tw));
+                    }
+                    if i == sel {
+                        selected_line = lines.len();
+                    }
+                    lines.push(table_row(copy_line(c, i == sel, cols), tw));
+                }
+            }
             Row::Account(code) => {
                 if let Some(a) = feed.accounts.iter().find(|a| &a.code == code) {
-                    lines.push(table_row(
-                        selected(
-                            format!(
-                                "{:<6} {:<14} {} · {}",
-                                a.code,
-                                a.name,
-                                provider_name(&a.provider),
-                                if a.kind == "login" {
-                                    "saved sign-in"
-                                } else if a.kind == "token" {
-                                    "token per machine"
-                                } else {
-                                    &a.kind
-                                }
-                            ),
-                            i == sel,
-                        ),
-                        tw,
-                    ));
-                    lines.push(table_row(
-                        line(
-                            format!("         {}  {}", a.numbers(), a.status_label()),
-                            account_color(a),
-                        ),
-                        tw,
-                    ));
+                    lines.push(table_row(account_line(a, i == sel), tw));
+                    lines.push(table_row(status_line(a), tw));
                 }
             }
             Row::Owner(id) => {
@@ -642,13 +766,38 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                     detail.extend(wrapped("⏎ first · h l choose model · J K reorder · a add · d drop · ⌫ follow parent · S edit list",w,fg(DIM),None));
                 }
             }
-            Some(Row::Account(code)) => {
+            Some(row @ (Row::Account(code) | Row::Copy(code, _))) => {
                 if let Some(a) = feed.accounts.iter().find(|a| &a.code == code) {
                     detail.extend([
                         heading(format!("{} · {}", a.code, a.name)),
                         line(provider_name(&a.provider), DIM),
                         Line::raw(""),
                     ]);
+                    let copy = match row {
+                        Row::Copy(_, id) => a.copy(id),
+                        _ => None,
+                    };
+                    if let Some(c) = copy {
+                        detail.extend(wrapped(
+                            &format!("{} on {name}", c.name()),
+                            w,
+                            bold(FG),
+                            None,
+                        ));
+                        detail.push(line(c.stored_label(), stored_color(c)));
+                        detail.push(line(c.works_label(), works_color(c)));
+                        if let Some(note) = c.note.as_deref().filter(|n| !n.trim().is_empty()) {
+                            detail.extend(wrapped(note, w, fg(DIM), None));
+                        }
+                        detail.push(Line::raw(""));
+                        detail.extend(wrapped(
+                            "Signing in this copy leaves the other copies as they are.",
+                            w,
+                            fg(FG2),
+                            None,
+                        ));
+                        detail.push(Line::raw(""));
+                    }
                     for m in app.machines.iter().filter(|m| m.is_shown()) {
                         if let Some(a) = m
                             .feed
@@ -669,7 +818,16 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                         }
                     }
                     detail.push(Line::raw(""));
-                    detail.extend(wrapped("⏎ sign in on this machine · e rename · t test · x remove · tab another machine",w,fg(DIM),None));
+                    detail.extend(wrapped(
+                        if copy.is_some() {
+                            "⏎ sign in this copy · t test it · e rename · x remove · tab another machine"
+                        } else {
+                            "⏎ sign in on this machine · e rename · t test · x remove · tab another machine"
+                        },
+                        w,
+                        fg(DIM),
+                        None,
+                    ));
                 }
             }
             _ => {}

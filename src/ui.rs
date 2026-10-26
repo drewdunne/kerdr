@@ -3805,6 +3805,106 @@ mod tests {
         }
     }
 
+    #[test]
+    fn every_copy_state_draws_at_every_size_and_says_what_it_is() {
+        let mut a = demo(false);
+        let copies = crate::demo::account_screens(&a)[1].clone();
+        a.mode = copies;
+        let small = rendered(&a, 80, 24);
+        for words in [
+            "Your agents",
+            "✓ stored",
+            "Tenants",
+            "✕ not stored",
+            "– not checked",
+        ] {
+            assert!(small.contains(words), "{words} missing at 80×24");
+        }
+        let large = rendered(&a, 176, 44);
+        for words in [
+            "held by root",
+            "✓ works · ",
+            "Tenants on build-box",
+            "⏎ sign in this copy",
+        ] {
+            assert!(large.contains(words), "{words} missing at 176×44");
+        }
+        let states = [
+            serde_json::json!({"id":"agents","label":"Your agents","stored":true,"works":false,"checked":"2026-10-21T17:40:00-05:00","note":"refused by Claude"}),
+            serde_json::json!({"id":"tenants","label":"A rather long label for a copy","stored":true,"works":null,"checked":null,"note":null}),
+            serde_json::json!({"id":"third","label":null,"stored":false,"works":true,"checked":"not a time","note":""}),
+        ];
+        let ark = a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .iter_mut()
+            .find(|x| x.code == "ARK")
+            .unwrap();
+        ark.copies = serde_json::from_value(serde_json::Value::from(states.to_vec())).unwrap();
+        let screens = crate::demo::account_screens(&a);
+        for sel in 0..a.account_rows(1).len() {
+            for (w, h) in [
+                (1, 1),
+                (10, 3),
+                (30, 8),
+                (60, 15),
+                (80, 24),
+                (120, 40),
+                (200, 60),
+            ] {
+                a.width = w;
+                a.mode = screens[1].clone();
+                if let Mode::Accounts {
+                    screen: crate::app::account_controls::AccountScreen::List { sel: s, .. },
+                    ..
+                } = &mut a.mode
+                {
+                    *s = sel;
+                }
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| draw(f, &a)).unwrap();
+            }
+        }
+        a.mode = screens[1].clone();
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("✕ doesn't work · "), "{text}");
+        assert!(text.contains("refused by Claude"));
+        assert!(text.contains("A rather long label…"));
+        assert!(text.contains("third"), "an unlabelled copy shows its id");
+        let signin = crate::demo::account_screens(&a)
+            .into_iter()
+            .find(|m| {
+                matches!(m, Mode::Accounts {
+                    screen: crate::app::account_controls::AccountScreen::Signin(s), ..
+                } if s.copy.is_some())
+            })
+            .unwrap();
+        a.mode = signin;
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("Sign ARK in on build-box: Tenants"), "{text}");
+        assert!(text.contains("Only the Tenants copy changes."));
+        assert!(text.contains("esc before it finishes leaves this one as it was"));
+        // Once it has finished, Esc only closes: the dialog no longer says it would undo anything.
+        if let Mode::Accounts {
+            screen: crate::app::account_controls::AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.current = 1;
+            s.ticket = None;
+        }
+        for (w, h) in [(1, 1), (30, 8), (80, 24), (176, 44)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| draw(f, &a)).unwrap();
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("The Tenants copy is signed in."), "{text}");
+        assert!(text.contains("Signed in.    esc accounts"));
+        assert!(!text.contains("leaves this one as it was"));
+    }
+
     fn rendered(a: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, a)).unwrap();

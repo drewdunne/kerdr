@@ -613,6 +613,17 @@ pub fn machines(away: bool) -> Vec<MachineState> {
             }
         }
     }
+    // The build box also holds the tenants' copy of ARK: one copy works, the other is missing.
+    if let Some(ark) = build_box
+        .feed
+        .as_mut()
+        .and_then(|f| f.accounts.iter_mut().find(|a| a.code == "ARK"))
+    {
+        ark.copies = serde_json::from_value(serde_json::json!([
+            {"id":"agents","label":"Your agents","stored":true,"works":true,"checked":"2026-10-21T17:40:00-05:00","note":null},
+            {"id":"tenants","label":"Tenants","stored":false,"works":null,"checked":null,"note":"held by root"}
+        ])).unwrap();
+    }
     vec![laptop, build_box, gpu, mac]
 }
 
@@ -652,11 +663,28 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
         },
         back: Box::new(Mode::Board),
     };
-    let mut result=vec![list.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now()},back:Box::new(move_screen)}];
+    let copies_rows = app.account_rows(1);
+    let tenants = copies_rows
+        .iter()
+        .position(
+            |r| matches!(r, crate::app::account_controls::Row::Copy(_, id) if id == "tenants"),
+        )
+        .unwrap_or(0);
+    let copies = Mode::Accounts {
+        screen: S::List {
+            machine: 1,
+            rows: copies_rows,
+            sel: tenants,
+            model: 0,
+        },
+        back: Box::new(Mode::Board),
+    };
+    let mut result=vec![list.clone(),copies.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now()},back:Box::new(move_screen)}];
     for screen in [
         S::PasteToken {
             machine: 0,
             code: "ARK".into(),
+            copy: None,
             token: Default::default(),
             submit: false,
         },
@@ -689,6 +717,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             deferred: None,
             restart: false,
             code: "ARK".into(),
+            copy: None,
             machines: vec![0, 1],
             current: 1,
             ticket: Some("demo-ticket".into()),
@@ -704,6 +733,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             deferred: None,
             restart: false,
             code: "KBZ".into(),
+            copy: None,
             machines: vec![1],
             current: 0,
             ticket: Some("demo-ticket".into()),
@@ -719,6 +749,37 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
         result.push(Mode::Accounts {
             screen,
             back: Box::new(list.clone()),
+        });
+    }
+    // Signing in one copy, and pasting a token for it.
+    for screen in [
+        S::Signin(Signin {
+            deferred: None,
+            restart: false,
+            code: "ARK".into(),
+            copy: Some(("tenants".into(), "Tenants".into())),
+            machines: vec![1],
+            current: 0,
+            ticket: Some("demo-ticket".into()),
+            url: Some("https://example.com/signin".into()),
+            needs_code: true,
+            page_code: String::new(),
+            editing: false,
+            poll_at: std::time::Instant::now(),
+            failed: false,
+            message: "Authorize in the browser window that just opened.".into(),
+        }),
+        S::PasteToken {
+            machine: 1,
+            code: "ARK".into(),
+            copy: Some("tenants".into()),
+            token: Default::default(),
+            submit: false,
+        },
+    ] {
+        result.push(Mode::Accounts {
+            screen,
+            back: Box::new(copies.clone()),
         });
     }
     result

@@ -278,6 +278,21 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
 }
 ```
 
+An account may also list `copies`: the separate stored sign-ins of it on this machine, in the
+order to show them, such as your agents' copy and the one root holds for tenants:
+
+```json
+"copies": [{"id":"agents","label":"Your agents","stored":true,"works":true,
+             "checked":"2026-10-26T17:40:00-05:00","note":null},
+           {"id":"tenants","label":"Tenants","stored":false,"works":null,"checked":null,
+             "note":"held by root"}]
+```
+
+`works` is `true`, `false`, or `null` (not tested); `checked` is when it was last tested; a
+missing `label` shows the `id`. With two or more copies the accounts screen shows one line per
+copy under the account; with none or one it is unchanged. The account's own `status` stays the
+copy that launches use. Copies change nothing on the board, the usage line or card badges.
+
 Account status is `ready`, `out`, `sign_in`, or `missing`. Usage values are percentages;
 missing or null usage displays as unknown. Providers, kinds, and runner names are strings
 so other programs and local endpoints can be represented. Creating accounts currently uses
@@ -306,7 +321,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` | adds, or renames the existing code |
-| `account-test` | `code` | status and message |
+| `account-test` | `code`, optional `copy` | status and message |
 | `account-remove` | `code` | removes after Kerdr’s local confirmation |
 
 The `S` tick runs `account-move-waiting` on configured feed machines only after the list was
@@ -336,6 +351,12 @@ move finishes. An unavailable target answers `ok: false` before stopping anythin
  "url":"https://example.com/authorize","needs_code":true}
 ```
 
+On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK","step":"start","copy":"tenants"}`.
+Kerdr sends the line's `id` for every copy, the first included; a request without `copy` means
+the account's default copy, as before. The ticket `start` returns belongs to that copy, so poll,
+finish and cancel need nothing new. Signing in one copy must never change another, and
+cancelling leaves the copy as it was. `account-test` takes `copy` the same way.
+
 Continue on that same machine:
 
 ```json
@@ -346,13 +367,14 @@ Continue on that same machine:
 
 Responses have `status: "waiting"`, `"done"`, or `"failed"`; cancel answers `"cancelled"` with
 `ok: true`, including an already finished or unknown valid ticket. A new start cancels an
-unfinished sign-in for that code. A failed finish may report an account identity mismatch,
+unfinished sign-in for that code and copy on that machine only; another copy's sign-in carries on. A failed finish may report an account identity mismatch,
 which Kerdr shows without advancing to another machine. Kerdr polls every two seconds
 while the dialog remains open, pauses while a page code is being entered, and stops on unknown results.
 A retry cancels any known previous ticket before starting another. Escape cancels a known ticket;
 a ticket returned after Escape is also cancelled, without opening a browser. After `done`,
 adding an account proceeds to the next selected machine with a **new** start and ticket.
-A `paste` step instead sends `code` and a `token` string, and answers `done` or a refusal.
+A `paste` step instead sends `code` and a `token` string (and `copy`, when pasting for one),
+and answers `done` or a refusal; a backend refuses a paste for a copy it can't take one for.
 The token never enters the result queue or saved settings. The backend must not echo it and
 must own its secure storage. Kerdr also removes submitted credential text from adapter output.
 Adapter output is captured in temporary files before parsing, so backends must never echo credentials.

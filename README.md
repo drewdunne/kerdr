@@ -199,6 +199,14 @@ a masked token field instead. Tokens are sent only to that machine, removed from
 result state on submission, and never written to Kerdr’s logs or settings. Escape cancels
 the current browser sign-in. No sign-in or action runs from the demo.
 
+Where a machine keeps more than one copy of an account's sign-in (your agents' and its
+tenants', say), each copy gets a line under the account: whether it is stored, whether it
+works (and when that was checked), and a note such as "held by root". `j k` move between the
+copy lines, Enter signs in the selected copy, whether it is missing, expired or wrong, and `t`
+tests it. The sign-in names its copy, and the other copies stay as they are.
+
+![One line per copy of an account's sign-in](docs/screenshots/account-copies.png)
+
 Windows uses a red ✕ for usage waits to avoid emoji rendering. Other terminals use U+23F8
 with its text-presentation selector; `KERDR_PAUSE_GLYPH=x` selects the same fallback.
 Account features work through the optional [feed and action contract](docs/feed.md#accounts).

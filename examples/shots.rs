@@ -229,6 +229,7 @@ fn main() {
 
     let names = [
         "accounts",
+        "account-copies",
         "move-account",
         "move-confirmation",
         "paste-token",
@@ -238,6 +239,8 @@ fn main() {
         "rename-account",
         "sign-in",
         "sign-in-again",
+        "sign-in-copy",
+        "paste-token-copy",
     ];
     let mut account_app = app(false);
     let screens = demo::account_screens(&account_app);
