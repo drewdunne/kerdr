@@ -583,7 +583,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             workspace_label: Some(label),
             tab_id: None,
             priority: Priority::Normal,
-            background: cfg.board.unlimited.iter().any(|u| u == &w.session),
+            background: cfg.board.is_unlimited(&w.session),
             cached_at: m.cached_at(),
             updated: None,
             stale_days: None,
@@ -629,7 +629,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         machine_order.push(name.clone());
         let Some(data) = &m.data else { continue };
         for info in data.sessions.iter().filter(|s| cfg.board.wants(&s.name)) {
-            let unlimited = cfg.board.unlimited.iter().any(|u| u == &info.name);
+            let unlimited = cfg.board.is_unlimited(&info.name);
             let feed_slots = m.feed.as_ref().and_then(|f| f.sessions.get(&info.name));
             let used_by_agents = all_ws
                 .iter()
@@ -987,6 +987,38 @@ mod tests {
                 session: Some("default".into()),
             }),
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn tenant_background_sessions_have_unlimited_slots_and_background_cards() {
+        let mut cfg = Config::default();
+        cfg.board.unlimited = vec!["*-bg".into(), "background".into()];
+        let sessions = ["pick4me-bg", "arknet-bg", "pick4me"]
+            .into_iter()
+            .map(|name| {
+                (
+                    name,
+                    Snapshot {
+                        workspaces: vec![ws("w1", name)],
+                        agents: vec![agent("w1", "working")],
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let board = build(&[live(machine("laptop", true), sessions, None)], &cfg);
+        for name in ["pick4me-bg", "arknet-bg", "pick4me"] {
+            let background = name.ends_with("-bg");
+            let session = board.sessions.iter().find(|s| s.session == name).unwrap();
+            assert_eq!(session.slots.limit, if background { None } else { Some(3) });
+            assert_eq!(session.slots.used, 1);
+            let card = board
+                .cards
+                .iter()
+                .find(|c| c.session.as_deref() == Some(name))
+                .unwrap();
+            assert_eq!(card.background, background);
         }
     }
 

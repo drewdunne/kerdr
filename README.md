@@ -319,7 +319,7 @@ every = 15
 
 [board]
 slots = 3                   # workspaces with an agent per session before it's full
-unlimited = ["background"]  # sessions with no limit
+unlimited = ["*-bg", "background"] # sessions with no limit; * matches any text
 skip = []                   # sessions never shown
 only = []                   # show only these sessions
 
@@ -332,6 +332,11 @@ name = "laptop"
 ssh = "laptop"
 ```
 
+`[board] unlimited` matches whole session names, with `*` matching zero or more characters
+anywhere in the name. For example, `"*-bg"` includes `pick4me-bg` and `arknet-bg`, but not
+`pick4me`; `"background"` remains an exact match. Other characters are literal, and matching
+is case-sensitive. A feed's explicit slot counts and limits still take precedence.
+
 The same file works on every machine: the machine whose hostname matches a `name` is "this
 machine", and Kerdr reaches the others over SSH. If you use the herdr session picker for
 Omarchy, Kerdr also reads its list of machines (`~/.config/herdr-sessions/machines`); set
@@ -342,7 +347,7 @@ you, the machine shows *needs you*, and `M` then `Enter` lets you answer it.
 
 ## Status
 
-Kerdr is new (0.5). Reading and navigation work without an action adapter. Opting into
+Kerdr is new (0.7). Reading and navigation work without an action adapter. Opting into
 `[actions] command` enables record changes, dispatch and reopening through your own adapter, on
 the record's home machine. Commands run in the background and show their result; an unknown result
 is never retried automatically. In herdr, Kerdr focuses the workspace you jump into, shows a

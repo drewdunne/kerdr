@@ -23,7 +23,7 @@ pub struct Config {
 pub struct BoardConfig {
     /// Workspaces with an agent a session holds before Kerdr calls it full.
     pub slots: u32,
-    /// Sessions with no limit, such as a lane for background agents.
+    /// Sessions with no limit; * matches any text in a session name.
     pub unlimited: Vec<String>,
     /// Show only these sessions (empty: all of them).
     pub only: Vec<String>,
@@ -32,6 +32,28 @@ pub struct BoardConfig {
 }
 
 impl BoardConfig {
+    pub fn is_unlimited(&self, session: &str) -> bool {
+        self.unlimited.iter().any(|pattern| {
+            let Some((prefix, rest)) = pattern.split_once('*') else {
+                return pattern == session;
+            };
+            let Some(mut remaining) = session.strip_prefix(prefix) else {
+                return false;
+            };
+            let mut parts = rest.split('*').peekable();
+            while let Some(part) = parts.next() {
+                if parts.peek().is_none() {
+                    return remaining.ends_with(part);
+                }
+                let Some((_, after)) = remaining.split_once(part) else {
+                    return false;
+                };
+                remaining = after;
+            }
+            true
+        })
+    }
+
     pub fn wants(&self, session: &str) -> bool {
         (self.only.is_empty() || self.only.iter().any(|s| s == session))
             && !self.skip.iter().any(|s| s == session)
@@ -310,6 +332,36 @@ mod tests {
         assert_eq!(machines.len(), 1);
         assert!(machines[0].is_local());
         assert_eq!(machines[0].name, "laptop");
+    }
+
+    #[test]
+    fn unlimited_patterns_match_the_whole_session_with_stars_anywhere() {
+        let c = cfg(
+            "[board]\nunlimited = ['*-bg', 'background', 'jobs-*-night*', 'a**b', 'literal?']\n",
+        );
+        for name in [
+            "pick4me-bg",
+            "arknet-bg",
+            "background",
+            "jobs-shop-nightly",
+            "jobs--night",
+            "ab",
+            "a猫b",
+            "literal?",
+        ] {
+            assert!(c.board.is_unlimited(name), "{name}");
+        }
+        for name in [
+            "pick4me",
+            "arknet",
+            "pick4me-bg-extra",
+            "mybackground",
+            "jobs-shop-day",
+            "jobs-night",
+            "literalX",
+        ] {
+            assert!(!c.board.is_unlimited(name), "{name}");
+        }
     }
 
     #[test]
