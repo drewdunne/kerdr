@@ -272,6 +272,30 @@ mod tests {
                 assert_eq!(response.ticket.as_deref(), Some("fixture-ticket"));
             }
         }
+        // A copy reaches the adapter: its start gets its own ticket, its test its own answer,
+        // and a paste meant for it is refused rather than landing in another copy.
+        let copy = |request: Value| {
+            let mut request = request;
+            request["copy"] = json!("tenants");
+            run(&machine(), &command, &request).unwrap()
+        };
+        let start = copy(json!({"action":"account-signin","step":"start","code":"EXAMPLE"}));
+        assert!(start.ok && start.needs_code);
+        assert_eq!(start.ticket.as_deref(), Some("fixture-tenants-ticket"));
+        let test = copy(json!({"action":"account-test","code":"EXAMPLE"}));
+        assert!(test.ok);
+        assert_eq!(test.message, "The tenants copy works");
+        let paste =
+            copy(json!({"action":"account-signin","step":"paste","code":"EXAMPLE","token":"t"}));
+        assert!(!paste.ok);
+        assert_eq!(paste.status.as_deref(), Some("failed"));
+        let agents = run(
+            &machine(),
+            &command,
+            &json!({"action":"account-signin","step":"start","code":"EXAMPLE","copy":"agents"}),
+        )
+        .unwrap();
+        assert_eq!(agents.ticket.as_deref(), Some("fixture-ticket"));
     }
 
     #[test]

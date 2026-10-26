@@ -8,7 +8,18 @@ use serde_json::{Value, json};
 #[derive(Clone, Debug, PartialEq)]
 pub enum Row {
     Account(String),
+    /// One copy of an account's sign-in on this machine: its code, then the copy's id.
+    Copy(String, String),
     Owner(String),
+}
+
+impl Row {
+    fn code(&self) -> Option<&str> {
+        match self {
+            Row::Account(code) | Row::Copy(code, _) => Some(code),
+            Row::Owner(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -24,6 +35,8 @@ pub struct Signin {
     pub deferred: Option<KeyCode>,
     pub restart: bool,
     pub code: String,
+    /// The copy being signed in (its id and label), when the account has copies.
+    pub copy: Option<(String, String)>,
     pub machines: Vec<usize>,
     pub current: usize,
     pub ticket: Option<String>,
@@ -34,6 +47,23 @@ pub struct Signin {
     pub poll_at: Instant,
     pub failed: bool,
     pub message: String,
+}
+
+/// Names the copy a request is for; no copy means the account's default copy, as before.
+fn for_copy(mut request: Value, copy: Option<&str>) -> Value {
+    if let Some(copy) = copy {
+        request["copy"] = json!(copy);
+    }
+    request
+}
+
+impl Signin {
+    fn start(&self) -> Value {
+        for_copy(
+            json!({"action":"account-signin","code":self.code,"step":"start"}),
+            self.copy.as_ref().map(|(id, _)| id.as_str()),
+        )
+    }
 }
 
 /// A typed credential is masked and excluded from Debug output.
@@ -50,6 +80,7 @@ pub enum AccountScreen {
     PasteToken {
         machine: usize,
         code: String,
+        copy: Option<String>,
         token: Secret,
         submit: bool,
     },
@@ -205,11 +236,20 @@ impl App {
         let Some(feed) = self.account_feed(machine) else {
             return vec![];
         };
-        let mut rows: Vec<Row> = feed
-            .accounts
-            .iter()
-            .map(|a| Row::Account(a.code.clone()))
-            .collect();
+        let mut rows: Vec<Row> = Vec::new();
+        for a in &feed.accounts {
+            let copies = a.shown_copies();
+            if copies.is_empty() {
+                rows.push(Row::Account(a.code.clone()));
+            } else {
+                // The copy lines are the stops: each one signs in and tests on its own.
+                rows.extend(
+                    copies
+                        .iter()
+                        .map(|c| Row::Copy(a.code.clone(), c.id.clone())),
+                );
+            }
+        }
         for o in feed.owners.iter().filter(|o| o.parent.is_none()) {
             rows.push(Row::Owner(o.id.clone()));
             rows.extend(
@@ -244,7 +284,12 @@ impl App {
                     let selected = rows.get(*sel).cloned();
                     *rows = app.account_rows(*machine);
                     *sel = selected
-                        .and_then(|r| rows.iter().position(|x| x == &r))
+                        .and_then(|r| {
+                            rows.iter().position(|x| x == &r).or_else(|| {
+                                let code = r.code()?;
+                                rows.iter().position(|x| x.code() == Some(code))
+                            })
+                        })
                         .unwrap_or((*sel).min(rows.len().saturating_sub(1)));
                 }
                 refresh(app, back);
@@ -322,14 +367,20 @@ impl App {
         Action::Mutate { machine, request }
     }
 
-    fn begin_signin(&mut self, code: String, machines: Vec<usize>) -> Action {
+    fn begin_signin(
+        &mut self,
+        code: String,
+        copy: Option<(String, String)>,
+        machines: Vec<usize>,
+    ) -> Action {
         let Some(&machine) = machines.first() else {
             return Action::None;
         };
-        self.push_account_screen(AccountScreen::Signin(Signin {
+        let signin = Signin {
             deferred: None,
             restart: false,
-            code: code.clone(),
+            code,
+            copy,
             machines,
             current: 0,
             ticket: None,
@@ -340,11 +391,10 @@ impl App {
             poll_at: Instant::now() + Duration::from_secs(2),
             failed: false,
             message: "Starting sign-in…".into(),
-        }));
-        let action = self.send_account(
-            machine,
-            json!({"action":"account-signin","code":code,"step":"start"}),
-        );
+        };
+        let request = signin.start();
+        self.push_account_screen(AccountScreen::Signin(signin));
+        let action = self.send_account(machine, request);
         if action == Action::None
             && let Mode::Accounts {
                 screen: AccountScreen::Signin(s),
@@ -491,6 +541,7 @@ impl App {
             AccountScreen::PasteToken {
                 machine,
                 code,
+                copy,
                 token,
                 ..
             } => match key.code {
@@ -503,7 +554,10 @@ impl App {
                     token.0.push(c)
                 }
                 KeyCode::Enter if !token.0.trim().is_empty() => {
-                    let request = json!({"action":"account-signin","code":code,"step":"paste","token":token.0.trim()});
+                    let request = for_copy(
+                        json!({"action":"account-signin","code":code,"step":"paste","token":token.0.trim()}),
+                        copy.as_deref(),
+                    );
                     token.0.clear();
                     let machine = *machine;
                     self.mode = *back;
@@ -578,21 +632,32 @@ impl App {
                         return Action::None;
                     }
                     _ => {
+                        let copy_id = match &row {
+                            Some(Row::Copy(_, id)) => Some(id.clone()),
+                            _ => None,
+                        };
                         match row {
-                            Some(Row::Account(code)) => {
+                            Some(Row::Account(code) | Row::Copy(code, _)) => {
                                 let a = self
                                     .account_feed(*machine)
                                     .and_then(|f| f.accounts.iter().find(|a| a.code == code))
                                     .cloned();
+                                let copy = copy_id.and_then(|id| {
+                                    let c = a.as_ref()?.copy(&id)?;
+                                    Some((c.id.clone(), c.name().to_string()))
+                                });
                                 if let Some(a) = a {
                                     match key.code {
                                         KeyCode::Enter => {
-                                            return self.begin_signin(code, vec![*machine]);
+                                            return self.begin_signin(code, copy, vec![*machine]);
                                         }
                                         KeyCode::Char('t') => {
                                             request = Some((
                                                 *machine,
-                                                json!({"action":"account-test","code":code}),
+                                                for_copy(
+                                                    json!({"action":"account-test","code":code}),
+                                                    copy.as_ref().map(|(id, _)| id.as_str()),
+                                                ),
                                             ))
                                         }
                                         KeyCode::Char('e') => {
@@ -901,10 +966,12 @@ impl App {
                         s.message =
                             "Browser sign-in cancelled. Paste a token, or r to start again.".into();
                         let code = s.code.clone();
+                        let copy = s.copy.as_ref().map(|(id, _)| id.clone());
                         self.mode = Mode::Accounts { screen, back };
                         self.push_account_screen(AccountScreen::PasteToken {
                             machine,
                             code,
+                            copy,
                             token: Secret::default(),
                             submit: false,
                         });
@@ -929,10 +996,7 @@ impl App {
                                 json!({"action":"account-signin","step":"cancel","ticket":ticket}),
                             ));
                         } else {
-                            request = Some((
-                                machine,
-                                json!({"action":"account-signin","code":s.code,"step":"start"}),
-                            ));
+                            request = Some((machine, s.start()));
                         }
                     }
                     KeyCode::Backspace if s.editing => {
@@ -1091,7 +1155,7 @@ impl App {
         while let Some((mi, request)) = self.account_queue.pop_front() {
             if request["action"] == "account-signin"
                 && request["step"] == "start"
-                && !matches!(&self.mode,Mode::Accounts{screen:AccountScreen::Signin(s),..} if s.machines.get(s.current)==Some(&mi) && request["code"]==s.code)
+                && !matches!(&self.mode,Mode::Accounts{screen:AccountScreen::Signin(s),..} if s.machines.get(s.current)==Some(&mi) && request==s.start())
             {
                 continue;
             }
@@ -1207,10 +1271,7 @@ impl App {
                     if response.ok {
                         s.ticket = None;
                         s.failed = false;
-                        self.account_queue.push_back((
-                            machine,
-                            json!({"action":"account-signin","code":s.code,"step":"start"}),
-                        ));
+                        self.account_queue.push_back((machine, s.start()));
                     } else {
                         s.failed = true;
                         s.message = format!("Could not cancel sign-in: {}", response.message);
@@ -1269,10 +1330,7 @@ impl App {
                     s.editing = false;
                     s.needs_code = false;
                     if let Some(&mi) = s.machines.get(s.current) {
-                        self.account_queue.push_back((
-                            mi,
-                            json!({"action":"account-signin","code":s.code,"step":"start"}),
-                        ));
+                        self.account_queue.push_back((mi, s.start()));
                     }
                 } else if request["step"] == "start" {
                     let valid = response
@@ -1353,7 +1411,7 @@ impl App {
                     if let Mode::Accounts { back, .. } = self.mode.clone() {
                         self.mode = *back;
                     }
-                    let action = self.begin_signin(code, selected);
+                    let action = self.begin_signin(code, None, selected);
                     if let Action::Mutate { machine, request } = action {
                         self.account_queue.push_back((machine, request));
                     }
@@ -1411,6 +1469,7 @@ fn same_screen(a: &AccountScreen, b: &AccountScreen) -> bool {
     match (a, b) {
         (AccountScreen::Signin(a), AccountScreen::Signin(b)) => {
             a.code == b.code
+                && a.copy == b.copy
                 && a.machines == b.machines
                 && a.current == b.current
                 && a.ticket == b.ticket
@@ -1881,7 +1940,7 @@ mod tests {
     #[test]
     fn sequence_uses_a_new_ticket_on_each_machine_and_escape_cancels_queued_start() {
         let mut a = app();
-        let action = a.begin_signin("ARK".into(), vec![0, 1]);
+        let action = a.begin_signin("ARK".into(), None, vec![0, 1]);
         complete(&mut a, action, started());
         let action = key(&mut a, KeyCode::Enter);
         complete(
@@ -1891,7 +1950,7 @@ mod tests {
         );
         key(&mut a, KeyCode::Esc);
         assert_eq!(a.account_tick(), Action::None);
-        let action = a.begin_signin("ARK".into(), vec![0, 1]);
+        let action = a.begin_signin("ARK".into(), None, vec![0, 1]);
         complete(&mut a, action, started());
         let action = key(&mut a, KeyCode::Enter);
         complete(
@@ -2106,5 +2165,196 @@ mod tests {
         a.saved_models(0, &json!({"owner":"studio","models":["KBZ"]}));
         assert_eq!(a.account_feed(0).unwrap().owners[0].models, ["KBZ"]);
         assert_eq!(a.account_feed(1).unwrap().owners, other);
+    }
+
+    fn open_copies(a: &mut App, copy: &str) {
+        let rows = a.account_rows(1);
+        let sel = rows
+            .iter()
+            .position(|r| *r == Row::Copy("ARK".into(), copy.into()))
+            .unwrap();
+        a.push_account_screen(AccountScreen::List {
+            machine: 1,
+            rows,
+            sel,
+            model: 0,
+        });
+    }
+
+    #[test]
+    fn two_copies_are_two_rows_and_one_copy_is_todays_display() {
+        let mut a = app();
+        let rows = a.account_rows(1);
+        assert!(rows.contains(&Row::Copy("ARK".into(), "agents".into())));
+        assert!(rows.contains(&Row::Copy("ARK".into(), "tenants".into())));
+        assert!(!rows.contains(&Row::Account("ARK".into())));
+        assert!(a.account_rows(0).contains(&Row::Account("ARK".into())));
+        let ark = a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .iter_mut()
+            .find(|x| x.code == "ARK")
+            .unwrap();
+        ark.copies.truncate(1);
+        let rows = a.account_rows(1);
+        assert!(rows.contains(&Row::Account("ARK".into())));
+        assert!(!rows.iter().any(|r| matches!(r, Row::Copy(..))));
+    }
+
+    #[test]
+    fn enter_and_t_on_a_copy_line_name_that_copy() {
+        let mut a = app();
+        open_copies(&mut a, "tenants");
+        let test = press(&mut a, 't');
+        assert_eq!(
+            sent(test.clone()),
+            (
+                1,
+                json!({"action":"account-test","code":"ARK","copy":"tenants"})
+            )
+        );
+        complete(
+            &mut a,
+            test,
+            json!({"ok":true,"message":"The tenants' copy works","status":"ready"}),
+        );
+        press(&mut a, 'k');
+        let test = press(&mut a, 't');
+        assert_eq!(
+            sent(test.clone()).1,
+            json!({"action":"account-test","code":"ARK","copy":"agents"})
+        );
+        complete(&mut a, test, json!({"ok":true,"message":"works"}));
+        press(&mut a, 'j');
+        let (mi, start) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(mi, 1);
+        assert_eq!(
+            start,
+            json!({"action":"account-signin","code":"ARK","step":"start","copy":"tenants"})
+        );
+        assert!(matches!(
+            &a.mode,
+            Mode::Accounts { screen: AccountScreen::Signin(s), .. }
+                if s.copy == Some(("tenants".into(), "Tenants".into())) && s.machines == [1]
+        ));
+    }
+
+    #[test]
+    fn retry_paste_and_finish_stay_on_the_copy_being_signed_in() {
+        let mut a = app();
+        open_copies(&mut a, "tenants");
+        let action = key(&mut a, KeyCode::Enter);
+        complete(&mut a, action, started());
+        a.on_paste("page-code");
+        let finish = key(&mut a, KeyCode::Enter);
+        assert_eq!(
+            sent(finish.clone()).1,
+            json!({"action":"account-signin","step":"finish","ticket":"login-ticket","page_code":"page-code"}),
+            "a ticket is already bound to its copy"
+        );
+        complete(
+            &mut a,
+            finish,
+            json!({"ok":false,"status":"failed","message":"the code was refused"}),
+        );
+        let cancel = press(&mut a, 'r');
+        complete(
+            &mut a,
+            cancel,
+            json!({"ok":true,"status":"cancelled","message":"cancelled"}),
+        );
+        assert_eq!(
+            sent(a.account_tick()).1,
+            json!({"action":"account-signin","code":"ARK","step":"start","copy":"tenants"})
+        );
+        complete_pending(&mut a, started());
+        press(&mut a, 'p');
+        let Mode::Accounts {
+            screen: AccountScreen::PasteToken { copy, machine, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("expected the token paste")
+        };
+        assert_eq!((copy.as_deref(), *machine), (Some("tenants"), 1));
+        let cancel = a.account_tick();
+        complete(
+            &mut a,
+            cancel,
+            json!({"ok":true,"status":"cancelled","message":"cancelled"}),
+        );
+        a.on_paste("  fixture-token  ");
+        let (_, paste) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(
+            paste,
+            json!({"action":"account-signin","code":"ARK","step":"paste","token":"fixture-token","copy":"tenants"})
+        );
+    }
+
+    fn complete_pending(a: &mut App, reply: Value) {
+        let pending = a.account_pending.clone().expect("a request in flight");
+        a.finish_action(
+            pending.machine,
+            pending.request,
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn a_finished_copy_signs_in_nothing_else() {
+        let mut a = app();
+        open_copies(&mut a, "tenants");
+        let action = key(&mut a, KeyCode::Enter);
+        complete(&mut a, action, started());
+        let poll = key(&mut a, KeyCode::Enter);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"done","message":"signed in"}),
+        );
+        assert!(a.account_queue.is_empty());
+        assert!(matches!(
+            &a.mode,
+            Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.current == 1
+        ));
+    }
+
+    #[test]
+    fn refreshing_keeps_the_account_selected_when_its_copies_come_or_go() {
+        let mut a = app();
+        open_copies(&mut a, "tenants");
+        let copies = std::mem::take(
+            &mut a.machines[1]
+                .feed
+                .as_mut()
+                .unwrap()
+                .accounts
+                .iter_mut()
+                .find(|x| x.code == "ARK")
+                .unwrap()
+                .copies,
+        );
+        a.rebuild();
+        let selected = |a: &App| match &a.mode {
+            Mode::Accounts {
+                screen: AccountScreen::List { rows, sel, .. },
+                ..
+            } => rows[*sel].clone(),
+            _ => panic!(),
+        };
+        assert_eq!(selected(&a), Row::Account("ARK".into()));
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .iter_mut()
+            .find(|x| x.code == "ARK")
+            .unwrap()
+            .copies = copies;
+        a.rebuild();
+        assert_eq!(selected(&a), Row::Copy("ARK".into(), "agents".into()));
     }
 }

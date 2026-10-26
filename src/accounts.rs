@@ -28,6 +28,54 @@ pub struct Account {
     pub until: Option<String>,
     pub pool: Option<String>,
     pub usage: Option<Usage>,
+    #[serde(deserialize_with = "null_default")]
+    pub copies: Vec<AccountCopy>,
+}
+
+/// One stored sign-in of an account on this machine, such as your agents' or the tenants'.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct AccountCopy {
+    #[serde(deserialize_with = "null_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_default")]
+    pub label: String,
+    #[serde(deserialize_with = "null_default")]
+    pub stored: bool,
+    pub works: Option<bool>,
+    pub checked: Option<String>,
+    pub note: Option<String>,
+}
+
+impl AccountCopy {
+    pub fn name(&self) -> &str {
+        if self.label.trim().is_empty() {
+            &self.id
+        } else {
+            &self.label
+        }
+    }
+
+    pub fn stored_label(&self) -> &'static str {
+        if self.stored {
+            "✓ stored"
+        } else {
+            "✕ not stored"
+        }
+    }
+
+    pub fn works_label(&self) -> String {
+        let when = self
+            .checked
+            .as_deref()
+            .map(|t| format!(" · {}", reset_time(t)))
+            .unwrap_or_default();
+        match self.works {
+            Some(true) => format!("✓ works{when}"),
+            Some(false) => format!("✕ doesn't work{when}"),
+            None => "– not checked".into(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -90,6 +138,19 @@ impl AccountAgent {
 }
 
 impl Account {
+    /// Copies get lines of their own only when there are two or more; one is today's display.
+    pub fn shown_copies(&self) -> &[AccountCopy] {
+        if self.copies.len() >= 2 {
+            &self.copies
+        } else {
+            &[]
+        }
+    }
+
+    pub fn copy(&self, id: &str) -> Option<&AccountCopy> {
+        self.shown_copies().iter().find(|c| c.id == id)
+    }
+
     pub fn numbers(&self) -> String {
         let number = |n: Option<f64>| {
             n.filter(|v| v.is_finite())

@@ -251,6 +251,37 @@ mod tests {
     }
 
     #[test]
+    fn account_copies_read_with_their_states_and_nulls() {
+        let f = parse(r#"{"kerdr_feed":1,"accounts":[{"code":"ARK","status":"ready","copies":[
+            {"id":"agents","label":"Your agents","stored":true,"works":true,"checked":"2026-10-26T17:40:00Z","note":null},
+            {"id":"tenants","label":"Tenants","stored":false,"works":null,"checked":null,"note":"held by root"},
+            {"id":"spare","label":null,"stored":null,"works":false}]},
+            {"code":"KBZ","copies":[{"id":"agents","stored":true,"works":true}]},
+            {"code":"OLD","copies":null}]}"#)
+        .unwrap();
+        let ark = &f.accounts[0];
+        assert_eq!(ark.shown_copies().len(), 3);
+        let [agents, tenants, spare] = &ark.copies[..] else {
+            panic!()
+        };
+        assert!(agents.works_label().starts_with("✓ works · "));
+        assert_eq!(
+            (tenants.stored_label(), tenants.works_label().as_str()),
+            ("✕ not stored", "– not checked")
+        );
+        assert_eq!(tenants.note.as_deref(), Some("held by root"));
+        assert_eq!(spare.name(), "spare");
+        assert!(!spare.stored && spare.works == Some(false));
+        assert_eq!(spare.works_label(), "✕ doesn't work");
+        assert!(
+            f.accounts[1].shown_copies().is_empty(),
+            "one copy is today's display"
+        );
+        assert!(f.accounts[1].copy("agents").is_none());
+        assert!(f.accounts[2].copies.is_empty());
+    }
+
+    #[test]
     fn reads_a_minimal_feed() {
         let feed =
             parse(r#"{"kerdr_feed":1,"cards":[{"id":"0143","title":"Find the next flywheel"}]}"#)
