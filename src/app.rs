@@ -63,6 +63,44 @@ pub enum Tone {
     Warn,
 }
 
+/// The background filter (b in the filter screen): every card, only background work (the cards
+/// marked bg), or none of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Background {
+    #[default]
+    All,
+    Only,
+    Hide,
+}
+
+impl Background {
+    pub const ALL: [Background; 3] = [Background::All, Background::Only, Background::Hide];
+
+    pub fn next(self) -> Background {
+        match self {
+            Background::All => Background::Only,
+            Background::Only => Background::Hide,
+            Background::Hide => Background::All,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Background::All => "all",
+            Background::Only => "bg only",
+            Background::Hide => "no bg",
+        }
+    }
+
+    pub fn shows(self, background: bool) -> bool {
+        match self {
+            Background::All => true,
+            Background::Only => background,
+            Background::Hide => !background,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SearchFilter {
     Everything,
@@ -117,6 +155,8 @@ pub enum Mode {
     Filter {
         query: String,
         sel: usize,
+        /// Letters go into the search (after /) rather than acting as the screen's keys.
+        typing: bool,
         back: Box<Mode>,
     },
     Confirm {
@@ -294,6 +334,7 @@ pub struct App {
     pub owner: Option<String>,
     pub project: Option<String>,
     pub provider: Option<String>,
+    pub background: Background,
     pub wont_do: bool,
     pub busy: bool,
     pub count: String,
@@ -350,6 +391,7 @@ impl App {
             owner: None,
             project: None,
             provider: None,
+            background: Background::All,
             wont_do: false,
             busy: false,
             count: String::new(),
@@ -2763,14 +2805,21 @@ mod tests {
                 .filter(|c| app.card_visible(c))
                 .all(|c| Some(c.owner_key()) == owner)
         );
-        // Typing narrows the list rather than moving through it.
+        // After /, letters narrow the list rather than moving through it.
         press(&mut app, 'f');
+        press(&mut app, '/');
         press(&mut app, 'j');
-        let Mode::Filter { query, .. } = &app.mode else {
+        let Mode::Filter { query, typing, .. } = &app.mode else {
             panic!("not in the filter list")
         };
-        assert_eq!(query, "j");
+        assert_eq!((query.as_str(), *typing), ("j", true));
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let Mode::Filter { query, typing, .. } = &app.mode else {
+            panic!("Esc while searching closed the filter list")
+        };
+        assert_eq!((query.as_str(), *typing), ("", false));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Board));
         assert_eq!(app.owner, owner, "Esc changed the filter");
         app.provider = Some("codex".into());
         press(&mut app, 'F');
@@ -2778,6 +2827,72 @@ mod tests {
             (app.owner.clone(), app.project.clone(), app.provider.clone()),
             (None, None, None)
         );
+    }
+
+    #[test]
+    fn b_in_the_filter_list_cycles_background_work_and_f_clears_it() {
+        let mut app = demo_app();
+        let shown = |app: &App| -> Vec<bool> {
+            app.board
+                .cards
+                .iter()
+                .filter(|c| c.stage != Stage::Misc && app.card_visible(c))
+                .map(|c| c.background)
+                .collect()
+        };
+        let everything = shown(&app);
+        assert!(everything.contains(&true) && everything.contains(&false));
+        press(&mut app, 'f');
+        press(&mut app, 'b');
+        let Mode::Filter { query, .. } = &app.mode else {
+            panic!("b left the filter list")
+        };
+        assert!(query.is_empty(), "b went into the search");
+        assert_eq!(app.background, Background::Only);
+        let only = shown(&app);
+        assert!(!only.is_empty() && only.iter().all(|b| *b));
+        // The list's counts follow it, so they say what picking a row would show.
+        assert_eq!(app.filter_rows()[0].open + app.filter_rows()[0].backlog, {
+            app.board
+                .cards
+                .iter()
+                .filter(|c| {
+                    c.background
+                        && !c.dismissed()
+                        && !matches!(c.stage, Stage::Maintain | Stage::Misc)
+                })
+                .count()
+        });
+        press(&mut app, 'b');
+        assert_eq!(app.background, Background::Hide);
+        let none = shown(&app);
+        assert!(!none.is_empty() && none.iter().all(|b| !*b));
+        assert!(
+            app.needs_you_order()
+                .iter()
+                .all(|k| !app.card(k).unwrap().background)
+        );
+        press(&mut app, 'b');
+        assert_eq!(app.background, Background::All);
+        assert_eq!(shown(&app), everything);
+        // While searching, b is a letter of the search.
+        press(&mut app, '/');
+        press(&mut app, 'b');
+        let Mode::Filter { query, .. } = &app.mode else {
+            panic!("left the filter list")
+        };
+        assert_eq!(query, "b");
+        assert_eq!(app.background, Background::All);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        press(&mut app, 'b');
+        press(&mut app, 'f');
+        assert!(
+            matches!(app.mode, Mode::Board),
+            "f didn't close the filter list"
+        );
+        assert_eq!(app.background, Background::Only);
+        press(&mut app, 'F');
+        assert_eq!(app.background, Background::All);
     }
 
     #[test]
@@ -2873,6 +2988,7 @@ mod tests {
         app.mode = Mode::Filter {
             query: String::new(),
             sel: rows.len() + 5,
+            typing: false,
             back: Box::new(Mode::Board),
         };
         app.on_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));

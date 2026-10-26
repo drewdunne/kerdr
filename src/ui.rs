@@ -8,7 +8,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::app::{App, Draft, Hit, Mode, Search, SearchFilter, Tone, match_range};
+use crate::app::{App, Background, Draft, Hit, Mode, Search, SearchFilter, Tone, match_range};
 use crate::board::{Scope, SessionRow};
 use crate::herdr;
 use crate::model::{Attention, Card, Priority, Stage, Verdict};
@@ -97,10 +97,15 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             dim_behind(f);
             compose(f, area, app, draft);
         }
-        Mode::Filter { query, sel, back } => {
+        Mode::Filter {
+            query,
+            sel,
+            typing,
+            back,
+        } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
-            filter_view(f, area, app, query, *sel);
+            filter_view(f, area, app, query, *sel, *typing);
         }
         Mode::Confirm {
             title,
@@ -653,6 +658,7 @@ fn filtered(app: &App) -> bool {
     app.owner.is_some()
         || app.project.is_some()
         || app.provider.is_some()
+        || app.background != Background::All
         || app.wont_do
         || app.busy
         || !app.count.is_empty()
@@ -668,6 +674,9 @@ fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
     }
     if app.provider.is_some() {
         shown.push(app.provider_label());
+    }
+    if app.background != Background::All {
+        shown.push(app.background.label().to_string());
     }
     let mut left = if shown.is_empty() {
         vec![Span::styled(" everything shown · f filters", fg(DIM))]
@@ -1819,7 +1828,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
                 ("b", "the backlog"),
                 ("w", "won’t do"),
                 ("i", "workspaces with no intent"),
-                ("f", "filter by who or project"),
+                ("f", "filter by who, agents or bg"),
                 ("a", "agents: all, Claude, Codex"),
                 ("M", "machines"),
                 ("?", "every key"),
@@ -2064,12 +2073,32 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
 }
 
 /// The filter list (f): who the work is for, or one of their projects.
-fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
+/// One filter's chips, the one in force drawn selected.
+fn chips(label: &str, options: &[(&str, bool)]) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::styled(format!("{label:<12}"), bold(FG2))];
+    for (name, on) in options {
+        spans.push(Span::styled(
+            format!(" {name} "),
+            if *on {
+                Style::default()
+                    .bg(BORDER)
+                    .fg(FG)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                fg(FG2)
+            },
+        ));
+        spans.push(Span::raw(" "));
+    }
+    spans
+}
+
+fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize, typing: bool) {
     let rows = app.filter_matches(query);
     let list_h = (rows.len() as u16)
-        .min(area.height.saturating_sub(14))
+        .min(area.height.saturating_sub(16))
         .max(1);
-    let rect = centered(area, 84, list_h + 10, Some(4));
+    let rect = centered(area, 84, list_h + 12, Some(4));
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
     let w = inner.width as usize;
@@ -2079,30 +2108,43 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
         inner,
         inner.y,
         vec![
-            Span::styled("SHOW ONLY", bold(CYAN)),
-            Span::styled("   who it's for, or one project", fg(FG2)),
+            Span::styled("FILTERS", bold(CYAN)),
+            Span::styled("   what the board shows", fg(FG2)),
         ],
         vec![Span::styled("esc close", fg(DIM))],
+    );
+    put_lr(
+        buf,
+        inner,
+        inner.y + 2,
+        vec![Span::styled("WHO IT’S FOR", bold(FG2))],
+        if typing {
+            vec![]
+        } else {
+            key_hints(&[("/", "search")])
+        },
     );
     put(
         buf,
         inner.x,
-        inner.y + 2,
+        inner.y + 3,
         inner.width,
-        if query.is_empty() {
-            vec![
-                Span::styled("› ", bold(CYAN)),
-                Span::styled("type to narrow", fg(DIM)),
-            ]
-        } else {
+        if typing {
             vec![
                 Span::styled("› ", bold(CYAN)),
                 Span::styled(query.to_string(), bold(FG)),
                 Span::styled("▏", fg(CYAN)),
+                Span::styled("      esc stops searching", fg(DIM)),
+            ]
+        } else {
+            vec![
+                Span::styled("› ", bold(CYAN)),
+                Span::styled("press / to search", fg(DIM)),
             ]
         },
     );
-    let top = inner.y + 4;
+    let top = inner.y + 5;
+    let agents_y = inner.bottom().saturating_sub(4);
     let sel = sel.min(rows.len().saturating_sub(1));
     let skip = sel.saturating_sub(list_h.saturating_sub(1) as usize);
     if rows.is_empty() {
@@ -2139,7 +2181,7 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
             height: 1,
             ..inner
         };
-        if y >= inner.bottom().saturating_sub(3) {
+        if y >= agents_y.saturating_sub(1) {
             break;
         }
         if n == sel {
@@ -2147,33 +2189,15 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
         }
         put_lr(buf, line, y, left, vec![Span::styled(counts, fg(FG2))]);
     }
-    let agents_y = inner.bottom().saturating_sub(3);
-    let mut agents = vec![Span::styled("AGENTS   ", bold(FG2))];
-    for (name, value) in [
-        ("all", None),
-        ("Claude", Some("claude")),
-        ("Codex", Some("codex")),
-    ] {
-        let on = app.provider.as_deref() == value;
-        agents.push(Span::styled(
-            format!(" {name} "),
-            if on {
-                Style::default().bg(SEL).fg(FG).add_modifier(Modifier::BOLD)
-            } else {
-                fg(FG2)
-            },
-        ));
-        agents.push(Span::raw(" "));
-    }
-    if let Some(other) = app
-        .provider
-        .as_deref()
-        .filter(|p| !matches!(*p, "claude" | "codex"))
-    {
-        agents.push(Span::styled(
-            format!(" {other} "),
-            Style::default().bg(SEL).fg(FG).add_modifier(Modifier::BOLD),
-        ));
+    let provider = app.provider.as_deref();
+    let other = provider.filter(|p| !matches!(*p, "claude" | "codex"));
+    let mut agents = vec![
+        ("all", provider.is_none()),
+        ("Claude", provider == Some("claude")),
+        ("Codex", provider == Some("codex")),
+    ];
+    if let Some(other) = other {
+        agents.push((other, true));
     }
     put_lr(
         buf,
@@ -2183,8 +2207,26 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
             ..inner
         },
         agents_y,
-        agents,
-        key_hints(&[("tab", "switches here"), ("a", "anywhere")]),
+        chips("AGENTS", &agents),
+        key_hints(&[("tab", "here"), ("a", "anywhere")]),
+    );
+    let background: Vec<(&str, bool)> = Background::ALL
+        .iter()
+        .map(|b| (b.label(), *b == app.background))
+        .collect();
+    let mut bg = chips("BACKGROUND", &background);
+    bg.push(Span::styled(" cards marked ", fg(DIM)));
+    bg.push(Span::styled("bg", fg(PURPLE)));
+    put_lr(
+        buf,
+        Rect {
+            y: agents_y + 1,
+            height: 1,
+            ..inner
+        },
+        agents_y + 1,
+        bg,
+        key_hints(&[("b", "cycles")]),
     );
     put(
         buf,
@@ -2192,12 +2234,21 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize) {
         inner.bottom().saturating_sub(1),
         inner.width,
         fit(
-            key_hints(&[
-                ("↑ ↓", "move"),
-                ("⏎", "show only this"),
-                ("All work", "shows everything"),
-                ("esc", "close"),
-            ]),
+            if typing {
+                key_hints(&[
+                    ("↑ ↓", "move"),
+                    ("⏎", "show only this"),
+                    ("esc", "stop searching"),
+                ])
+            } else {
+                key_hints(&[
+                    ("↑↓ j k", "move"),
+                    ("⏎", "show only this"),
+                    ("/", "search"),
+                    ("F", "clear all"),
+                    ("esc", "close"),
+                ])
+            },
             w,
         ),
     );
@@ -2611,7 +2662,7 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
             ("i", "workspaces with no intent (misc)", ""),
             (
                 "f",
-                "show only one owner, tenant or project",
+                "filters: one owner, tenant or project, agents, background",
                 "F shows everything",
             ),
             ("a", "agents: all, Claude, Codex, then others", ""),
@@ -3757,6 +3808,7 @@ mod tests {
             Mode::Filter {
                 query: "zzz".into(),
                 sel: 99,
+                typing: true,
                 back: Box::new(Mode::Board),
             },
             Mode::Confirm {
@@ -4147,7 +4199,7 @@ mod tests {
                 "move to the top",
                 "new intent",
                 "the backlog",
-                "filter by who or project",
+                "filter by who, agents or bg",
                 "agents: all, Claude, Codex",
                 "machines",
                 "every key",
@@ -4156,6 +4208,47 @@ mod tests {
                 assert!(text.contains(expected), "{expected} missing at {w}x{h}");
             }
         }
+    }
+
+    #[test]
+    fn the_filter_screen_names_each_filter_and_the_board_names_the_background_one() {
+        let mut a = demo(false);
+        a.mode = Mode::Filter {
+            query: String::new(),
+            sel: 0,
+            typing: false,
+            back: Box::new(Mode::Board),
+        };
+        for (w, h) in [(100, 30), (176, 44)] {
+            let text = rendered(&a, w, h);
+            for expected in [
+                "FILTERS",
+                "WHO IT’S FOR",
+                "press / to search",
+                "AGENTS",
+                "BACKGROUND",
+                "bg only",
+                "no bg",
+                "b cycles",
+            ] {
+                assert!(text.contains(expected), "{expected} missing at {w}x{h}");
+            }
+        }
+        a.mode = Mode::Filter {
+            query: "ark".into(),
+            sel: 0,
+            typing: true,
+            back: Box::new(Mode::Board),
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("esc stops searching"), "{text}");
+        a.mode = Mode::Board;
+        assert!(!rendered(&a, 176, 44).contains("bg only"));
+        a.background = Background::Only;
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("showing bg only"), "{text}");
+        a.background = Background::Hide;
+        assert!(rendered(&a, 176, 44).contains("showing no bg"));
     }
 
     #[test]
