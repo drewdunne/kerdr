@@ -200,7 +200,7 @@ fn key_hints(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
 /// can be done to the card you're on. Empty when the selected card isn't waiting work.
 fn card_hints(app: &App) -> Vec<Span<'static>> {
     let Some(card) = app.backlog_card_for_keys() else {
-        return done_hints(app);
+        return started_hints(app);
     };
     let mut spans = card_badge(card, YELLOW);
     spans.extend(key_hints(if card.dismissed() {
@@ -210,10 +210,31 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
             ("d", "start it"),
             ("y", "still want it"),
             ("x", "won’t do"),
+            ("C", "done"),
             ("J K", "move down / up"),
             ("t", "to the top"),
         ]
     }));
+    spans.push(Span::styled("   │   ", fg(BORDER)));
+    spans
+}
+
+/// Work already started with no workspace open, selected on the board: ⏎ reopens it, and C and
+/// x end it without starting anything (intent 0289). Else what done_hints says.
+fn started_hints(app: &App) -> Vec<Span<'static>> {
+    let Some(card) = app
+        .started_card_for_keys()
+        .filter(|_| matches!(app.mode, Mode::Board) && app.actions_on())
+    else {
+        return done_hints(app);
+    };
+    let mut spans = card_badge(card, if card.no_agent() { YELLOW } else { CYAN });
+    let mut hints = vec![];
+    if card.reopenable() {
+        hints.push(("⏎", "reopen it"));
+    }
+    hints.extend([("C", "done"), ("x", "won’t do")]);
+    spans.extend(key_hints(&hints));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
 }
@@ -1163,7 +1184,7 @@ struct CardLines {
     head: Vec<Span<'static>>,
     badge: Vec<Span<'static>>,
     title: Vec<String>,
-    note: String,
+    note: (String, ratatui::style::Color),
     age: (String, ratatui::style::Color),
 }
 
@@ -1238,6 +1259,13 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
     if modern {
         note = account.map(|a| a.account.clone()).unwrap_or_default();
     }
+    // Open work its agent left, or whose workspace closed under it: say so where it shows
+    // (intent 0289). C marks it done and x sets it aside, each starting nothing.
+    let note = if c.no_agent() && !cached {
+        ("no agent".to_string(), YELLOW)
+    } else {
+        (note, DIM)
+    };
     // A record that gives only a date says nothing about the hour, so it shows as a day.
     let date_only = c
         .detail
@@ -1376,7 +1404,7 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
             buf,
             inner,
             note_y,
-            vec![Span::styled(cl.note.clone(), fg(DIM))],
+            vec![Span::styled(cl.note.0.clone(), fg(cl.note.1))],
             vec![Span::styled(cl.age.0.clone(), fg(cl.age.1))],
         );
         y += h;
@@ -1771,12 +1799,17 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             ("d", "start it in its session"),
             ("y", "still want it"),
             ("x", "won’t do"),
+            ("C", "done"),
             ("J K", "move down / up"),
             ("t", "to the top"),
         ],
         None if c.reopenable() && app.actions_on() => vec![("⏎", reopen.as_str())],
         None => vec![("⏎", "jump in")],
     };
+    // Started work with no workspace ends without an agent too (intent 0289).
+    if app.started_card_for_keys().is_some() && app.actions_on() {
+        hints.extend([("C", "done"), ("x", "won’t do")]);
+    }
     hints.push(("n N", "next that needs you"));
     if max_scroll > 0 {
         hints.push(("j k", "scroll"));
@@ -1808,7 +1841,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
     };
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
-    let card = app.backlog_card_for_keys();
+    let card = app.card_for_keys();
     let this_card = card
         .map(|c| format!("{} {}", c.reference, c.title))
         .unwrap_or_else(|| "select a backlog card first".into());
@@ -1828,13 +1861,17 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
         vec![Span::styled("esc close", fg(DIM))],
     );
     let restore = card.is_some_and(|c| c.dismissed());
+    let started = app.backlog_card_for_keys().is_none() && card.is_some();
     let card_keys: &[(&str, &str)] = if restore {
         &[("u", "bring it back")]
+    } else if started {
+        &[("C", "done, starting nothing"), ("x", "won’t do")]
     } else {
         &[
             ("d", "start it"),
             ("y", "still want it"),
             ("x", "won’t do"),
+            ("C", "done"),
             ("J K", "move down / up"),
             ("t", "move to the top"),
         ]
@@ -2674,7 +2711,16 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
                 "asks first past the usual limit",
             ),
             ("y", "still want it: its age starts again", ""),
-            ("x", "won’t do", "asks first"),
+            (
+                "x",
+                "won’t do",
+                "asks first; backlog, or work with no agent",
+            ),
+            (
+                "C",
+                "done: closes it, starting nothing",
+                "asks first; work with no agent",
+            ),
             ("u", "bring it back from won’t do", ""),
             ("J  K", "move it down / up your order", "10J moves ten"),
             ("t", "move it to the top of your order", ""),
@@ -3754,6 +3800,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                     ("d", "start it"),
                     ("y", "still want it"),
                     ("x", "won’t do"),
+                    ("C", "done"),
                     ("J K", "move down / up · 10J ten places"),
                     ("t", "to the top"),
                     ("c", "new intent"),
@@ -4150,6 +4197,62 @@ mod tests {
         assert!(!text.contains("STARTING IT"));
         assert!(text.contains("WON’T DO"));
         assert!(text.contains("u bring it back"));
+    }
+
+    /// Intent 0289: work its agent left open says "no agent" on its card, and the bottom line,
+    /// a peek, the menu and the keys list name C and x for it.
+    #[test]
+    fn work_with_no_agent_says_so_and_names_c_and_x() {
+        let mut a = demo(false);
+        a.cfg.actions.command = Some("test-adapter".into());
+        let i = a
+            .board
+            .cards
+            .iter()
+            .position(|c| c.detail.is_some() && c.stage == Stage::Build)
+            .unwrap();
+        let card = &mut a.board.cards[i];
+        card.workspace_id = None;
+        card.session = None;
+        card.agents.clear();
+        card.attention = Attention::Idle;
+        card.detail.as_mut().unwrap().no_agent = true;
+        let reference = card.reference.clone();
+        a.sel = crate::app::Selection {
+            col: Stage::Build.index(),
+            key: Some(card.key.clone()),
+        };
+        let board = rendered(&a, 220, 44);
+        assert!(board.contains("no agent"), "{board}");
+        assert!(
+            board.contains(&format!(" {reference}   ⏎ reopen it   C done   x won’t do")),
+            "{board}"
+        );
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        let peek = rendered(&a, 176, 44);
+        assert!(peek.contains("C done   x won’t do"), "{peek}");
+        a.mode = Mode::Palette {
+            back: Box::new(Mode::Board),
+            target: Some(a.board.cards[i].key.clone()),
+        };
+        let menu = rendered(&a, 176, 44);
+        assert!(menu.contains("done, starting nothing"), "{menu}");
+        assert!(WORK_KEYS.iter().any(|(_, rows)| {
+            rows.iter()
+                .any(|(k, what, _)| *k == "C" && what.starts_with("done: closes it"))
+        }));
+        // A workspace on it again: no mark, and C and x aren't offered.
+        a.mode = Mode::Board;
+        a.board.cards[i].workspace_id = Some("w9".into());
+        a.board.cards[i].session = Some("web".into());
+        let board = rendered(&a, 220, 44);
+        assert!(
+            !board.contains("no agent") && !board.contains("C done"),
+            "{board}"
+        );
     }
 
     #[test]

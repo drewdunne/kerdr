@@ -117,6 +117,14 @@ talking about it, `Enter` on its card in Maintain asks to reopen it: the backend
 first, saying it's done, and only your yes opens it again and resumes its conversation. See
 [docs/feed.md](docs/feed.md#reopening-done-work).
 
+Nor is work that's over but was never closed. When an agent stops without closing its work, or
+its workspace closes under it, your feed can say no agent is at it, and its card says "no agent".
+`C` marks any open card done, and `x` sets it aside as won't do, without starting an agent or
+spending a token, once you've said yes: on work in the backlog, or on started work with no
+workspace open. A card with a workspace open refuses, since its agent may be there, and the
+backend refuses one whose agent it finds running elsewhere. See
+[docs/feed.md](docs/feed.md#closing-work-with-no-agent).
+
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
 `M` lists every machine and every state it can be in: live, connecting, reconnecting, can't
@@ -241,6 +249,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `/` | search |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
+| `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
 | `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
 | `A` / `S` / `s` | accounts / viewed session’s ordered models / move selected agent |
 | `a` | cycle provider: All, Claude, Codex, and detected providers |

@@ -91,6 +91,7 @@ know rather than guessing.
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
 | `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
 | `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
+| `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. |
 
 ## Actions
 
@@ -115,7 +116,8 @@ operation; the backend defines which additional fields that operation needs:
 {"action":"dispatch","id":"0041","session":"web","override":false}
 ```
 
-The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore` and `move`.
+The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore`, `move` and
+`close`.
 `create` carries the user's own words, the session they were looking at, and an id for this
 submission, nothing else:
 
@@ -146,8 +148,8 @@ written up, give the card `intake: "pending"` in the feed. A response that names
 the record exists even when `ok` is false (saved but not published, say): Kerdr won't send the
 same words again.
 `refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
-the active backlog and `restore` brings it back. `move` changes backlog order. `reopen` is
-described below.
+the active backlog and `restore` brings it back. `move` changes backlog order. `reopen` and
+`close` are described below, and so is `dismiss` for work already started.
 
 Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `submission` and `confirm` (strings),
 `override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
@@ -231,6 +233,24 @@ tell: a record another account owns, one homed on another machine, or one with n
 running there. The card's hint line and the peek say `⏎ ask to reopen it`, naming the agent
 from `resume` when the feed gives it. Without `[actions]`, `Enter` says the card is done and sends
 nothing.
+
+## Closing work with no agent
+
+`C` on a card asks, then sends `close`, for the backend to mark the record done without starting
+anything:
+
+```json
+{"action":"close","id":"0117"}
+```
+
+Kerdr offers it for an open record that isn't dismissed or still being written up, in the backlog
+or in a working column, with no workspace open. `x` (`dismiss`) works on the same started work,
+not only on the backlog: the record leaves the board for the Won't do view, keeping its state, and
+`restore` brings it back where it was. Kerdr refuses a card with a workspace open itself, since its
+agent may be there; refuse in the backend, with a plain `message`, whatever only it can tell, such
+as the work's agent conversation still running outside any workspace. Done work is refused too.
+Before sending the yes, Kerdr rechecks that the card is still the same work, still open, with no
+workspace, and, for `x` on started work, not back in the backlog.
 
 ## Agents reporting for themselves
 
