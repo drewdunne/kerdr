@@ -4,7 +4,7 @@
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
@@ -200,18 +200,9 @@ fn key_hints(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
 /// can be done to the card you're on. Empty when the selected card isn't waiting work.
 fn card_hints(app: &App) -> Vec<Span<'static>> {
     let Some(card) = app.backlog_card_for_keys() else {
-        return vec![];
+        return done_hints(app);
     };
-    let mut spans = vec![
-        Span::styled(
-            format!(" {} ", card.reference),
-            Style::default()
-                .bg(YELLOW)
-                .fg(BG)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw("  "),
-    ];
+    let mut spans = card_badge(card, YELLOW);
     spans.extend(key_hints(if card.dismissed() {
         &[("u", "bring it back")]
     } else {
@@ -225,6 +216,33 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
     }));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
+}
+
+/// A done card selected on the board: what ⏎ does for it, which is to ask to reopen it.
+fn done_hints(app: &App) -> Vec<Span<'static>> {
+    let Some(card) = app
+        .selected()
+        .filter(|c| matches!(app.mode, Mode::Board) && c.can_reopen_done() && app.actions_on())
+    else {
+        return vec![];
+    };
+    let mut spans = card_badge(card, GREEN);
+    spans.extend(key_hints(&[("⏎", "ask to reopen it")]));
+    spans.push(Span::styled("   │   ", fg(BORDER)));
+    spans
+}
+
+fn card_badge(card: &Card, color: Color) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!(" {} ", card.reference),
+            Style::default()
+                .bg(color)
+                .fg(BG)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+    ]
 }
 
 fn pad(rect: Rect, h: u16, v: u16) -> Rect {
@@ -1739,10 +1757,13 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         vec![Span::styled("─".repeat(w), fg(BORDER))],
     );
     // Waiting work has nothing to jump into: its line names the keys that start or change it.
-    // Work whose workspace closed says what ⏎ does for it: reopen it, resuming its agent.
-    let reopen = match c.resume_agent() {
-        Some(agent) => format!("reopen it, resuming its {agent} conversation"),
-        None => "reopen its workspace".to_string(),
+    // Work whose workspace closed says what ⏎ does for it: reopen it, resuming its agent. Done
+    // work says ⏎ asks first, since a yes opens it again.
+    let reopen = match (c.can_reopen_done(), c.resume_agent()) {
+        (false, Some(agent)) => format!("reopen it, resuming its {agent} conversation"),
+        (false, None) => "reopen its workspace".to_string(),
+        (true, Some(agent)) => format!("ask to reopen it, resuming its {agent} conversation"),
+        (true, None) => "ask to reopen it".to_string(),
     };
     let mut hints = match app.backlog_card_for_keys() {
         Some(c) if c.dismissed() => vec![("u", "bring it back")],
@@ -1753,7 +1774,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             ("J K", "move down / up"),
             ("t", "to the top"),
         ],
-        None if c.can_reopen() && app.actions_on() => vec![("⏎", reopen.as_str())],
+        None if c.reopenable() && app.actions_on() => vec![("⏎", reopen.as_str())],
         None => vec![("⏎", "jump in")],
     };
     hints.push(("n N", "next that needs you"));
@@ -2571,6 +2592,11 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
             (
                 "⏎",
                 "on work whose workspace closed: reopen it, resuming its agent's conversation",
+                "with actions on",
+            ),
+            (
+                "⏎",
+                "on done work: asks, then opens it again and resumes its agent's conversation",
                 "with actions on",
             ),
             (
@@ -4273,6 +4299,50 @@ mod tests {
         let text = rendered(&a, 176, 44);
         assert!(text.contains("d start it in its session"), "{text}");
         assert!(!text.contains("⏎ jump in"));
+    }
+
+    #[test]
+    fn a_done_card_says_enter_asks_to_reopen_it_on_the_board_in_a_peek_and_in_help() {
+        let mut a = demo(false);
+        a.cfg.actions.command = Some("test-adapter".into());
+        let i = a
+            .board
+            .cards
+            .iter()
+            .position(|c| c.can_reopen_done())
+            .expect("a done card in the demo");
+        a.board.cards[i].detail.as_mut().unwrap().resume = Some(crate::feed::Resume {
+            agent: Some("claude".into()),
+            conversation: Some("4f2b8c1e-5d3a-4b6f-9c2e-1a7d3e9b0c41".into()),
+        });
+        a.sel = crate::app::Selection {
+            col: Stage::Maintain.index(),
+            key: Some(a.board.cards[i].key.clone()),
+        };
+        let reference = a.board.cards[i].reference.clone();
+        let board = rendered(&a, 220, 44);
+        assert!(
+            board.contains(&format!(" {reference}   ⏎ ask to reopen it")),
+            "{board}"
+        );
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        let peek = rendered(&a, 176, 44);
+        assert!(
+            peek.contains("⏎ ask to reopen it, resuming its Claude conversation"),
+            "{peek}"
+        );
+        // Without actions, nothing offers what Enter can't do.
+        a.cfg.actions.command = None;
+        assert!(!rendered(&a, 176, 44).contains("ask to reopen"));
+        a.mode = Mode::Board;
+        assert!(!rendered(&a, 220, 44).contains("ask to reopen"));
+        assert!(BOARD_KEYS.iter().any(|(_, rows)| {
+            rows.iter()
+                .any(|(k, what, _)| *k == "⏎" && what.starts_with("on done work: asks"))
+        }));
     }
 
     #[test]

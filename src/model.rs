@@ -274,6 +274,26 @@ impl Card {
         self.under_way() && !self.is_open_workspace()
     }
 
+    /// Done work with no workspace open. Enter asks the action backend to open it again, and the
+    /// backend always asks first (intent 0278).
+    pub fn can_reopen_done(&self) -> bool {
+        self.done() && !self.is_open_workspace()
+    }
+
+    /// Done work, whatever its workspace: a record in Maintain, not dismissed or still being
+    /// written up. What reopening it needs, once its workspace is known to have gone.
+    pub fn done(&self) -> bool {
+        self.detail.is_some()
+            && self.stage == Stage::Maintain
+            && !self.dismissed()
+            && self.intake().is_none()
+    }
+
+    /// Whether Enter reopens this card: work under way whose workspace closed, or done work.
+    pub fn reopenable(&self) -> bool {
+        self.can_reopen() || self.can_reopen_done()
+    }
+
     /// Work under way, whatever its workspace: a record in a working stage, not done, dismissed or
     /// still being written up. What a reopen needs, once its workspace is known to have gone.
     pub fn under_way(&self) -> bool {

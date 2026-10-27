@@ -111,6 +111,11 @@ Kerdr takes you straight in. The backend asks first when that would go past the 
 workspace limit or the conversation may still be open somewhere else. See
 [docs/feed.md](docs/feed.md#reopening-work-whose-workspace-closed).
 
+Done work isn't a dead end either. When an agent finishes and wraps itself before you're done
+talking about it, `Enter` on its card in Maintain asks to reopen it: the backend always asks
+first, saying it's done, and only your yes opens it again and resumes its conversation. See
+[docs/feed.md](docs/feed.md#reopening-done-work).
+
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
 `M` lists every machine and every state it can be in: live, connecting, reconnecting, can't
@@ -226,7 +231,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | On the board | |
 |---|---|
 | `h j k l` or arrows | move between columns and cards |
-| `Enter` | jump in; on work whose workspace closed, reopen it (with actions) |
+| `Enter` | jump in; on work whose workspace closed, reopen it; on done work, ask to reopen it (both with actions) |
 | `m` or `Space` | peek |
 | `n` / `N` | next / previous card that needs you (also `Ctrl+Alt+j/k`) |
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
