@@ -1,6 +1,6 @@
 //! Account screens keep selections and confirmations bound to a machine and a conversation.
 use super::*;
-use crate::accounts::{AccountAgent, Owner};
+use crate::accounts::{Account, AccountAgent, Owner, Usage};
 use crate::actions::Response;
 use crate::feed::Feed;
 use serde_json::{Value, json};
@@ -193,6 +193,26 @@ impl App {
     }
     pub fn account_feed(&self, machine: usize) -> Option<&Feed> {
         self.machines.get(machine)?.feed.as_ref()
+    }
+
+    /// An account's usage: the freshest reading of it in any machine's feed, whichever machine
+    /// is shown, since usage belongs to the account. Machines are taken in the same order for
+    /// every caller, so a tie gives the same figures on every tab.
+    pub fn account_usage<'a>(&'a self, a: &'a Account) -> Option<&'a Usage> {
+        crate::accounts::freshest(
+            self.machines
+                .iter()
+                .filter_map(|m| m.feed.as_ref())
+                .flat_map(|f| f.accounts.iter())
+                .filter(|other| other.code == a.code)
+                .filter_map(|other| other.usage.as_ref()),
+        )
+        .or(a.usage.as_ref())
+    }
+
+    /// An account's usage figures as `five│week`, from its freshest reading on any machine.
+    pub fn account_numbers(&self, a: &Account) -> String {
+        crate::accounts::numbers(self.account_usage(a), self.now())
     }
 
     pub fn account_machine(&self) -> Option<usize> {

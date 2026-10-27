@@ -1503,7 +1503,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
                 format!(
                     "{} · {} · {}",
                     crate::accounts::provider_name(&a.provider),
-                    a.numbers(),
+                    app.account_numbers(a),
                     a.status_label()
                 )
             })
@@ -3773,6 +3773,7 @@ mod tests {
     use super::*;
     use crate::app::{Search, SearchFilter, Selection};
     use crate::config::Config;
+    use chrono::TimeZone;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
 
@@ -4381,6 +4382,136 @@ mod tests {
             .collect::<String>();
         for hint in ["No work cards", "[ ]", "{ }", "a agents", "i misc"] {
             assert!(text.contains(hint), "missing {hint}: {text}");
+        }
+    }
+
+    /// Each machine's feed holds only the usage its own sessions last saw. Gives ARK an old
+    /// reading on the laptop and a new one on the build box, and KBZ the other way round.
+    fn split_readings(a: &mut App) {
+        let at = |h, m| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 10, 21, h, m, 0)
+                .single()
+                .unwrap()
+                .to_rfc3339()
+        };
+        let reading = |seen: String, five: f64, week: f64| crate::accounts::Usage {
+            five: Some(five),
+            five_at: Some(at(21, 0)),
+            week: Some(week),
+            week_at: Some(at(23, 0)),
+            seen: Some(seen),
+        };
+        for m in &mut a.machines {
+            let laptop = m.name() == "laptop";
+            let Some(f) = &mut m.feed else { continue };
+            for acc in &mut f.accounts {
+                acc.usage = Some(match (acc.code.as_str(), laptop) {
+                    ("ARK", true) => reading(at(11, 44), 0.0, 0.0),
+                    ("ARK", false) => reading(at(17, 45), 65.0, 19.0),
+                    ("KBZ", true) => reading(at(17, 44), 17.0, 87.0),
+                    _ => reading(at(9, 0), 2.0, 83.0),
+                });
+                acc.status = "ready".into();
+            }
+        }
+    }
+
+    fn top_line(a: &App, w: u16) -> String {
+        rendered(a, w, 44).chars().take(w as usize).collect()
+    }
+
+    #[test]
+    fn usage_is_each_accounts_freshest_reading_on_every_machine_tab() {
+        let mut a = demo(false);
+        split_readings(&mut a);
+        for machine in [None, Some("laptop"), Some("build-box")] {
+            a.machine = machine.map(str::to_string);
+            a.rebuild();
+            let top = top_line(&a, 176);
+            assert!(top.contains("ARK 65│19"), "{machine:?}: {top}");
+            assert!(top.contains("KBZ 17│87"), "{machine:?}: {top}");
+            a.open_accounts();
+            let screen = rendered(&a, 176, 44);
+            assert!(screen.contains("65│19  ready"), "{machine:?}: {screen}");
+            assert!(screen.contains("17│87  ready"), "{machine:?}: {screen}");
+            assert!(!screen.contains("0│0"), "{machine:?}: {screen}");
+            a.mode = Mode::Board;
+        }
+    }
+
+    #[test]
+    fn tied_readings_show_the_same_figures_on_every_tab() {
+        let mut a = demo(false);
+        for m in &mut a.machines {
+            let laptop = m.name() == "laptop";
+            let Some(f) = &mut m.feed else { continue };
+            for acc in f.accounts.iter_mut().filter(|acc| acc.code == "ARK") {
+                acc.usage = Some(crate::accounts::Usage {
+                    five: Some(if laptop { 65.0 } else { 1.0 }),
+                    week: Some(19.0),
+                    seen: Some("2026-10-21T17:40:00-05:00".into()),
+                    ..Default::default()
+                });
+            }
+        }
+        for machine in [None, Some("laptop"), Some("build-box")] {
+            a.machine = machine.map(str::to_string);
+            a.rebuild();
+            let top = top_line(&a, 176);
+            assert!(top.contains("ARK 65│19"), "{machine:?}: {top}");
+        }
+    }
+
+    #[test]
+    fn a_reading_past_its_reset_time_says_so_instead_of_showing_old_figures() {
+        let mut a = demo(false);
+        let at = |h, m| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 10, 21, h, m, 0)
+                .single()
+                .unwrap()
+                .to_rfc3339()
+        };
+        let (five_at, week_at) = (at(16, 40), at(17, 0));
+        for m in &mut a.machines {
+            let Some(f) = &mut m.feed else { continue };
+            for acc in &mut f.accounts {
+                acc.usage = Some(crate::accounts::Usage {
+                    five: Some(40.0),
+                    five_at: Some(five_at.clone()),
+                    week: Some(19.0),
+                    week_at: Some(if acc.code == "ARK" {
+                        week_at.clone()
+                    } else {
+                        "2026-10-24T09:00:00-05:00".into()
+                    }),
+                    seen: Some(at(11, 44)),
+                });
+            }
+        }
+        a.machine = Some("laptop".into());
+        a.rebuild();
+        let top = top_line(&a, 176);
+        assert!(top.contains("ARK —│—"), "{top}");
+        assert!(top.contains("KBZ —│19"), "{top}");
+        a.open_accounts();
+        let five = format!(
+            "five-hour window reset {}; use since unknown",
+            crate::accounts::reset_time(&five_at)
+        );
+        let week = format!(
+            "weekly window reset {}; use since unknown",
+            crate::accounts::reset_time(&week_at)
+        );
+        // KBZ is out in the demo and ARK ready; both explain their resets in full at every width.
+        for w in [80, 120, 176] {
+            let screen = rendered(&a, w, 44);
+            assert!(screen.contains("—│—  ready"), "{w}: {screen}");
+            let out = format!("—│19  {}", crate::accounts::pause_glyph());
+            assert!(screen.contains(&out), "{w}: {screen}");
+            assert_eq!(screen.matches(&five).count(), 2, "{w}: {screen}");
+            assert_eq!(screen.matches(&week).count(), 1, "{w}: {screen}");
         }
     }
 }

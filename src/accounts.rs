@@ -88,6 +88,66 @@ pub struct Usage {
     pub seen: Option<String>,
 }
 
+fn time(value: Option<&str>) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+    chrono::DateTime::parse_from_rfc3339(value?).ok()
+}
+
+impl Usage {
+    /// When the reading was taken, if the feed says.
+    pub fn seen_at(&self) -> Option<chrono::DateTime<chrono::FixedOffset>> {
+        time(self.seen.as_deref())
+    }
+
+    /// The windows whose reset time has passed since this reading, with that time: what the
+    /// reading counted no longer applies, and what's been used since isn't known.
+    pub fn reset_since(&self, now: chrono::DateTime<chrono::Local>) -> Vec<(&'static str, String)> {
+        [
+            ("five-hour", self.five_at.as_deref()),
+            ("weekly", self.week_at.as_deref()),
+        ]
+        .into_iter()
+        .filter_map(|(window, at)| {
+            time(at)
+                .filter(|t| *t <= now)
+                .map(|_| (window, reset_time(at.unwrap_or_default())))
+        })
+        .collect()
+    }
+
+    fn current(
+        figure: Option<f64>,
+        resets: Option<&str>,
+        now: chrono::DateTime<chrono::Local>,
+    ) -> Option<f64> {
+        figure.filter(|_| time(resets).is_none_or(|t| t > now))
+    }
+}
+
+/// The reading to show for an account, given each machine's: the one with the newest `seen`.
+/// Usage belongs to the account, not to a machine, and each machine's feed only has what its own
+/// sessions last saw, so a machine that hasn't run the account lately holds figures hours old.
+/// Readings without `seen` count as oldest; on a tie the first one given wins.
+pub fn freshest<'a>(readings: impl IntoIterator<Item = &'a Usage>) -> Option<&'a Usage> {
+    readings.into_iter().fold(None, |best, u| match best {
+        Some(b) if b.seen_at() >= u.seen_at() => Some(b),
+        _ => Some(u),
+    })
+}
+
+/// Five-hour and weekly use as `five│week`. A figure whose window has reset since the reading
+/// shows `—`, like one the feed doesn't have, rather than an old number as if it were current.
+pub fn numbers(usage: Option<&Usage>, now: chrono::DateTime<chrono::Local>) -> String {
+    let number = |n: Option<f64>| {
+        n.filter(|v| v.is_finite())
+            .map_or("—".into(), |v| format!("{v:.0}"))
+    };
+    format!(
+        "{}│{}",
+        number(usage.and_then(|u| Usage::current(u.five, u.five_at.as_deref(), now))),
+        number(usage.and_then(|u| Usage::current(u.week, u.week_at.as_deref(), now)))
+    )
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Owner {
@@ -149,18 +209,6 @@ impl Account {
 
     pub fn copy(&self, id: &str) -> Option<&AccountCopy> {
         self.shown_copies().iter().find(|c| c.id == id)
-    }
-
-    pub fn numbers(&self) -> String {
-        let number = |n: Option<f64>| {
-            n.filter(|v| v.is_finite())
-                .map_or("—".into(), |v| format!("{v:.0}"))
-        };
-        format!(
-            "{}│{}",
-            number(self.usage.as_ref().and_then(|u| u.five)),
-            number(self.usage.as_ref().and_then(|u| u.week))
-        )
     }
 
     pub fn status_label(&self) -> String {
@@ -279,6 +327,69 @@ pub fn open_signin_url(url: &str) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
+
+    fn reading(seen: Option<&str>, five: f64) -> Usage {
+        Usage {
+            five: Some(five),
+            seen: seen.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn freshest_reading_is_the_newest_seen_and_ties_keep_the_first() {
+        let old = reading(Some("2026-10-26T11:44:03-05:00"), 0.0);
+        let new = reading(Some("2026-10-26T18:53:11-05:00"), 65.0);
+        // The same moment written in another zone is a tie, not a newer reading.
+        let same = reading(Some("2026-10-26T23:53:11Z"), 1.0);
+        let unknown = reading(None, 9.0);
+        assert_eq!(freshest([&old, &new]), Some(&new));
+        assert_eq!(freshest([&new, &old]), Some(&new));
+        assert_eq!(freshest([&new, &same]), Some(&new));
+        assert_eq!(freshest([&unknown, &old]), Some(&old));
+        assert_eq!(freshest([&unknown]), Some(&unknown));
+        assert_eq!(freshest(std::iter::empty::<&Usage>()), None);
+    }
+
+    #[test]
+    fn a_figure_whose_window_has_reset_shows_as_unknown() {
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 10, 26, 18, 0, 0)
+            .single()
+            .unwrap();
+        let at = |h| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 10, 26, h, 0, 0)
+                .single()
+                .unwrap()
+                .to_rfc3339()
+        };
+        let u = Usage {
+            five: Some(40.0),
+            five_at: Some(at(17)),
+            week: Some(19.0),
+            week_at: Some(at(19)),
+            seen: Some(at(12)),
+        };
+        assert_eq!(numbers(Some(&u), now), "—│19");
+        assert_eq!(u.reset_since(now), vec![("five-hour", reset_time(&at(17)))]);
+        let both = Usage {
+            week_at: Some(at(18)),
+            ..u.clone()
+        };
+        assert_eq!(numbers(Some(&both), now), "—│—");
+        assert_eq!(both.reset_since(now).len(), 2);
+        let no_reset_time = Usage {
+            five_at: None,
+            week_at: Some("not a time".into()),
+            ..u
+        };
+        assert_eq!(numbers(Some(&no_reset_time), now), "40│19");
+        assert!(no_reset_time.reset_since(now).is_empty());
+        assert_eq!(numbers(None, now), "—│—");
+    }
+
     #[test]
     fn opener_rejects_commands_and_non_web_protocols() {
         for bad in [
