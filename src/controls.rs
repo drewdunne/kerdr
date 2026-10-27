@@ -451,6 +451,28 @@ impl App {
         (card.dismissed() || waiting_work(card)).then_some(card)
     }
 
+    /// The selected card when any card key applies to it: backlog_card_for_keys's, or open work
+    /// with no workspace, which `C` marks done and `x` sets aside (intent 0289). The menu's
+    /// THIS CARD and its keys are for it.
+    pub fn card_for_keys(&self) -> Option<&Card> {
+        self.backlog_card_for_keys()
+            .or_else(|| self.started_card_for_keys())
+    }
+
+    /// The selected card when it's work already started with no workspace open: `C` and `x` act
+    /// on it, and ⏎ reopens it. None for backlog work, which backlog_card_for_keys covers.
+    pub fn started_card_for_keys(&self) -> Option<&Card> {
+        let card = match &self.mode {
+            Mode::Palette { target, .. } => target.as_ref().and_then(|k| self.card(k)),
+            Mode::Backlog { sel } => self
+                .backlog_cards()
+                .get(*sel)
+                .and_then(|&i| self.board.cards.get(i)),
+            _ => self.selected(),
+        }?;
+        (card.closable() && !waiting_work(card)).then_some(card)
+    }
+
     fn selected_for_control(&self) -> Option<&Card> {
         match &self.mode {
             Mode::Backlog { sel } => self
@@ -607,6 +629,9 @@ impl App {
         if request["action"] == "reopen" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Reopening {}…", self.reference_for(id))
+        } else if request["action"] == "close" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Marking {} done…", self.reference_for(id))
         } else {
             "Changing the intent…".into()
         }
@@ -642,14 +667,44 @@ impl App {
             );
             return Action::None;
         }
-        if !card.dismissed() && !waiting_work(&card) {
+        // C and x on work already started (intent 0289): only with no workspace open, since that
+        // is where its agent would be; the backend checks for one running elsewhere too.
+        let ends = matches!(action, "close" | "dismiss");
+        let started = !card.dismissed() && !waiting_work(&card);
+        if action == "close" && card.dismissed() {
             self.say(
                 format!(
-                    "{} is already under way or done. d, y, x, J, K and t change backlog work.",
+                    "{} is in won't do; u brings it back before it can be marked done.",
                     card.reference
                 ),
                 Tone::Info,
             );
+            return Action::None;
+        }
+        if started && !(ends && card.closable()) {
+            let reference = &card.reference;
+            let said = if ends && card.done() || card.state.as_deref() == Some("closed") {
+                if action == "close" {
+                    format!("{reference} is done already.")
+                } else {
+                    format!("{reference} is done; won't do is for work that isn't.")
+                }
+            } else if ends && card.is_open_workspace() {
+                format!(
+                    "{reference} has a workspace open, so an agent may be at it: C and x are for work with none. ⏎ goes in."
+                )
+            } else if ends && card.intake() == Some("pending") {
+                format!("{reference} is still being written up.")
+            } else if card.closable() {
+                format!(
+                    "{reference} is already under way. d, y, J, K and t change backlog work; with no agent at it, C marks it done and x sets it aside."
+                )
+            } else {
+                format!(
+                    "{reference} is already under way or done. d, y, x, J, K and t change backlog work."
+                )
+            };
+            self.say(said, Tone::Info);
             return Action::None;
         }
         if card.dismissed() && action != "restore" {
@@ -669,10 +724,26 @@ impl App {
         if let Some(obj) = extra.as_object() {
             request.as_object_mut().unwrap().extend(obj.clone());
         }
-        if action == "dismiss" {
+        if ends {
+            let (title, message) = match (action, started) {
+                ("close", _) => (
+                    format!("Mark {} done?", card.reference),
+                    "It closes as done with nothing started: no agent, no tokens. Its log says you closed it from Kerdr, and ⏎ on it later asks to reopen it.".to_string(),
+                ),
+                (_, true) => (
+                    format!("Won't do {}?", card.reference),
+                    "Set it aside in Won't do, off the board, with nothing started. Its record keeps where it was; u brings it back.".to_string(),
+                ),
+                _ => (
+                    format!("Won't do {}?", card.reference),
+                    "Keep the intent in Won't do, outside the active backlog. You can restore it later.".to_string(),
+                ),
+            };
             self.mode = Mode::Confirm {
-                machine, request, title: format!("Won't do {}?", card.reference),
-                message: "Keep the intent in Won't do, outside the active backlog. You can restore it later.".into(),
+                machine,
+                request,
+                title,
+                message,
                 back: Box::new(self.mode.clone()),
                 target: Some(Box::new(CardSnapshot::of(&card))),
                 queue: false,
@@ -724,18 +795,18 @@ impl App {
         self.mode = (*back).clone();
         let card_key = matches!(
             key.code,
-            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K')
+            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C')
         );
         // A refresh while the menu was open may have moved or removed the card it opened on;
         // its keys then act on nothing rather than on whatever took its place.
-        if card_key && self.backlog_card_for_keys().map(|c| &c.key) != target.as_ref() {
+        if card_key && self.card_for_keys().map(|c| &c.key) != target.as_ref() {
             self.say("The selected intent changed while the menu was open. Select it again before changing it.", Tone::Warn);
             return Action::None;
         }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Char('c') => self.new_intent(),
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C')) => {
                 return self.card_action(c, 1);
             }
             KeyCode::Char('b') => self.enter_backlog(false),
@@ -763,6 +834,7 @@ impl App {
             'd' => self.intent_action("dispatch", json!({})),
             'y' => self.intent_action("refresh", json!({})),
             'x' => self.intent_action("dismiss", json!({})),
+            'C' => self.intent_action("close", json!({})),
             'u' => self.intent_action("restore", json!({})),
             't' => self.intent_action("move", json!({"top":true})),
             'J' => self.intent_action("move", json!({"delta":count})),
@@ -1114,7 +1186,7 @@ impl App {
                 Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
             )
         {
-            let target = self.backlog_card_for_keys().map(|c| c.key.clone());
+            let target = self.card_for_keys().map(|c| c.key.clone());
             if let Some(key) = &target {
                 self.backlog_focus = Some(key.clone());
             }
@@ -1179,7 +1251,7 @@ impl App {
         }
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C')) => {
                 return Some(self.card_action(c, count));
             }
             KeyCode::Char('{') | KeyCode::Char('}')
@@ -1382,6 +1454,14 @@ impl App {
                     }
                     // Started where it was asked: its home hasn't moved since.
                     Some("dispatch") => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
+                    // Still open with no workspace, the same work (intent 0289).
+                    Some("close") => c.closable() && target.is_some_and(|t| t.same_work(c)),
+                    // Started work set aside only while it's still that, with no workspace;
+                    // backlog work only while it still waits.
+                    Some("dismiss") => match target {
+                        Some(t) if !t.waiting => c.closable() && !waiting_work(c) && t.same_work(c),
+                        _ => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
+                    },
                     _ => waiting_work(c),
                 }
         })

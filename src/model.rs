@@ -294,6 +294,27 @@ impl Card {
         self.can_reopen() || self.can_reopen_done()
     }
 
+    /// Open work no agent is at, as its feed says (no workspace on it, and nothing running its
+    /// conversation), and no workspace or agent here says otherwise. The card says "no agent".
+    pub fn no_agent(&self) -> bool {
+        self.detail.as_ref().is_some_and(|d| d.no_agent)
+            && !self.is_open_workspace()
+            && self.agents.is_empty()
+    }
+
+    /// Open work that `C` can mark done, and `x` set aside, without starting anything: a record
+    /// that isn't done, dismissed or still being written up, with no workspace open. The action
+    /// backend still refuses one it finds an agent at (intent 0289).
+    pub fn closable(&self) -> bool {
+        self.detail.is_some()
+            && !matches!(self.stage, Stage::Maintain | Stage::Misc)
+            && self.state.as_deref() != Some("closed")
+            && self.attention != Attention::Done
+            && !self.dismissed()
+            && self.intake() != Some("pending")
+            && !self.is_open_workspace()
+    }
+
     /// Work under way, whatever its workspace: a record in a working stage, not done, dismissed or
     /// still being written up. What a reopen needs, once its workspace is known to have gone.
     pub fn under_way(&self) -> bool {
@@ -362,6 +383,10 @@ pub struct CardSnapshot {
     pub resume_agent: Option<String>,
     pub resume_conversation: Option<String>,
     pub workspace: Option<String>,
+    /// Whether it was work waiting in the backlog: a won't do asked about it then applies only
+    /// while it still is, and one asked about started work only while it isn't. Not part of
+    /// same_work.
+    pub waiting: bool,
 }
 
 impl CardSnapshot {
@@ -377,6 +402,7 @@ impl CardSnapshot {
             resume_agent: resume.and_then(|r| r.agent.clone()),
             resume_conversation: resume.and_then(|r| r.conversation.clone()),
             workspace: card.workspace_id.clone(),
+            waiting: crate::app::waiting_work(card),
         }
     }
 
@@ -393,9 +419,11 @@ impl CardSnapshot {
             .is_none_or(|w| self.workspace.as_deref() == Some(w) || made == Some(w))
             && CardSnapshot {
                 workspace: None,
+                waiting: false,
                 ..now
             } == CardSnapshot {
                 workspace: None,
+                waiting: false,
                 ..self.clone()
             }
     }

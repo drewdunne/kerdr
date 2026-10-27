@@ -124,6 +124,11 @@ pub struct FeedCard {
     /// For work under way: the agent conversation that worked it, which a reopen resumes.
     #[serde(default)]
     pub resume: Option<Resume>,
+    /// Open work in a working stage that no agent is at: no workspace on it, and nothing running
+    /// its conversation. The card says "no agent"; `C` marks it done and `x` sets it aside, each
+    /// starting nothing.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_agent: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

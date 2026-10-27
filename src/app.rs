@@ -16,7 +16,6 @@ pub mod account_controls;
 #[path = "controls.rs"]
 mod controls;
 use account_controls::AccountScreen;
-#[cfg(test)]
 pub(crate) use controls::waiting_work;
 
 /// A new intent in Andrew's own words. The agent that writes it up fills in everything else:
@@ -3287,6 +3286,191 @@ mod tests {
         };
         assert_eq!(enter(&mut app), Action::None);
         assert!(app.message().unwrap().0.contains("nothing to jump into"));
+    }
+
+    /// Intent 0289: the Wi-Fi outage (0117)'s case, work its agent left open with no workspace.
+    /// C asks, then marks it done; nothing reopens or starts.
+    #[test]
+    fn c_marks_open_work_with_no_workspace_done_after_asking() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("C didn't ask first")
+        };
+        assert_eq!(title, &format!("Mark {reference} done?"));
+        assert!(message.contains("nothing started"), "{message}");
+        // No is no.
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Board));
+        press(&mut app, 'C');
+        settle(&mut app);
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request, serde_json::json!({"action": "close", "id": id}));
+        // Backlog work that turns out to be done already closes the same way.
+        let (key, id) = waiting_backlog_card(&app);
+        app.busy = false;
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key),
+        };
+        press(&mut app, 'C');
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("yes on a backlog card sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "close", "id": id}));
+    }
+
+    #[test]
+    fn x_sets_aside_started_work_with_no_workspace_after_asking() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("x didn't ask first")
+        };
+        assert_eq!(title, &format!("Won't do {reference}?"));
+        assert!(
+            message.contains("Its record keeps where it was"),
+            "{message}"
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "dismiss", "id": id}));
+    }
+
+    #[test]
+    fn c_and_x_refuse_work_with_a_workspace_done_work_and_won_t_do() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        // Its workspace is open: an agent may be at it.
+        app.board.cards[i].workspace_id = Some("w9".into());
+        app.board.cards[i].session = Some("web".into());
+        for c in ['C', 'x'] {
+            assert_eq!(press(&mut app, c), Action::None);
+            assert!(matches!(app.mode, Mode::Board));
+            assert!(
+                app.message().unwrap().0.contains("has a workspace open"),
+                "{:?}",
+                app.message()
+            );
+        }
+        // Done.
+        app.board.cards[i].workspace_id = None;
+        app.board.cards[i].session = None;
+        app.board.cards[i].stage = Stage::Maintain;
+        app.board.cards[i].attention = Attention::Done;
+        app.sel.col = Stage::Maintain.index();
+        press(&mut app, 'C');
+        assert!(app.message().unwrap().0.ends_with("is done already."));
+        press(&mut app, 'x');
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("won't do is for work that isn't")
+        );
+        // In won't do: brought back first.
+        app.board.cards[i].stage = Stage::Build;
+        app.board.cards[i].attention = Attention::Idle;
+        app.board.cards[i].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        app.wont_do = true;
+        app.mode = Mode::Backlog { sel: 0 };
+        let sel = app.backlog_cards().iter().position(|&j| j == i).unwrap();
+        app.mode = Mode::Backlog { sel };
+        press(&mut app, 'C');
+        assert!(app.message().unwrap().0.contains("u brings it back"));
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+    }
+
+    #[test]
+    fn d_on_started_work_with_no_workspace_names_c_and_x() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        let said = app.message().unwrap().0;
+        assert!(
+            said.contains("C marks it done and x sets it aside"),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_close_or_won_t_do_rechecks_the_card_before_sending() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        // A workspace opens on it while the question is up: its agent is back.
+        for c in ['C', 'x'] {
+            press(&mut app, c);
+            settle(&mut app);
+            app.board.cards[i].workspace_id = Some("w9".into());
+            app.board.cards[i].session = Some("web".into());
+            assert_eq!(enter(&mut app), Action::None);
+            assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+            app.board.cards[i].workspace_id = None;
+            app.board.cards[i].session = None;
+        }
+        // Won't do asked about backlog work whose home moved meanwhile: not the work asked about.
+        let (bkey, _) = waiting_backlog_card(&app);
+        let b = app.board.cards.iter().position(|c| c.key == bkey).unwrap();
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(bkey),
+        };
+        press(&mut app, 'x');
+        settle(&mut app);
+        app.board.cards[b].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(app.machines[0].name()),
+            session: Some("elsewhere".into()),
+        });
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        app.sel = Selection {
+            col: Stage::Build.index(),
+            key: Some(key),
+        };
+        // Won't do asked about started work, which went back to the backlog meanwhile.
+        press(&mut app, 'x');
+        settle(&mut app);
+        app.board.cards[i].stage = Stage::Backlog;
+        app.board.cards[i].state = Some("queued".into());
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn the_menu_offers_c_and_x_for_started_work_with_no_workspace() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        assert!(app.backlog_card_for_keys().is_none());
+        assert_eq!(
+            app.card_for_keys().map(|c| c.key.clone()),
+            Some(key.clone())
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(matches!(&app.mode, Mode::Palette { target: Some(t), .. } if *t == key));
+        press(&mut app, 'C');
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the menu's C sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "close", "id": id}));
     }
 
     /// A done card (intent 0278): the same work, in Maintain, its workspace gone with its wrap.
