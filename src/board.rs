@@ -314,7 +314,9 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     let mut claimed: HashSet<(usize, String, String)> = HashSet::new();
     let mut cards = Vec::new();
 
-    // One copy of each feed card: the one from its home machine, else one that's live.
+    // One copy of each feed card: the one from its home machine; when copies name different homes
+    // (a record with none, whose machines each name themselves where its work is), the one that
+    // can resume its agent's conversation; else one that's live.
     let mut chosen: BTreeMap<String, (usize, &FeedCard, &Feed)> = BTreeMap::new();
     for (mi, m) in machines.iter().enumerate() {
         if !m.is_shown() {
@@ -332,19 +334,24 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 continue;
             }
             let key = format!("{source}:{}", fc.id);
-            let home_here = |mi: usize| {
-                fc.home
+            // Whether a copy's own home is the machine it came from.
+            let home_here = |c: &FeedCard, mi: usize| {
+                c.home
                     .as_ref()
                     .and_then(|h| h.machine.as_deref())
                     .is_some_and(|h| machines[mi].answers_to(h))
             };
+            let resumes = |c: &FeedCard| c.resume.is_some();
             let better = match chosen.get(&key) {
                 None => true,
-                Some((pmi, _, _)) => {
-                    (home_here(mi) && !home_here(*pmi))
-                        || (home_here(mi) == home_here(*pmi)
-                            && m.conn.is_live()
-                            && !machines[*pmi].conn.is_live())
+                Some((pmi, pfc, _)) => {
+                    let (here, there) = (home_here(fc, mi), home_here(pfc, *pmi));
+                    (here && !there)
+                        || (here == there
+                            && ((resumes(fc) && !resumes(pfc))
+                                || (resumes(fc) == resumes(pfc)
+                                    && m.conn.is_live()
+                                    && !machines[*pmi].conn.is_live())))
                 }
             };
             if better {
@@ -1521,6 +1528,115 @@ mod tests {
             card.detail.as_ref().unwrap().status.as_deref(),
             Some("from the laptop")
         );
+    }
+
+    #[test]
+    fn a_copy_naming_a_home_beats_one_naming_none_whichever_comes_first() {
+        // Work whose record has no home: the feed on the machine that holds its agent's
+        // conversation names that machine alone, with no session, and that copy wins wherever its
+        // machine is listed, so the card and its actions go there.
+        for named_first in [false, true] {
+            let mut none = feed_card("0222", "maintain", "closed");
+            none.home = None;
+            none.status = Some("from the server".into());
+            let mut named = none.clone();
+            named.home = Some(Home {
+                machine: Some("laptop".into()),
+                session: None,
+            });
+            named.status = Some("from the laptop".into());
+            let server = live(
+                machine("build-box", true),
+                vec![("default", Snapshot::default())],
+                Some(Feed {
+                    kerdr_feed: 1,
+                    cards: vec![none],
+                    ..Default::default()
+                }),
+            );
+            let laptop = live(
+                machine("laptop", false),
+                vec![("default", Snapshot::default())],
+                Some(Feed {
+                    kerdr_feed: 1,
+                    cards: vec![named],
+                    ..Default::default()
+                }),
+            );
+            let machines = if named_first {
+                [laptop, server]
+            } else {
+                [server, laptop]
+            };
+            let board = build(&machines, &Config::default());
+            let card = board.cards.iter().find(|c| c.reference == "#222").unwrap();
+            assert_eq!(card.machine, "laptop", "named first: {named_first}");
+            assert_eq!(
+                card.detail.as_ref().unwrap().status.as_deref(),
+                Some("from the laptop"),
+                "named first: {named_first}"
+            );
+        }
+    }
+
+    #[test]
+    fn of_two_copies_naming_themselves_home_the_one_that_resumes_wins() {
+        // Both machines name themselves where the work is: the server holds the agent's recorded
+        // conversation (resume), the laptop only a transcript that mentions it. The server's copy
+        // wins wherever it's listed; with neither able to resume, the first live one stays.
+        for server_first in [false, true] {
+            for server_resumes in [true, false] {
+                let claim = |name: &str| {
+                    let mut c = feed_card("0230", "maintain", "closed");
+                    c.home = Some(Home {
+                        machine: Some(name.into()),
+                        session: None,
+                    });
+                    c.status = Some(format!("from {name}"));
+                    c
+                };
+                let mut on_server = claim("build-box");
+                if server_resumes {
+                    on_server.resume = Some(crate::feed::Resume {
+                        agent: Some("claude".into()),
+                        conversation: Some("6b1f0c2e-8a4d-4c3b-9e5f-2d7a1c0b3e48".into()),
+                    });
+                }
+                let feed = |c: FeedCard| {
+                    Some(Feed {
+                        kerdr_feed: 1,
+                        cards: vec![c],
+                        ..Default::default()
+                    })
+                };
+                let server = live(
+                    machine("build-box", true),
+                    vec![("default", Snapshot::default())],
+                    feed(on_server),
+                );
+                let laptop = live(
+                    machine("laptop", false),
+                    vec![("default", Snapshot::default())],
+                    feed(claim("laptop")),
+                );
+                let machines = if server_first {
+                    [server, laptop]
+                } else {
+                    [laptop, server]
+                };
+                let board = build(&machines, &Config::default());
+                let card = board.cards.iter().find(|c| c.reference == "#230").unwrap();
+                let want = if server_resumes || server_first {
+                    "build-box"
+                } else {
+                    "laptop"
+                };
+                assert_eq!(
+                    card.machine, want,
+                    "server first: {server_first}, server resumes: {server_resumes}"
+                );
+            }
+        }
     }
 
     #[test]

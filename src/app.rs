@@ -3162,6 +3162,27 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
     }
 
+    #[test]
+    fn enter_reopens_work_whose_home_names_only_a_machine_there() {
+        // A record with no home, its conversation on another machine: that machine's feed names
+        // it, with no session, and Enter sends the reopen there, not to the card's own machine,
+        // leaving the session to the backend.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let other = app.machines[1].name();
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(other),
+            session: None,
+        });
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen: {:?}", app.message())
+        };
+        assert_eq!(machine, 1);
+        assert_eq!(request, serde_json::json!({"action": "reopen", "id": id}));
+    }
+
     fn esc(app: &mut App) -> Action {
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
     }
