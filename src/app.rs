@@ -3425,6 +3425,25 @@ mod tests {
             app.board.cards[i].workspace_id = None;
             app.board.cards[i].session = None;
         }
+        // Won't do asked about backlog work whose home moved meanwhile: not the work asked about.
+        let (bkey, _) = waiting_backlog_card(&app);
+        let b = app.board.cards.iter().position(|c| c.key == bkey).unwrap();
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(bkey),
+        };
+        press(&mut app, 'x');
+        settle(&mut app);
+        app.board.cards[b].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(app.machines[0].name()),
+            session: Some("elsewhere".into()),
+        });
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        app.sel = Selection {
+            col: Stage::Build.index(),
+            key: Some(key),
+        };
         // Won't do asked about started work, which went back to the backlog meanwhile.
         press(&mut app, 'x');
         settle(&mut app);

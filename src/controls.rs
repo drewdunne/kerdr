@@ -1460,7 +1460,7 @@ impl App {
                     // backlog work only while it still waits.
                     Some("dismiss") => match target {
                         Some(t) if !t.waiting => c.closable() && !waiting_work(c) && t.same_work(c),
-                        _ => waiting_work(c),
+                        _ => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
                     },
                     _ => waiting_work(c),
                 }
