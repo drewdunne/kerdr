@@ -4508,7 +4508,8 @@ mod tests {
         for w in [80, 120, 176] {
             let screen = rendered(&a, w, 44);
             assert!(screen.contains("—│—  ready"), "{w}: {screen}");
-            assert!(screen.contains("—│19  ⏸"), "{w}: {screen}");
+            let out = format!("—│19  {}", crate::accounts::pause_glyph());
+            assert!(screen.contains(&out), "{w}: {screen}");
             assert_eq!(screen.matches(&five).count(), 2, "{w}: {screen}");
             assert_eq!(screen.matches(&week).count(), 1, "{w}: {screen}");
         }
