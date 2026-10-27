@@ -209,7 +209,7 @@ question and a new token: Kerdr asks again. Before sending a yes, Kerdr also rec
 card has the same home and conversation and no new workspace.
 
 When the question says the session is full (it carries `used`), it also offers `w`: the request
-again with `queue: true`, for the backend to queue the work in that session instead, as starting
+again with `queue: true` and that `confirm` token, for the backend to queue the work in that session instead, as starting
 new work would be. Without `[actions]`, `Enter` says the card has no workspace and sends nothing.
 
 ### Reopening done work
@@ -219,7 +219,10 @@ with no workspace open sends the same `reopen` request, so work that wrapped its
 were finished with it is one key away. The backend must ask first, every time: answer the first
 request with a question whose `message` says the work is done and that a yes opens it again, and
 put every other reason in the same question. Only the yes, with its `confirm` token, opens the
-record again and reopens it; a no sends nothing, so nothing changes. Kerdr rechecks before
+record again and reopens it; a no sends nothing, so nothing changes. Require the token for a
+queue answer (`w`) to done work too, and ask again when it's missing or from a question that
+didn't say the work was done (one asked while it was still under way). Done work found open
+already (its workspace, or its conversation in another pane) is asked about the same way. Kerdr rechecks before
 sending the yes that the card is still the same work with no new workspace.
 
 Kerdr refuses a dismissed card itself ("u brings it back"), and a card homed on a machine it

@@ -3541,6 +3541,8 @@ mod tests {
             (sent["queue"].as_bool(), sent.get("override")),
             (Some(true), None)
         );
+        // The token goes with it: queueing done work is a yes to what was asked, too.
+        assert_eq!(sent["confirm"], "0123456789ab0004");
         app.finish_action(
             0,
             sent,
