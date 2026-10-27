@@ -604,28 +604,22 @@ fn account_line(a: &Account, yes: bool) -> Line<'static> {
         yes,
     )
 }
-fn status_line(app: &App, a: &Account) -> Line<'static> {
-    let reset = app
-        .account_usage(a)
-        .map(|u| u.reset_since(app.now()))
-        .unwrap_or_default();
-    let note = if reset.is_empty() {
-        String::new()
-    } else {
-        let windows: Vec<_> = reset
-            .iter()
-            .map(|(window, at)| format!("{window} reset {at}"))
-            .collect();
-        format!(" · {}, no reading since", windows.join(", "))
-    };
-    line(
-        format!(
-            "         {}  {}{note}",
-            app.account_numbers(a),
-            a.status_label()
-        ),
+/// An account's figures and status, then a line for each window that has reset since its
+/// freshest reading, whose figure shows as unknown.
+fn status_lines(app: &App, a: &Account) -> Vec<Line<'static>> {
+    let mut lines = vec![line(
+        format!("         {}  {}", app.account_numbers(a), a.status_label()),
         account_color(a),
-    )
+    )];
+    if let Some(u) = app.account_usage(a) {
+        for (window, at) in u.reset_since(app.now()) {
+            lines.push(line(
+                format!("         {window} window reset {at}; use since unknown"),
+                DIM,
+            ));
+        }
+    }
+    lines
 }
 
 fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usize, model: usize) {
@@ -684,7 +678,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                 {
                     if a.shown_copies().first().map(|c| &c.id) == Some(id) {
                         lines.push(table_row(account_line(a, false), tw));
-                        lines.push(table_row(status_line(app, a), tw));
+                        lines.extend(status_lines(app, a).into_iter().map(|l| table_row(l, tw)));
                     }
                     if i == sel {
                         selected_line = lines.len();
@@ -695,7 +689,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
             Row::Account(code) => {
                 if let Some(a) = feed.accounts.iter().find(|a| &a.code == code) {
                     lines.push(table_row(account_line(a, i == sel), tw));
-                    lines.push(table_row(status_line(app, a), tw));
+                    lines.extend(status_lines(app, a).into_iter().map(|l| table_row(l, tw)));
                 }
             }
             Row::Owner(id) => {

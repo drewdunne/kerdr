@@ -317,7 +317,7 @@ Account status is `ready`, `out`, `sign_in`, or `missing`. Usage values are perc
 missing or null usage displays as unknown. Usage belongs to the account rather than the machine,
 so wherever Kerdr shows an account's figures, on any machine tab or on All, it uses the reading
 with the newest `seen` among every machine's feed for that account code; a reading without `seen`
-counts as oldest. A figure whose `five_at` or `week_at` has passed displays as unknown (`—`)
+counts as oldest, and a tie goes to the first machine in the board's order on every tab. A figure whose `five_at` or `week_at` has passed displays as unknown (`—`)
 until a newer reading arrives, and the accounts screen says which window reset and when. Providers, kinds, and runner names are strings
 so other programs and local endpoints can be represented. Creating accounts currently uses
 `provider: "claude"` and `kind: "token"`; the engine validates what it supports.

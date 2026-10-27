@@ -4441,36 +4441,76 @@ mod tests {
     }
 
     #[test]
+    fn tied_readings_show_the_same_figures_on_every_tab() {
+        let mut a = demo(false);
+        for m in &mut a.machines {
+            let laptop = m.name() == "laptop";
+            let Some(f) = &mut m.feed else { continue };
+            for acc in f.accounts.iter_mut().filter(|acc| acc.code == "ARK") {
+                acc.usage = Some(crate::accounts::Usage {
+                    five: Some(if laptop { 65.0 } else { 1.0 }),
+                    week: Some(19.0),
+                    seen: Some("2026-10-21T17:40:00-05:00".into()),
+                    ..Default::default()
+                });
+            }
+        }
+        for machine in [None, Some("laptop"), Some("build-box")] {
+            a.machine = machine.map(str::to_string);
+            a.rebuild();
+            let top = top_line(&a, 176);
+            assert!(top.contains("ARK 65│19"), "{machine:?}: {top}");
+        }
+    }
+
+    #[test]
     fn a_reading_past_its_reset_time_says_so_instead_of_showing_old_figures() {
         let mut a = demo(false);
-        let five_at = chrono::Local
-            .with_ymd_and_hms(2026, 10, 21, 16, 40, 0)
-            .single()
-            .unwrap()
-            .to_rfc3339();
+        let at = |h, m| {
+            chrono::Local
+                .with_ymd_and_hms(2026, 10, 21, h, m, 0)
+                .single()
+                .unwrap()
+                .to_rfc3339()
+        };
+        let (five_at, week_at) = (at(16, 40), at(17, 0));
         for m in &mut a.machines {
             let Some(f) = &mut m.feed else { continue };
             for acc in &mut f.accounts {
-                acc.status = "ready".into();
                 acc.usage = Some(crate::accounts::Usage {
                     five: Some(40.0),
                     five_at: Some(five_at.clone()),
                     week: Some(19.0),
-                    week_at: Some("2026-10-24T09:00:00-05:00".into()),
-                    seen: Some("2026-10-21T11:44:00-05:00".into()),
+                    week_at: Some(if acc.code == "ARK" {
+                        week_at.clone()
+                    } else {
+                        "2026-10-24T09:00:00-05:00".into()
+                    }),
+                    seen: Some(at(11, 44)),
                 });
             }
         }
         a.machine = Some("laptop".into());
         a.rebuild();
         let top = top_line(&a, 176);
-        assert!(top.contains("ARK —│19"), "{top}");
+        assert!(top.contains("ARK —│—"), "{top}");
+        assert!(top.contains("KBZ —│19"), "{top}");
         a.open_accounts();
-        let screen = rendered(&a, 176, 44);
-        let note = format!(
-            "—│19  ready · five-hour reset {}, no reading since",
+        let five = format!(
+            "five-hour window reset {}; use since unknown",
             crate::accounts::reset_time(&five_at)
         );
-        assert!(screen.contains(&note), "{screen}");
+        let week = format!(
+            "weekly window reset {}; use since unknown",
+            crate::accounts::reset_time(&week_at)
+        );
+        // KBZ is out in the demo and ARK ready; both explain their resets in full at every width.
+        for w in [80, 120, 176] {
+            let screen = rendered(&a, w, 44);
+            assert!(screen.contains("—│—  ready"), "{w}: {screen}");
+            assert!(screen.contains("—│19  ⏸"), "{w}: {screen}");
+            assert_eq!(screen.matches(&five).count(), 2, "{w}: {screen}");
+            assert_eq!(screen.matches(&week).count(), 1, "{w}: {screen}");
+        }
     }
 }
