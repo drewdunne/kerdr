@@ -256,6 +256,51 @@ impl App {
             })
     }
 
+    /// What S says when its list is saved unchanged. A list only picks the account agents start
+    /// on, so when this owner has a running agent s could move, it says that's the key, naming
+    /// the cards (F-0294: Andrew reached for S to move one agent and was told only "unchanged").
+    pub fn unchanged_list_said(&self, machine: usize, owner: &Owner) -> String {
+        let first = owner.models.first().map(String::as_str);
+        let mut cards: Vec<(String, String)> = self
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.machine_index == machine && c.detail.is_some())
+            .filter(|c| {
+                c.session.as_deref().is_some_and(|s| {
+                    self.account_owner(machine, s).is_some_and(|o| {
+                        o.id == owner.id || (o.parent.as_ref() == Some(&owner.id) && !o.own)
+                    })
+                })
+            })
+            .filter_map(|c| {
+                let agent = self.move_agent(c)?;
+                Some((c.reference.clone(), agent.account))
+            })
+            .collect();
+        if cards.is_empty() {
+            return "Model list unchanged.".into();
+        }
+        // The ones running off the list's first account first: those are what a move is for.
+        cards.sort_by_key(|(_, account)| Some(account.as_str()) == first);
+        let named: Vec<String> = cards
+            .iter()
+            .take(3)
+            .map(|(r, a)| {
+                if a.is_empty() {
+                    r.clone()
+                } else {
+                    format!("{r} on {a}")
+                }
+            })
+            .collect();
+        format!(
+            "Model list unchanged. It picks the account agents start on and moves none that's running: to move one, select its card and press s ({}{}).",
+            named.join(", "),
+            if cards.len() > 3 { ", …" } else { "" }
+        )
+    }
+
     pub fn account_owner(&self, machine: usize, session: &str) -> Option<&Owner> {
         let f = self.account_feed(machine)?;
         f.owners
@@ -506,7 +551,14 @@ impl App {
                             sel: 0,
                         });
                     } else if card.agents.is_empty() {
-                        self.say("This card has no agent running to move.", Tone::Info);
+                        self.say(
+                            if card.cancellable() {
+                                "This card's agent isn't running, so there's nothing to move: ⏎ goes in, X cancels it."
+                            } else {
+                                "This card has no agent running to move."
+                            },
+                            Tone::Info,
+                        );
                     } else if self.account_feed(card.machine_index).is_none() {
                         self.say(
                             "This card's machine hasn't sent its accounts yet.",
@@ -874,7 +926,8 @@ impl App {
                     }
                     KeyCode::Enter if !models.is_empty() => {
                         if *models == owner.models && (owner.own || owner.parent.is_none()) {
-                            self.say("Model list unchanged.", Tone::Info);
+                            let said = self.unchanged_list_said(*machine, owner);
+                            self.say(said, Tone::Info);
                             if *move_waiting {
                                 self.queue_waiting_moves(&owner.id);
                             }
@@ -1865,6 +1918,46 @@ mod tests {
         let action = key(&mut a, KeyCode::Enter);
         complete(&mut a, action, json!({"ok":false,"message":"write failed"}));
         assert!(a.account_queue.is_empty());
+    }
+
+    #[test]
+    fn s_upper_saved_unchanged_points_to_s_on_a_card_when_an_agent_could_move() {
+        // F-0294: Andrew pressed S to move one running agent, and "Model list unchanged" alone
+        // read as "can't be done".
+        let mut a = app();
+        let owner = a
+            .account_feed(1)
+            .unwrap()
+            .owners
+            .iter()
+            .find(|o| o.id == "platform")
+            .unwrap()
+            .clone();
+        let open = |a: &mut App, owner: &crate::accounts::Owner| {
+            a.push_account_screen(AccountScreen::Models {
+                machine: 1,
+                models: owner.models.clone(),
+                owner: owner.clone(),
+                sel: 0,
+                move_waiting: false,
+            });
+        };
+        open(&mut a, &owner);
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        let said = a.message().unwrap().0;
+        assert!(
+            said.starts_with("Model list unchanged. It picks the account agents start on and moves none that's running: to move one, select its card and press s ("),
+            "{said}"
+        );
+        // The build box's Platform sessions: the ones off the list's first account (KBZ) first.
+        assert!(said.contains(" on ARK"), "{said}");
+        // With no agent there to move, it's only unchanged.
+        for c in a.board.cards.iter_mut() {
+            c.agents.clear();
+        }
+        open(&mut a, &owner);
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(a.message().unwrap().0, "Model list unchanged.");
     }
 
     #[test]

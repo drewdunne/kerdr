@@ -125,6 +125,13 @@ workspace open. A card with a workspace open refuses, since its agent may be the
 backend refuses one whose agent it finds running elsewhere. See
 [docs/feed.md](docs/feed.md#closing-work-with-no-agent).
 
+Work an agent is still at can be stopped from the board too. `X` on its card asks, saying what it
+will stop and close, then stops that agent, mid-step or idle, by closing its workspace (only its
+tab, for a child running in its parent's workspace), and sets the work aside in Won't do, where
+`u` brings it back. And `s` on the card moves just that card's agent to another account, keeping
+its conversation, without touching the session's other agents or its owner's list, which is what
+`S` edits. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
+
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
 `M` lists every machine and every state it can be in: live, connecting, reconnecting, can't
@@ -250,8 +257,9 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
+| `X` | cancel: stop the selected card's agent, close its workspace (or only a child's tab), and set it aside in Won't do (work an agent is at; asks first) |
 | `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
-| `A` / `S` / `s` | accounts / viewed session’s ordered models / move selected agent |
+| `A` / `S` / `s` | accounts / the viewed session owner’s ordered models, for agents that start next / move the selected card’s agent to another account, keeping its conversation |
 | `a` | cycle provider: All, Claude, Codex, and detected providers |
 | `b` | backlog |
 | `w` | toggle Won't do view |

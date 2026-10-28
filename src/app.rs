@@ -3473,6 +3473,200 @@ mod tests {
         assert_eq!(request, serde_json::json!({"action": "close", "id": id}));
     }
 
+    /// Work an agent is at (intent 0321): the demo's Build card, its workspace 07-build open in
+    /// web on the first machine, a Claude agent mid-step in it.
+    fn running_card(app: &mut App) -> (String, String) {
+        let (key, id) = closed_workspace_card(app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        let card = &mut app.board.cards[i];
+        card.workspace_id = Some("w7".into());
+        card.workspace_label = Some("07-build".into());
+        card.session = Some("web".into());
+        card.attention = Attention::Running;
+        card.agents = vec![crate::model::AgentInfo {
+            agent: "claude".into(),
+            status: "working".into(),
+            pane_id: "w7:p1".into(),
+            ..Default::default()
+        }];
+        (key, id)
+    }
+
+    #[test]
+    fn x_upper_cancels_work_an_agent_is_at_after_saying_what_it_stops() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("X didn't ask first: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {reference}?"));
+        assert!(
+            message.starts_with("Stops its Claude agent (mid-step) and closes workspace 07-build (web), with every tab in it, then sets"),
+            "{message}"
+        );
+        assert!(message.contains("aside in Won't do"), "{message}");
+        assert!(message.contains("u brings it back"), "{message}");
+        // No is no.
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Board));
+        press(&mut app, 'X');
+        settle(&mut app);
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(
+            request,
+            serde_json::json!({"action": "cancel", "id": id, "session": "web", "workspace": "w7"})
+        );
+        assert!(app.working_on(&request).contains("stopping its agent"));
+    }
+
+    #[test]
+    fn x_upper_on_a_child_closes_only_its_tab_and_a_parent_names_its_children() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].tab_id = Some("w7:t2".into());
+        press(&mut app, 'X');
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("X didn't ask first")
+        };
+        assert!(
+            message.contains(
+                "closes its tab in 07-build (web), leaving the rest of that workspace running"
+            ),
+            "{message}"
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(request["tab"], "w7:t2");
+        assert_eq!(request["id"], serde_json::json!(id));
+        // The parent: another card, the whole workspace, its child named.
+        app.busy = false;
+        let child = app.board.cards[i].reference.clone();
+        let p = app
+            .board
+            .cards
+            .iter()
+            .position(|c| {
+                c.key != key
+                    && c.detail.is_some()
+                    && !matches!(c.stage, Stage::Maintain | Stage::Misc | Stage::Backlog)
+            })
+            .unwrap();
+        let card = &mut app.board.cards[p];
+        card.workspace_id = Some("w7".into());
+        card.workspace_label = Some("07-build".into());
+        card.session = Some("web".into());
+        card.machine_index = 0;
+        card.tab_id = None;
+        card.attention = Attention::Idle;
+        card.agents.clear();
+        card.state = Some("active".into());
+        let d = card.detail.as_mut().unwrap();
+        d.disposition = None;
+        d.intake = None;
+        app.sel = Selection {
+            col: app.board.cards[p].stage.index(),
+            key: Some(app.board.cards[p].key.clone()),
+        };
+        press(&mut app, 'X');
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("X on the parent didn't ask: {:?}", app.message())
+        };
+        assert!(
+            message.starts_with("Stops whatever runs there"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "{child} in a tab there stops too and stays open with no agent"
+            )),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn x_upper_rechecks_where_the_work_runs_before_sending() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = running_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        press(&mut app, 'X');
+        settle(&mut app);
+        // Its workspace closed and another opened on it while the question was up.
+        app.board.cards[i].workspace_id = Some("w9".into());
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn x_upper_refuses_work_no_agent_is_at_and_done_work() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        assert!(matches!(app.mode, Mode::Board));
+        assert!(
+            app.message().unwrap().0.contains(
+                "has no workspace open, so no agent to stop: x sets it aside, C marks it done."
+            ),
+            "{:?}",
+            app.message()
+        );
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].workspace_id = Some("w7".into());
+        app.board.cards[i].session = Some("web".into());
+        app.board.cards[i].stage = Stage::Maintain;
+        app.board.cards[i].attention = Attention::Done;
+        app.sel.col = Stage::Maintain.index();
+        press(&mut app, 'X');
+        assert!(app.message().unwrap().0.contains("done already"));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn the_menu_and_the_bottom_line_offer_x_and_s_for_work_an_agent_is_at() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        assert_eq!(
+            app.card_for_keys().map(|c| c.key.clone()),
+            Some(key.clone())
+        );
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        assert!(matches!(&app.mode, Mode::Palette { target: Some(t), .. } if *t == key));
+        press(&mut app, 'X');
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the menu's X sent nothing")
+        };
+        assert_eq!(request["action"], "cancel");
+        assert_eq!(request["id"], serde_json::json!(id));
+        // The menu's s is the board's: it moves this card's own agent, by its pane (from review).
+        app.busy = false;
+        app.mode = Mode::Board;
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 's');
+        let Mode::Accounts {
+            screen: AccountScreen::Move { target, .. },
+            ..
+        } = &app.mode
+        else {
+            panic!("the menu's s didn't open the move: {:?}", app.message())
+        };
+        assert_eq!(target.key, key);
+        assert_eq!(target.agent.pane, "w7:p1");
+        assert_eq!(target.agent.session, "web");
+    }
+
     /// A done card (intent 0278): the same work, in Maintain, its workspace gone with its wrap.
     fn done_card(app: &mut App) -> (String, String) {
         let (key, id) = closed_workspace_card(app);
