@@ -3650,6 +3650,21 @@ mod tests {
         };
         assert_eq!(request["action"], "cancel");
         assert_eq!(request["id"], serde_json::json!(id));
+        // The menu's s is the board's: it moves this card's own agent, by its pane (from review).
+        app.busy = false;
+        app.mode = Mode::Board;
+        app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+        press(&mut app, 's');
+        let Mode::Accounts {
+            screen: AccountScreen::Move { target, .. },
+            ..
+        } = &app.mode
+        else {
+            panic!("the menu's s didn't open the move: {:?}", app.message())
+        };
+        assert_eq!(target.key, key);
+        assert_eq!(target.agent.pane, "w7:p1");
+        assert_eq!(target.agent.session, "web");
     }
 
     /// A done card (intent 0278): the same work, in Maintain, its workspace gone with its wrap.

@@ -266,14 +266,18 @@ machine, naming where the yes was given:
 {"action":"cancel","id":"0322","session":"default","workspace":"w2M","tab":"w2M:t3"}
 ```
 
-The backend stops that agent, mid-step or idle, by closing that workspace or tab, ends anything
-that outlived the close, and then sets the record aside as `dismiss` does: it leaves the board
-for Won't do, keeping its state, so `restore` brings it back and `Enter` then reopens it, resuming
-its conversation. Refuse, with a plain `message` and nothing stopped, when the work runs anywhere
-other than the workspace and tab named, when it's done, in Won't do or still being written up, or
-when the action itself runs inside that workspace. When the agent stopped but its conversation
-is still running somewhere, say so and leave the record as it was. Before sending the yes, Kerdr
-rechecks that the card is the same work, still open in that workspace and tab.
+The backend stops that agent, mid-step or idle, and everything else running in that workspace or
+tab, then closes it, and then sets the record aside as `dismiss` does: it leaves the board for
+Won't do, keeping its state, so `restore` brings it back and `Enter` then reopens it, resuming its
+conversation. ark-sdlc's backend stops every process under the panes where it stands first, holding
+each by a pidfd, walks them again until nothing new appears, and only then ends them, so nothing
+they start meanwhile gets away and no signal reaches a process that took a pid since. Refuse, with
+a plain `message` and nothing stopped, when the work runs anywhere other than the workspace and
+tab named, or in more than one place, when it's done, in Won't do or still being written up, or
+when the action itself runs inside that workspace. When the agent stopped but the work is still
+open somewhere, or its conversation still running, say so and leave the record as it was. Before
+sending the yes, Kerdr rechecks that the card is the same work, still open in that workspace and
+tab.
 
 `X` on a card with no workspace open says `x` and `C` are for it instead. Children in tabs of a
 workspace that closes stop too and stay open with no agent; `x` or `C` ends them.
