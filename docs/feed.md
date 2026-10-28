@@ -269,9 +269,11 @@ machine, naming where the yes was given:
 The backend stops that agent, mid-step or idle, and everything else running in that workspace or
 tab, then closes it, and then sets the record aside as `dismiss` does: it leaves the board for
 Won't do, keeping its state, so `restore` brings it back and `Enter` then reopens it, resuming its
-conversation. ark-sdlc's backend stops every process under the panes where it stands first, holding
-each by a pidfd, walks them again until nothing new appears, and only then ends them, so nothing
-they start meanwhile gets away and no signal reaches a process that took a pid since. Refuse, with
+conversation. ark-sdlc's backend stops every process under the panes, and every one still in a
+pane's terminal session, where it stands first, holding each by a pidfd, walks them again until
+nothing new appears, and only then ends them, so nothing they start meanwhile gets away and no
+signal reaches a process that took a pid since. Anything going wrong on the way lets go of what it
+stopped. Refuse, with
 a plain `message` and nothing stopped, when the work runs anywhere other than the workspace and
 tab named, or in more than one place, when it's done, in Won't do or still being written up, or
 when the action itself runs inside that workspace. When the agent stopped but the work is still
