@@ -315,6 +315,19 @@ impl Card {
             && !self.is_open_workspace()
     }
 
+    /// Work an agent may be at, its workspace (or, for a child, its tab) open on its card's
+    /// machine: `X` stops that agent, closes the workspace or tab, and sets the work aside in Won't
+    /// do, after a yes (intent 0321). A record that isn't done, dismissed or still being written up.
+    pub fn cancellable(&self) -> bool {
+        self.detail.is_some()
+            && self.is_open_workspace()
+            && !matches!(self.stage, Stage::Maintain | Stage::Misc)
+            && self.state.as_deref() != Some("closed")
+            && self.attention != Attention::Done
+            && !self.dismissed()
+            && self.intake() != Some("pending")
+    }
+
     /// Work under way, whatever its workspace: a record in a working stage, not done, dismissed or
     /// still being written up. What a reopen needs, once its workspace is known to have gone.
     pub fn under_way(&self) -> bool {

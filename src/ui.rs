@@ -226,7 +226,7 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
         .started_card_for_keys()
         .filter(|_| matches!(app.mode, Mode::Board) && app.actions_on())
     else {
-        return done_hints(app);
+        return running_hints(app);
     };
     let mut spans = card_badge(card, if card.no_agent() { YELLOW } else { CYAN });
     let mut hints = vec![];
@@ -234,6 +234,41 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
         hints.push(("⏎", "reopen it"));
     }
     hints.extend([("C", "done"), ("x", "won’t do")]);
+    spans.extend(key_hints(&hints));
+    spans.push(Span::styled("   │   ", fg(BORDER)));
+    spans
+}
+
+/// The account move s offers for a card, as its hint says it: the card's own agent, off the
+/// account it's on (intent 0321, F-0294). None when s has no agent there to move.
+fn move_hint(app: &App, card: &Card) -> Option<String> {
+    let agent = app.move_agent(card)?;
+    Some(if agent.account.is_empty() {
+        "move its agent to another account".into()
+    } else {
+        format!("move its agent off {}", agent.account)
+    })
+}
+
+/// Work an agent is at, selected on the board: ⏎ goes in, s moves its agent to another account
+/// (saying which it's on), and X cancels it, stopping that agent (intent 0321). Else what
+/// done_hints says.
+fn running_hints(app: &App) -> Vec<Span<'static>> {
+    let Some(card) = app
+        .running_card_for_keys()
+        .filter(|_| matches!(app.mode, Mode::Board))
+    else {
+        return done_hints(app);
+    };
+    let mut spans = card_badge(card, CYAN);
+    let moving = move_hint(app, card);
+    let mut hints = vec![("⏎", "go in")];
+    if let Some(m) = &moving {
+        hints.push(("s", m.as_str()));
+    }
+    if app.actions_on() {
+        hints.push(("X", "cancel"));
+    }
     spans.extend(key_hints(&hints));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
@@ -440,13 +475,17 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         );
     }
     let backlog_hints = card_hints(app);
+    let card_moves = matches!(app.mode, Mode::Board)
+        && app
+            .running_card_for_keys()
+            .is_some_and(|c| app.move_agent(c).is_some());
     let mut hints = if accounts {
         let mut h = account_ui::new_intents(app);
-        h.extend(key_hints(&[
-            ("s", "move"),
-            ("A", "accounts"),
-            ("S", "models"),
-        ]));
+        h.extend(key_hints(if card_moves {
+            &[("A", "accounts"), ("S", "models")][..]
+        } else {
+            &[("s", "move"), ("A", "accounts"), ("S", "models")][..]
+        }));
         h
     } else {
         card_hints(app)
@@ -1442,8 +1481,11 @@ fn wrapped(
 
 fn line_for_account_keys() -> Line<'static> {
     Line::from(key_hints(&[
-        ("s", "move account"),
-        ("S", "models"),
+        (
+            "s",
+            "move this agent to another account, keeping its conversation",
+        ),
+        ("S", "the list new agents start on"),
         ("A", "accounts"),
     ]))
 }
@@ -1520,7 +1562,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     }
     lines.extend(wrapped(&facts.join(" · "), w, fg(DIM), None));
 
-    if let Some(agent) = app.account_agent(c) {
+    if let Some(agent) = app.account_agent(c).cloned().or_else(|| app.move_agent(c)) {
         lines.push(Line::raw(""));
         lines.push(section("ACCOUNT"));
         let account = app
@@ -1537,16 +1579,21 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             })
             .unwrap_or_default();
         lines.extend(wrapped(
-            &format!(
-                "{}  {state} · {}",
-                agent.account,
-                match agent.how.as_str() {
-                    "manual" => "moved by hand",
-                    "next" => "next in the list",
-                    "handed_over" => "handed over to a fresh agent",
-                    _ => "follows the list",
-                }
-            ),
+            &if agent.account.is_empty() {
+                "No account recorded for this agent yet: s moves it to one and records it."
+                    .to_string()
+            } else {
+                format!(
+                    "{}  {state} · {}",
+                    agent.account,
+                    match agent.how.as_str() {
+                        "manual" => "moved by hand",
+                        "next" => "next in the list",
+                        "handed_over" => "handed over to a fresh agent",
+                        _ => "follows the list",
+                    }
+                )
+            },
             w,
             fg(FG2),
             None,
@@ -1810,6 +1857,16 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     if app.started_card_for_keys().is_some() && app.actions_on() {
         hints.extend([("C", "done"), ("x", "won’t do")]);
     }
+    // Work an agent is at: its agent to another account, or cancelled (intent 0321).
+    let moving = move_hint(app, c);
+    if app.running_card_for_keys().is_some() {
+        if let Some(m) = &moving {
+            hints.push(("s", m.as_str()));
+        }
+        if app.actions_on() {
+            hints.push(("X", "cancel"));
+        }
+    }
     hints.push(("n N", "next that needs you"));
     if max_scroll > 0 {
         hints.push(("j k", "scroll"));
@@ -1844,7 +1901,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
     let card = app.card_for_keys();
     let this_card = card
         .map(|c| format!("{} {}", c.reference, c.title))
-        .unwrap_or_else(|| "select a backlog card first".into());
+        .unwrap_or_else(|| "select a card first".into());
     let buf = f.buffer_mut();
     let mut title = vec![
         Span::styled("CTRL+SPACE", bold(CYAN)),
@@ -1862,8 +1919,16 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
     );
     let restore = card.is_some_and(|c| c.dismissed());
     let started = app.backlog_card_for_keys().is_none() && card.is_some();
+    let running = app.backlog_card_for_keys().is_none()
+        && app.started_card_for_keys().is_none()
+        && app.running_card_for_keys().is_some();
     let card_keys: &[(&str, &str)] = if restore {
         &[("u", "bring it back")]
+    } else if running {
+        &[
+            ("s", "move its agent to another account"),
+            ("X", "cancel: stop its agent, won’t do"),
+        ]
     } else if started {
         &[("C", "done, starting nothing"), ("x", "won’t do")]
     } else {
@@ -2354,11 +2419,20 @@ fn confirm(
                         match action {
                             Some("dispatch") => "start anyway",
                             Some("reopen") => "go ahead",
+                            Some("cancel") => "stop it",
                             _ => "yes",
                         },
                     ),
                     ("w", "queue it for a free slot"),
-                    ("Esc / n", "cancel"),
+                    // On X's question, "cancel" would read as the yes (intent 0321).
+                    (
+                        "Esc / n",
+                        if action == Some("cancel") {
+                            "keep it running"
+                        } else {
+                            "cancel"
+                        },
+                    ),
                 ][..]
                     .iter()
                     .filter(|(k, _)| queue || *k != "w")
@@ -2691,13 +2765,13 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
             ),
             (
                 "s",
-                "move the selected agent to another account",
-                "asks only when needed",
+                "move the selected card's agent to another account",
+                "keeps its conversation; only that agent",
             ),
             (
                 "S",
-                "the viewed session’s ordered models",
-                "space moves waiting sessions",
+                "the viewed session owner's ordered models",
+                "for agents that start next; moves none running",
             ),
         ],
     ),
@@ -2720,6 +2794,11 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
                 "C",
                 "done: closes it, starting nothing",
                 "asks first; work with no agent",
+            ),
+            (
+                "X",
+                "cancel: stop its agent, close its workspace, won’t do",
+                "asks first; work an agent is at",
             ),
             ("u", "bring it back from won’t do", ""),
             ("J  K", "move it down / up your order", "10J moves ten"),
@@ -4040,6 +4119,70 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    /// F-0294 and intent 0321: a card an agent is at says on the board itself that s moves its
+    /// agent, off the account it's on, and X cancels it; its peek says what s does.
+    #[test]
+    fn a_card_an_agent_is_at_names_s_and_x_on_the_board_and_in_its_peek() {
+        let mut a = demo(false);
+        a.cfg.actions.command = Some("fixture".into());
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#44")
+            .unwrap()
+            .clone();
+        assert!(card.cancellable(), "{card:?}");
+        let account = a.move_agent(&card).unwrap().account;
+        a.sel = crate::app::Selection {
+            col: card.stage.index(),
+            key: Some(card.key.clone()),
+        };
+        let screen = rendered(&a, 176, 44);
+        let bottom = &screen[screen.len() - 176..];
+        assert!(
+            bottom.contains(&format!(
+                "#44   ⏎ go in   s move its agent off {account}   X cancel"
+            )),
+            "{bottom}"
+        );
+        // At 80 columns the card's own keys still show whole.
+        let narrow = rendered(&a, 80, 24);
+        assert!(
+            narrow[narrow.len() - 80..]
+                .contains(&format!("s move its agent off {account}   X cancel")),
+            "80 columns"
+        );
+        // The generic "s move" isn't said twice.
+        assert_eq!(bottom.matches(" s ").count(), 1, "{bottom}");
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        let peek = rendered(&a, 176, 44);
+        assert!(
+            peek.contains("s move this agent to another account, keeping its conversation"),
+            "peek"
+        );
+        assert!(
+            peek.contains(&format!("s move its agent off {account}")),
+            "peek"
+        );
+        assert!(peek.contains("X cancel"), "peek");
+        // X's question: its buttons say stop it or keep it running, never a bare "cancel".
+        a.mode = Mode::Board;
+        a.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('X'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(matches!(a.mode, Mode::Confirm { .. }), "{:?}", a.message());
+        let asked = rendered(&a, 176, 44);
+        assert!(
+            asked.contains("Enter / y stop it   Esc / n keep it running"),
+            "question"
+        );
     }
 
     #[test]

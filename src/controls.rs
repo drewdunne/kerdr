@@ -457,6 +457,21 @@ impl App {
     pub fn card_for_keys(&self) -> Option<&Card> {
         self.backlog_card_for_keys()
             .or_else(|| self.started_card_for_keys())
+            .or_else(|| self.running_card_for_keys())
+    }
+
+    /// The selected card when an agent may be at it, its workspace open: `X` cancels it, and `s`
+    /// moves its agent to another account (intent 0321). The menu's THIS CARD names both.
+    pub fn running_card_for_keys(&self) -> Option<&Card> {
+        let card = match &self.mode {
+            Mode::Palette { target, .. } => target.as_ref().and_then(|k| self.card(k)),
+            Mode::Backlog { sel } => self
+                .backlog_cards()
+                .get(*sel)
+                .and_then(|&i| self.board.cards.get(i)),
+            _ => self.selected(),
+        }?;
+        card.cancellable().then_some(card)
     }
 
     /// The selected card when it's work already started with no workspace open: `C` and `x` act
@@ -632,6 +647,9 @@ impl App {
         } else if request["action"] == "close" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Marking {} done…", self.reference_for(id))
+        } else if request["action"] == "cancel" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Cancelling {}: stopping its agent…", self.reference_for(id))
         } else {
             "Changing the intent…".into()
         }
@@ -756,6 +774,124 @@ impl App {
         }
     }
 
+    /// X (intent 0321): the agent at the selected card's work stopped, mid-step or idle, by
+    /// closing its workspace (only its tab, for a child running in its parent's workspace), and the
+    /// work set aside in Won't do, its state kept, so u brings it back and ⏎ then resumes its
+    /// conversation. It asks first, saying what it will stop and how it leaves the intent; the
+    /// request names the workspace and tab the yes was for, so the backend closes nothing else.
+    fn cancel_action(&mut self) -> Action {
+        let Some(card) = self.selected_for_control().cloned() else {
+            self.say("Select an intent first.", Tone::Info);
+            return Action::None;
+        };
+        let Some(detail) = &card.detail else {
+            self.say(
+                "This workspace has no intent record: X cancels an intent's work. Close the workspace in herdr instead.",
+                Tone::Info,
+            );
+            return Action::None;
+        };
+        self.backlog_focus = Some(card.key.clone());
+        let reference = card.reference.clone();
+        if !card.cancellable() {
+            let said = if card.dismissed() {
+                format!("{reference} is in won't do already.")
+            } else if card.done()
+                || card.state.as_deref() == Some("closed")
+                || card.attention == Attention::Done
+            {
+                format!("{reference} is done already; there's nothing to cancel.")
+            } else if card.intake() == Some("pending") {
+                format!("{reference} is still being written up.")
+            } else if card.closable() {
+                format!(
+                    "{reference} has no workspace open, so no agent to stop: x sets it aside, C marks it done."
+                )
+            } else {
+                format!("X cancels work an agent is at; {reference} has none.")
+            };
+            self.say(said, Tone::Info);
+            return Action::None;
+        }
+        // Its workspace is where the card came from: that machine's herdr closes it.
+        let machine = card.machine_index;
+        if !self.can_write(machine) {
+            return Action::None;
+        }
+        let (Some(session), Some(workspace)) = (card.session.clone(), card.workspace_id.clone())
+        else {
+            return Action::None;
+        };
+        let mut request =
+            json!({"action":"cancel","id":detail.id,"session":session,"workspace":workspace});
+        if let Some(tab) = &card.tab_id {
+            request["tab"] = json!(tab);
+        }
+        let place = card
+            .workspace_label
+            .clone()
+            .unwrap_or_else(|| workspace.clone());
+        let what = match card.agents.as_slice() {
+            [] => "whatever runs there".to_string(),
+            [a] => format!(
+                "its {} agent{}",
+                crate::accounts::provider_name(&a.agent),
+                match a.status.as_str() {
+                    "working" => " (mid-step)",
+                    "blocked" => " (at a question)",
+                    "idle" | "done" => " (idle)",
+                    _ => "",
+                }
+            ),
+            agents => format!("its {} agents", agents.len()),
+        };
+        let closes = if card.tab_id.is_some() {
+            format!("its tab in {place} ({session}), leaving the rest of that workspace running")
+        } else {
+            format!("workspace {place} ({session}), with every tab in it")
+        };
+        // Children in tabs of a workspace that closes stop too, and stay open with no agent.
+        let children: Vec<String> = if card.tab_id.is_none() {
+            self.board
+                .cards
+                .iter()
+                .filter(|c| {
+                    c.key != card.key
+                        && c.machine_index == card.machine_index
+                        && c.session == card.session
+                        && c.workspace_id == card.workspace_id
+                        && c.tab_id.is_some()
+                })
+                .map(|c| c.reference.clone())
+                .collect()
+        } else {
+            vec![]
+        };
+        let mut message = format!(
+            "Stops {what} and closes {closes}, then sets {reference} aside in Won't do. Anything it hadn't committed stays as it left it. Its log says you cancelled it; u brings it back, and ⏎ then resumes its conversation."
+        );
+        if !children.is_empty() {
+            message.push_str(&format!(
+                " {} in a tab there {} too and {} open with no agent; x or C ends {}.",
+                children.join(", "),
+                if children.len() == 1 { "stops" } else { "stop" },
+                if children.len() == 1 { "stays" } else { "stay" },
+                if children.len() == 1 { "it" } else { "them" }
+            ));
+        }
+        self.mode = Mode::Confirm {
+            machine,
+            request,
+            title: format!("Cancel {reference}?"),
+            message,
+            back: Box::new(self.mode.clone()),
+            target: Some(Box::new(CardSnapshot::of(&card))),
+            queue: false,
+            ready_at: None,
+        };
+        Action::None
+    }
+
     fn new_intent(&mut self) {
         if self.busy {
             self.say(
@@ -795,7 +931,7 @@ impl App {
         self.mode = (*back).clone();
         let card_key = matches!(
             key.code,
-            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C')
+            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X' | 's')
         );
         // A refresh while the menu was open may have moved or removed the card it opened on;
         // its keys then act on nothing rather than on whatever took its place.
@@ -806,8 +942,14 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Char('c') => self.new_intent(),
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X')) => {
                 return self.card_action(c, 1);
+            }
+            // The menu's s is the board's: the selected card's agent to another account.
+            KeyCode::Char('s') => {
+                return self
+                    .account_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))
+                    .unwrap_or(Action::None);
             }
             KeyCode::Char('b') => self.enter_backlog(false),
             KeyCode::Char('w') => self.enter_backlog(!self.wont_do),
@@ -835,6 +977,7 @@ impl App {
             'y' => self.intent_action("refresh", json!({})),
             'x' => self.intent_action("dismiss", json!({})),
             'C' => self.intent_action("close", json!({})),
+            'X' => self.cancel_action(),
             'u' => self.intent_action("restore", json!({})),
             't' => self.intent_action("move", json!({"top":true})),
             'J' => self.intent_action("move", json!({"delta":count})),
@@ -1251,7 +1394,7 @@ impl App {
         }
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X')) => {
                 return Some(self.card_action(c, count));
             }
             KeyCode::Char('{') | KeyCode::Char('}')
@@ -1456,6 +1599,14 @@ impl App {
                     Some("dispatch") => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
                     // Still open with no workspace, the same work (intent 0289).
                     Some("close") => c.closable() && target.is_some_and(|t| t.same_work(c)),
+                    // Still the same work, open where the yes was given (intent 0321).
+                    Some("cancel") => {
+                        c.cancellable()
+                            && target.is_some_and(|t| t.same_work(c))
+                            && c.session.as_deref() == request["session"].as_str()
+                            && c.workspace_id.as_deref() == request["workspace"].as_str()
+                            && c.tab_id.as_deref() == request["tab"].as_str()
+                    }
                     // Started work set aside only while it's still that, with no workspace;
                     // backlog work only while it still waits.
                     Some("dismiss") => match target {

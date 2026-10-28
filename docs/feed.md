@@ -116,8 +116,8 @@ operation; the backend defines which additional fields that operation needs:
 {"action":"dispatch","id":"0041","session":"web","override":false}
 ```
 
-The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore`, `move` and
-`close`.
+The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore`, `move`,
+`close` and `cancel`.
 `create` carries the user's own words, the session they were looking at, and an id for this
 submission, nothing else:
 
@@ -148,10 +148,10 @@ written up, give the card `intake: "pending"` in the feed. A response that names
 the record exists even when `ok` is false (saved but not published, say): Kerdr won't send the
 same words again.
 `refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
-the active backlog and `restore` brings it back. `move` changes backlog order. `reopen` and
-`close` are described below, and so is `dismiss` for work already started.
+the active backlog and `restore` brings it back. `move` changes backlog order. `reopen`,
+`close` and `cancel` are described below, and so is `dismiss` for work already started.
 
-Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `submission` and `confirm` (strings),
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission` and `confirm` (strings),
 `override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
@@ -251,6 +251,42 @@ agent may be there; refuse in the backend, with a plain `message`, whatever only
 as the work's agent conversation still running outside any workspace. Done work is refused too.
 Before sending the yes, Kerdr rechecks that the card is still the same work, still open, with no
 workspace, and, for `x` on started work, not back in the backlog.
+
+## Cancelling work an agent is at
+
+`X` is for the other case, work an agent is still at: its card has a workspace open, or, for a
+child running in a tab of its parent's workspace, a tab. Kerdr asks first, saying what it will
+stop (the card's agent, and whether it's mid-step, idle or at a question), what it will close
+(that workspace with every tab in it, or only the child's tab), that the work goes to Won't do,
+and which children in tabs of that workspace stop with it. A yes sends `cancel` to the card's own
+machine, naming where the yes was given:
+
+```json
+{"action":"cancel","id":"0300","session":"default","workspace":"w2M"}
+{"action":"cancel","id":"0322","session":"default","workspace":"w2M","tab":"w2M:t3"}
+```
+
+The backend stops that agent, mid-step or idle, by closing that workspace or tab, ends anything
+that outlived the close, and then sets the record aside as `dismiss` does: it leaves the board
+for Won't do, keeping its state, so `restore` brings it back and `Enter` then reopens it, resuming
+its conversation. Refuse, with a plain `message` and nothing stopped, when the work runs anywhere
+other than the workspace and tab named, when it's done, in Won't do or still being written up, or
+when the action itself runs inside that workspace. When the agent stopped but its conversation
+is still running somewhere, say so and leave the record as it was. Before sending the yes, Kerdr
+rechecks that the card is the same work, still open in that workspace and tab.
+
+`X` on a card with no workspace open says `x` and `C` are for it instead. Children in tabs of a
+workspace that closes stop too and stay open with no agent; `x` or `C` ends them.
+
+## Moving one card's agent to another account
+
+`s` on a card moves that card's agent, and only that agent, to another account, resuming its
+conversation there; the session's other agents and its owner's list stay as they are. It's
+`account-move` (see [Account actions](#account-actions)), keyed by the card's pane. A card an
+agent is at says so on the board's bottom line (`s move its agent off KBZ`), in its peek, and in
+the `Ctrl+Space` menu. `S` edits the list new agents start on, and moves no agent that's running:
+saved unchanged while an agent there could move, it says that `s` on its card is the key and names
+those cards, those off the list's first account first.
 
 ## Agents reporting for themselves
 
