@@ -239,6 +239,8 @@ fn main() {
         "rename-account",
         "sign-in",
         "sign-in-again",
+        "sign-in-code",
+        "sign-in-where",
         "sign-in-copy",
         "paste-token-copy",
     ];

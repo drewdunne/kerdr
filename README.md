@@ -199,8 +199,9 @@ at the top right: yellow ▲ needs you, red ⏸︎ waits for usage, blue ● run
 The bottom line names the first ready account for new work in the session you are viewing.
 Older feeds retain the original board layout.
 
-`A` opens accounts and each organization’s and tenant’s ordered model list. `Tab` changes
-the machine whose sign-in status you are viewing. Tenants can follow their organization or
+`A` opens accounts and each organization’s and tenant’s ordered model list, on the machine
+tab you chose on the board, or else on the machine Kerdr runs on. `Tab` changes the machine
+whose sign-in status you are viewing. Tenants can follow their organization or
 keep their own order. Select an owner with `j k`, choose a model with `h l`, then Enter makes
 it first, `J K` reorders, and `a d` adds or drops in a draft that Enter saves. Backspace asks
 before following the parent. `S` opens the
@@ -218,19 +219,29 @@ The backend owns fallback and resuming: same program, same conversation; another
 a fresh agent from the work’s log; nothing left, wait for an account to return.
 
 `A` then `+` adds a Claude account: a code of 2–4 capital letters, name, and machines, then a separate browser sign-in
-on each machine. Enter on an existing account signs it in again on the selected machine;
+on each machine. Enter on an existing account signs it in on the machine you are viewing,
+then on every other machine that needs it, one after another, with no Tab needed; its hint
+names them (“⏎ sign in on laptop, then build-box”). On an account already ready there, Enter
+asks instead: it offers all the machines that need a sign-in one after another (when there are
+several), each of them, or signing in again where it's ready.
 `e` renames, `t` tests, and `x` removes after a question. The browser opens using the system’s
 URL handler. `c` copies the visible link through the terminal clipboard and `o` opens it again.
-Tab focuses the optional page-code field; paste or type the code and press Enter. `p` opens
-a masked token field instead. Tokens are sent only to that machine, removed from UI and
-result state on submission, and never written to Kerdr’s logs or settings. Escape cancels
-the current browser sign-in. No sign-in or action runs from the demo.
+
+![Enter on an account that's ready offers the machines that need a sign-in](docs/screenshots/sign-in-where.png)
+
+Tab focuses the optional code field. After you press Authorize, the page shows a long code:
+paste it there and press Enter. A short code that claude.ai emails you goes in the browser
+instead, and Kerdr says so rather than sending it. For a token account, `p` opens a masked
+token field instead; a saved sign-in, or a copy that takes no token, doesn't offer it. Tokens
+are sent only to that machine, removed from UI and result state on submission, and never
+written to Kerdr’s logs or settings. Escape cancels the current browser sign-in. No sign-in
+or action runs from the demo.
 
 Where a machine keeps more than one copy of an account's sign-in (your agents' and its
 tenants', say), each copy gets a line under the account: whether it is stored, whether it
 works (and when that was checked), and a note such as "held by root". `j k` move between the
-copy lines, Enter signs in the selected copy, whether it is missing, expired or wrong, and `t`
-tests it. The sign-in names its copy, and the other copies stay as they are.
+copy lines, Enter signs in the selected copy, whether it is missing, expired or wrong (one
+that works already is asked about first), and `t` tests it. The sign-in names its copy, and the other copies stay as they are.
 
 ![One line per copy of an account's sign-in](docs/screenshots/account-copies.png)
 

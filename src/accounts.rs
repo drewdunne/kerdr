@@ -45,9 +45,16 @@ pub struct AccountCopy {
     pub works: Option<bool>,
     pub checked: Option<String>,
     pub note: Option<String>,
+    /// Whether this copy takes a pasted token. Missing, it follows the account's kind.
+    pub paste: Option<bool>,
 }
 
 impl AccountCopy {
+    /// Stored and tested working: signing it in again would only replace a working sign-in.
+    pub fn ready(&self) -> bool {
+        self.stored && self.works == Some(true)
+    }
+
     pub fn name(&self) -> &str {
         if self.label.trim().is_empty() {
             &self.id
@@ -209,6 +216,38 @@ impl Account {
 
     pub fn copy(&self, id: &str) -> Option<&AccountCopy> {
         self.shown_copies().iter().find(|c| c.id == id)
+    }
+
+    pub fn ready(&self) -> bool {
+        self.status == "ready"
+    }
+
+    /// Signed out, or never signed in, on this machine.
+    pub fn needs_signin(&self) -> bool {
+        matches!(self.status.as_str(), "sign_in" | "missing")
+    }
+
+    /// The first copy is the one launches use, so the account's own status is that copy's.
+    fn first_copy(&self, c: &AccountCopy) -> bool {
+        self.copies.first().is_some_and(|f| f.id == c.id)
+    }
+
+    /// Whether a copy needs no sign-in: tested working, or the copy launches use while the
+    /// account is ready and no test says otherwise.
+    pub fn copy_ready(&self, c: &AccountCopy) -> bool {
+        c.ready() || (self.first_copy(c) && self.ready() && c.stored && c.works != Some(false))
+    }
+
+    /// Whether a sign-in of this account (or of one copy) can take a pasted token instead of the
+    /// browser: a token account's can, a saved sign-in's can't, and a copy may say otherwise. A
+    /// feed from before `paste` leaves any other copy without one, as root's takes none.
+    pub fn takes_paste(&self, copy: Option<&AccountCopy>) -> bool {
+        match copy {
+            Some(c) => c
+                .paste
+                .unwrap_or(self.kind == "token" && self.first_copy(c)),
+            None => self.kind == "token",
+        }
     }
 
     pub fn status_label(&self) -> String {

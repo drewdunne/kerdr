@@ -4010,6 +4010,116 @@ mod tests {
         }
     }
 
+    /// Intent 0327: the accounts screen names the machine Enter signs in on, the sign-in box names
+    /// it in its title, says which code it wants, and offers a pasted token only where one works.
+    #[test]
+    fn sign_in_says_which_machine_and_which_code() {
+        use crate::app::account_controls::AccountScreen as S;
+        let mut a = demo(false);
+        a.open_accounts();
+        let list = a.mode.clone();
+        let text = rendered(&a, 176, 44);
+        // KBZ is out on the laptop, not ready: Enter signs in there, and says so.
+        assert!(text.contains("⏎ sign in on laptop · t test"), "{text}");
+        assert!(
+            text.contains("j k move · ⏎ sign in on laptop · t test · e rename"),
+            "{text}"
+        );
+        // At 80 columns the panel is hidden, so the bottom line names every machine Enter signs in.
+        for f in a.machines[1].feed.iter_mut() {
+            f.accounts
+                .iter_mut()
+                .find(|x| x.code == "KBZ")
+                .unwrap()
+                .status = "sign_in".into();
+        }
+        let narrow = rendered(&a, 80, 24);
+        assert!(
+            narrow.contains("⏎ sign in on laptop, then build-box"),
+            "{narrow}"
+        );
+        for f in a.machines[1].feed.iter_mut() {
+            f.accounts
+                .iter_mut()
+                .find(|x| x.code == "KBZ")
+                .unwrap()
+                .status = "out".into();
+        }
+        if let Mode::Accounts {
+            screen: S::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = 1;
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("⏎ ready on laptop: choose where to sign in"),
+            "{text}"
+        );
+        let screens = crate::demo::account_screens(&a);
+        let find = |f: &dyn Fn(&S) -> bool| {
+            screens
+                .iter()
+                .find(|m| matches!(m, Mode::Accounts { screen, .. } if f(screen)))
+                .unwrap()
+                .clone()
+        };
+        a.mode = find(&|s| matches!(s, S::Where { .. }));
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("Sign ARK in where?"), "{text}");
+        assert!(text.contains("ARK is already signed in and ready on build-box"));
+        assert!(text.contains("laptop                 ✕ sign in"));
+        assert!(text.contains("⏎ sign in there"));
+        a.mode = find(&|s| matches!(s, S::Signin(x) if x.note.is_some()));
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("Sign KBZ in on laptop"), "{text}");
+        assert!(!text.contains("on each machine"));
+        assert!(text.contains("After you press Authorize, the page shows a long code"));
+        assert!(text.contains("long code from the page"));
+        assert!(text.contains("That's the short code claude.ai emails you"));
+        assert!(
+            text.contains("⏎ send code    esc stop"),
+            "a saved sign-in offers no token: {text}"
+        );
+        assert!(!text.contains("p token"));
+        a.mode = find(&|s| matches!(s, S::Signin(x) if x.paste && x.copy.is_none()));
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("Sign ARK in on laptop, then build-box"),
+            "{text}"
+        );
+        assert!(
+            text.contains("⏎ send code    p token    esc stop"),
+            "{text}"
+        );
+        a.mode = find(&|s| matches!(s, S::Signin(x) if x.failed && !x.paste));
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("r try again    esc later"), "{text}");
+        // At 80×24, a three-machine sign-in with ark-account's whole message still shows the code
+        // field and its note while a code is typed, rather than the machine row it would follow.
+        let mut typing = find(&|s| matches!(s, S::Signin(x) if x.note.is_some()));
+        if let Mode::Accounts {
+            screen: S::Signin(x),
+            ..
+        } = &mut typing
+        {
+            x.machines = vec![0, 1, 2];
+            x.message = "Authorize as you@example.com on laptop. The page signs in whichever account the browser is signed in to claude.ai as: if it names another, use Switch account at its foot.".into();
+        }
+        a.mode = typing;
+        let text = rendered(&a, 80, 24);
+        assert!(text.contains("long code from the page"), "{text}");
+        assert!(text.contains("That's the short code"), "{text}");
+        for mode in [list, a.mode.clone()] {
+            a.mode = mode;
+            for (w, h) in [(1, 1), (10, 3), (30, 8), (60, 15), (80, 24), (120, 40)] {
+                let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+                t.draw(|f| draw(f, &a)).unwrap();
+            }
+        }
+    }
+
     #[test]
     fn every_copy_state_draws_at_every_size_and_says_what_it_is() {
         let mut a = demo(false);
