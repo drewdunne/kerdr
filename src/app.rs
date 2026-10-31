@@ -373,6 +373,9 @@ pub struct App {
     pub prefix: String,
     first_selection_done: bool,
     pub account_queue: std::collections::VecDeque<(usize, serde_json::Value)>,
+    /// Sign-in cancellations for a machine not answering, sent once it answers again, so Esc
+    /// during a disconnect still ends that machine's sign-in.
+    pub account_cancels: Vec<(usize, serde_json::Value)>,
     pub signin_open: Option<String>,
     pub account_batch_messages: Vec<String>,
     pub account_pending: Option<account_controls::Pending>,
@@ -415,6 +418,7 @@ impl App {
             prefix: "ctrl+b".to_string(),
             first_selection_done: false,
             account_queue: Default::default(),
+            account_cancels: Vec::new(),
             signin_open: None,
             account_batch_messages: vec![],
             account_pending: None,

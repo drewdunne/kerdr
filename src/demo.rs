@@ -730,6 +730,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             message: "Authorize in the browser window that just opened.".into(),
             paste: true,
             note: None,
+            recheck: false,
         }),
         S::Signin(Signin {
             deferred: None,
@@ -748,6 +749,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             message: "The saved sign-in needs you to sign in again.".into(),
             paste: false,
             note: None,
+            recheck: false,
         }),
         // A saved sign-in's code box, having caught claude.ai's emailed code.
         S::Signin(Signin {
@@ -767,6 +769,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             message: "Authorize as you@example.com on laptop.".into(),
             paste: false,
             note: Some("That's the short code claude.ai emails you: type it on the claude.ai page in your browser. Here, paste the long code the page shows after you press Authorize.".into()),
+            recheck: false,
         }),
         // Enter on an account already ready on the machine viewed.
         S::Where {
@@ -810,6 +813,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             message: "Authorize in the browser window that just opened.".into(),
             paste: false,
             note: None,
+            recheck: false,
         }),
         S::PasteToken {
             machine: 1,

@@ -4021,7 +4021,30 @@ mod tests {
         let text = rendered(&a, 176, 44);
         // KBZ is out on the laptop, not ready: Enter signs in there, and says so.
         assert!(text.contains("⏎ sign in on laptop · t test"), "{text}");
-        assert!(text.contains("⏎ first / sign in on laptop"), "{text}");
+        assert!(
+            text.contains("j k move · ⏎ sign in on laptop · t test · e rename"),
+            "{text}"
+        );
+        // At 80 columns the panel is hidden, so the bottom line names every machine Enter signs in.
+        for f in a.machines[1].feed.iter_mut() {
+            f.accounts
+                .iter_mut()
+                .find(|x| x.code == "KBZ")
+                .unwrap()
+                .status = "sign_in".into();
+        }
+        let narrow = rendered(&a, 80, 24);
+        assert!(
+            narrow.contains("⏎ sign in on laptop, then build-box"),
+            "{narrow}"
+        );
+        for f in a.machines[1].feed.iter_mut() {
+            f.accounts
+                .iter_mut()
+                .find(|x| x.code == "KBZ")
+                .unwrap()
+                .status = "out".into();
+        }
         if let Mode::Accounts {
             screen: S::List { sel, .. },
             ..

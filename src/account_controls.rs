@@ -51,6 +51,9 @@ pub struct Signin {
     pub paste: bool,
     /// Why the code typed wasn't sent, shown under the code box until the next one is.
     pub note: Option<String>,
+    /// Machines after the first were picked because they needed a sign-in: each is skipped if
+    /// its feed no longer says so by its turn. Machines chosen by hand (adding an account) aren't.
+    pub recheck: bool,
 }
 
 /// One way to sign an account in, offered when it's already ready on the machine viewed.
@@ -643,6 +646,7 @@ impl App {
             message: "Starting sign-in…".into(),
             paste,
             note: None,
+            recheck: false,
         };
         let request = signin.start();
         self.push_account_screen(AccountScreen::Signin(signin));
@@ -657,6 +661,25 @@ impl App {
             s.message =
                 "This machine is not answering. Reconnect, then press r to try sign-in again."
                     .into();
+        }
+        action
+    }
+
+    /// A sign-in whose later machines were picked because they needed one: by each one's turn,
+    /// one signed in meanwhile is skipped rather than signed in again unasked.
+    fn begin_needed_signin(
+        &mut self,
+        code: String,
+        copy: Option<(String, String)>,
+        machines: Vec<usize>,
+    ) -> Action {
+        let action = self.begin_signin(code, copy, machines);
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut self.mode
+        {
+            s.recheck = true;
         }
         action
     }
@@ -934,7 +957,7 @@ impl App {
                                             }
                                             let machines =
                                                 self.signin_order(&code, copy.is_some(), *machine);
-                                            return self.begin_signin(code, copy, machines);
+                                            return self.begin_needed_signin(code, copy, machines);
                                         }
                                         KeyCode::Char('t') => {
                                             request = Some((
@@ -1338,7 +1361,7 @@ impl App {
                             (code.clone(), copy.clone(), choice.machines.clone());
                         // The sign-in opens over the list, so Esc from it goes back there.
                         self.mode = *back;
-                        return self.begin_signin(code, copy, machines);
+                        return self.begin_needed_signin(code, copy, machines);
                     }
                 }
                 _ => {}
@@ -1466,7 +1489,23 @@ impl App {
                 .account_key(KeyEvent::new(key, KeyModifiers::NONE))
                 .unwrap_or(Action::None);
         }
+        if let Some(i) = self
+            .account_cancels
+            .iter()
+            .position(|(mi, _)| self.machines.get(*mi).is_some_and(|m| m.conn.is_live()))
+        {
+            let (mi, request) = self.account_cancels.remove(i);
+            return self.send_account(mi, request);
+        }
         while let Some((mi, request)) = self.account_queue.pop_front() {
+            if request["action"] == "account-signin"
+                && request["step"] == "cancel"
+                && !self.machines.get(mi).is_some_and(|m| m.conn.is_live())
+            {
+                // Refused now, it would be lost and leave that machine's sign-in running.
+                self.account_cancels.push((mi, request));
+                continue;
+            }
             if request["action"] == "account-signin"
                 && request["step"] == "start"
                 && !matches!(&self.mode,Mode::Accounts{screen:AccountScreen::Signin(s),..} if s.machines.get(s.current)==Some(&mi) && request==s.start())
@@ -1623,6 +1662,24 @@ impl App {
                 }
                 return;
             }
+            // What each machine of the sign-in says now, read before the screen is borrowed.
+            let now: Vec<(bool, String)> = match &self.mode {
+                Mode::Accounts {
+                    screen: AccountScreen::Signin(s),
+                    ..
+                } => s
+                    .machines
+                    .iter()
+                    .map(|&mi| {
+                        let needs = self
+                            .account_feed(mi)
+                            .and_then(|f| f.accounts.iter().find(|a| a.code == s.code))
+                            .is_none_or(|a| a.needs_signin());
+                        (needs, self.machines[mi].name())
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             if let Mode::Accounts {
                 screen: AccountScreen::Signin(s),
                 ..
@@ -1643,6 +1700,26 @@ impl App {
                     s.page_code.clear();
                     s.editing = false;
                     s.needs_code = false;
+                    let mut skipped = Vec::new();
+                    while s.recheck
+                        && s.current < s.machines.len()
+                        && now.get(s.current).is_some_and(|(needs, _)| !needs)
+                    {
+                        skipped.push(now[s.current].1.clone());
+                        s.current += 1;
+                    }
+                    if !skipped.is_empty() {
+                        s.message = format!(
+                            "{} {} signed in meanwhile, so {} skipped.",
+                            response.message,
+                            skipped.join(" and "),
+                            if skipped.len() == 1 {
+                                "it was"
+                            } else {
+                                "they were"
+                            }
+                        );
+                    }
                     if let Some(&mi) = s.machines.get(s.current) {
                         self.account_queue.push_back((mi, s.start()));
                     }
@@ -3154,5 +3231,60 @@ mod tests {
         assert!(signin_screen(&a).note.is_none());
         assert!(emailed_code("004211") && emailed_code("1234"));
         assert!(!emailed_code("123") && !emailed_code("12345678901") && !emailed_code("12ab56"));
+    }
+
+    /// Codex's second look: a machine picked because it needed a sign-in, but signed in by the
+    /// time its turn comes, is skipped rather than signed in again unasked.
+    #[test]
+    fn a_machine_signed_in_meanwhile_is_skipped_in_turn() {
+        let mut a = app();
+        set_status(&mut a, 0, "KBZ", "sign_in");
+        set_status(&mut a, 1, "KBZ", "sign_in");
+        a.open_accounts();
+        let action = key(&mut a, KeyCode::Enter);
+        assert_eq!(signin_screen(&a).machines, vec![0, 1]);
+        assert!(signin_screen(&a).recheck);
+        complete(&mut a, action, started());
+        set_status(&mut a, 1, "KBZ", "ready");
+        let action = key(&mut a, KeyCode::Enter);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"status":"done","message":"KBZ signed in on laptop"}),
+        );
+        assert_eq!(a.account_tick(), Action::None, "no start for build-box");
+        let s = signin_screen(&a);
+        assert_eq!(s.current, 2);
+        assert!(
+            s.message
+                .contains("build-box signed in meanwhile, so it was skipped"),
+            "{}",
+            s.message
+        );
+    }
+
+    #[test]
+    fn esc_while_a_machine_is_not_answering_cancels_once_it_answers() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        let live = a.machines[0].conn.clone();
+        a.machines[0].conn = crate::poll::Conn::Connecting;
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_tick(), Action::None, "nothing can reach it yet");
+        assert_eq!(
+            a.account_cancels.len(),
+            1,
+            "the cancel is kept, not dropped"
+        );
+        assert_eq!(a.account_tick(), Action::None);
+        a.machines[0].conn = live;
+        let (mi, r) = sent(a.account_tick());
+        assert_eq!(mi, 0);
+        assert_eq!(
+            r,
+            json!({"action":"account-signin","step":"cancel","ticket":"login-ticket"})
+        );
+        assert!(a.account_cancels.is_empty());
     }
 }

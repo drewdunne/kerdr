@@ -447,7 +447,9 @@ machine tab or else on the machine Kerdr runs on, then, one after another as bel
 other answering machine whose feed says `sign_in` or `missing` for that code (a copy's line
 signs in that copy alone). When the account's `status` on the viewed machine is already
 `ready`, Kerdr asks first instead, offering those machines (all in turn, then each) and signing
-in again there; each `start` goes to its own machine.
+in again there; each `start` goes to its own machine. By each later machine's turn, one whose
+feed no longer says `sign_in` or `missing` is skipped (machines ticked when adding an account
+aren't). A `cancel` for a machine not answering is kept and sent once it answers.
 
 On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK","step":"start","copy":"tenants"}`.
 Kerdr sends the line's `id` for every copy, the first included; a request without `copy` means

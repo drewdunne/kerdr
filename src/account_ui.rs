@@ -677,6 +677,24 @@ fn status_lines(app: &App, a: &Account) -> Vec<Line<'static>> {
     lines
 }
 
+/// What Enter does on an account's line, naming every machine it signs in on (intent 0327).
+fn enter_hint(app: &App, mi: usize, a: &Account, copy: Option<&AccountCopy>) -> String {
+    let name = app.machines.get(mi).map(|m| m.name()).unwrap_or_default();
+    match copy {
+        Some(c) if a.copy_ready(c) => format!("⏎ signed in on {name}: sign in again? · t test it"),
+        Some(_) => format!("⏎ sign in this copy on {name} · t test it"),
+        None if a.ready() => format!("⏎ ready on {name}: choose where to sign in · t test"),
+        None => {
+            let names: Vec<String> = app
+                .signin_order(&a.code, false, mi)
+                .into_iter()
+                .map(|i| app.machines[i].name())
+                .collect();
+            format!("⏎ sign in on {} · t test", names.join(", then "))
+        }
+    }
+}
+
 fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usize, model: usize) {
     f.render_widget(Clear, area);
     f.render_widget(Block::default().style(fg(FG).bg(BG)), area);
@@ -889,23 +907,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                     }
                     detail.push(Line::raw(""));
                     // Names the machine: "this machine" read as the laptop Kerdr ran on (intent 0327).
-                    let enter = match copy {
-                        Some(c) if a.copy_ready(c) => {
-                            format!("⏎ signed in on {name}: sign in again? · t test it")
-                        }
-                        Some(_) => format!("⏎ sign in this copy on {name} · t test it"),
-                        None if a.ready() => {
-                            format!("⏎ ready on {name}: choose where to sign in · t test")
-                        }
-                        None => {
-                            let names: Vec<String> = app
-                                .signin_order(code, false, mi)
-                                .into_iter()
-                                .map(|i| app.machines[i].name())
-                                .collect();
-                            format!("⏎ sign in on {} · t test", names.join(", then "))
-                        }
-                    };
+                    let enter = enter_hint(app, mi, a, copy);
                     detail.extend(wrapped(
                         &format!("{enter} · e rename · x remove · tab another machine"),
                         w,
@@ -921,6 +923,30 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
         f.render_widget(Paragraph::new(detail), right);
     }
     if inner.height > 1 {
-        f.render_widget(Paragraph::new(format!("j k move · h l model · ⏎ first / sign in on {name} · J K reorder · a d add/drop · + new · e t x · tab machine · esc board")).style(fg(DIM)),Rect{y:inner.bottom()-1,height:1,..inner});
+        // On an account's line it says where Enter signs in, since narrow screens hide the panel.
+        let account_hint = match rows.get(sel) {
+            Some(row @ (Row::Account(code) | Row::Copy(code, _))) => {
+                feed.accounts.iter().find(|a| &a.code == code).map(|a| {
+                    let copy = match row {
+                        Row::Copy(_, id) => a.copy(id),
+                        _ => None,
+                    };
+                    enter_hint(app, mi, a, copy)
+                })
+            }
+            _ => None,
+        };
+        let hints = match account_hint {
+            Some(hint) => format!("j k move · {hint} · e rename · x remove · + new · tab machine · esc board"),
+            None => "j k move · h l model · ⏎ first · J K reorder · a d add/drop · + new · e t x · tab machine · esc board".into(),
+        };
+        f.render_widget(
+            Paragraph::new(hints).style(fg(DIM)),
+            Rect {
+                y: inner.bottom() - 1,
+                height: 1,
+                ..inner
+            },
+        );
     }
 }
