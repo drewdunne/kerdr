@@ -220,9 +220,10 @@ a fresh agent from the work’s log; nothing left, wait for an account to return
 
 `A` then `+` adds a Claude account: a code of 2–4 capital letters, name, and machines, then a separate browser sign-in
 on each machine. Enter on an existing account signs it in on the machine you are viewing,
-which its hint names (“⏎ sign in on build-box”). On an account already ready there, Enter
-asks instead: it offers the machines that need a sign-in, all of them one after another when
-there are several, or signing in again where it's ready.
+then on every other machine that needs it, one after another, with no Tab needed; its hint
+names them (“⏎ sign in on laptop, then build-box”). On an account already ready there, Enter
+asks instead: it offers all the machines that need a sign-in one after another (when there are
+several), each of them, or signing in again where it's ready.
 `e` renames, `t` tests, and `x` removes after a question. The browser opens using the system’s
 URL handler. `c` copies the visible link through the terminal clipboard and `o` opens it again.
 

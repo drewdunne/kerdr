@@ -4073,6 +4073,21 @@ mod tests {
         a.mode = find(&|s| matches!(s, S::Signin(x) if x.failed && !x.paste));
         let text = rendered(&a, 176, 44);
         assert!(text.contains("r try again    esc later"), "{text}");
+        // At 80×24, a three-machine sign-in with ark-account's whole message still shows the code
+        // field and its note while a code is typed, rather than the machine row it would follow.
+        let mut typing = find(&|s| matches!(s, S::Signin(x) if x.note.is_some()));
+        if let Mode::Accounts {
+            screen: S::Signin(x),
+            ..
+        } = &mut typing
+        {
+            x.machines = vec![0, 1, 2];
+            x.message = "Authorize as you@example.com on laptop. The page signs in whichever account the browser is signed in to claude.ai as: if it names another, use Switch account at its foot.".into();
+        }
+        a.mode = typing;
+        let text = rendered(&a, 80, 24);
+        assert!(text.contains("long code from the page"), "{text}");
+        assert!(text.contains("That's the short code"), "{text}");
         for mode in [list, a.mode.clone()] {
             a.mode = mode;
             for (w, h) in [(1, 1), (10, 3), (30, 8), (60, 15), (80, 24), (120, 40)] {

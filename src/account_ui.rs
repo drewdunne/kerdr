@@ -469,6 +469,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             };
             lines.push(Line::raw(""));
             let top = lines.len();
+            let mut code_at: Option<usize> = None;
             for (i, &mi) in s.machines.iter().enumerate() {
                 lines.push(line(
                     format!(
@@ -531,6 +532,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                     if let Some(note) = &s.note {
                         lines.extend(wrapped(note, 68, fg(YELLOW), None));
                     }
+                    // While a code is typed, or refused, scroll to it rather than the machine row.
+                    if s.editing || s.note.is_some() {
+                        code_at = Some(lines.len() - 1);
+                    }
                 }
             }
             // Named every time: "on each machine" over a one-machine sign-in hid where it ran.
@@ -567,7 +572,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 &title,
                 lines,
                 &hints,
-                s.current + top,
+                code_at.unwrap_or(s.current + top),
                 if s.failed { RED } else { CYAN },
             );
         }
@@ -885,14 +890,21 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                     detail.push(Line::raw(""));
                     // Names the machine: "this machine" read as the laptop Kerdr ran on (intent 0327).
                     let enter = match copy {
-                        Some(c) if c.ready() => {
-                            format!("⏎ works on {name}: sign in again? · t test it")
+                        Some(c) if a.copy_ready(c) => {
+                            format!("⏎ signed in on {name}: sign in again? · t test it")
                         }
                         Some(_) => format!("⏎ sign in this copy on {name} · t test it"),
                         None if a.ready() => {
                             format!("⏎ ready on {name}: choose where to sign in · t test")
                         }
-                        None => format!("⏎ sign in on {name} · t test"),
+                        None => {
+                            let names: Vec<String> = app
+                                .signin_order(code, false, mi)
+                                .into_iter()
+                                .map(|i| app.machines[i].name())
+                                .collect();
+                            format!("⏎ sign in on {} · t test", names.join(", then "))
+                        }
                     };
                     detail.extend(wrapped(
                         &format!("{enter} · e rename · x remove · tab another machine"),
