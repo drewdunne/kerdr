@@ -1,6 +1,6 @@
 [package]
 name = "kerdr"
-version = "0.13.0"
+version = "0.13.1"
 edition = "2024"
 description = "An opinionated kanban cockpit for driving herdr sessions"
 license = "MIT"

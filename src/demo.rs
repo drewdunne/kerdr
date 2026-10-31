@@ -728,6 +728,8 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             poll_at: std::time::Instant::now(),
             failed: false,
             message: "Authorize in the browser window that just opened.".into(),
+            paste: true,
+            note: None,
         }),
         S::Signin(Signin {
             deferred: None,
@@ -744,7 +746,45 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             poll_at: std::time::Instant::now(),
             failed: true,
             message: "The saved sign-in needs you to sign in again.".into(),
+            paste: false,
+            note: None,
         }),
+        // A saved sign-in's code box, having caught claude.ai's emailed code.
+        S::Signin(Signin {
+            deferred: None,
+            restart: false,
+            code: "KBZ".into(),
+            copy: None,
+            machines: vec![0],
+            current: 0,
+            ticket: Some("demo-ticket".into()),
+            url: Some("https://example.com/signin".into()),
+            needs_code: true,
+            page_code: String::new(),
+            editing: true,
+            poll_at: std::time::Instant::now(),
+            failed: false,
+            message: "Authorize as you@example.com on laptop.".into(),
+            paste: false,
+            note: Some("That's the short code claude.ai emails you: type it on the claude.ai page in your browser. Here, paste the long code the page shows after you press Authorize.".into()),
+        }),
+        // Enter on an account already ready on the machine viewed.
+        S::Where {
+            code: "ARK".into(),
+            copy: None,
+            message: "ARK is already signed in and ready on build-box. This machine needs a sign-in:".into(),
+            choices: vec![
+                crate::app::account_controls::WhereChoice {
+                    label: "laptop                 ✕ sign in".into(),
+                    machines: vec![0],
+                },
+                crate::app::account_controls::WhereChoice {
+                    label: "build-box again, though it's ready".into(),
+                    machines: vec![1],
+                },
+            ],
+            sel: 0,
+        },
     ] {
         result.push(Mode::Accounts {
             screen,
@@ -768,11 +808,13 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             poll_at: std::time::Instant::now(),
             failed: false,
             message: "Authorize in the browser window that just opened.".into(),
+            paste: false,
+            note: None,
         }),
         S::PasteToken {
             machine: 1,
             code: "ARK".into(),
-            copy: Some("tenants".into()),
+            copy: Some("agents".into()),
             token: Default::default(),
             submit: false,
         },

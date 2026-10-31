@@ -371,7 +371,10 @@ order to show them, such as your agents' copy and the one root holds for tenants
 ```
 
 `works` is `true`, `false`, or `null` (not tested); `checked` is when it was last tested; a
-missing `label` shows the `id`. With two or more copies the accounts screen shows one line per
+missing `label` shows the `id`. An optional `paste` says whether the copy takes a pasted token
+(`false` for one that signs in only on its own machine, as root's does); missing, it follows
+the account's `kind`, so a `token` account's copies take one and a `login` account's don't.
+A copy that is `stored` and `works: true` is asked about before Enter signs it in again. With two or more copies the accounts screen shows one line per
 copy under the account; with none or one it is unchanged. The account's own `status` stays the
 copy that launches use. Copies change nothing on the board, the usage line or card badges.
 
@@ -437,6 +440,12 @@ move finishes. An unavailable target answers `ok: false` before stopping anythin
  "url":"https://example.com/authorize","needs_code":true}
 ```
 
+Enter starts this on the machine the accounts screen is viewing, which opens on the board's
+machine tab or else on the machine Kerdr runs on. When the account's `status` there is already
+`ready`, Kerdr asks first instead, offering the machines whose feed says `sign_in` or `missing`
+for that code (each, then all in turn) and signing in again there; whichever is chosen, its
+`start` goes to that machine.
+
 On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK","step":"start","copy":"tenants"}`.
 Kerdr sends the line's `id` for every copy, the first included; a request without `copy` means
 the account's default copy, as before. The ticket `start` returns belongs to that copy, so poll,
@@ -461,6 +470,9 @@ a ticket returned after Escape is also cancelled, without opening a browser. Aft
 adding an account proceeds to the next selected machine with a **new** start and ticket.
 A `paste` step instead sends `code` and a `token` string (and `copy`, when pasting for one),
 and answers `done` or a refusal; a backend refuses a paste for a copy it can't take one for.
+Kerdr offers it (`p`) only for a `token` account, or a copy whose `paste` is `true`. The
+`page_code` a `finish` sends is the long code the page shows after Authorize; Kerdr keeps back
+an entry of 4–10 digits alone, which is claude.ai's emailed sign-in code, and says where it goes.
 The token never enters the result queue or saved settings. The backend must not echo it and
 must own its secure storage. Kerdr also removes submitted credential text from adapter output.
 Adapter output is captured in temporary files before parsing, so backends must never echo credentials.

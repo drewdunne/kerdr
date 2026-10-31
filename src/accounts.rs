@@ -45,9 +45,16 @@ pub struct AccountCopy {
     pub works: Option<bool>,
     pub checked: Option<String>,
     pub note: Option<String>,
+    /// Whether this copy takes a pasted token. Missing, it follows the account's kind.
+    pub paste: Option<bool>,
 }
 
 impl AccountCopy {
+    /// Stored and tested working: signing it in again would only replace a working sign-in.
+    pub fn ready(&self) -> bool {
+        self.stored && self.works == Some(true)
+    }
+
     pub fn name(&self) -> &str {
         if self.label.trim().is_empty() {
             &self.id
@@ -209,6 +216,21 @@ impl Account {
 
     pub fn copy(&self, id: &str) -> Option<&AccountCopy> {
         self.shown_copies().iter().find(|c| c.id == id)
+    }
+
+    pub fn ready(&self) -> bool {
+        self.status == "ready"
+    }
+
+    /// Signed out, or never signed in, on this machine.
+    pub fn needs_signin(&self) -> bool {
+        matches!(self.status.as_str(), "sign_in" | "missing")
+    }
+
+    /// Whether a sign-in of this account (or of one copy) can take a pasted token instead of the
+    /// browser: a token account's can, a saved sign-in's can't, and a copy may say otherwise.
+    pub fn takes_paste(&self, copy: Option<&AccountCopy>) -> bool {
+        copy.and_then(|c| c.paste).unwrap_or(self.kind == "token")
     }
 
     pub fn status_label(&self) -> String {

@@ -47,6 +47,23 @@ pub struct Signin {
     pub poll_at: Instant,
     pub failed: bool,
     pub message: String,
+    /// Whether p offers a pasted token: only where the backend can take one.
+    pub paste: bool,
+    /// Why the code typed wasn't sent, shown under the code box until the next one is.
+    pub note: Option<String>,
+}
+
+/// One way to sign an account in, offered when it's already ready on the machine viewed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct WhereChoice {
+    pub label: String,
+    pub machines: Vec<usize>,
+}
+
+/// claude.ai's emailed sign-in code: a few digits, typed in the browser. The code Kerdr wants is
+/// the long one the page shows after Authorize, so this is caught before it's sent (intent 0327).
+pub fn emailed_code(code: &str) -> bool {
+    (4..=10).contains(&code.len()) && code.chars().all(|c| c.is_ascii_digit())
 }
 
 /// Names the copy a request is for; no copy means the account's default copy, as before.
@@ -121,6 +138,14 @@ pub enum AccountScreen {
         name: String,
     },
     Signin(Signin),
+    /// Enter on an account already ready on the machine viewed: where to sign it in instead.
+    Where {
+        code: String,
+        copy: Option<(String, String)>,
+        message: String,
+        choices: Vec<WhereChoice>,
+        sel: usize,
+    },
     Confirm {
         machine: usize,
         request: Value,
@@ -215,16 +240,122 @@ impl App {
         crate::accounts::numbers(self.account_usage(a), self.now())
     }
 
+    /// The machine the accounts screen opens on: the board's machine tab when one is chosen, else
+    /// the machine Kerdr runs on, whose browser a sign-in link opens. The selected card's machine
+    /// comes only after that: a card picked for other reasons opened it on LAB-Server, already
+    /// signed in, and Enter signed KBZ in there four times while the laptop needed it (intent 0327).
     pub fn account_machine(&self) -> Option<usize> {
+        let with_accounts = |m: &crate::board::MachineState| {
+            m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+        };
         self.machine
             .as_ref()
             .and_then(|n| self.machine_index(n))
-            .or_else(|| self.selected().map(|c| c.machine_index))
             .or_else(|| {
-                self.machines.iter().position(|m| {
-                    m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+                self.machines
+                    .iter()
+                    .position(|m| m.machine.is_local() && with_accounts(m))
+            })
+            .or_else(|| self.selected().map(|c| c.machine_index))
+            .or_else(|| self.machines.iter().position(with_accounts))
+    }
+
+    /// What Enter offers instead of a sign-in when the account (or the copy) is already ready on
+    /// the machine viewed: the machines that need one, all of them in turn when there are several,
+    /// and signing in again here. None when it isn't ready here, so Enter signs in at once.
+    pub fn signin_choices(
+        &self,
+        code: &str,
+        copy: Option<&(String, String)>,
+        machine: usize,
+    ) -> Option<(String, Vec<WhereChoice>)> {
+        let a = self
+            .account_feed(machine)?
+            .accounts
+            .iter()
+            .find(|a| a.code == code)?;
+        let here = self.machines.get(machine)?.name();
+        if let Some((id, label)) = copy {
+            let c = a.copy(id).filter(|c| c.ready())?;
+            let when = c
+                .checked
+                .as_deref()
+                .map(|t| format!(" (checked {})", crate::accounts::reset_time(t)))
+                .unwrap_or_default();
+            return Some((
+                format!(
+                    "The {label} copy of {code} on {here} already works{when}. Signing it in again replaces that sign-in."
+                ),
+                vec![WhereChoice {
+                    label: format!("Sign the {label} copy in again on {here}"),
+                    machines: vec![machine],
+                }],
+            ));
+        }
+        if !a.ready() {
+            return None;
+        }
+        // This machine first: its browser is the one a sign-in link opens.
+        let mut order: Vec<usize> = (0..self.machines.len()).collect();
+        order.sort_by_key(|&i| !self.machines[i].machine.is_local());
+        let need: Vec<(usize, String)> = order
+            .into_iter()
+            .filter(|&i| i != machine && self.machines[i].is_shown())
+            .filter_map(|i| {
+                let m = &self.machines[i];
+                let other = m.feed.as_ref()?.accounts.iter().find(|x| x.code == code)?;
+                other.needs_signin().then(|| {
+                    let live = if m.conn.is_live() {
+                        ""
+                    } else {
+                        ", not answering"
+                    };
+                    (
+                        i,
+                        format!("{:<22} {}{live}", m.name(), other.status_label()),
+                    )
                 })
             })
+            .collect();
+        let mut choices: Vec<WhereChoice> = need
+            .iter()
+            .map(|(i, label)| WhereChoice {
+                label: label.clone(),
+                machines: vec![*i],
+            })
+            .collect();
+        let live: Vec<usize> = need
+            .iter()
+            .map(|(i, _)| *i)
+            .filter(|&i| self.machines[i].conn.is_live())
+            .collect();
+        if live.len() >= 2 {
+            let names: Vec<String> = live.iter().map(|&i| self.machines[i].name()).collect();
+            choices.push(WhereChoice {
+                label: format!(
+                    "All {}, one after another: {}",
+                    live.len(),
+                    names.join(", ")
+                ),
+                machines: live,
+            });
+        }
+        choices.push(WhereChoice {
+            label: format!("{here} again, though it's ready"),
+            machines: vec![machine],
+        });
+        let message = match need.len() {
+            0 => format!(
+                "{code} is already signed in and ready on {here}, and on every other machine that has it. Sign it in again here anyway?"
+            ),
+            1 => format!(
+                "{code} is already signed in and ready on {here}. This machine needs a sign-in:"
+            ),
+            n => format!(
+                "{code} is already signed in and ready on {here}. These {n} machines need a sign-in:"
+            ),
+        };
+        Some((message, choices))
     }
 
     pub fn account_agent(&self, card: &Card) -> Option<&AccountAgent> {
@@ -461,6 +592,16 @@ impl App {
         let Some(&machine) = machines.first() else {
             return Action::None;
         };
+        // An account not in the feed yet was just added here, and Kerdr adds token accounts.
+        let paste = self
+            .account_feed(machine)
+            .and_then(|f| f.accounts.iter().find(|a| a.code == code))
+            .is_none_or(|a| {
+                a.takes_paste(
+                    copy.as_ref()
+                        .and_then(|(id, _)| a.copies.iter().find(|c| &c.id == id)),
+                )
+            });
         let signin = Signin {
             deferred: None,
             restart: false,
@@ -476,6 +617,8 @@ impl App {
             poll_at: Instant::now() + Duration::from_secs(2),
             failed: false,
             message: "Starting sign-in…".into(),
+            paste,
+            note: None,
         };
         let request = signin.start();
         self.push_account_screen(AccountScreen::Signin(signin));
@@ -617,7 +760,9 @@ impl App {
             if typing_poll
                 && let AccountScreen::Signin(s) = &mut screen
                 && (key.code == KeyCode::Enter
-                    || (!s.editing && matches!(key.code, KeyCode::Char('p' | 'r'))))
+                    || (!s.editing
+                        && (key.code == KeyCode::Char('r')
+                            || (s.paste && key.code == KeyCode::Char('p')))))
             {
                 s.deferred = Some(key.code);
                 self.mode = Mode::Accounts { screen, back };
@@ -751,6 +896,18 @@ impl App {
                                 if let Some(a) = a {
                                     match key.code {
                                         KeyCode::Enter => {
+                                            if let Some((message, choices)) =
+                                                self.signin_choices(&code, copy.as_ref(), *machine)
+                                            {
+                                                self.push_account_screen(AccountScreen::Where {
+                                                    code,
+                                                    copy,
+                                                    message,
+                                                    choices,
+                                                    sel: 0,
+                                                });
+                                                return Action::None;
+                                            }
                                             return self.begin_signin(code, copy, vec![*machine]);
                                         }
                                         KeyCode::Char('t') => {
@@ -1057,7 +1214,7 @@ impl App {
                 };
                 match key.code {
                     KeyCode::Tab if s.needs_code => s.editing = !s.editing,
-                    KeyCode::Char('p') if !s.editing => {
+                    KeyCode::Char('p') if !s.editing && s.paste => {
                         if let Some(ticket) = &s.ticket {
                             self.account_queue.push_back((
                                 machine,
@@ -1119,6 +1276,11 @@ impl App {
                                     machine,
                                     json!({"action":"account-signin","ticket":ticket,"step":"poll"}),
                                 ));
+                            } else if emailed_code(s.page_code.trim()) {
+                                // Kept here: Claude Code would refuse it and end the sign-in.
+                                s.note = Some("That's the short code claude.ai emails you: type it on the claude.ai page in your browser. Here, paste the long code the page shows after you press Authorize.".into());
+                                s.page_code.clear();
+                                s.editing = true;
                             } else {
                                 request = Some((
                                     machine,
@@ -1126,12 +1288,35 @@ impl App {
                                 ));
                                 s.page_code.clear();
                                 s.editing = false;
+                                s.note = None;
                             }
                         }
                     }
                     _ => {}
                 }
             }
+            AccountScreen::Where {
+                code,
+                copy,
+                choices,
+                sel,
+                ..
+            } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = (*sel + 1).min(choices.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Enter => {
+                    if let Some(choice) = choices.get(*sel) {
+                        let (code, copy, machines) =
+                            (code.clone(), copy.clone(), choice.machines.clone());
+                        // The sign-in opens over the list, so Esc from it goes back there.
+                        self.mode = *back;
+                        return self.begin_signin(code, copy, machines);
+                    }
+                }
+                _ => {}
+            },
             AccountScreen::Confirm {
                 machine,
                 request: pending,
@@ -1648,6 +1833,47 @@ mod tests {
         a.open_accounts();
         key(a, KeyCode::Enter)
     }
+    fn set_status(a: &mut App, machine: usize, code: &str, status: &str) {
+        a.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .iter_mut()
+            .find(|x| x.code == code)
+            .unwrap()
+            .status = status.into();
+    }
+    /// Signs in ARK, a token account, on the laptop, where it needs it: KBZ is a saved sign-in,
+    /// which takes no pasted token.
+    fn token_signin(a: &mut App) -> Action {
+        set_status(a, 0, "ARK", "sign_in");
+        a.open_accounts();
+        key(a, KeyCode::Down);
+        key(a, KeyCode::Enter)
+    }
+    fn signin_screen(a: &App) -> &Signin {
+        let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &a.mode
+        else {
+            panic!("expected the sign-in, got {:?}", a.mode)
+        };
+        s
+    }
+    fn where_screen(a: &App) -> (&str, &[WhereChoice]) {
+        let Mode::Accounts {
+            screen: AccountScreen::Where {
+                message, choices, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("expected where to sign in, got {:?}", a.mode)
+        };
+        (message, choices)
+    }
     fn started() -> Value {
         json!({"ok":true,"message":"Authorize in your browser.","status":"waiting","url":"https://example.com/authorize?state=example","ticket":"login-ticket","needs_code":true})
     }
@@ -1655,7 +1881,7 @@ mod tests {
     #[test]
     fn token_paste_leaves_only_metadata_in_ui_and_result_state() {
         let mut a = app();
-        let action = signin(&mut a);
+        let action = token_signin(&mut a);
         complete(&mut a, action, started());
         press(&mut a, 'p');
         let cancel = a.account_tick();
@@ -2265,7 +2491,7 @@ mod tests {
     fn offline_retry_and_token_submission_stay_retryable() {
         let mut a = app();
         a.machines[0].conn = crate::poll::Conn::Connecting;
-        assert_eq!(signin(&mut a), Action::None);
+        assert_eq!(token_signin(&mut a), Action::None);
         assert_eq!(press(&mut a, 'r'), Action::None);
         assert!(
             matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed && s.message.contains("not answering"))
@@ -2307,7 +2533,7 @@ mod tests {
     #[test]
     fn token_enter_during_cancel_is_deferred_and_trims_the_paste() {
         let mut a = app();
-        let action = signin(&mut a);
+        let action = token_signin(&mut a);
         complete(&mut a, action, started());
         press(&mut a, 'p');
         let cancel = a.account_tick();
@@ -2568,5 +2794,237 @@ mod tests {
             .copies = copies;
         a.rebuild();
         assert_eq!(selected(&a), Row::Copy("ARK".into(), "agents".into()));
+    }
+
+    /// Intent 0327: on All, with a LAB-Server card selected, A opened on LAB-Server and Enter signed
+    /// KBZ in there though the laptop was the one that needed it.
+    #[test]
+    fn accounts_open_on_this_machine_unless_a_machine_tab_is_chosen() {
+        let mut a = app();
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.machine_index == 1)
+            .unwrap()
+            .clone();
+        a.sel = Selection {
+            col: card.stage.index(),
+            key: Some(card.key.clone()),
+        };
+        assert_eq!(a.selected().unwrap().machine_index, 1);
+        assert!(a.machine.is_none());
+        assert_eq!(
+            a.account_machine(),
+            Some(0),
+            "All opens on the machine Kerdr runs on"
+        );
+        a.machine = Some("build-box".into());
+        assert_eq!(
+            a.account_machine(),
+            Some(1),
+            "a machine tab is a choice, and wins"
+        );
+        // With no account information here, the selected card's machine is next.
+        a.machine = None;
+        a.machines[0].feed.as_mut().unwrap().accounts.clear();
+        assert_eq!(a.account_machine(), Some(1));
+    }
+
+    #[test]
+    fn enter_on_an_account_ready_here_offers_the_machines_that_need_one() {
+        let mut a = app();
+        set_status(&mut a, 1, "KBZ", "ready");
+        set_status(&mut a, 0, "KBZ", "sign_in");
+        a.machine = Some("build-box".into());
+        a.open_accounts();
+        assert_eq!(
+            key(&mut a, KeyCode::Enter),
+            Action::None,
+            "nothing starts by itself"
+        );
+        let (message, choices) = where_screen(&a);
+        assert!(
+            message.contains("KBZ is already signed in and ready on build-box"),
+            "{message}"
+        );
+        assert_eq!(choices.len(), 2);
+        assert!(choices[0].label.starts_with("laptop") && choices[0].label.contains("✕ sign in"));
+        assert_eq!(choices[0].machines, vec![0]);
+        assert_eq!(
+            choices[1].machines,
+            vec![1],
+            "signing in again here is offered last"
+        );
+        assert!(choices[1].label.contains("though it's ready"));
+        let (mi, start) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(mi, 0, "the machine that needed it");
+        assert_eq!(
+            start,
+            json!({"action":"account-signin","code":"KBZ","step":"start"})
+        );
+        assert_eq!(signin_screen(&a).machines, vec![0]);
+        a.busy = false;
+        a.account_pending = None;
+        key(&mut a, KeyCode::Esc);
+        assert!(
+            matches!(
+                &a.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::List { machine: 1, .. },
+                    ..
+                }
+            ),
+            "Esc from the sign-in goes back to the list, not the question: {:?}",
+            a.mode
+        );
+    }
+
+    #[test]
+    fn ready_everywhere_asks_before_signing_in_again_and_several_can_go_in_turn() {
+        let mut a = app();
+        set_status(&mut a, 0, "KBZ", "ready");
+        set_status(&mut a, 1, "KBZ", "ready");
+        a.open_accounts();
+        key(&mut a, KeyCode::Enter);
+        let (message, choices) = where_screen(&a);
+        assert!(
+            message.contains("on every other machine that has it"),
+            "{message}"
+        );
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].machines, vec![0]);
+        key(&mut a, KeyCode::Esc);
+        // A third machine signed out as well: each is offered, then both in turn.
+        a.machines[2].feed = a.machines[1].feed.clone();
+        a.machines[2].conn = a.machines[1].conn.clone();
+        set_status(&mut a, 1, "KBZ", "sign_in");
+        set_status(&mut a, 2, "KBZ", "missing");
+        a.open_accounts();
+        key(&mut a, KeyCode::Enter);
+        let (message, choices) = where_screen(&a);
+        assert!(
+            message.contains("These 2 machines need a sign-in"),
+            "{message}"
+        );
+        let machines: Vec<Vec<usize>> = choices.iter().map(|c| c.machines.clone()).collect();
+        assert_eq!(machines, vec![vec![1], vec![2], vec![1, 2], vec![0]]);
+        assert!(choices[2].label.starts_with("All 2, one after another"));
+        key(&mut a, KeyCode::Down);
+        key(&mut a, KeyCode::Down);
+        let (mi, _) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(mi, 1);
+        assert_eq!(signin_screen(&a).machines, vec![1, 2]);
+    }
+
+    #[test]
+    fn a_copy_that_works_asks_before_signing_in_again_and_one_that_doesnt_starts() {
+        let mut a = app();
+        open_copies(&mut a, "agents");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        let (message, choices) = where_screen(&a);
+        assert!(
+            message.contains("The Your agents copy of ARK on build-box already works"),
+            "{message}"
+        );
+        assert_eq!(choices.len(), 1);
+        let (mi, start) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(mi, 1);
+        assert_eq!(
+            start,
+            json!({"action":"account-signin","code":"ARK","step":"start","copy":"agents"})
+        );
+        let mut a = app();
+        open_copies(&mut a, "tenants");
+        assert_eq!(sent(key(&mut a, KeyCode::Enter)).1["copy"], "tenants");
+    }
+
+    #[test]
+    fn p_token_only_for_token_accounts_and_copies_that_take_one() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        assert!(!signin_screen(&a).paste, "KBZ is a saved sign-in");
+        assert_eq!(press(&mut a, 'p'), Action::None);
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if !s.failed && s.ticket.is_some()),
+            "p on a saved sign-in neither cancels it nor opens the paste: {:?}",
+            a.mode
+        );
+        assert!(a.account_queue.is_empty());
+        let mut a = app();
+        let action = token_signin(&mut a);
+        complete(&mut a, action, started());
+        assert!(signin_screen(&a).paste);
+        press(&mut a, 'p');
+        assert!(matches!(
+            &a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::PasteToken { .. },
+                ..
+            }
+        ));
+        // Root's copy says it takes none; a copy that says nothing follows its account's kind.
+        let mut a = app();
+        let ark = a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .iter_mut()
+            .find(|x| x.code == "ARK")
+            .unwrap();
+        ark.copies[1].paste = Some(false);
+        ark.copies[0].works = Some(false);
+        open_copies(&mut a, "tenants");
+        key(&mut a, KeyCode::Enter);
+        assert!(!signin_screen(&a).paste);
+        let mut a = app();
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .iter_mut()
+            .find(|x| x.code == "ARK")
+            .unwrap()
+            .copies[0]
+            .works = Some(false);
+        open_copies(&mut a, "agents");
+        key(&mut a, KeyCode::Enter);
+        assert!(signin_screen(&a).paste);
+    }
+
+    #[test]
+    fn a_short_all_digit_code_is_caught_before_it_is_sent() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        a.on_paste("123456");
+        assert_eq!(
+            key(&mut a, KeyCode::Enter),
+            Action::None,
+            "the emailed code isn't sent"
+        );
+        let s = signin_screen(&a);
+        assert!(
+            s.note
+                .as_deref()
+                .unwrap()
+                .contains("short code claude.ai emails you")
+        );
+        assert!(
+            s.note
+                .as_deref()
+                .unwrap()
+                .contains("long code the page shows after you press Authorize")
+        );
+        assert!(s.page_code.is_empty() && s.editing && !s.failed);
+        a.on_paste("Ab3-long-code#state-xyz");
+        let (_, finish) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(finish["page_code"], "Ab3-long-code#state-xyz");
+        assert!(signin_screen(&a).note.is_none());
+        assert!(emailed_code("004211") && emailed_code("1234"));
+        assert!(!emailed_code("123") && !emailed_code("12345678901") && !emailed_code("12ab56"));
     }
 }

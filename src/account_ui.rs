@@ -513,38 +513,88 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 }
                 if s.needs_code {
                     lines.push(Line::raw(""));
+                    // Which code: a six-digit one from claude.ai's email was typed here and refused.
+                    lines.extend(wrapped(
+                        "After you press Authorize, the page shows a long code: paste that here. A short code that claude.ai emails you goes in the browser, not here.",
+                        68,
+                        fg(DIM),
+                        None,
+                    ));
                     lines.push(selected(
                         format!(
-                            "code from the page   {}{}",
+                            "long code from the page   {}{}",
                             "•".repeat(s.page_code.chars().count().min(30)),
                             if s.editing { "▏" } else { "" }
                         ),
                         s.editing,
                     ));
+                    if let Some(note) = &s.note {
+                        lines.extend(wrapped(note, 68, fg(YELLOW), None));
+                    }
                 }
             }
-            let title = match (&s.copy, s.machines.first()) {
-                (Some((_, label)), Some(&mi)) => {
-                    format!("Sign {} in on {}: {label}", s.code, app.machines[mi].name())
+            // Named every time: "on each machine" over a one-machine sign-in hid where it ran.
+            let names: Vec<String> = s
+                .machines
+                .iter()
+                .map(|&mi| app.machines[mi].name())
+                .collect();
+            let title = match (&s.copy, names.as_slice()) {
+                (Some((_, label)), [first, ..]) => {
+                    format!("Sign {} in on {first}: {label}", s.code)
                 }
-                _ => format!("Sign {} in on each machine", s.code),
+                (None, [one]) => format!("Sign {} in on {one}", s.code),
+                _ => format!("Sign {} in on {}", s.code, names.join(", then ")),
+            };
+            let hints = if done && s.copy.is_some() {
+                "Signed in.    esc accounts".to_string()
+            } else if done {
+                "All selected machines signed in.    esc accounts".to_string()
+            } else if s.failed {
+                format!(
+                    "r try again{}    esc later",
+                    if s.paste { "    p paste token" } else { "" }
+                )
+            } else {
+                format!(
+                    "tab code / buttons    ⏎ send code{}    esc stop",
+                    if s.paste { "    p token" } else { "" }
+                )
             };
             modal(
                 f,
                 area,
                 &title,
                 lines,
-                if done && s.copy.is_some() {
-                    "Signed in.    esc accounts"
-                } else if done {
-                    "All selected machines signed in.    esc accounts"
-                } else if s.failed {
-                    "r try again    p paste token    esc later"
-                } else {
-                    "tab code / buttons    ⏎ send code    p token    esc stop"
-                },
+                &hints,
                 s.current + top,
                 if s.failed { RED } else { CYAN },
+            );
+        }
+        AccountScreen::Where {
+            code,
+            message,
+            choices,
+            sel,
+            ..
+        } => {
+            let mut lines = wrapped(message, 68, fg(FG), None);
+            lines.push(Line::raw(""));
+            let top = lines.len();
+            lines.extend(
+                choices
+                    .iter()
+                    .enumerate()
+                    .map(|(i, c)| selected(c.label.clone(), i == *sel)),
+            );
+            modal(
+                f,
+                area,
+                &format!("Sign {code} in where?"),
+                lines,
+                "j k choose    ⏎ sign in there    esc back",
+                top + sel,
+                YELLOW,
             );
         }
         AccountScreen::Confirm {
@@ -833,12 +883,19 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                         }
                     }
                     detail.push(Line::raw(""));
+                    // Names the machine: "this machine" read as the laptop Kerdr ran on (intent 0327).
+                    let enter = match copy {
+                        Some(c) if c.ready() => {
+                            format!("⏎ works on {name}: sign in again? · t test it")
+                        }
+                        Some(_) => format!("⏎ sign in this copy on {name} · t test it"),
+                        None if a.ready() => {
+                            format!("⏎ ready on {name}: choose where to sign in · t test")
+                        }
+                        None => format!("⏎ sign in on {name} · t test"),
+                    };
                     detail.extend(wrapped(
-                        if copy.is_some() {
-                            "⏎ sign in this copy · t test it · e rename · x remove · tab another machine"
-                        } else {
-                            "⏎ sign in on this machine · e rename · t test · x remove · tab another machine"
-                        },
+                        &format!("{enter} · e rename · x remove · tab another machine"),
                         w,
                         fg(DIM),
                         None,
@@ -852,6 +909,6 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
         f.render_widget(Paragraph::new(detail), right);
     }
     if inner.height > 1 {
-        f.render_widget(Paragraph::new("j k move · h l model · ⏎ first / sign in · J K reorder · a d add/drop · + new · e t x · tab machine · esc board").style(fg(DIM)),Rect{y:inner.bottom()-1,height:1,..inner});
+        f.render_widget(Paragraph::new(format!("j k move · h l model · ⏎ first / sign in on {name} · J K reorder · a d add/drop · + new · e t x · tab machine · esc board")).style(fg(DIM)),Rect{y:inner.bottom()-1,height:1,..inner});
     }
 }
