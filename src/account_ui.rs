@@ -1,7 +1,7 @@
 //! Account layouts, using the same Tokyo Night palette and panels as the board.
 use super::*;
-use crate::accounts::{Account, AccountCopy, pause_glyph, provider_name};
-use crate::app::account_controls::{AccountScreen, Row};
+use crate::accounts::{Account, AccountCopy, Figures, pause_glyph};
+use crate::app::account_controls::{AccountScreen, AddAccount, Row};
 
 fn account_color(a: &Account) -> ratatui::style::Color {
     match a.status.as_str() {
@@ -11,21 +11,26 @@ fn account_color(a: &Account) -> ratatui::style::Color {
     }
 }
 
+/// The top bar's accounts, grouped by provider in the feed's order: `Claude KBZ_C 86│100 · ARK_C
+/// 12│30   Codex KBZ_X 7`.
 pub(super) fn usage(app: &App, mi: usize) -> Vec<Span<'static>> {
     let Some(feed) = app.account_feed(mi) else {
         return vec![];
     };
-    let mut accounts: Vec<_> = feed.accounts.iter().collect();
-    accounts.sort_by(|a, b| a.provider.cmp(&b.provider));
+    let providers = app.providers(mi);
+    let order = providers.order();
+    let rank = |id: &str| order.iter().position(|p| p == id).unwrap_or(usize::MAX);
+    let mut accounts: Vec<_> = feed.accounts.iter().enumerate().collect();
+    accounts.sort_by_key(|(i, a)| (rank(&a.provider), *i));
     let mut spans = Vec::new();
-    let mut provider = "";
-    for a in accounts {
-        if provider != a.provider {
+    let mut provider = None;
+    for (_, a) in accounts {
+        if provider != Some(&a.provider) {
             spans.push(Span::styled(
-                format!("  {} ", provider_name(&a.provider)),
+                format!("  {} ", providers.label(&a.provider)),
                 fg(FAINT),
             ));
-            provider = &a.provider;
+            provider = Some(&a.provider);
         } else {
             spans.push(Span::styled(" · ", fg(FAINT)));
         }
@@ -34,7 +39,7 @@ pub(super) fn usage(app: &App, mi: usize) -> Vec<Span<'static>> {
             if matches!(a.status.as_str(), "sign_in" | "missing") {
                 "✕ sign in".into()
             } else {
-                app.account_numbers(a)
+                app.account_figures(a, Figures::Short)
             },
             fg(if a.status == "ready" {
                 FG2
@@ -65,10 +70,9 @@ pub(super) fn new_intents(app: &App) -> Vec<Span<'static>> {
             .or_else(|| owner.models.first())
     {
         let provider = app
-            .account_feed(mi)
-            .and_then(|f| f.accounts.iter().find(|a| &a.code == first))
-            .map(|a| provider_name(&a.provider))
-            .unwrap_or("");
+            .account(mi, first)
+            .map(|a| app.providers(mi).label(&a.provider))
+            .unwrap_or_default();
         return vec![
             Span::styled(format!("new in {session}: "), fg(DIM)),
             Span::styled(format!("{provider} {first}  "), bold(FG)),
@@ -148,8 +152,7 @@ fn copy_line(c: &AccountCopy, yes: bool, cols: CopyColumns) -> Line<'static> {
 }
 
 fn copy_label(app: &App, machine: usize, code: &str, copy: &str) -> String {
-    app.account_feed(machine)
-        .and_then(|f| f.accounts.iter().find(|a| a.code == code))
+    app.account(machine, code)
         .and_then(|a| a.copy(copy))
         .map_or_else(|| copy.to_string(), |c| c.name().to_string())
 }
@@ -282,18 +285,16 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             for (i, code) in choices.iter().enumerate() {
                 let text = if code == "list" {
                     "follow the list".into()
-                } else if let Some(a) = app
-                    .account_feed(target.machine)
-                    .and_then(|f| f.accounts.iter().find(|a| &a.code == code))
-                {
+                } else if let Some(a) = app.account(target.machine, code) {
                     format!(
-                        "{:<8} {:<16} {}  {}{}",
+                        "{:<7} {:<8} {:<15} {}  {}{}",
                         a.code,
+                        app.providers(target.machine).label(&a.provider),
                         a.name,
                         app.account_numbers(a),
                         a.status_label(),
                         if a.code == target.agent.account {
-                            " (now)"
+                            " (on it now)"
                         } else {
                             ""
                         }
@@ -331,30 +332,60 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             sel,
             move_waiting,
         } => {
-            let mut lines = vec![
-                line(
-                    format!(
-                        "{} · {}",
-                        owner.name,
-                        if owner.own {
-                            "own list"
-                        } else {
-                            "follows parent"
-                        }
-                    ),
-                    DIM,
+            let mut lines = wrapped(
+                &format!(
+                    "{} · {}. New work starts on the first that's ready; when one runs out, the next.",
+                    owner.name,
+                    if owner.own {
+                        "own list"
+                    } else {
+                        "follows parent"
+                    }
                 ),
-                Line::raw(""),
-            ];
+                68,
+                fg(DIM),
+                None,
+            );
+            lines.push(Line::raw(""));
+            let top = lines.len();
+            let providers = app.providers(*machine);
+            let find = |code: &str| app.account(*machine, code);
+            // Each line names its provider, so the list reads as a provider order.
             for (i, code) in models.iter().enumerate() {
-                let numbers = app
-                    .account_feed(*machine)
-                    .and_then(|f| f.accounts.iter().find(|a| &a.code == code))
-                    .map(|a| app.account_numbers(a))
-                    .unwrap_or_default();
-                lines.push(selected(format!("{:<8} {numbers}", code), i == *sel));
+                let text = match find(code) {
+                    Some(a) => format!(
+                        "{}. {:<7} {:<8} {:<16} {}",
+                        i + 1,
+                        code,
+                        providers.label(&a.provider),
+                        a.name,
+                        app.account_numbers(a)
+                    ),
+                    None => format!("{}. {code:<7} no longer available", i + 1),
+                };
+                lines.push(selected(text, i == *sel));
             }
             lines.push(Line::raw(""));
+            // What new work runs with the list as it stands: the first ready account's program.
+            if let Some(a) = models
+                .iter()
+                .filter_map(|c| find(c))
+                .find(|a| a.ready())
+                .or_else(|| models.first().and_then(|c| find(c)))
+            {
+                lines.extend(wrapped(
+                    &format!(
+                        "New {} work starts on {} and runs {}. Agents already running stay on what they run.",
+                        owner.name,
+                        a.code,
+                        providers.program_label(&a.runs)
+                    ),
+                    68,
+                    fg(FG2),
+                    None,
+                ));
+                lines.push(Line::raw(""));
+            }
             lines.push(line(
                 format!(
                     "[{}] move waiting sessions on every machine",
@@ -366,10 +397,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             modal(
                 f,
                 area,
-                &format!("Default accounts: {}", owner.name),
+                &format!("{}'s ordered models", owner.name),
                 lines,
                 "⏎ save    space tick    j k choose    esc cancel",
-                sel + 2,
+                sel + top,
                 CYAN,
             );
         }
@@ -392,32 +423,122 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 CYAN,
             );
         }
-        AccountScreen::Add {
-            code,
-            name,
-            field,
-            machines,
-            chosen,
-            ..
+        AccountScreen::Provider {
+            machine,
+            choices,
+            sel,
         } => {
+            let providers = app.providers(*machine);
+            let mut lines: Vec<_> = choices
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    let runs: Vec<String> = p
+                        .programs
+                        .iter()
+                        .map(|id| providers.program_label(id))
+                        .collect();
+                    selected(
+                        format!(
+                            "{:<10} {}",
+                            p.name(),
+                            if runs.is_empty() {
+                                String::new()
+                            } else {
+                                format!("runs {}", runs.join(" or "))
+                            }
+                        ),
+                        i == *sel,
+                    )
+                })
+                .collect();
+            lines.push(Line::raw(""));
+            if let Some(p) = choices.get(*sel)
+                && let Some(program) = p.programs.first()
+            {
+                lines.extend(wrapped(
+                    &format!(
+                        "The provider decides the program: an agent on a {} account runs {}.",
+                        p.name(),
+                        providers.program_label(program)
+                    ),
+                    68,
+                    fg(DIM),
+                    None,
+                ));
+            }
+            modal(
+                f,
+                area,
+                "Add an account: which provider?",
+                lines,
+                "j k choose    ⏎ next    esc cancel",
+                *sel,
+                CYAN,
+            );
+        }
+        AccountScreen::Add(add) => {
+            let field = add.field;
+            let text = |value: &str, suggested: &str, label: &str, at: usize| -> Line<'static> {
+                let cursor = if field == at { "▏" } else { "" };
+                if value.is_empty() && !suggested.is_empty() {
+                    // The suggestion stands until something is typed over it.
+                    let yes = field == at;
+                    Line::from(vec![
+                        Span::styled(
+                            format!("{} {label:<9} ", if yes { "›" } else { " " }),
+                            if yes { bold(FG).bg(SEL) } else { fg(FG2) },
+                        ),
+                        Span::styled(
+                            format!("{suggested}{cursor}"),
+                            if yes { fg(DIM).bg(SEL) } else { fg(DIM) },
+                        ),
+                    ])
+                } else {
+                    selected(format!("{label:<9} {value}{cursor}"), field == at)
+                }
+            };
             let mut lines = vec![
-                selected(
-                    format!("code      {code}{}", if *field == 0 { "▏" } else { "" }),
-                    *field == 0,
-                ),
-                Line::raw(""),
-                selected(
-                    format!("name      {name}{}", if *field == 1 { "▏" } else { "" }),
-                    *field == 1,
-                ),
-                Line::raw(""),
-                line("machines", DIM),
+                text(&add.code, &add.suggested.0, "code", 0),
+                text(&add.name, &add.suggested.1, "name", 1),
             ];
-            for (i, &mi) in machines.iter().enumerate() {
+            // The provider's own questions, each in its words.
+            for (i, (f, value)) in add.provider.fields.iter().zip(&add.extra).enumerate() {
+                let label = if f.label.is_empty() { &f.id } else { &f.label };
+                let hint = if f.required { "" } else { "optional" };
+                lines.push(text(value, hint, label, AddAccount::FIELDS_AT + i));
+            }
+            let signs_in = add.provider.signin.is_some() || !app.offered(add.machine).listed();
+            if !add.provider.kinds.is_empty() {
+                lines.push(Line::raw(""));
+                lines.push(line(if signs_in { "sign-in" } else { "kind" }, DIM));
+            }
+            let kinds_at = add.kinds_at();
+            for (i, kind) in add.provider.kinds.iter().enumerate() {
+                let at = kinds_at + i;
+                let has = app.codes_of(add.machine, &add.provider.id, kind);
+                lines.push(selected(
+                    format!(
+                        "({}) {}{}",
+                        if add.kind == i { "•" } else { " " },
+                        add.provider.kind_label(kind),
+                        if has.is_empty() {
+                            String::new()
+                        } else {
+                            format!("   {} uses it", has.join(", "))
+                        }
+                    ),
+                    field == at,
+                ));
+            }
+            lines.push(Line::raw(""));
+            lines.push(line("machines", DIM));
+            let machines_at = add.machines_at();
+            for (i, &mi) in add.machines.iter().enumerate() {
                 lines.push(selected(
                     format!(
                         "[{}] {}{}",
-                        if chosen[i] { "x" } else { " " },
+                        if add.chosen[i] { "x" } else { " " },
                         app.machines[mi].name(),
                         if app.machines[mi].conn.is_live() {
                             ""
@@ -425,16 +546,32 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                             " · offline"
                         }
                     ),
-                    *field == i + 2,
+                    field == machines_at + i,
                 ));
             }
+            lines.push(Line::raw(""));
+            lines.extend(wrapped(
+                "It joins no list until you add it with S, so nothing runs on it yet.",
+                68,
+                fg(DIM),
+                None,
+            ));
+            let at_line = match field {
+                f if f < kinds_at => f,
+                f if f < machines_at => f + 2,
+                f => f + 4,
+            };
             modal(
                 f,
                 area,
-                "Add a Claude account",
+                &format!("Add a {} account", add.provider.name()),
                 lines,
-                "⏎ next: sign in    tab field    space tick    esc cancel",
-                if *field < 2 { field * 2 } else { field + 3 },
+                if signs_in {
+                    "⏎ next: sign in    tab field    space choose    esc cancel"
+                } else {
+                    "⏎ add    tab field    space choose    esc cancel"
+                },
+                at_line,
                 CYAN,
             );
         }
@@ -480,6 +617,8 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                         } else if i == s.current {
                             if s.failed {
                                 "✕ sign-in stopped"
+                            } else if s.user_code.is_some() {
+                                "◐ type the code on the page"
                             } else {
                                 "◐ authorize in your browser"
                             }
@@ -503,7 +642,42 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 fg(if s.failed { RED } else { FG2 }),
                 None,
             ));
-            if s.current < s.machines.len() {
+            if s.current < s.machines.len()
+                && let Some(code) = &s.user_code
+            {
+                // The provider's page takes a code: show it big, with nothing to paste back.
+                lines.push(Line::raw(""));
+                lines.extend(wrapped(
+                    &typed_code_intro(s.url.as_deref(), s.expires.as_deref(), app.now()),
+                    68,
+                    fg(FG),
+                    None,
+                ));
+                let edge = "─".repeat(width(code) + 4);
+                lines.push(line(format!("╭{edge}╮"), YELLOW));
+                lines.push(Line::from(vec![
+                    Span::styled("│  ", fg(YELLOW)),
+                    Span::styled(code.clone(), bold(YELLOW)),
+                    Span::styled("  │", fg(YELLOW)),
+                ]));
+                lines.push(line(format!("╰{edge}╯"), YELLOW));
+                code_at = Some(lines.len() - 1);
+                lines.push(Line::from(key_hints(&[
+                    ("c", "copy code"),
+                    ("o", "open the page again"),
+                    ("l", "copy link"),
+                ])));
+                if let Some(url) = &s.url {
+                    lines.extend(wrapped(url, 68, fg(DIM), None));
+                }
+                lines.push(Line::raw(""));
+                lines.extend(wrapped(
+                    "Nothing to paste back here: it ticks by itself once you've typed the code and allowed it.",
+                    68,
+                    fg(FG2),
+                    None,
+                ));
+            } else if s.current < s.machines.len() {
                 lines.push(Line::raw(""));
                 lines.push(Line::from(key_hints(&[
                     ("c", "copy link"),
@@ -514,16 +688,16 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 }
                 if s.needs_code {
                     lines.push(Line::raw(""));
-                    // Which code: a six-digit one from claude.ai's email was typed here and refused.
+                    // Which code: a six-digit emailed one was once typed here and refused.
                     lines.extend(wrapped(
-                        "After you press Authorize, the page shows a long code: paste that here. A short code that claude.ai emails you goes in the browser, not here.",
+                        "Once you allow it, the page shows a code: paste that here. A short code emailed to you goes in the browser, not here.",
                         68,
                         fg(DIM),
                         None,
                     ));
                     lines.push(selected(
                         format!(
-                            "long code from the page   {}{}",
+                            "code from the page   {}{}",
                             "•".repeat(s.page_code.chars().count().min(30)),
                             if s.editing { "▏" } else { "" }
                         ),
@@ -560,6 +734,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                     "r try again{}    esc later",
                     if s.paste { "    p paste token" } else { "" }
                 )
+            } else if s.expired(app.now()) {
+                "r start again    esc stop".to_string()
+            } else if s.user_code.is_some() {
+                "c copy code    o open page    l copy link    esc stop".to_string()
             } else {
                 format!(
                     "tab code / buttons    ⏎ send code{}    esc stop",
@@ -603,12 +781,18 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             );
         }
         AccountScreen::Confirm {
-            message, yes, no, ..
+            machine,
+            request,
+            message,
+            yes,
+            no,
+            target,
+            ..
         } => {
             modal(
                 f,
                 area,
-                "Account change",
+                &confirm_title(app, *machine, request, target.as_deref()),
                 wrapped(message, 68, fg(FG), None),
                 &format!("y {yes}    n {no}    esc cancel"),
                 0,
@@ -616,6 +800,54 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             );
         }
     }
+}
+
+/// What a sign-in typed on the provider's page says above the code: where, and for how long.
+fn typed_code_intro(
+    url: Option<&str>,
+    expires: Option<&str>,
+    now: chrono::DateTime<chrono::Local>,
+) -> String {
+    let page = url
+        .and_then(|u| u.strip_prefix("https://"))
+        .and_then(|rest| rest.split('/').next())
+        .filter(|host| !host.is_empty())
+        .map_or("On the sign-in page".to_string(), |host| {
+            format!("On the page at {host}")
+        });
+    let lasts = expires
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| (t.with_timezone(&chrono::Local) - now).num_minutes())
+        .map_or(String::new(), |m| match m {
+            m if m <= 0 => " It may have run out: r starts again.".into(),
+            1 => " It's good for about a minute.".into(),
+            m => format!(" It's good for {m} minutes."),
+        });
+    format!("{page}, type this code.{lasts}")
+}
+
+/// The question's title: a move to an account another program runs is a hand-over, named so.
+fn confirm_title(
+    app: &App,
+    machine: usize,
+    request: &serde_json::Value,
+    target: Option<&crate::app::account_controls::MoveTarget>,
+) -> String {
+    if request["action"] == "account-move"
+        && let Some(t) = target
+        && let Some(to) = request["to"].as_str()
+        && let Some(a) = app.account(machine, to)
+        && !t.agent.program.is_empty()
+        && !a.runs.is_empty()
+        && t.agent.program != a.runs
+    {
+        return format!(
+            "Hand {} over to {}?",
+            t.reference,
+            app.providers(machine).program_label(&a.runs)
+        );
+    }
+    "Account change".into()
 }
 
 fn table_edge(w: usize, top: bool) -> Line<'static> {
@@ -641,35 +873,46 @@ fn table_row(mut row: Line<'static>, w: usize) -> Line<'static> {
     row
 }
 
-fn account_line(a: &Account, yes: bool) -> Line<'static> {
+/// An account's line: its code, name, provider and kind, in its provider's words.
+fn account_line(app: &App, mi: usize, a: &Account, yes: bool) -> Line<'static> {
+    let providers = app.providers(mi);
     selected(
         format!(
-            "{:<6} {:<14} {} · {}",
+            "{:<7} {:<16} {} · {}",
             a.code,
             a.name,
-            provider_name(&a.provider),
-            if a.kind == "login" {
-                "saved sign-in"
-            } else if a.kind == "token" {
-                "token per machine"
-            } else {
-                &a.kind
-            }
+            providers.label(&a.provider),
+            providers.kind_label(&a.provider, &a.kind)
         ),
         yes,
     )
 }
+
+/// The window a plan lacks that its provider can have, as `weekly limit only` for a plan whose
+/// one window is weekly: why there's one number where others have two.
+fn lone_window(app: &App, a: &Account) -> Option<String> {
+    let windows = app.account_windows(a);
+    let [one] = windows.as_slice() else {
+        return None;
+    };
+    (!app.account_lacking(a).is_empty()).then(|| format!("{} limit only", one.name()))
+}
+
 /// An account's figures and status, then a line for each window that has reset since its
 /// freshest reading, whose figure shows as unknown.
 fn status_lines(app: &App, a: &Account) -> Vec<Line<'static>> {
-    let mut lines = vec![line(
-        format!("         {}  {}", app.account_numbers(a), a.status_label()),
-        account_color(a),
+    let mut first = vec![Span::styled(
+        format!("          {}  {}", app.account_numbers(a), a.status_label()),
+        fg(account_color(a)),
     )];
+    if let Some(only) = lone_window(app, a) {
+        first.push(Span::styled(format!("   {only}"), fg(DIM)));
+    }
+    let mut lines = vec![Line::from(first)];
     if let Some(u) = app.account_usage(a) {
         for (window, at) in u.reset_since(app.now()) {
             lines.push(line(
-                format!("         {window} window reset {at}; use since unknown"),
+                format!("          {window} window reset {at}; use since unknown"),
                 DIM,
             ));
         }
@@ -680,6 +923,9 @@ fn status_lines(app: &App, a: &Account) -> Vec<Line<'static>> {
 /// What Enter does on an account's line, naming every machine it signs in on (intent 0327).
 fn enter_hint(app: &App, mi: usize, a: &Account, copy: Option<&AccountCopy>) -> String {
     let name = app.machines.get(mi).map(|m| m.name()).unwrap_or_default();
+    if !app.offered(mi).signs_in(&a.provider) {
+        return format!("⏎ test it on {name} (it needs no sign-in)");
+    }
     match copy {
         Some(c) if a.copy_ready(c) => format!("⏎ signed in on {name}: sign in again? · t test it"),
         Some(_) => format!("⏎ sign in this copy on {name} · t test it"),
@@ -692,6 +938,97 @@ fn enter_hint(app: &App, mi: usize, a: &Account, copy: Option<&AccountCopy>) -> 
                 .collect();
             format!("⏎ sign in on {} · t test", names.join(", then "))
         }
+    }
+}
+
+/// The detail panel's usage: each window the account has, its share and reset, and which
+/// windows its provider can have that this plan doesn't.
+fn usage_detail(app: &App, a: &Account, w: usize) -> Vec<Line<'static>> {
+    let windows = app.account_windows(a);
+    if app.account_usage(a).is_none() || windows.is_empty() {
+        return vec![];
+    }
+    let mut lines = vec![Line::raw(""), heading("USAGE")];
+    for win in &windows {
+        // As the account's line has it: unknown once its window has reset since the reading.
+        let used = win
+            .current(app.now())
+            .map_or("—".to_string(), |v| format!("{v:.0}%"));
+        let resets = win
+            .resets
+            .as_deref()
+            .map(|t| format!(" · resets {}", crate::accounts::reset_time(t)))
+            .unwrap_or_default();
+        lines.extend(wrapped(
+            &format!(
+                "{used} of {}{resets}",
+                crate::accounts::window_period(win.minutes)
+            ),
+            w,
+            fg(FG2),
+            None,
+        ));
+    }
+    let missing = app.account_lacking(a);
+    if !missing.is_empty() {
+        lines.extend(wrapped(
+            &format!(
+                "This plan has no {} window, so {}.",
+                missing.join(" or "),
+                if windows.len() == 1 {
+                    "one number".to_string()
+                } else {
+                    format!("{} numbers", windows.len())
+                }
+            ),
+            w,
+            fg(DIM),
+            None,
+        ));
+    }
+    lines
+}
+
+/// Where an account stands in the owners' own lists: `Last for Arkship and Kibbelz`, or that
+/// it's in none, so nothing runs on it yet.
+fn in_the_lists(feed: &crate::feed::Feed, code: &str, w: usize) -> Vec<Line<'static>> {
+    let mut places: Vec<(String, Vec<String>)> = Vec::new();
+    for o in feed.owners.iter().filter(|o| o.own || o.parent.is_none()) {
+        let Some(i) = o.models.iter().position(|c| c == code) else {
+            continue;
+        };
+        let place = match (i, o.models.len()) {
+            (0, _) => "First".to_string(),
+            (i, n) if i + 1 == n => "Last".to_string(),
+            (i, n) => format!("{} of {n}", i + 1),
+        };
+        match places.iter_mut().find(|(p, _)| *p == place) {
+            Some((_, names)) => names.push(o.name.clone()),
+            None => places.push((place, vec![o.name.clone()])),
+        }
+    }
+    let text = if places.is_empty() {
+        "In no list yet: nothing runs on it until you add it with S.".to_string()
+    } else {
+        let said: Vec<String> = places
+            .into_iter()
+            .map(|(place, names)| format!("{place} for {}", and_list(&names)))
+            .collect();
+        format!(
+            "{}. Whatever is first is what new work runs.",
+            said.join("; ")
+        )
+    };
+    let mut lines = vec![Line::raw(""), heading("IN THE LISTS")];
+    lines.extend(wrapped(&text, w, fg(FG2), None));
+    lines
+}
+
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
 }
 
@@ -737,7 +1074,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                 Line::raw(""),
                 heading("NEW INTENTS"),
                 table_edge(tw, true),
-                table_row(line("  tenant                  ordered models", DIM), tw),
+                table_row(line("  owner                   ordered models", DIM), tw),
             ]);
             owner_section = true;
         }
@@ -750,7 +1087,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                     && let Some(c) = a.copy(id)
                 {
                     if a.shown_copies().first().map(|c| &c.id) == Some(id) {
-                        lines.push(table_row(account_line(a, false), tw));
+                        lines.push(table_row(account_line(app, mi, a, false), tw));
                         lines.extend(status_lines(app, a).into_iter().map(|l| table_row(l, tw)));
                     }
                     if i == sel {
@@ -761,7 +1098,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
             }
             Row::Account(code) => {
                 if let Some(a) = feed.accounts.iter().find(|a| &a.code == code) {
-                    lines.push(table_row(account_line(a, i == sel), tw));
+                    lines.push(table_row(account_line(app, mi, a, i == sel), tw));
                     lines.extend(status_lines(app, a).into_iter().map(|l| table_row(l, tw)));
                 }
             }
@@ -856,11 +1193,20 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
             }
             Some(row @ (Row::Account(code) | Row::Copy(code, _))) => {
                 if let Some(a) = feed.accounts.iter().find(|a| &a.code == code) {
-                    detail.extend([
-                        heading(format!("{} · {}", a.code, a.name)),
-                        line(provider_name(&a.provider), DIM),
-                        Line::raw(""),
-                    ]);
+                    let providers = app.providers(mi);
+                    detail.push(heading(format!("{} · {}", a.code, a.name)));
+                    detail.extend(wrapped(
+                        &format!(
+                            "{} · runs {} · {}",
+                            providers.label(&a.provider),
+                            providers.program_label(&a.runs),
+                            providers.kind_label(&a.provider, &a.kind)
+                        ),
+                        w,
+                        fg(DIM),
+                        None,
+                    ));
+                    detail.push(Line::raw(""));
                     let copy = match row {
                         Row::Copy(_, id) => a.copy(id),
                         _ => None,
@@ -905,6 +1251,8 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                             ));
                         }
                     }
+                    detail.extend(usage_detail(app, a, w));
+                    detail.extend(in_the_lists(feed, &a.code, w));
                     detail.push(Line::raw(""));
                     // Names the machine: "this machine" read as the laptop Kerdr ran on (intent 0327).
                     let enter = enter_hint(app, mi, a, copy);

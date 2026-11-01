@@ -341,19 +341,19 @@ impl Card {
             && self.intake().is_none()
     }
 
-    /// The agent whose conversation a reopen would resume, named for people: "Claude", "Codex".
-    pub fn resume_agent(&self) -> Option<String> {
-        let agent = self
-            .detail
-            .as_ref()?
-            .resume
-            .as_ref()?
-            .agent
-            .as_deref()?
-            .trim();
-        let mut chars = agent.chars();
-        let first = chars.next()?;
-        Some(first.to_uppercase().chain(chars).collect())
+    /// The program whose conversation a reopen would resume, as the feed names it (`claude`):
+    /// the board names it for people through the feed's providers.
+    pub fn resume_agent(&self) -> Option<&str> {
+        Some(
+            self.detail
+                .as_ref()?
+                .resume
+                .as_ref()?
+                .agent
+                .as_deref()?
+                .trim(),
+        )
+        .filter(|a| !a.is_empty())
     }
 
     /// How a message names this card's workspace: "#41's workspace", or "Workspace 41-dark-mode"

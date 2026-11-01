@@ -131,7 +131,11 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         agents: vec![
             agent("w1", "idle", "Retry copy for declined cards"),
             agent("w2", "blocked", "Two palettes for dark mode"),
-            agent("w3", "working", "Spelling suggestions in the index"),
+            Agent {
+                // Handed over from a Claude Code agent whose account ran out (its feed says so).
+                agent: Some("codex".into()),
+                ..agent("w3", "working", "Spelling suggestions in the index")
+            },
             agent("w4", "idle", "Team invites"),
         ],
         ..Default::default()
@@ -582,14 +586,17 @@ pub fn machines(away: bool) -> Vec<MachineState> {
     });
     for m in [&mut laptop, &mut build_box] {
         let f = m.feed.as_mut().unwrap();
+        f.providers = providers();
         f.accounts=serde_json::from_value(serde_json::json!([
-            {"code":"KBZ","name":"Personal","provider":"claude","kind":"login","runs":"claude","status":"out","until":"2026-10-22T09:00:00-05:00","pool":"week","usage":{"five":86,"week":100}},
-            {"code":"ARK","name":"Studio","provider":"claude","kind":"token","runs":"claude","status":"ready","usage":{"five":12,"week":30}}
+            {"code":"KBZ_C","name":"Personal","provider":"claude","kind":"login","runs":"claude","status":"out","until":"2026-10-22T09:00:00-05:00","pool":"week","usage":{"five":86,"week":100}},
+            {"code":"ARK_C","name":"Studio","provider":"claude","kind":"token","runs":"claude","status":"ready","usage":{"five":12,"week":30}},
+            {"code":"KBZ_X","name":"Personal Codex","provider":"codex","kind":"login","runs":"codex","status":"ready","provider_label":"Codex","program_label":"Codex","paste":false,
+             "usage":{"week":7,"week_at":"2026-10-28T01:48:00-05:00","seen":"2026-10-21T17:44:00-05:00"}}
         ])).unwrap();
         f.owners=serde_json::from_value(serde_json::json!([
-            {"id":"studio","kind":"organization","name":"Example Studio","models":["ARK","KBZ"],"own":true,"sessions":["default"]},
-            {"id":"shop","kind":"tenant","name":"Shop","parent":"studio","models":["ARK","KBZ"],"own":false,"sessions":["web","shop-bg"]},
-            {"id":"platform","kind":"tenant","name":"Platform","parent":"studio","models":["KBZ","ARK"],"own":true,"sessions":["api","background"]}
+            {"id":"studio","kind":"organization","name":"Example Studio","code":"ARK","models":["ARK_C","KBZ_C","KBZ_X"],"own":true,"sessions":["default"]},
+            {"id":"shop","kind":"tenant","name":"Shop","code":"SHP","parent":"studio","models":["ARK_C","KBZ_C","KBZ_X"],"own":false,"sessions":["web","shop-bg"]},
+            {"id":"platform","kind":"tenant","name":"Platform","code":"PLT","parent":"studio","models":["KBZ_C","ARK_C"],"own":true,"sessions":["api","background"]}
         ])).unwrap();
         f.owners_source = Some("mock".into());
         f.machine_owner = Some("studio".into());
@@ -597,27 +604,44 @@ pub fn machines(away: bool) -> Vec<MachineState> {
             if let Ok(snap) = snap {
                 for agent in &snap.agents {
                     let waiting = session == "api" && agent.pane_id == "w1:p1";
+                    let program = agent.agent.clone().unwrap_or_default();
+                    let handed = program == "codex";
                     f.agents.push(crate::accounts::AccountAgent {
                         pane: agent.pane_id.clone(),
                         session: session.clone(),
                         conversation: format!("demo-{session}-{}", agent.pane_id),
-                        account: if waiting { "KBZ" } else { "ARK" }.into(),
-                        how: "list".into(),
+                        account: if handed {
+                            "KBZ_X"
+                        } else if waiting {
+                            "KBZ_C"
+                        } else {
+                            "ARK_C"
+                        }
+                        .into(),
+                        how: if handed { "next" } else { "list" }.into(),
                         problem: None,
                         waiting: waiting.then(|| crate::accounts::Waiting {
                             why: "usage".into(),
                             until: Some("2026-10-22T09:00:00-05:00".into()),
                         }),
+                        handed_from: handed.then(|| crate::accounts::HandedFrom {
+                            account: "KBZ_C".into(),
+                            program: "claude".into(),
+                            conversation: format!("demo-{session}-before"),
+                            why: "usage_limit".into(),
+                            at: Some((now() - chrono::Duration::minutes(2)).to_rfc3339()),
+                        }),
+                        program,
                     });
                 }
             }
         }
     }
-    // The build box also holds the tenants' copy of ARK: one copy works, the other is missing.
+    // The build box also holds the tenants' copy of ARK_C: one copy works, the other is missing.
     if let Some(ark) = build_box
         .feed
         .as_mut()
-        .and_then(|f| f.accounts.iter_mut().find(|a| a.code == "ARK"))
+        .and_then(|f| f.accounts.iter_mut().find(|a| a.code == "ARK_C"))
     {
         ark.copies = serde_json::from_value(serde_json::json!([
             {"id":"agents","label":"Your agents","stored":true,"works":true,"checked":"2026-10-21T17:40:00-05:00","note":null},
@@ -627,11 +651,27 @@ pub fn machines(away: bool) -> Vec<MachineState> {
     vec![laptop, build_box, gpu, mac]
 }
 
+/// The providers the demo's feeds describe, as an accounts backend with Claude and Codex would:
+/// Kerdr names neither itself.
+pub fn providers() -> Vec<crate::accounts::Provider> {
+    serde_json::from_value(serde_json::json!([
+        {"id":"claude","label":"Claude","letter":"C","kinds":["token","login"],
+         "kind_labels":{"token":"a token per machine","login":"the machine's saved sign-in"},
+         "programs":["claude"],"program_labels":{"claude":"Claude Code"},
+         "signin":"page_code","windows":["five","week"]},
+        {"id":"codex","label":"Codex","letter":"X","kinds":["login","token"],
+         "kind_labels":{"login":"this machine's own Codex sign-in","token":"a sign-in of its own, per machine"},
+         "programs":["codex"],"program_labels":{"codex":"Codex"},
+         "signin":"device_code","windows":["five","week"]}
+    ]))
+    .unwrap()
+}
+
 /// Every account dialog, also used by the all-sizes rendering checks and screenshot generator.
 pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
     use crate::app::{
         Mode,
-        account_controls::{AccountScreen as S, MoveTarget, Signin},
+        account_controls::{AccountScreen as S, AddAccount, MoveTarget, Signin},
     };
     let owner = app.machines[0].feed.as_ref().unwrap().owners[0].clone();
     let card = app
@@ -646,11 +686,17 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
         reference: card.reference.clone(),
         agent: app.account_agent(card).unwrap().clone(),
     });
+    let rows = app.account_rows(0);
+    // The Codex account, whose panel says what it has and where it stands in the lists.
+    let codex = rows
+        .iter()
+        .position(|r| *r == crate::app::account_controls::Row::Account("KBZ_X".into()))
+        .unwrap_or(0);
     let list = Mode::Accounts {
         screen: S::List {
             machine: 0,
-            rows: app.account_rows(0),
-            sel: 3,
+            rows,
+            sel: codex,
             model: 0,
         },
         back: Box::new(Mode::Board),
@@ -658,7 +704,12 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
     let move_screen = Mode::Accounts {
         screen: S::Move {
             target: target.clone(),
-            choices: vec!["ARK".into(), "KBZ".into(), "list".into()],
+            choices: vec![
+                "ARK_C".into(),
+                "KBZ_C".into(),
+                "KBZ_X".into(),
+                "list".into(),
+            ],
             sel: 0,
         },
         back: Box::new(Mode::Board),
@@ -679,11 +730,50 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
         },
         back: Box::new(Mode::Board),
     };
-    let mut result=vec![list.clone(),copies.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now()},back:Box::new(move_screen)}];
+    let mut result=vec![list.clone(),copies.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK_C","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now()},back:Box::new(move_screen)}];
+    // s to an account another program runs: the engine's question, a hand-over.
+    if let Some(card) = app.board.cards.iter().find(|c| {
+        app.account_agent(c)
+            .is_some_and(|a| a.program == "claude" && a.waiting.is_none())
+    }) {
+        let agent = app.account_agent(card).unwrap().clone();
+        let machine = card.machine_index;
+        let handing = Box::new(MoveTarget {
+            machine,
+            key: card.key.clone(),
+            reference: card.reference.clone(),
+            agent: agent.clone(),
+        });
+        let picker = Mode::Accounts {
+            screen: S::Move {
+                target: handing.clone(),
+                choices: vec![
+                    "ARK_C".into(),
+                    "KBZ_X".into(),
+                    "KBZ_C".into(),
+                    "list".into(),
+                ],
+                sel: 1,
+            },
+            back: Box::new(Mode::Board),
+        };
+        result.push(Mode::Accounts {
+            screen: S::Confirm {
+                machine,
+                request: serde_json::json!({"action":"account-move","pane":agent.pane,"session":agent.session,"conversation":agent.conversation,"to":"KBZ_X","confirm":"demo-confirm"}),
+                message: "This agent runs Claude Code. KBZ_X runs Codex, so its conversation can't carry over: a fresh Codex agent starts in the same pane and picks up from the intent's log, its pinboard and the end of this conversation. It's mid-step. Move it to KBZ_X when it next stops? It won't be cut off.".into(),
+                yes: "hand over when it stops".into(),
+                no: "leave it".into(),
+                target: Some(handing),
+                ready_at: std::time::Instant::now(),
+            },
+            back: Box::new(picker),
+        });
+    }
     for screen in [
         S::PasteToken {
             machine: 0,
-            code: "ARK".into(),
+            code: "ARK_C".into(),
             copy: None,
             token: Default::default(),
             submit: false,
@@ -697,32 +787,43 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
         },
         S::AddModel {
             machine: 0,
-            choices: vec!["ARK".into()],
+            choices: vec!["ARK_C".into()],
             sel: 0,
         },
-        S::Add {
+        S::Provider {
             machine: 0,
-            code: "NEW".into(),
-            name: "Studio".into(),
-            field: 0,
+            choices: providers(),
+            sel: 1,
+        },
+        S::Add(Box::new(AddAccount {
+            machine: 0,
+            provider: providers()[1].clone(),
+            code: String::new(),
+            name: String::new(),
+            suggested: ("ARK_X".into(), "Example Studio Codex".into()),
+            kind: 1,
+            extra: vec![],
+            field: AddAccount::FIELDS_AT + 1,
             machines: vec![0, 1],
             chosen: vec![true, true],
-        },
+        })),
         S::Rename {
             machine: 0,
-            code: "ARK".into(),
+            code: "ARK_C".into(),
             name: "Studio".into(),
         },
-        S::Signin(Signin {
+        S::Signin(Box::new(Signin {
             deferred: None,
             restart: false,
-            code: "ARK".into(),
+            code: "ARK_C".into(),
             copy: None,
             machines: vec![0, 1],
             current: 1,
             ticket: Some("demo-ticket".into()),
             url: Some("https://example.com/signin".into()),
             needs_code: true,
+            user_code: None,
+            expires: None,
             page_code: String::new(),
             editing: false,
             poll_at: std::time::Instant::now(),
@@ -731,17 +832,20 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             paste: true,
             note: None,
             recheck: false,
-        }),
-        S::Signin(Signin {
+            added: None,
+        })),
+        S::Signin(Box::new(Signin {
             deferred: None,
             restart: false,
-            code: "KBZ".into(),
+            code: "KBZ_C".into(),
             copy: None,
             machines: vec![1],
             current: 0,
             ticket: Some("demo-ticket".into()),
             url: Some("https://example.com/signin".into()),
             needs_code: true,
+            user_code: None,
+            expires: None,
             page_code: String::new(),
             editing: true,
             poll_at: std::time::Instant::now(),
@@ -750,32 +854,59 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             paste: false,
             note: None,
             recheck: false,
-        }),
+            added: None,
+        })),
         // A saved sign-in's code box, having caught claude.ai's emailed code.
-        S::Signin(Signin {
+        S::Signin(Box::new(Signin {
             deferred: None,
             restart: false,
-            code: "KBZ".into(),
+            code: "KBZ_C".into(),
             copy: None,
             machines: vec![0],
             current: 0,
             ticket: Some("demo-ticket".into()),
             url: Some("https://example.com/signin".into()),
             needs_code: true,
+            user_code: None,
+            expires: None,
             page_code: String::new(),
             editing: true,
             poll_at: std::time::Instant::now(),
             failed: false,
             message: "Authorize as you@example.com on laptop.".into(),
             paste: false,
-            note: Some("That's the short code claude.ai emails you: type it on the claude.ai page in your browser. Here, paste the long code the page shows after you press Authorize.".into()),
+            note: Some(crate::app::account_controls::EMAILED_CODE.into()),
             recheck: false,
-        }),
+            added: None,
+        })),
+        // Codex signs in with a code typed on OpenAI's page; nothing comes back to paste.
+        S::Signin(Box::new(Signin {
+            deferred: None,
+            restart: false,
+            code: "KBZ_X".into(),
+            copy: None,
+            machines: vec![0, 1],
+            current: 1,
+            ticket: Some("demo-ticket".into()),
+            url: Some("https://auth.example.com/codex/device".into()),
+            needs_code: false,
+            user_code: Some("K7QD-3MPWX".into()),
+            expires: Some((now() + chrono::Duration::minutes(15)).to_rfc3339()),
+            page_code: String::new(),
+            editing: false,
+            poll_at: std::time::Instant::now(),
+            failed: false,
+            message: "Open the link and type the code K7QD-3MPWX on the page, signed in as Personal Codex's account (KBZ_X), to sign in KBZ_X on build-box. The code lasts 15 minutes; nothing comes back to paste here.".into(),
+            paste: false,
+            note: None,
+            recheck: false,
+            added: None,
+        })),
         // Enter on an account already ready on the machine viewed.
         S::Where {
-            code: "ARK".into(),
+            code: "ARK_C".into(),
             copy: None,
-            message: "ARK is already signed in and ready on build-box. This machine needs a sign-in:".into(),
+            message: "ARK_C is already signed in and ready on build-box. This machine needs a sign-in:".into(),
             choices: vec![
                 crate::app::account_controls::WhereChoice {
                     label: "laptop                 ✕ sign in".into(),
@@ -796,16 +927,18 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
     }
     // Signing in one copy, and pasting a token for it.
     for screen in [
-        S::Signin(Signin {
+        S::Signin(Box::new(Signin {
             deferred: None,
             restart: false,
-            code: "ARK".into(),
+            code: "ARK_C".into(),
             copy: Some(("tenants".into(), "Tenants".into())),
             machines: vec![1],
             current: 0,
             ticket: Some("demo-ticket".into()),
             url: Some("https://example.com/signin".into()),
             needs_code: true,
+            user_code: None,
+            expires: None,
             page_code: String::new(),
             editing: false,
             poll_at: std::time::Instant::now(),
@@ -814,10 +947,11 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             paste: false,
             note: None,
             recheck: false,
-        }),
+            added: None,
+        })),
         S::PasteToken {
             machine: 1,
-            code: "ARK".into(),
+            code: "ARK_C".into(),
             copy: Some("agents".into()),
             token: Default::default(),
             submit: false,

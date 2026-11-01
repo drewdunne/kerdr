@@ -37,6 +37,11 @@ pub struct Feed {
     #[serde(default)]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub agents: Vec<crate::accounts::AccountAgent>,
+    /// The providers its accounts can be (absent on older feeds): their names, kinds, letters,
+    /// sign-in style and windows, so Kerdr names none itself.
+    #[serde(default)]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub providers: Vec<crate::accounts::Provider>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -239,8 +244,13 @@ mod tests {
     #[test]
     fn optional_account_fields_accept_future_providers_and_null_usage() {
         let f=parse(r#"{"kerdr_feed":1,"accounts":[{"code":"LOCAL","provider":"local","kind":"endpoint","status":"ready","usage":null}],"owners":[{"id":"studio","kind":"organization","parent":null,"models":["LOCAL"]}],"agents":[{"pane":"w1:p1","session":"web","account":"LOCAL","waiting":null}],"owners_source":"mock","machine_owner":"studio","unowned_sessions":["stray"]}"#).unwrap();
+        // A provider the feed doesn't describe shows the windows a feed without providers has.
         assert_eq!(
-            crate::accounts::numbers(f.accounts[0].usage.as_ref(), chrono::Local::now()),
+            crate::accounts::numbers(
+                &crate::accounts::shown_windows(f.accounts[0].usage.as_ref(), None),
+                crate::accounts::Figures::Short,
+                chrono::Local::now()
+            ),
             "—│—"
         );
         assert_eq!(f.owners[0].models, ["LOCAL"]);

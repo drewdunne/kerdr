@@ -1229,6 +1229,8 @@ struct CardLines {
     title: Vec<String>,
     note: (String, ratatui::style::Color),
     age: (String, ratatui::style::Color),
+    /// An account code is never cut: the age gives way to it instead.
+    whole: bool,
 }
 
 fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
@@ -1300,7 +1302,16 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
     }
     note.push_str(&c.why);
     if modern {
-        note = account.map(|a| a.account.clone()).unwrap_or_default();
+        // ⇄: handed over from another program, when there's room beside the code for it.
+        note = account
+            .map(|a| {
+                if a.handed_from.is_some() && width(&a.account) + 2 <= inner_w {
+                    format!("{} ⇄", a.account)
+                } else {
+                    a.account.clone()
+                }
+            })
+            .unwrap_or_default();
     }
     // Open work its agent left, or whose workspace closed under it: say so where it shows
     // (intent 0289). C marks it done and x sets it aside, each starting nothing.
@@ -1325,6 +1336,7 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         head,
         badge,
         title,
+        whole: modern && note.1 == DIM && !note.0.is_empty(),
         note,
         age,
     }
@@ -1443,12 +1455,18 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
             );
         }
         let note_y = inner.y + 1 + title_rows as u16;
+        let crowded = width(&cl.note.0) + 1 + width(&cl.age.0) > inner.width as usize;
+        let age = if cl.whole && crowded {
+            String::new()
+        } else {
+            cl.age.0.clone()
+        };
         put_lr(
             buf,
             inner,
             note_y,
             vec![Span::styled(cl.note.0.clone(), fg(cl.note.1))],
-            vec![Span::styled(cl.age.0.clone(), fg(cl.age.1))],
+            vec![Span::styled(age, fg(cl.age.1))],
         );
         y += h;
     }
@@ -1569,14 +1587,13 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     if let Some(agent) = app.account_agent(c).cloned().or_else(|| app.move_agent(c)) {
         lines.push(Line::raw(""));
         lines.push(section("ACCOUNT"));
-        let account = app
-            .account_feed(c.machine_index)
-            .and_then(|f| f.accounts.iter().find(|a| a.code == agent.account));
+        let providers = app.providers(c.machine_index);
+        let account = app.account(c.machine_index, &agent.account);
         let state = account
             .map(|a| {
                 format!(
                     "{} · {} · {}",
-                    crate::accounts::provider_name(&a.provider),
+                    providers.label(&a.provider),
                     app.account_numbers(a),
                     a.status_label()
                 )
@@ -1602,6 +1619,43 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             fg(FG2),
             None,
         ));
+        // Handed over from another program: from which account and program, why and when.
+        if let Some(from) = &agent.handed_from {
+            let now_runs = app.agent_program(c.machine_index, &agent).or_else(|| {
+                account
+                    .filter(|a| !a.runs.is_empty())
+                    .map(|a| providers.program_label(&a.runs))
+            });
+            let when = from
+                .at
+                .as_deref()
+                .map(|t| format!(" at {}", crate::accounts::moment(t, now)))
+                .unwrap_or_default();
+            // A program the feed doesn't name is left out of the sentence rather than guessed.
+            let fresh = now_runs
+                .as_deref()
+                .map_or("A fresh agent".into(), |p| format!("A fresh {p} agent"));
+            let stays = now_runs
+                .as_deref()
+                .map_or("It stays".into(), |p| format!("It stays on {p}"));
+            lines.extend(wrapped(
+                &format!(
+                    "Handed over from {} ({}){when}: {}. {fresh} picked up from the log.",
+                    from.account,
+                    providers.program_label(&from.program),
+                    from.reason()
+                ),
+                w,
+                fg(YELLOW),
+                None,
+            ));
+            lines.extend(wrapped(
+                &format!("{stays} until {} runs out or the work ends.", agent.account),
+                w,
+                fg(DIM),
+                None,
+            ));
+        }
         if let Some(problem) = agent.problem.as_deref().filter(|p| !p.trim().is_empty()) {
             lines.extend(wrapped(problem, w, fg(RED), None));
         }
@@ -1838,7 +1892,10 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
     // Waiting work has nothing to jump into: its line names the keys that start or change it.
     // Work whose workspace closed says what ⏎ does for it: reopen it, resuming its agent. Done
     // work says ⏎ asks first, since a yes opens it again.
-    let reopen = match (c.can_reopen_done(), c.resume_agent()) {
+    let program = c
+        .resume_agent()
+        .map(|id| app.providers(c.machine_index).program_label(id));
+    let reopen = match (c.can_reopen_done(), program) {
         (false, Some(agent)) => format!("reopen it, resuming its {agent} conversation"),
         (false, None) => "reopen its workspace".to_string(),
         (true, Some(agent)) => format!("ask to reopen it, resuming its {agent} conversation"),
@@ -1956,7 +2013,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
                 ("w", "won’t do"),
                 ("i", "workspaces with no intent"),
                 ("f", "filter by who, agents or bg"),
-                ("a", "agents: all, Claude, Codex"),
+                ("a", "agents: all, then each one"),
                 ("M", "machines"),
                 ("?", "every key"),
             ],
@@ -2316,16 +2373,16 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize, ty
         }
         put_lr(buf, line, y, left, vec![Span::styled(counts, fg(FG2))]);
     }
+    // Every program the feeds name, then any other herdr reports, each in its feed's words.
     let provider = app.provider.as_deref();
-    let other = provider.filter(|p| !matches!(*p, "claude" | "codex"));
-    let mut agents = vec![
-        ("all", provider.is_none()),
-        ("Claude", provider == Some("claude")),
-        ("Codex", provider == Some("codex")),
-    ];
-    if let Some(other) = other {
-        agents.push((other, true));
-    }
+    let names = app.all_providers();
+    let mut labels = vec![("all".to_string(), provider.is_none())];
+    labels.extend(
+        app.agent_programs()
+            .into_iter()
+            .map(|id| (names.program_label(&id), provider == Some(id.as_str()))),
+    );
+    let agents: Vec<(&str, bool)> = labels.iter().map(|(l, on)| (l.as_str(), *on)).collect();
     put_lr(
         buf,
         Rect {
@@ -2820,7 +2877,11 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
                 "filters: one owner, tenant or project, agents, background",
                 "F shows everything",
             ),
-            ("a", "agents: all, Claude, Codex, then others", ""),
+            (
+                "a",
+                "agents: all, then each program the feeds name, then others",
+                "",
+            ),
         ],
     ),
     (
@@ -3898,6 +3959,19 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     );
 }
 
+/// The whole screen as text, for other modules' tests.
+#[cfg(test)]
+pub(crate) fn tests_render(a: &App, w: u16, h: u16) -> String {
+    let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+    t.draw(|f| draw(f, a)).unwrap();
+    t.backend()
+        .buffer()
+        .content
+        .iter()
+        .map(|c| c.symbol())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4023,7 +4097,7 @@ mod tests {
         a.open_accounts();
         let list = a.mode.clone();
         let text = rendered(&a, 176, 44);
-        // KBZ is out on the laptop, not ready: Enter signs in there, and says so.
+        // KBZ_C is out on the laptop, not ready: Enter signs in there, and says so.
         assert!(text.contains("⏎ sign in on laptop · t test"), "{text}");
         assert!(
             text.contains("j k move · ⏎ sign in on laptop · t test · e rename"),
@@ -4033,7 +4107,7 @@ mod tests {
         for f in a.machines[1].feed.iter_mut() {
             f.accounts
                 .iter_mut()
-                .find(|x| x.code == "KBZ")
+                .find(|x| x.code == "KBZ_C")
                 .unwrap()
                 .status = "sign_in".into();
         }
@@ -4045,7 +4119,7 @@ mod tests {
         for f in a.machines[1].feed.iter_mut() {
             f.accounts
                 .iter_mut()
-                .find(|x| x.code == "KBZ")
+                .find(|x| x.code == "KBZ_C")
                 .unwrap()
                 .status = "out".into();
         }
@@ -4071,17 +4145,18 @@ mod tests {
         };
         a.mode = find(&|s| matches!(s, S::Where { .. }));
         let text = rendered(&a, 176, 44);
-        assert!(text.contains("Sign ARK in where?"), "{text}");
-        assert!(text.contains("ARK is already signed in and ready on build-box"));
+        assert!(text.contains("Sign ARK_C in where?"), "{text}");
+        assert!(text.contains("ARK_C is already signed in and ready on build-box"));
         assert!(text.contains("laptop                 ✕ sign in"));
         assert!(text.contains("⏎ sign in there"));
         a.mode = find(&|s| matches!(s, S::Signin(x) if x.note.is_some()));
         let text = rendered(&a, 176, 44);
-        assert!(text.contains("Sign KBZ in on laptop"), "{text}");
+        assert!(text.contains("Sign KBZ_C in on laptop"), "{text}");
         assert!(!text.contains("on each machine"));
-        assert!(text.contains("After you press Authorize, the page shows a long code"));
-        assert!(text.contains("long code from the page"));
-        assert!(text.contains("That's the short code claude.ai emails you"));
+        assert!(text.contains("Once you allow it, the page shows a code"));
+        assert!(text.contains("code from the page"));
+        assert!(text.contains("short code a sign-in page emails you"));
+        assert!(!text.contains("claude.ai"), "{text}");
         assert!(
             text.contains("⏎ send code    esc stop"),
             "a saved sign-in offers no token: {text}"
@@ -4090,7 +4165,7 @@ mod tests {
         a.mode = find(&|s| matches!(s, S::Signin(x) if x.paste && x.copy.is_none()));
         let text = rendered(&a, 176, 44);
         assert!(
-            text.contains("Sign ARK in on laptop, then build-box"),
+            text.contains("Sign ARK_C in on laptop, then build-box"),
             "{text}"
         );
         assert!(
@@ -4113,8 +4188,8 @@ mod tests {
         }
         a.mode = typing;
         let text = rendered(&a, 80, 24);
-        assert!(text.contains("long code from the page"), "{text}");
-        assert!(text.contains("That's the short code"), "{text}");
+        assert!(text.contains("code from the page"), "{text}");
+        assert!(text.contains("That looks like the short code"), "{text}");
         for mode in [list, a.mode.clone()] {
             a.mode = mode;
             for (w, h) in [(1, 1), (10, 3), (30, 8), (60, 15), (80, 24), (120, 40)] {
@@ -4159,7 +4234,7 @@ mod tests {
             .unwrap()
             .accounts
             .iter_mut()
-            .find(|x| x.code == "ARK")
+            .find(|x| x.code == "ARK_C")
             .unwrap();
         ark.copies = serde_json::from_value(serde_json::Value::from(states.to_vec())).unwrap();
         let screens = crate::demo::account_screens(&a);
@@ -4202,7 +4277,10 @@ mod tests {
             .unwrap();
         a.mode = signin;
         let text = rendered(&a, 176, 44);
-        assert!(text.contains("Sign ARK in on build-box: Tenants"), "{text}");
+        assert!(
+            text.contains("Sign ARK_C in on build-box: Tenants"),
+            "{text}"
+        );
         assert!(text.contains("Only the Tenants copy changes."));
         assert!(text.contains("esc before it finishes leaves this one as it was"));
         // Once it has finished, Esc only closes: the dialog no longer says it would undo anything.
@@ -4338,13 +4416,13 @@ mod tests {
             .unwrap();
         let mi = a.machine_index(&a.this_machine()).unwrap();
         for owner in &mut a.machines[mi].feed.as_mut().unwrap().owners {
-            owner.models = vec!["KBZ".into(), "ARK".into()];
+            owner.models = vec!["KBZ_C".into(), "ARK_C".into()];
         }
-        assert!(rendered(&a, 176, 44).contains("new in web: Claude ARK"));
+        assert!(rendered(&a, 176, 44).contains("new in web: Claude ARK_C"));
         for account in &mut a.machines[mi].feed.as_mut().unwrap().accounts {
             account.status = "out".into();
         }
-        assert!(rendered(&a, 176, 44).contains("new in web: Claude KBZ"));
+        assert!(rendered(&a, 176, 44).contains("new in web: Claude KBZ_C"));
     }
 
     #[test]
@@ -4539,7 +4617,7 @@ mod tests {
             };
             let text = rendered(&a, width, 30);
             assert!(
-                text.contains("agents: all, Claude, Codex"),
+                text.contains("agents: all, then each one"),
                 "provider command hidden at {width}"
             );
             a.mode = Mode::Board;
@@ -4587,7 +4665,7 @@ mod tests {
                 "new intent",
                 "the backlog",
                 "filter by who, agents or bg",
-                "agents: all, Claude, Codex",
+                "agents: all, then each one",
                 "machines",
                 "every key",
                 "without Ctrl+Space",
@@ -4692,7 +4770,7 @@ mod tests {
         };
         let peek = rendered(&a, 176, 44);
         assert!(
-            peek.contains("⏎ ask to reopen it, resuming its Claude conversation"),
+            peek.contains("⏎ ask to reopen it, resuming its Claude Code conversation"),
             "{peek}"
         );
         // Without actions, nothing offers what Enter can't do.
@@ -4745,8 +4823,8 @@ mod tests {
         }
     }
 
-    /// Each machine's feed holds only the usage its own sessions last saw. Gives ARK an old
-    /// reading on the laptop and a new one on the build box, and KBZ the other way round.
+    /// Each machine's feed holds only the usage its own sessions last saw. Gives ARK_C an old
+    /// reading on the laptop and a new one on the build box, and KBZ_C the other way round.
     fn split_readings(a: &mut App) {
         let at = |h, m| {
             chrono::Local
@@ -4761,15 +4839,16 @@ mod tests {
             week: Some(week),
             week_at: Some(at(23, 0)),
             seen: Some(seen),
+            ..Default::default()
         };
         for m in &mut a.machines {
             let laptop = m.name() == "laptop";
             let Some(f) = &mut m.feed else { continue };
             for acc in &mut f.accounts {
                 acc.usage = Some(match (acc.code.as_str(), laptop) {
-                    ("ARK", true) => reading(at(11, 44), 0.0, 0.0),
-                    ("ARK", false) => reading(at(17, 45), 65.0, 19.0),
-                    ("KBZ", true) => reading(at(17, 44), 17.0, 87.0),
+                    ("ARK_C", true) => reading(at(11, 44), 0.0, 0.0),
+                    ("ARK_C", false) => reading(at(17, 45), 65.0, 19.0),
+                    ("KBZ_C", true) => reading(at(17, 44), 17.0, 87.0),
                     _ => reading(at(9, 0), 2.0, 83.0),
                 });
                 acc.status = "ready".into();
@@ -4789,8 +4868,8 @@ mod tests {
             a.machine = machine.map(str::to_string);
             a.rebuild();
             let top = top_line(&a, 176);
-            assert!(top.contains("ARK 65│19"), "{machine:?}: {top}");
-            assert!(top.contains("KBZ 17│87"), "{machine:?}: {top}");
+            assert!(top.contains("ARK_C 65│19"), "{machine:?}: {top}");
+            assert!(top.contains("KBZ_C 17│87"), "{machine:?}: {top}");
             a.open_accounts();
             let screen = rendered(&a, 176, 44);
             assert!(screen.contains("65│19  ready"), "{machine:?}: {screen}");
@@ -4806,7 +4885,7 @@ mod tests {
         for m in &mut a.machines {
             let laptop = m.name() == "laptop";
             let Some(f) = &mut m.feed else { continue };
-            for acc in f.accounts.iter_mut().filter(|acc| acc.code == "ARK") {
+            for acc in f.accounts.iter_mut().filter(|acc| acc.code == "ARK_C") {
                 acc.usage = Some(crate::accounts::Usage {
                     five: Some(if laptop { 65.0 } else { 1.0 }),
                     week: Some(19.0),
@@ -4819,7 +4898,7 @@ mod tests {
             a.machine = machine.map(str::to_string);
             a.rebuild();
             let top = top_line(&a, 176);
-            assert!(top.contains("ARK 65│19"), "{machine:?}: {top}");
+            assert!(top.contains("ARK_C 65│19"), "{machine:?}: {top}");
         }
     }
 
@@ -4836,25 +4915,27 @@ mod tests {
         let (five_at, week_at) = (at(16, 40), at(17, 0));
         for m in &mut a.machines {
             let Some(f) = &mut m.feed else { continue };
-            for acc in &mut f.accounts {
+            // The Codex account keeps its own weekly-only reading.
+            for acc in f.accounts.iter_mut().filter(|acc| acc.code != "KBZ_X") {
                 acc.usage = Some(crate::accounts::Usage {
                     five: Some(40.0),
                     five_at: Some(five_at.clone()),
                     week: Some(19.0),
-                    week_at: Some(if acc.code == "ARK" {
+                    week_at: Some(if acc.code == "ARK_C" {
                         week_at.clone()
                     } else {
                         "2026-10-24T09:00:00-05:00".into()
                     }),
                     seen: Some(at(11, 44)),
+                    ..Default::default()
                 });
             }
         }
         a.machine = Some("laptop".into());
         a.rebuild();
         let top = top_line(&a, 176);
-        assert!(top.contains("ARK —│—"), "{top}");
-        assert!(top.contains("KBZ —│19"), "{top}");
+        assert!(top.contains("ARK_C —│—"), "{top}");
+        assert!(top.contains("KBZ_C —│19"), "{top}");
         a.open_accounts();
         let five = format!(
             "five-hour window reset {}; use since unknown",
@@ -4864,7 +4945,7 @@ mod tests {
             "weekly window reset {}; use since unknown",
             crate::accounts::reset_time(&week_at)
         );
-        // KBZ is out in the demo and ARK ready; both explain their resets in full at every width.
+        // KBZ_C is out in the demo and ARK_C ready; both explain their resets in full at every width.
         for w in [80, 120, 176] {
             let screen = rendered(&a, w, 44);
             assert!(screen.contains("—│—  ready"), "{w}: {screen}");
@@ -4873,5 +4954,116 @@ mod tests {
             assert_eq!(screen.matches(&five).count(), 2, "{w}: {screen}");
             assert_eq!(screen.matches(&week).count(), 1, "{w}: {screen}");
         }
+    }
+
+    /// Intent 0356: Codex accounts beside Claude's, every name from the feed's providers.
+    #[test]
+    fn the_top_bar_groups_accounts_by_provider_with_the_windows_each_has() {
+        let mut a = demo(false);
+        a.machine = Some("laptop".into());
+        a.rebuild();
+        let top = top_line(&a, 176);
+        assert!(top.contains("Claude KBZ_C 86│100"), "{top}");
+        assert!(top.contains("· ARK_C 12│30"), "{top}");
+        // Codex comes after Claude, as the feed lists them, with its one weekly figure.
+        let (claude, codex) = (
+            top.find("Claude").unwrap(),
+            top.find("Codex KBZ_X 7").unwrap(),
+        );
+        assert!(claude < codex, "{top}");
+    }
+
+    #[test]
+    fn a_handed_over_card_shows_its_mark_and_its_peek_says_from_where_why_and_when() {
+        let mut a = demo(false);
+        a.machine = Some("laptop".into());
+        a.rebuild();
+        assert!(rendered(&a, 176, 44).contains("KBZ_X ⇄"));
+        // Narrow, the whole code stays and the mark and the age give way.
+        let narrow = rendered(&a, 80, 30);
+        assert!(narrow.contains("KBZ_X  │"), "{narrow}");
+        let c = a.board.cards.iter().find(|c| c.reference == "#47").unwrap();
+        a.sel = Selection {
+            col: c.stage.index(),
+            key: Some(c.key.clone()),
+        };
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        let peek = rendered(&a, 176, 44);
+        assert!(peek.contains("KBZ_X Codex · 7 this week · ready"), "{peek}");
+        assert!(
+            peek.contains("Handed over from KBZ_C (Claude Code) at"),
+            "{peek}"
+        );
+        assert!(
+            peek.contains("KBZ_C ran out. A fresh Codex agent"),
+            "{peek}"
+        );
+        assert!(
+            peek.contains("It stays on Codex until KBZ_X runs out"),
+            "{peek}"
+        );
+        // A program the feed doesn't name is left out of the sentences, not shown blank.
+        for m in &mut a.machines {
+            if let Some(f) = &mut m.feed {
+                for g in f.agents.iter_mut().filter(|g| g.handed_from.is_some()) {
+                    g.program.clear();
+                }
+                for acc in f.accounts.iter_mut().filter(|acc| acc.code == "KBZ_X") {
+                    acc.runs.clear();
+                }
+            }
+        }
+        let peek = rendered(&a, 176, 44);
+        assert!(
+            peek.contains("A fresh agent picked up from the log."),
+            "{peek}"
+        );
+        assert!(peek.contains("It stays until KBZ_X runs out"), "{peek}");
+        assert!(!peek.contains("fresh  agent"), "{peek}");
+    }
+
+    #[test]
+    fn a_six_letter_code_is_never_cut_on_its_card() {
+        let mut a = demo(false);
+        a.machine = Some("laptop".into());
+        for m in &mut a.machines {
+            if let Some(f) = &mut m.feed {
+                for agent in f.agents.iter_mut().filter(|g| g.account == "ARK_C") {
+                    agent.account = "ANET_C".into();
+                }
+            }
+        }
+        a.rebuild();
+        for w in [80, 100, 176] {
+            let screen = rendered(&a, w, 30);
+            assert!(screen.contains("ANET_C"), "{w}: {screen}");
+            assert!(!screen.contains("ANET_…"), "{w}: {screen}");
+        }
+    }
+
+    #[test]
+    fn a_feed_without_providers_names_accounts_as_before() {
+        let mut a = demo(false);
+        a.machine = Some("laptop".into());
+        for m in &mut a.machines {
+            if let Some(f) = &mut m.feed {
+                f.providers.clear();
+                f.accounts.retain(|acc| acc.provider == "claude");
+                for acc in &mut f.accounts {
+                    acc.provider_label = None;
+                    acc.program_label = None;
+                }
+            }
+        }
+        a.rebuild();
+        let top = top_line(&a, 176);
+        assert!(top.contains("Claude KBZ_C 86│100"), "{top}");
+        a.open_accounts();
+        let screen = rendered(&a, 176, 44);
+        assert!(screen.contains("Claude · saved sign-in"), "{screen}");
+        assert!(screen.contains("Claude · token per machine"), "{screen}");
     }
 }

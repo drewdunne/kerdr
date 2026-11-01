@@ -13,6 +13,7 @@ pub mod images;
 pub mod jump;
 pub mod model;
 pub mod poll;
+pub mod providers;
 pub mod report;
 pub mod state;
 pub mod theme;

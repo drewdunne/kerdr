@@ -231,17 +231,18 @@ fn event_loop(
                 }
             }
             Action::CopyLink(url) => {
-                if crate::accounts::valid_signin_url(&url) {
-                    use base64::Engine;
-                    use std::io::Write;
-                    let encoded = base64::engine::general_purpose::STANDARD.encode(url.as_bytes());
-                    let mut out = stdout();
-                    if write!(out, "\x1b]52;c;{encoded}\x07")
-                        .and_then(|_| out.flush())
-                        .is_ok()
-                    {
-                        app.say("Sign-in link sent to the terminal clipboard.", Tone::Info);
-                    }
+                if crate::accounts::valid_signin_url(&url) && to_clipboard(&url) {
+                    app.say("Sign-in link sent to the terminal clipboard.", Tone::Info);
+                }
+            }
+            Action::CopyCode(code) => {
+                if crate::app::account_controls::user_code_ok(&code) && to_clipboard(&code) {
+                    app.say(
+                        format!(
+                            "{code} sent to the terminal clipboard: type it on the sign-in page."
+                        ),
+                        Tone::Info,
+                    );
                 }
             }
             Action::OpenLink(url) => open_signin(app, &url),
@@ -682,6 +683,17 @@ fn closed(workspace: &str) -> String {
     format!("{workspace} has closed since the board last read it.")
 }
 
+/// Sends text to the terminal's clipboard (OSC 52), on every platform's terminal alike.
+fn to_clipboard(text: &str) -> bool {
+    use base64::Engine;
+    use std::io::Write;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    let mut out = stdout();
+    write!(out, "\x1b]52;c;{encoded}\x07")
+        .and_then(|_| out.flush())
+        .is_ok()
+}
+
 fn open_signin(app: &mut App, url: &str) {
     if app.demo {
         app.say("Demo sign-in: no browser opened.", Tone::Info);
@@ -690,7 +702,7 @@ fn open_signin(app: &mut App, url: &str) {
     match crate::accounts::open_signin_url(url) {
         Ok(()) => {}
         Err(error) => app.say(
-            format!("Could not open the browser: {error}. Press c to copy the link."),
+            format!("Could not open the browser: {error}. Copy the link instead (c, or l where the page takes a code)."),
             Tone::Warn,
         ),
     }

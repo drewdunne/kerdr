@@ -28,8 +28,9 @@ Kerdr answers those questions in one look:
 - **How close to done is each thing?** Its column, its lifecycle rail, and its done-when
   criteria when the work records have them.
 - **Should I take on more?** Session tabs show the slots each session has left. With account data,
-  the top right shows each provider’s five-hour and weekly usage, such as `KBZ 86│100`: each
-  account's newest reading from any machine, whichever machine you're looking at.
+  the top right shows each account's usage, grouped by provider, one figure per window it has,
+  such as `Claude KBZ_C 86│100   Codex KBZ_X 7`: each account's newest reading from any machine,
+  whichever machine you're looking at.
 
 ## Human on the loop
 
@@ -196,16 +197,33 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 
 With an account-aware feed, each card shows its account at the bottom left and one status
 at the top right: yellow ▲ needs you, red ⏸︎ waits for usage, green ● running, grey ■ idle.
+A code is never cut short: on a narrow card the age gives way to it. `⇄` beside the code
+means the work was handed over from another program (a Claude Code agent's account ran out,
+say, and a fresh Codex agent took over from the work's log); its peek says from which account
+and program, why, and when.
 The bottom line names the first ready account for new work in the session you are viewing.
 Older feeds retain the original board layout.
 
+Accounts can be of any provider the feed describes: Claude and Codex today, a local model
+later. Kerdr names none itself. The feed's `providers` give each one's name, the letter its
+codes end with (`KBZ_C`, `KBZ_X`), its kinds of account in its own words, how it signs in,
+and the usage windows it can have, so a provider added later is listed, added, signed in and
+shown with no Kerdr release. The top bar groups accounts by provider and shows the windows
+each has: `Claude KBZ_C 86│100 · ARK_C 12│30   Codex KBZ_X 7`, where a plan with only a weekly
+limit shows one number.
+
+![A card handed over to Codex, and its peek](docs/screenshots/peek-handed-over.png)
+
 `A` opens accounts and each organization’s and tenant’s ordered model list, on the machine
 tab you chose on the board, or else on the machine Kerdr runs on. `Tab` changes the machine
-whose sign-in status you are viewing. Tenants can follow their organization or
-keep their own order. Select an owner with `j k`, choose a model with `h l`, then Enter makes
+whose sign-in status you are viewing. Each account's line names its provider and kind; its
+panel shows each usage window and where it stands in the lists. Tenants can follow their
+organization or keep their own order. Select an owner with `j k`, choose a model with `h l`, then Enter makes
 it first, `J K` reorders, and `a d` adds or drops in a draft that Enter saves. Backspace asks
 before following the parent. `S` opens the
-viewed session’s list as a draft: reorder, optionally tick “move waiting sessions,” then save.
+viewed session’s list as a draft, each line naming its provider, so the list reads as a
+provider order: whatever is first and ready is what new work runs. Reorder, optionally tick
+“move waiting sessions,” then save.
 The tick sends a separate move request to every reachable configured feed machine.
 
 ![Accounts and tenant model lists](docs/screenshots/accounts.png)
@@ -213,13 +231,25 @@ The tick sends a separate move request to every reachable configured feed machin
 `s` opens the selected agent’s move picker. Choosing an account sends the request to that
 agent’s machine and session. If its backend asks about a step or background job in progress,
 a separate question appears. A confirmation applies only to that same conversation.
-A Claude Code agent the feed has no record of yet can be moved too: Kerdr sends its pane with
-an empty `conversation`, and the backend takes the conversation from herdr and records it.
-The backend owns fallback and resuming: same program, same conversation; another program,
-a fresh agent from the work’s log; nothing left, wait for an account to return.
+An agent the feed has no record of yet can be moved too, if its program is one the machine's
+accounts run: Kerdr sends its pane with an empty `conversation`, and the backend takes the
+conversation from herdr and records it. The backend owns fallback and resuming: same program,
+same conversation; another program, a fresh agent from the work’s log; nothing left, wait for
+an account to return. A move to an account another program runs is a hand-over, and the
+backend's question says so before anything happens ("Hand #45 over to Codex?").
 
-`A` then `+` adds a Claude account: a code of 2–4 capital letters, name, and machines, then a separate browser sign-in
-on each machine. Enter on an existing account signs it in on the machine you are viewing,
+![s to an account of another program asks first](docs/screenshots/hand-over.png)
+
+`A` then `+` asks which provider first, since the provider decides the program, then the
+code (suggested as the owner's code, `_` and the provider's letter, like `ARK_X`), the name,
+the kind of sign-in in that provider's words, anything else the provider asks for, and the
+machines; then a separate sign-in on each machine.
+
+![+ asks the provider first](docs/screenshots/add-provider.png)
+
+![Adding a Codex account](docs/screenshots/add-account.png)
+
+Enter on an existing account signs it in on the machine you are viewing,
 then on every other machine that needs it, one after another, with no Tab needed; its hint
 names them (“⏎ sign in on laptop, then build-box”). On an account already ready there, Enter
 asks instead: it offers all the machines that need a sign-in one after another (when there are
@@ -229,7 +259,14 @@ URL handler. `c` copies the visible link through the terminal clipboard and `o` 
 
 ![Enter on an account that's ready offers the machines that need a sign-in](docs/screenshots/sign-in-where.png)
 
-Tab focuses the optional code field. After you press Authorize, the page shows a long code:
+A provider whose page takes a code (Codex) shows that code, big, with how long it lasts: `c`
+copies it, `o` opens the page again and `l` copies the link. You type it on the provider's
+page, and nothing comes back to paste: the line ticks once you've allowed it.
+
+![Codex signs in with a code you type on its page](docs/screenshots/sign-in-device.png)
+
+For a provider whose page gives a code back (Claude), Tab focuses the optional code field.
+After you press Authorize, the page shows a long code:
 paste it there and press Enter. A short code that claude.ai emails you goes in the browser
 instead, and Kerdr says so rather than sending it. For a token account, `p` opens a masked
 token field instead; a saved sign-in, or a copy that takes no token, doesn't offer it. Tokens
@@ -271,7 +308,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `X` | cancel: stop the selected card's agent, close its workspace (or only a child's tab), and set it aside in Won't do (work an agent is at; asks first) |
 | `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
 | `A` / `S` / `s` | accounts / the viewed session owner’s ordered models, for agents that start next / move the selected card’s agent to another account, keeping its conversation |
-| `a` | cycle provider: All, Claude, Codex, and detected providers |
+| `a` | cycle agents: all, each program the feeds name, then any other herdr reports |
 | `b` | backlog |
 | `w` | toggle Won't do view |
 | `i` | Misc: workspaces with no record |
@@ -408,7 +445,7 @@ you, the machine shows *needs you*, and `M` then `Enter` lets you answer it.
 
 ## Status
 
-Kerdr is new (0.7). Reading and navigation work without an action adapter. Opting into
+Kerdr is new (0.14). Reading and navigation work without an action adapter. Opting into
 `[actions] command` enables record changes, dispatch and reopening through your own adapter, on
 the record's home machine. Commands run in the background and show their result; an unknown result
 is never retried automatically. In herdr, Kerdr focuses the workspace you jump into, shows a

@@ -269,6 +269,8 @@ pub enum Action {
     LoadImages(crate::images::Source),
     None,
     CopyLink(String),
+    /// A code to type on a sign-in page, to the terminal clipboard.
+    CopyCode(String),
     OpenLink(String),
     Quit,
     /// Open herdr full screen on this card's workspace.
@@ -3228,10 +3230,7 @@ mod tests {
         let mut app = demo_app();
         let (key, id) = closed_workspace_card(&mut app);
         assert!(app.card(&key).unwrap().can_reopen());
-        assert_eq!(
-            app.card(&key).unwrap().resume_agent().as_deref(),
-            Some("Codex")
-        );
+        assert_eq!(app.card(&key).unwrap().resume_agent(), Some("codex"));
         // Without actions there's no one to ask: it says how to get there, and sends nothing.
         assert_eq!(enter(&mut app), Action::None);
         assert!(app.message().unwrap().0.contains("[actions]"));
@@ -3508,7 +3507,7 @@ mod tests {
         };
         assert_eq!(title, &format!("Cancel {reference}?"));
         assert!(
-            message.starts_with("Stops its Claude agent (mid-step) and closes workspace 07-build (web), with every tab in it, then sets"),
+            message.starts_with("Stops its Claude Code agent (mid-step) and closes workspace 07-build (web), with every tab in it, then sets"),
             "{message}"
         );
         assert!(message.contains("aside in Won't do"), "{message}");
