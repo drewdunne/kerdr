@@ -294,6 +294,17 @@ fn main() {
     };
     rasterize(&render(&handed), &fonts, &out.join("peek-handed-over.png"));
 
+    // A card's own screen (o), on the child at work in a tab of its workspace.
+    let mut card = app(false);
+    select(&mut card, "#41");
+    for c in ['o', 'j'] {
+        card.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char(c),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    rasterize(&render(&card), &fonts, &out.join("card.png"));
+
     let mut road = app(true);
     select(&mut road, "#41");
     rasterize(&render(&road), &fonts, &out.join("reconnecting.png"));
@@ -351,7 +362,7 @@ fn main() {
     rasterize(&render(&compose), &fonts, &out.join("new-intent.png"));
 
     let mut confirmation = app(false);
-    confirmation.mode = Mode::Confirm { machine: 0,
+    confirmation.mode = Mode::Confirm { plain: false, machine: 0,
         request: serde_json::json!({"action":"dispatch","id":"40","override":true}),
         title: "Start #40 in web?".into(),
         message: "web has 3 active workspaces. The usual limit is 3. Starting this makes 4; the maximum is 5.".into(),

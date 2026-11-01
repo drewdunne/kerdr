@@ -15,6 +15,8 @@ use crate::poll::{Conn, Event};
 pub mod account_controls;
 #[path = "controls.rs"]
 mod controls;
+#[path = "inside.rs"]
+pub mod inside;
 use account_controls::AccountScreen;
 pub(crate) use controls::waiting_work;
 
@@ -172,8 +174,19 @@ pub enum Mode {
         /// For a question that appears on its own (an action's answer): keys before this are
         /// ignored, so one held or typed before it appeared can't answer it.
         ready_at: Option<Instant>,
+        /// A question Kerdr asks for itself (reopening a card's own agent when its tab is gone):
+        /// the yes sends the request as it is, so the backend still asks its own questions.
+        plain: bool,
     },
     Board,
+    /// A card's own screen: the card itself, then what's inside it (`o`). `focus` is the row
+    /// selected: "" for the card itself, a piece's key, or `group:<id>` for a folded group.
+    Card {
+        card: String,
+        focus: String,
+        opened: Vec<crate::family::Group>,
+        back: Box<Mode>,
+    },
     Peek {
         scroll: u16,
         back: Box<Mode>,
@@ -572,9 +585,17 @@ impl App {
         let mut cols: [Vec<usize>; 7] = Default::default();
         let scope = self.scope();
         for (i, c) in self.board.cards.iter().enumerate() {
-            if c.stage != Stage::Misc && scope.contains(c) && self.card_visible(c) {
+            // What sits inside a card on the board is on its line, not in a column (intent 0349).
+            if c.stage != Stage::Misc
+                && scope.contains(c)
+                && self.card_visible(c)
+                && self.holder(i).is_none()
+            {
                 cols[c.stage.index()].push(i);
             }
+        }
+        for stage in Stage::ALL {
+            self.arrange(stage, &mut cols[stage.index()]);
         }
         cols
     }
@@ -602,6 +623,9 @@ impl App {
                     .map(|&i| self.board.cards[i].key.clone());
                 set_misc_selection(&mut self.mode, selected);
             }
+            return;
+        }
+        if self.fix_card_screen() {
             return;
         }
         if holds_peek(&self.mode) {
@@ -710,49 +734,15 @@ impl App {
         self.select_index(self.sel.col, row);
     }
 
-    /// Cards that need you, in board order: column by column, top to bottom.
+    /// Cards that need you, in board order: column by column, top to bottom, each followed by
+    /// the pieces inside it that need you.
     pub fn needs_you_order(&self) -> Vec<String> {
-        let cols = self.columns();
-        let vis = self.visible_columns();
-        let mut out = Vec::new();
-        for ci in 0..7 {
-            if !vis[ci] {
-                continue;
-            }
-            for &i in &cols[ci] {
-                if self.board.cards[i].needs_you() {
-                    out.push(self.board.cards[i].key.clone());
-                }
-            }
-        }
-        out
+        self.needs_order()
     }
 
-    /// Moves to the next (or previous) card that needs you. Returns its key.
+    /// Moves to the next (or previous) card or piece that needs you. Returns its key.
     pub fn step_needs_you(&mut self, dir: i32) -> Option<String> {
-        let order = self.needs_you_order();
-        if order.is_empty() {
-            self.say("Nothing here needs you right now.", Tone::Good);
-            return None;
-        }
-        let pos = self
-            .sel
-            .key
-            .as_ref()
-            .and_then(|k| order.iter().position(|o| o == k));
-        let next = match pos {
-            Some(p) => (p as i32 + dir).rem_euclid(order.len() as i32) as usize,
-            None if dir > 0 => 0,
-            None => order.len() - 1,
-        };
-        let key = order[next].clone();
-        if let Some(card) = self.card(&key) {
-            self.sel = Selection {
-                col: card.stage.index(),
-                key: Some(key.clone()),
-            };
-        }
-        Some(key)
+        self.needs_step(dir)
     }
 
     /// The next card that needs you after `key`, skipping it and any in `skip` (workspaces found
@@ -891,6 +881,9 @@ impl App {
             return Action::None;
         };
         if card.is_open_workspace() {
+            if let Some(action) = self.own_tab_unknown(&card) {
+                return action;
+            }
             return Action::Jump(key);
         }
         // Work under way whose workspace closed, or done work: reopen it rather than leave a dead
@@ -970,6 +963,12 @@ impl App {
             Mode::Machines { sel } => self.machines_key(key, sel),
             Mode::Backlog { sel } => self.backlog_key(key, sel),
             Mode::Misc { sel } => self.misc_key(key, sel),
+            Mode::Card {
+                card,
+                focus,
+                opened,
+                back,
+            } => self.card_key(key, card, focus, opened, back),
             Mode::Accounts { .. }
             | Mode::Palette { .. }
             | Mode::Compose { .. }
@@ -1042,6 +1041,11 @@ impl App {
             KeyCode::Char('N') => {
                 self.step_needs_you(-1);
             }
+            KeyCode::Char('o') => {
+                if let Some(k) = self.sel.key.clone() {
+                    self.open_inside(&k);
+                }
+            }
             KeyCode::Char(']') | KeyCode::Tab => self.step_tab(1),
             KeyCode::Char('[') | KeyCode::BackTab => self.step_tab(-1),
             KeyCode::Char('}') => self.step_machine(1),
@@ -1102,21 +1106,31 @@ impl App {
                     return action;
                 }
             }
-            KeyCode::Char('j') if ca => {
-                self.step_needs_you(1);
-                self.mode = Mode::Peek { scroll: 0, back };
+            KeyCode::Char('j' | 'k') if ca => {
+                self.peek_step(
+                    if key.code == KeyCode::Char('j') {
+                        1
+                    } else {
+                        -1
+                    },
+                    back,
+                );
             }
-            KeyCode::Char('k') if ca => {
-                self.step_needs_you(-1);
-                self.mode = Mode::Peek { scroll: 0, back };
+            KeyCode::Char('n' | 'N') => {
+                self.peek_step(
+                    if key.code == KeyCode::Char('n') {
+                        1
+                    } else {
+                        -1
+                    },
+                    back,
+                );
             }
-            KeyCode::Char('n') => {
-                self.step_needs_you(1);
-                self.mode = Mode::Peek { scroll: 0, back };
-            }
-            KeyCode::Char('N') => {
-                self.step_needs_you(-1);
-                self.mode = Mode::Peek { scroll: 0, back };
+            KeyCode::Char('o') => {
+                if let Some(k) = self.sel.key.clone() {
+                    self.mode = *back;
+                    self.open_inside(&k);
+                }
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 self.mode = Mode::Peek {
@@ -1133,6 +1147,17 @@ impl App {
             _ => {}
         }
         Action::None
+    }
+
+    /// n in a peek: the next that needs you, peeked at from where it shows, a piece from its
+    /// card's screen.
+    fn peek_step(&mut self, dir: i32, back: Box<Mode>) {
+        self.mode = *back;
+        self.step_needs_you(dir);
+        self.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(self.mode.clone()),
+        };
     }
 
     fn search_key(&mut self, key: KeyEvent, mut s: Search) -> Action {
@@ -1452,10 +1477,11 @@ impl App {
             .cards
             .iter()
             .enumerate()
-            .filter(|(_, c)| {
+            .filter(|(i, c)| {
                 (c.stage == Stage::Backlog || self.wont_do)
                     && scope.contains(c)
                     && self.card_visible(c)
+                    && self.holder(*i).is_none()
             })
             .map(|(i, _)| i)
             .collect()
@@ -1484,6 +1510,14 @@ impl App {
                     filter: SearchFilter::Everything,
                     sel: 0,
                 })
+            }
+            KeyCode::Char('o') => {
+                if let Some(&i) = items.get(sel) {
+                    let key = self.board.cards[i].key.clone();
+                    self.backlog_focus = Some(key.clone());
+                    self.open_inside(&key);
+                    return Action::None;
+                }
             }
             KeyCode::Enter | KeyCode::Char('m') | KeyCode::Char(' ') => {
                 if let Some(&i) = items.get(sel) {
@@ -1728,6 +1762,7 @@ mod tests {
             title: "Real intent".into(),
             stage: Some("test".into()),
             workspace: Some(crate::feed::FeedWorkspace {
+                own_tab: None,
                 session: Some(session),
                 id: misc.workspace_id.clone(),
                 label: None,

@@ -211,6 +211,34 @@ pub struct Card {
     pub source: Source,
     /// Done-when progress: met and total, from the feed's criteria or a reported `n/m`.
     pub progress: Option<(u32, u32)>,
+    /// The tab its own agent runs in, when its feed names one: Enter on the card lands there.
+    pub own_tab: Option<String>,
+    /// The card this one sits inside (`family::link`): its parent's, else the one it sees through
+    /// as an undertaker, else the one it came out of. None for a card on its own.
+    pub inside: Option<String>,
+    /// How its record names that card ("#256"), even when no feed has it, and what it is there.
+    pub link: Option<(String, Link)>,
+}
+
+/// What a card is to the card it sits inside.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Link {
+    /// A child (`parent`): part of that card's work.
+    Part,
+    /// It sees that card's agents through (`undertaker_for`).
+    Undertaker,
+    /// It came out of that card's work (`from`).
+    FollowUp,
+}
+
+impl Link {
+    pub fn label(self) -> &'static str {
+        match self {
+            Link::Part => "part",
+            Link::Undertaker => "undertaker",
+            Link::FollowUp => "follow-up",
+        }
+    }
 }
 
 impl Card {

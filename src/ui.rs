@@ -17,6 +17,8 @@ use crate::theme::*;
 
 #[path = "account_ui.rs"]
 mod account_ui;
+#[path = "card_ui.rs"]
+mod card_ui;
 
 pub fn draw(f: &mut Frame, app: &App) {
     let area = f.area();
@@ -122,6 +124,12 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
         Mode::Machines { sel } => machines_view(f, area, app, *sel),
         Mode::Backlog { sel } => backlog_view(f, area, app, *sel),
         Mode::Misc { sel } => misc_view(f, area, app, *sel),
+        Mode::Card {
+            card,
+            focus,
+            opened,
+            ..
+        } => card_ui::draw(f, area, app, card, focus, opened),
         Mode::Search(s) => {
             board_view(f, area, app);
             dim_behind(f);
@@ -229,12 +237,13 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
         return running_hints(app);
     };
     let mut spans = card_badge(card, if card.no_agent() { YELLOW } else { CYAN });
-    let mut hints = vec![];
+    let mut hints: Vec<(&str, String)> = vec![];
     if card.reopenable() {
-        hints.push(("⏎", "reopen it"));
+        hints.push(("⏎", "reopen it".into()));
     }
-    hints.extend([("C", "done"), ("x", "won’t do")]);
-    spans.extend(key_hints(&hints));
+    hints.extend([("C", "done".into()), ("x", "won’t do".into())]);
+    with_inside(app, card, &mut hints);
+    spans.extend(owned_hints(&hints));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
 }
@@ -262,14 +271,15 @@ fn running_hints(app: &App) -> Vec<Span<'static>> {
     };
     let mut spans = card_badge(card, CYAN);
     let moving = move_hint(app, card);
-    let mut hints = vec![("⏎", "go in")];
-    if let Some(m) = &moving {
-        hints.push(("s", m.as_str()));
+    let mut hints: Vec<(&str, String)> = vec![("⏎", "go in".into())];
+    if let Some(m) = moving {
+        hints.push(("s", m));
     }
     if app.actions_on() {
-        hints.push(("X", "cancel"));
+        hints.push(("X", "cancel".into()));
     }
-    spans.extend(key_hints(&hints));
+    with_inside(app, card, &mut hints);
+    spans.extend(owned_hints(&hints));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
 }
@@ -283,9 +293,45 @@ fn done_hints(app: &App) -> Vec<Span<'static>> {
         return vec![];
     };
     let mut spans = card_badge(card, GREEN);
-    spans.extend(key_hints(&[("⏎", "ask to reopen it")]));
+    let mut hints: Vec<(&str, String)> = vec![("⏎", "ask to reopen it".into())];
+    with_inside(app, card, &mut hints);
+    spans.extend(owned_hints(&hints));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
+}
+
+/// `o`'s hint for a card: what's inside it, or the card out of view that it sits in.
+fn inside_hint(app: &App, card: &Card) -> Option<String> {
+    let i = app.card_index(&card.key)?;
+    if let Some(r) = app.held_elsewhere(i)
+        && app.board.up.get(i).copied().flatten().is_some()
+    {
+        return Some(format!("opens {r}"));
+    }
+    let n = app.pieces(i).len();
+    (n > 0).then(|| format!("what's inside ({n})"))
+}
+
+/// The hints a card holding work adds: ⏎ is its own agent, and o opens what's inside.
+fn with_inside(app: &App, card: &Card, hints: &mut Vec<(&str, String)>) {
+    if let Some(h) = inside_hint(app, card) {
+        let holds = !app.tabs_inside(card).is_empty() || h.starts_with("what");
+        for (k, v) in hints.iter_mut() {
+            if *k == "⏎" && v == "go in" && holds {
+                *v = "its own agent".into();
+            }
+        }
+        let at = hints
+            .iter()
+            .position(|(k, _)| *k == "⏎")
+            .map_or(0, |p| p + 1);
+        hints.insert(at, ("o", h));
+    }
+}
+
+fn owned_hints(hints: &[(&str, String)]) -> Vec<Span<'static>> {
+    let refs: Vec<(&str, &str)> = hints.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    key_hints(&refs)
 }
 
 fn card_badge(card: &Card, color: Color) -> Vec<Span<'static>> {
@@ -1105,7 +1151,19 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     for (row, &i) in items.iter().enumerate().skip(start).take(visible) {
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
-        let (glyph, gcolor, meta, mcolor) = list_glyph(c, now);
+        let (glyph, gcolor, mut meta, mut mcolor) = list_glyph(c, now);
+        // A card holding work says so with ▸; a done one with work still open says how much,
+        // yellow only when some of it needs you. One whose card is out of view names that card.
+        let holds = app.holds(i);
+        if holds.open > 0 && c.stage == Stage::Maintain {
+            meta = format!("{} open", holds.open);
+            mcolor = if holds.needs > 0 { YELLOW } else { FG2 };
+        }
+        if let Some(r) = app.held_elsewhere(i) {
+            meta = format!("in {r}");
+            mcolor = CYAN;
+        }
+        let marker = if holds.count > 0 { "▸" } else { "" };
         let is_sel = Some(c.key.as_str()) == selected;
         let text_style = if is_sel {
             bold(FG)
@@ -1129,7 +1187,9 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
             y,
             vec![
                 Span::styled(format!("{glyph} "), fg(gcolor)),
-                Span::styled(format!("{} {}", c.reference, c.title), text_style),
+                Span::styled(c.reference.clone(), text_style),
+                Span::styled(marker, fg(CYAN)),
+                Span::styled(format!(" {}", c.title), text_style),
             ],
             vec![Span::styled(meta, fg(mcolor))],
         );
@@ -1246,6 +1306,10 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
     if c.background {
         head.push(Span::styled(" bg", fg(PURPLE)));
     }
+    if let Some(r) = app.card_index(&c.key).and_then(|i| app.held_elsewhere(i)) {
+        head.push(Span::styled(" in ", fg(DIM)));
+        head.push(Span::styled(r, fg(CYAN)));
+    }
     let color = if cached {
         DIM
     } else {
@@ -1345,17 +1409,21 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
 fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option<&str>) {
     let inner_w = body.width.saturating_sub(4) as usize;
     let compact = body.height < 18;
+    let holds: std::collections::HashMap<usize, crate::family::Holds> =
+        items.iter().map(|&i| (i, app.holds(i))).collect();
     let all: Vec<(usize, CardLines)> = items
         .iter()
         .map(|&i| (i, card_lines(app, &app.board.cards[i], inner_w)))
         .collect();
-    let height = |cl: &CardLines| -> u16 {
+    let height = |i: usize, cl: &CardLines| -> u16 {
         let title = if compact {
             1
         } else {
             cl.title.len().max(1) as u16
         };
-        2 + 1 + title + 1
+        // A card holding work has one more line: what's inside it.
+        let tray = u16::from(holds.get(&i).is_some_and(|h| h.count > 0));
+        2 + 1 + title + 1 + tray
     };
     let sel_pos = all
         .iter()
@@ -1364,7 +1432,7 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
     let mut start = 0;
     if let Some(p) = sel_pos {
         loop {
-            let used: u16 = all[start..=p].iter().map(|(_, cl)| height(cl)).sum();
+            let used: u16 = all[start..=p].iter().map(|(i, cl)| height(*i, cl)).sum();
             if used < body.height || start == p {
                 break;
             }
@@ -1383,7 +1451,8 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
         y += 1;
     }
     for (k, (i, cl)) in all.iter().enumerate().skip(start) {
-        let h = height(cl);
+        let h = height(*i, cl);
+        let held = &holds[i];
         let remaining = (body.y + body.height).saturating_sub(y);
         if h > remaining || (k + 1 < all.len() && h + 1 > remaining) {
             let more = all.len() - k;
@@ -1403,7 +1472,7 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
             CYAN
         } else if (c.attention == Attention::Waiting && c.why == "waiting for usage") && !cached {
             RED
-        } else if c.attention == Attention::NeedsYou && !cached {
+        } else if (c.attention == Attention::NeedsYou || held.needs > 0) && !cached {
             YELLOW
         } else if c.attention == Attention::Running
             && !cached
@@ -1468,6 +1537,21 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
             vec![Span::styled(cl.note.0.clone(), fg(cl.note.1))],
             vec![Span::styled(age, fg(cl.age.1))],
         );
+        if held.count > 0 {
+            // The card's line: how many inside, a few marks, and what needs you, named. It uses
+            // the card's whole inside width, one column in from its border.
+            let w = rect.width.saturating_sub(2);
+            let line = held.line(w as usize);
+            let used: usize = line.iter().map(|(t, _)| width(t)).sum();
+            let gap = u16::from(used < w as usize);
+            put(
+                buf,
+                rect.x + 1 + gap,
+                note_y + 1,
+                w - gap,
+                card_ui::holds_spans(line),
+            );
+        }
         y += h;
     }
 }
@@ -2785,6 +2869,36 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
         ],
     ),
     (
+        "WORK INSIDE A CARD",
+        &[
+            (
+                "o",
+                "open the card's own screen: itself, then what's inside",
+                "board, backlog, a peek",
+            ),
+            (
+                "⏎",
+                "on a card holding work: its own agent, in its own tab",
+                "never another's tab",
+            ),
+            (
+                "n  N",
+                "stop on work inside a card too, opening its screen on it",
+                "",
+            ),
+            (
+                "j k ⏎",
+                "on its screen: move, then go where that row runs",
+                "⏎ on a ▸ group opens it",
+            ),
+            (
+                "space  esc",
+                "on its screen: peek at the row / back, on the card",
+                "d y x C X s act on the row",
+            ),
+        ],
+    ),
+    (
         "SESSIONS AND MACHINES",
         &[
             (
@@ -2897,7 +3011,11 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
 /// Keys inside herdr, after herdr's prefix.
 pub const HERDR_KEYS: &[KeyRow] = &[
     ("q", "back to the board", "herdr's own detach"),
-    ("space", "next card that needs you, without the board", ""),
+    (
+        "space",
+        "next card that needs you, without the board",
+        "work inside cards too, straight to its tab",
+    ),
     ("backspace", "back to the board, as listed in herdr", ""),
     (
         "?",
@@ -3990,8 +4108,27 @@ mod tests {
     }
 
     fn modes(a: &App) -> Vec<Mode> {
+        let holder = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#41")
+            .map(|c| c.key.clone())
+            .unwrap_or_default();
         let mut modes = vec![
             Mode::Board,
+            Mode::Card {
+                card: holder.clone(),
+                focus: String::new(),
+                opened: vec![],
+                back: Box::new(Mode::Board),
+            },
+            Mode::Card {
+                card: holder,
+                focus: "group:done".into(),
+                opened: vec![],
+                back: Box::new(Mode::Board),
+            },
             Mode::Peek {
                 scroll: 0,
                 back: Box::new(Mode::Board),
@@ -4043,6 +4180,7 @@ mod tests {
                 back: Box::new(Mode::Board),
             },
             Mode::Confirm {
+                plain: false,
                 machine: 0,
                 request: serde_json::json!({"action":"dispatch"}),
                 title: "Start this work?".into(),
