@@ -235,7 +235,11 @@ pub fn attention(s: &Signals) -> (Attention, String) {
         return (Attention::Done, "done".into());
     }
     if let Some(att) = s.token.and_then(Attention::parse) {
-        return (att, status_or(att.label()));
+        // A reported needs_you yields to its own agent at work, as the feed's does: nothing takes the
+        // token down when you answer. Asking you something is herdr's blocked, below.
+        if !(att == Attention::NeedsYou && s.at_work) {
+            return (att, status_or(att.label()));
+        }
     }
     if s.herdr == Some("blocked") {
         return (
@@ -1226,6 +1230,15 @@ mod tests {
         signals.at_work = true;
         signals.herdr = Some("blocked");
         assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        // A needs_you the agent reported (`kerdr report`) yields to it at work too, but not to a
+        // question on its screen.
+        signals.feed = None;
+        signals.token = Some("needs_you");
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        signals.herdr = Some("working");
+        assert_eq!(attention(&signals).0, Attention::Running);
+        signals.at_work = false;
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
     }
 
     #[test]
@@ -1504,9 +1517,12 @@ mod tests {
         );
 
         // What an agent reported for the workspace is the workspace card's, not the tab's.
-        let b = board("working", "working", Some("needs_you"));
+        let b = board("idle", "working", Some("needs_you"));
         assert_eq!(card(&b, "#237").attention, Attention::NeedsYou);
         assert_ne!(card(&b, "#246").attention, Attention::NeedsYou);
+        // Once its agent is at work again, a needs_you it reported has had its answer.
+        let b = board("working", "idle", Some("needs_you"));
+        assert_eq!(card(&b, "#237").attention, Attention::Running);
     }
 
     #[test]

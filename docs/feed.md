@@ -307,7 +307,8 @@ kerdr report --clear
 These are herdr workspace tokens (`kerdr_stage`, `kerdr_status`, `kerdr_note`,
 `kerdr_progress`), so they need nothing but herdr. herdr keeps them until they change, the
 workspace closes or its server restarts. A feed's card for the same workspace takes precedence,
-except that a reported status still applies.
+except that a reported status still applies. A reported `needs-you` gives way while the
+workspace's own agent is working, since nothing takes the token down when you answer it.
 
 `kerdr cards` identifies unlinked conversations with `"stage": "misc"`. Misc is a separate
 view (`i`, or `Ctrl+Space m`), not a lifecycle column. A matching feed record moves the
