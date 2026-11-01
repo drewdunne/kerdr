@@ -574,7 +574,8 @@ pub fn machines(away: bool) -> Vec<MachineState> {
                 if let Some(w) = &mut c.workspace {
                     w.tab = Some("w1:t2".into());
                 }
-                c.words = Some("Found while testing #41: a declined card empties the basket.".into());
+                c.words =
+                    Some("Found while testing #41: a declined card empties the basket.".into());
                 c.message = Some("The basket now survives a decline; one flaky test left.".into());
             }
             "49" => {

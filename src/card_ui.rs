@@ -155,6 +155,7 @@ fn cols(w: usize) -> Cols {
 }
 
 /// One table row: its name part, then the columns, each cut to its width.
+#[allow(clippy::too_many_arguments)]
 fn table(
     buf: &mut Buffer,
     rect: Rect,

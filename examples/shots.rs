@@ -294,6 +294,17 @@ fn main() {
     };
     rasterize(&render(&handed), &fonts, &out.join("peek-handed-over.png"));
 
+    // A card's own screen (o), on the child at work in a tab of its workspace.
+    let mut card = app(false);
+    select(&mut card, "#41");
+    for c in ['o', 'j'] {
+        card.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char(c),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+    }
+    rasterize(&render(&card), &fonts, &out.join("card.png"));
+
     let mut road = app(true);
     select(&mut road, "#41");
     rasterize(&render(&road), &fonts, &out.join("reconnecting.png"));

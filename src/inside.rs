@@ -664,7 +664,13 @@ mod tests {
     use crate::poll::{Conn, MachineData};
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
-    fn machine(name: &str, ssh: bool, session: &str, snap: Snapshot, cards: Vec<FeedCard>) -> MachineState {
+    fn machine(
+        name: &str,
+        ssh: bool,
+        session: &str,
+        snap: Snapshot,
+        cards: Vec<FeedCard>,
+    ) -> MachineState {
         let mut m = MachineState::new(Machine {
             name: name.into(),
             ssh: ssh.then(|| name.to_lowercase()),
@@ -794,12 +800,22 @@ mod tests {
                     c.no_agent = true;
                     c.lane = Some("background".into());
                 }),
-                card("0348", "Knowledge browser live access checks", "backlog", |c| {
-                    c.from = Some("0139".into());
-                }),
-                card("0350", "Browser key-node shapes design pass", "backlog", |c| {
-                    c.from = Some("0139".into());
-                }),
+                card(
+                    "0348",
+                    "Knowledge browser live access checks",
+                    "backlog",
+                    |c| {
+                        c.from = Some("0139".into());
+                    },
+                ),
+                card(
+                    "0350",
+                    "Browser key-node shapes design pass",
+                    "backlog",
+                    |c| {
+                        c.from = Some("0139".into());
+                    },
+                ),
                 card("0143", "Find the next flywheel", "maintain", |c| {
                     c.attention = Some("done".into());
                     c.closed = Some("2026-10-31".into());
@@ -820,20 +836,25 @@ mod tests {
             true,
             "ARK-Background",
             one_snap,
-            vec![card("0331", "Live check: Arkship work on arknet-one", "build", |c| {
-                c.from = Some("0256".into());
-                c.lane = Some("background".into());
-                c.home = Some(Home {
-                    machine: Some("arknet-one".into()),
-                    session: Some("ARK-Background".into()),
-                });
-                c.workspace = Some(FeedWorkspace {
-                    session: Some("ARK-Background".into()),
-                    id: Some("w1".into()),
-                    label: Some("31-live-check".into()),
-                    ..Default::default()
-                });
-            })],
+            vec![card(
+                "0331",
+                "Live check: Arkship work on arknet-one",
+                "build",
+                |c| {
+                    c.from = Some("0256".into());
+                    c.lane = Some("background".into());
+                    c.home = Some(Home {
+                        machine: Some("arknet-one".into()),
+                        session: Some("ARK-Background".into()),
+                    });
+                    c.workspace = Some(FeedWorkspace {
+                        session: Some("ARK-Background".into()),
+                        id: Some("w1".into()),
+                        label: Some("31-live-check".into()),
+                        ..Default::default()
+                    });
+                },
+            )],
         );
         let mut cfg = Config::default();
         cfg.actions.command = Some("ark-card-action".into());
@@ -894,7 +915,10 @@ mod tests {
         let cols = column_ids(&app);
         let all: Vec<&String> = cols.iter().flatten().collect();
         for piece in ["0262", "0277", "0331", "0332", "0287", "0348", "0350"] {
-            assert!(!all.iter().any(|id| *id == piece), "{piece} is inside its card");
+            assert!(
+                !all.iter().any(|id| *id == piece),
+                "{piece} is inside its card"
+            );
         }
         // Column counts count a card once.
         assert_eq!(cols[Stage::Test.index()], ["0256"]);
@@ -947,7 +971,11 @@ mod tests {
                     && b[(x + 3, y)].symbol() == "6"
             })
             .expect("#256 on the board");
-        assert_eq!(b[(x - 2, y)].fg, crate::theme::YELLOW, "its border is yellow");
+        assert_eq!(
+            b[(x - 2, y)].fg,
+            crate::theme::YELLOW,
+            "its border is yellow"
+        );
     }
 
     #[test]
@@ -963,10 +991,7 @@ mod tests {
         assert_eq!(app.jump_tab(&child), (Some("w2K:t2".into()), true));
         // herdr finds the card's own tab gone: it asks to reopen the card, landing nowhere.
         app.tab_gone(&k);
-        let Mode::Confirm {
-            request, plain, ..
-        } = &app.mode
-        else {
+        let Mode::Confirm { request, plain, .. } = &app.mode else {
             panic!("asks: {:?}", app.mode)
         };
         assert_eq!(request["action"], "reopen");
@@ -1003,10 +1028,22 @@ mod tests {
         assert!(matches!(app.mode, Mode::Card { .. }));
         for (w, h) in SIZES {
             let text = rendered(&mut app, w, h);
-            for r in ["#256", "#262", "#277", "#331", "#332", "NEEDS YOU", "UNDER WAY", "NOT STARTED"] {
+            for r in [
+                "#256",
+                "#262",
+                "#277",
+                "#331",
+                "#332",
+                "NEEDS YOU",
+                "UNDER WAY",
+                "NOT STARTED",
+            ] {
                 assert!(text.contains(r), "{w}x{h} shows {r}:\n{text}");
             }
-            assert!(text.contains("the card itself") || w < 110, "{w}x{h}:\n{text}");
+            assert!(
+                text.contains("the card itself") || w < 110,
+                "{w}x{h}:\n{text}"
+            );
         }
         // The card itself first, then what needs you.
         let rows = |app: &App| {
@@ -1016,10 +1053,16 @@ mod tests {
             focus.clone()
         };
         assert_eq!(rows(&app), "");
-        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(key(&app, "0256")));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Action::Jump(key(&app, "0256"))
+        );
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(rows(&app), key(&app, "0262"));
-        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(key(&app, "0262")));
+        assert_eq!(
+            press(&mut app, KeyCode::Enter),
+            Action::Jump(key(&app, "0262"))
+        );
         press(&mut app, KeyCode::Char('j'));
         assert_eq!(rows(&app), key(&app, "0331"));
         let one = key(&app, "0331");
@@ -1063,13 +1106,19 @@ mod tests {
         let Mode::Card { card, focus, .. } = &app.mode else {
             panic!("{:?}", app.mode)
         };
-        assert_eq!((card.as_str(), focus.as_str()), ("ark-sdlc:0256", "ark-sdlc:0262"));
+        assert_eq!(
+            (card.as_str(), focus.as_str()),
+            ("ark-sdlc:0256", "ark-sdlc:0262")
+        );
         // The next is inside another card: its screen, on it.
         app.step_needs_you(1);
         let Mode::Card { card, focus, .. } = &app.mode else {
             panic!("{:?}", app.mode)
         };
-        assert_eq!((card.as_str(), focus.as_str()), ("ark-sdlc:0139", "ark-sdlc:0287"));
+        assert_eq!(
+            (card.as_str(), focus.as_str()),
+            ("ark-sdlc:0139", "ark-sdlc:0287")
+        );
         // Ctrl+Space Space goes straight to a piece's own tab: only those with a workspace open.
         assert_eq!(
             app.next_needs_you_after(&key(&app, "0287"), &[]),
@@ -1093,7 +1142,10 @@ mod tests {
         let Mode::Card { card, focus, .. } = &app.mode else {
             panic!("{:?}", app.mode)
         };
-        assert_eq!((card.as_str(), focus.as_str()), ("ark-sdlc:0256", "ark-sdlc:0331"));
+        assert_eq!(
+            (card.as_str(), focus.as_str()),
+            ("ark-sdlc:0256", "ark-sdlc:0331")
+        );
     }
 
     #[test]
@@ -1119,7 +1171,12 @@ mod tests {
                 })
             })
             .collect();
-        app.machines[0].feed.as_mut().unwrap().cards.append(&mut extra);
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .append(&mut extra);
         app.rebuild();
         select(&mut app, "0143");
         press(&mut app, KeyCode::Char('o'));
@@ -1134,7 +1191,10 @@ mod tests {
         for (w, h) in SIZES {
             let text = rendered(&mut app, w, h);
             assert!(text.contains("#400"), "{w}x{h}:\n{text}");
-            assert!(text.contains("below"), "past a screenful it scrolls, {w}x{h}:\n{text}");
+            assert!(
+                text.contains("below"),
+                "past a screenful it scrolls, {w}x{h}:\n{text}"
+            );
         }
     }
 
@@ -1142,11 +1202,19 @@ mod tests {
     fn a_loop_of_links_leaves_every_card_on_the_board() {
         let mut app = families(Some("w2K:t1"));
         let f = app.machines[0].feed.as_mut().unwrap();
-        f.cards.push(card("0500", "a", "build", |c| c.parent = Some("0501".into())));
-        f.cards.push(card("0501", "b", "build", |c| c.parent = Some("0500".into())));
+        f.cards.push(card("0500", "a", "build", |c| {
+            c.parent = Some("0501".into())
+        }));
+        f.cards.push(card("0501", "b", "build", |c| {
+            c.parent = Some("0500".into())
+        }));
         app.rebuild();
         let cols = column_ids(&app);
-        let on_board = cols.iter().flatten().filter(|id| *id == "0500" || *id == "0501").count();
+        let on_board = cols
+            .iter()
+            .flatten()
+            .filter(|id| *id == "0500" || *id == "0501")
+            .count();
         assert_eq!(on_board, 1, "one heads the family, holding the other");
     }
 }

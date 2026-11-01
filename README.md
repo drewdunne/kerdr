@@ -70,11 +70,27 @@ you, its done-when criteria, the agent's last update, and the latest lines of it
 
 ![Peeking at a card: lifecycle rail, what it needs from you, done-when criteria and its log](docs/screenshots/peek.png)
 
+### Work inside a card
+
+What an agent made for a card (its children, its undertaker, the follow-ups that came out of its
+work) lives inside that card, not in a column of its own. The card's last line counts it, marks
+each piece, and names the one that needs you, and its border turns yellow while one does. A done
+card with work still open inside stays at the top of Maintain, saying "3 open". `o` opens the card's
+own screen: the card itself first, then what's inside, grouped as needs you, under way, not started
+and done, with the selected row's details beside it. `Enter` on a row goes where that work runs: a
+child's tab, a follow-up's own workspace, or another machine. `Enter` on the board goes to the
+card's own agent, in its own tab, never a child's. `n` and `prefix Space` stop on a piece that needs
+you too. Feeds say which card a record sits in with `parent`, `undertaker_for` or `from`; see
+[docs/feed.md](docs/feed.md#work-inside-a-card).
+
+![A card's own screen: the card itself, then what's inside it by group, and the selected piece's details](docs/screenshots/card.png)
+
 ### Jump in, step out, keep going
 
 - `Enter` focuses the card's herdr workspace and opens herdr full screen, with herdr's sidebar
   hidden, since the board does that job now. A card whose feed names a tab, for work running in
-  one tab of a shared workspace, lands on that tab.
+  one tab of a shared workspace, lands on that tab, and a card holding work lands on its own
+  agent's tab; when that tab has closed, Kerdr offers to reopen it rather than open another.
 - `prefix q` is herdr's own detach. Inside Kerdr it brings you back to the board.
 - `prefix Space` jumps straight to the next card that needs you, without stopping at the board,
   so you can answer several agents in a row.
@@ -297,7 +313,8 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `h j k l` or arrows | move between columns and cards |
 | `Enter` | jump in; on work whose workspace closed, reopen it; on done work, ask to reopen it (both with actions) |
 | `m` or `Space` | peek |
-| `n` / `N` | next / previous card that needs you (also `Ctrl+Alt+j/k`) |
+| `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
+| `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`) |
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
@@ -321,7 +338,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | Inside herdr | |
 |---|---|
 | `prefix q` | back to the board (herdr's own detach) |
-| `prefix Space` | next card that needs you |
+| `prefix Space` | next card that needs you, work inside cards included, straight to its tab |
 | `prefix Backspace` | back to the board, as listed in herdr's menu |
 
 `prefix` is herdr's prefix key, Ctrl+B unless you've set another. `prefix Space` and
@@ -445,7 +462,7 @@ you, the machine shows *needs you*, and `M` then `Enter` lets you answer it.
 
 ## Status
 
-Kerdr is new (0.14). Reading and navigation work without an action adapter. Opting into
+Kerdr is new (0.15). Reading and navigation work without an action adapter. Opting into
 `[actions] command` enables record changes, dispatch and reopening through your own adapter, on
 the record's home machine. Commands run in the background and show their result; an unknown result
 is never retried automatically. In herdr, Kerdr focuses the workspace you jump into, shows a

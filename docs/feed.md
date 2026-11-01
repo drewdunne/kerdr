@@ -36,7 +36,7 @@ Kerdr shows the last good feed, with herdr's live view, when a run fails.
       "priority": "normal",
       "lane": "interactive",
       "home": {"machine": "laptop", "session": "web"},
-      "workspace": {"session": "web", "id": "w1", "label": "41-checkout-expired-cards"},
+      "workspace": {"session": "web", "id": "w1", "label": "41-checkout-expired-cards", "own_tab": "w1:t1"},
       "attention": "needs_you",
       "status": "Waiting on you",
       "needs": "Your OK on the retry message before it ships",
@@ -54,6 +54,8 @@ Kerdr shows the last good feed, with herdr's live view, when a run fails.
       "closed": "2026-10-21",
       "path": "intents/0041-checkout-expired-cards",
       "parent": "0038",
+      "from": "0036",
+      "undertaker_for": "0035",
       "resume": {"agent": "claude", "conversation": "4f2b8c1e-…"}
     }
   ],
@@ -91,7 +93,36 @@ know rather than guessing.
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
 | `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
 | `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
+| `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
+| `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. |
+
+## Work inside a card
+
+What an agent made for a card sits inside that card rather than in a column of its own: its
+children (`parent`), the undertaker seeing its agents through (`undertaker_for`) and the
+follow-ups that came out of its work (`from`). Kerdr matches each by `id` within the same `source`,
+across every machine's feed, so a follow-up running on another machine still sits in its card. A
+piece of a piece sits in the topmost card of its family that's on the board, and a loop in these
+links is broken where it closes, leaving every card on the board.
+
+On the board, a card holding work has one more line: how many pieces, a few marks (▲ needs you, ○
+no agent at it, ● under way, ■ waiting, ◇ waits on another intent, · not started, ✓ done), `+N` for
+the rest, and the piece that needs you, named. Its border turns yellow only when a piece needs you
+(asking, waiting on you, blocked, or open with no agent at it). Column counts count the card once. A
+done card with work still open inside goes to the top of Maintain with a plain count, "3 open",
+yellow only when some of it needs you, so **keep a closed card in the feed while anything inside
+it is open**. When the card a piece sits in is out of view (another machine's tab, a filter, a
+record no feed has), the piece shows as a card of its own marked "in #256", and `o` on it opens
+that card when it can.
+
+`o` opens a card's own screen: the card itself, then what's inside grouped as needs you, under way,
+not started and done, with the selected row's details beside the list (below it on a narrow
+screen). `Enter` on a row goes wherever that record runs, reopening one with no agent at it as
+`Enter` on the board does. `Enter` on a card goes to `workspace.own_tab`; when the workspace holds
+tabs other work runs in and that tab is unknown or has closed, Kerdr says so and offers to send
+`reopen` instead of landing on another tab. A Kerdr older than 0.15 ignores all of this: it shows
+every card in its own column and opens the workspace on `Enter`.
 
 ## Actions
 
