@@ -778,7 +778,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         .collect();
 
     let (up, down) = crate::family::tree(&cards);
-    let (subtree, holds) = crate::family::summaries(&cards, &down);
+    let (subtree, holds, down) = crate::family::summaries(&cards, &down);
     Board {
         cards,
         up,

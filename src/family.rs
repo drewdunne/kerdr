@@ -128,22 +128,20 @@ pub fn tree(cards: &[Card]) -> (Vec<Option<usize>>, Vec<Vec<usize>>) {
 }
 
 /// By card, computed once per board: the most urgent group among it and everything inside it,
-/// and what it holds (every card inside it, nested ones too).
-pub fn summaries(cards: &[Card], down: &[Vec<usize>]) -> (Vec<Group>, Vec<Holds>) {
+/// what it holds, and its direct pieces in the order its screen lists them. Built bottom-up, each
+/// card from its pieces' own summaries, so the cost grows with the cards, not with their depth.
+pub fn summaries(cards: &[Card], down: &[Vec<usize>]) -> (Vec<Group>, Vec<Holds>, Vec<Vec<usize>>) {
     let n = cards.len();
     let mut subtree: Vec<Group> = cards.iter().map(group).collect();
-    let mut inside: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut holds = vec![Holds::default(); n];
+    let mut first: Vec<Option<usize>> = vec![None; n];
+    let kids = |i: usize| down.get(i).map(Vec::as_slice).unwrap_or(&[]);
     // Children before parents: the tree has no loops (`link` broke them), so a post-order walk
     // from every card with no parent reaches each card once.
-    let has_parent: Vec<bool> = {
-        let mut v = vec![false; n];
-        for kids in down {
-            for &k in kids {
-                v[k] = true;
-            }
-        }
-        v
-    };
+    let mut has_parent = vec![false; n];
+    for &k in down.iter().flatten() {
+        has_parent[k] = true;
+    }
     let mut order = Vec::with_capacity(n);
     for root in (0..n).filter(|&i| !has_parent[i]) {
         let mut stack = vec![(root, false)];
@@ -152,26 +150,47 @@ pub fn summaries(cards: &[Card], down: &[Vec<usize>]) -> (Vec<Group>, Vec<Holds>
                 order.push(i);
             } else {
                 stack.push((i, true));
-                for &k in down.get(i).map(Vec::as_slice).unwrap_or(&[]) {
-                    stack.push((k, false));
-                }
+                stack.extend(kids(i).iter().map(|&k| (k, false)));
             }
         }
     }
+    // The piece named on a card's line: the most urgent that needs you, then by number.
+    let rank = |k: usize| {
+        let c = &cards[k];
+        (c.attention, c.reference.len(), c.reference.clone())
+    };
     for &i in &order {
-        for &k in down.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+        for &k in kids(i) {
             subtree[i] = subtree[i].min(subtree[k]);
-            let nested = std::mem::take(&mut inside[k]);
-            inside[i].push(k);
-            inside[i].extend(nested.iter().copied());
-            inside[k] = nested;
+            let h = holds[k].clone();
+            holds[i].add(&cards[k]);
+            holds[i].merge(&h);
+            let candidate = if needs(&cards[k]) { Some(k) } else { first[k] };
+            if let Some(c) = candidate
+                && first[i].is_none_or(|f| rank(c) < rank(f))
+            {
+                first[i] = Some(c);
+            }
         }
+        holds[i].first_needing = first[i].map(|f| cards[f].reference.clone());
     }
-    let holds = inside
-        .iter()
-        .map(|ks| Holds::of(ks.iter().map(|&k| &cards[k])))
+    let sorted = (0..n)
+        .map(|i| {
+            let mut ks = kids(i).to_vec();
+            ks.sort_by_key(|&k| {
+                let c = &cards[k];
+                (
+                    subtree[k],
+                    group(c),
+                    c.attention,
+                    c.reference.len(),
+                    c.reference.clone(),
+                )
+            });
+            ks
+        })
         .collect();
-    (subtree, holds)
+    (subtree, holds, sorted)
 }
 
 /// Where a piece of work stands, as its card's screen groups it.
@@ -269,6 +288,17 @@ pub enum Mark {
 }
 
 impl Mark {
+    pub const ALL: [Mark; 8] = [
+        Mark::NeedsYou,
+        Mark::NoAgent,
+        Mark::Running,
+        Mark::Waiting,
+        Mark::WaitsOn,
+        Mark::NotStarted,
+        Mark::Done,
+        Mark::WontDo,
+    ];
+
     pub fn glyph(self) -> &'static str {
         match self {
             Mark::NeedsYou => "▲",
@@ -315,30 +345,49 @@ pub struct Holds {
     /// How many need you, and the first of them.
     pub needs: usize,
     pub first_needing: Option<String>,
-    /// One mark per piece, the most urgent first.
-    pub marks: Vec<Mark>,
+    /// How many pieces show each mark, in `Mark::ALL`'s order, the most urgent first.
+    pub marks: [usize; 8],
 }
 
 impl Holds {
     pub fn of<'a>(pieces: impl IntoIterator<Item = &'a Card>) -> Holds {
         let mut h = Holds::default();
-        let mut first: Option<(Group, &str)> = None;
         for p in pieces {
-            h.count += 1;
-            if !finished(p) {
-                h.open += 1;
+            h.add(p);
+            if needs(p) && h.first_needing.is_none() {
+                h.first_needing = Some(p.reference.clone());
             }
-            if needs(p) {
-                h.needs += 1;
-                if first.is_none() {
-                    first = Some((Group::NeedsYou, p.reference.as_str()));
-                }
-            }
-            h.marks.push(mark(p));
         }
-        h.marks.sort();
-        h.first_needing = first.map(|(_, r)| r.to_string());
         h
+    }
+
+    /// Counts one more piece (not its name: `first_needing` is chosen by whoever adds).
+    fn add(&mut self, p: &Card) {
+        self.count += 1;
+        if !finished(p) {
+            self.open += 1;
+        }
+        if needs(p) {
+            self.needs += 1;
+        }
+        self.marks[mark(p) as usize] += 1;
+    }
+
+    /// Counts everything another card holds as held here too.
+    fn merge(&mut self, other: &Holds) {
+        self.count += other.count;
+        self.open += other.open;
+        self.needs += other.needs;
+        for (a, b) in self.marks.iter_mut().zip(other.marks) {
+            *a += b;
+        }
+    }
+
+    /// One mark per piece, the most urgent first.
+    fn mark_list(&self) -> impl Iterator<Item = Mark> + '_ {
+        Mark::ALL
+            .into_iter()
+            .flat_map(|m| std::iter::repeat_n(m, self.marks[m as usize]))
     }
 
     /// The card's line: its count, a few marks (the rest as +N), and the piece that needs you
@@ -360,11 +409,11 @@ impl Holds {
             let mut parts: Vec<(String, Option<Mark>)> = vec![(count.clone(), None)];
             if shown > 0 {
                 parts.push((" ".into(), None));
-                for m in self.marks.iter().take(shown) {
-                    parts.push((m.glyph().into(), Some(*m)));
+                for m in self.mark_list().take(shown) {
+                    parts.push((m.glyph().into(), Some(m)));
                 }
-                if self.marks.len() > shown {
-                    parts.push((format!("+{}", self.marks.len() - shown), None));
+                if self.count > shown {
+                    parts.push((format!("+{}", self.count - shown), None));
                 }
             }
             if let Some(w) = words {
@@ -379,7 +428,7 @@ impl Holds {
                 .sum::<usize>()
                 <= width
         };
-        let most = self.marks.len().min(MOST);
+        let most = self.count.min(MOST);
         let words: Vec<Option<&String>> = if named.is_empty() {
             vec![None]
         } else {

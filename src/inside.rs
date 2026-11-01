@@ -84,20 +84,9 @@ impl App {
         card.link.as_ref().map(|(r, _)| r.clone())
     }
 
+    /// Card i's direct pieces in its screen's order (sorted once per board, `family::summaries`).
     fn children(&self, i: usize) -> Vec<usize> {
-        let mut kids = self.board.down.get(i).cloned().unwrap_or_default();
-        let key = |k: &usize| {
-            let c = &self.board.cards[*k];
-            (
-                self.subtree_group(*k),
-                family::group(c),
-                c.attention,
-                c.reference.len(),
-                c.reference.clone(),
-            )
-        };
-        kids.sort_by_key(key);
-        kids
+        self.board.down.get(i).cloned().unwrap_or_default()
     }
 
     /// The most urgent group among a card and everything inside it.
@@ -245,7 +234,7 @@ impl App {
     pub(super) fn fix_card_screen(&mut self) -> bool {
         let Mode::Card {
             card,
-            mut focus,
+            focus,
             mut opened,
             back,
         } = self.mode.clone()
@@ -271,11 +260,10 @@ impl App {
                 }
                 _ => None,
             });
-            match group {
-                Some(g) if !opened.contains(&g) => opened.push(g),
-                // A folded group that's gone, or none: its card itself.
-                _ if focus.starts_with("group:") => focus = String::new(),
-                _ => {}
+            if let Some(g) = group
+                && !opened.contains(&g)
+            {
+                opened.push(g);
             }
         }
         // A piece that has left this card (closed out of the feed, or moved to another family)
@@ -367,6 +355,13 @@ impl App {
                 go(self, next.unwrap_or_default(), opened);
             }
             KeyCode::Enter => {
+                if !foci.contains(&focus) {
+                    self.say(
+                        "That row has left this card; j and k choose another.",
+                        Tone::Info,
+                    );
+                    return Action::None;
+                }
                 if let Some(id) = focus.strip_prefix("group:") {
                     if let Some(g) = Group::ALL.into_iter().find(|g| g.id() == id) {
                         opened.push(g);
@@ -379,13 +374,6 @@ impl App {
                         });
                         go(self, first.unwrap_or_default(), opened);
                     }
-                    return Action::None;
-                }
-                if !foci.contains(&focus) {
-                    self.say(
-                        "That row has left this card; j and k choose another.",
-                        Tone::Info,
-                    );
                     return Action::None;
                 }
                 let key = if focus.is_empty() { card } else { focus };
@@ -554,8 +542,10 @@ impl App {
                 let back = leave(&self.mode);
                 self.open_card(h, Some(key.to_string()), back);
             }
+            // A card on the board, from a card's screen: the board itself, on it, wherever the
+            // screens were opened from.
             None if matches!(self.mode, Mode::Card { .. }) => {
-                self.mode = leave(&self.mode);
+                self.mode = Mode::Board;
                 self.sel = Selection {
                     col: self.board.cards[i].stage.index(),
                     key: Some(key.to_string()),
@@ -1321,5 +1311,117 @@ mod tests {
             press(&mut app, KeyCode::Char('k'));
             assert_eq!(app.sel.key, Some(key(&app, "0256")));
         }
+    }
+
+    #[test]
+    fn n_to_a_card_on_the_board_lands_on_the_board_from_the_backlog_and_a_peek_too() {
+        for start in ["backlog", "peek"] {
+            let mut app = families(Some("w2K:t1"));
+            let f = app.machines[0].feed.as_mut().unwrap();
+            f.cards.push(card("0400", "Piece of a piece", "build", |c| {
+                c.parent = Some("0262".into())
+            }));
+            f.cards
+                .push(card("0500", "Unrelated, asking", "build", |c| {
+                    c.attention = Some("needs_you".into())
+                }));
+            f.cards
+                .push(card("0600", "Waiting, holding work", "backlog", |_| {}));
+            f.cards.push(card("0601", "Its piece", "backlog", |c| {
+                c.from = Some("0600".into())
+            }));
+            app.rebuild();
+            let base = if start == "backlog" {
+                app.enter_backlog(false);
+                Mode::Backlog { sel: 0 }
+            } else {
+                Mode::Board
+            };
+            app.mode = base;
+            app.open_inside(&key(&app, "0256"));
+            press(&mut app, KeyCode::Char('j'));
+            press(&mut app, KeyCode::Char('o'));
+            if start == "peek" {
+                press(&mut app, KeyCode::Char(' '));
+                assert!(matches!(app.mode, Mode::Peek { .. }));
+                press(&mut app, KeyCode::Char('N'));
+                let Mode::Peek { back, .. } = &app.mode else {
+                    panic!("{:?}", app.mode)
+                };
+                assert!(matches!(**back, Mode::Board), "{start}: {back:?}");
+            } else {
+                assert_eq!(app.step_needs_you(-1), Some(key(&app, "0500")));
+                assert!(matches!(app.mode, Mode::Board), "{start}: {:?}", app.mode);
+            }
+            assert_eq!(app.sel.key, Some(key(&app, "0500")), "{start}");
+        }
+    }
+
+    #[test]
+    fn a_selected_folded_group_that_vanishes_or_unfolds_leaves_nothing_selected() {
+        let mut app = families(Some("w2K:t1"));
+        let f = app.machines[0].feed.as_mut().unwrap();
+        for n in 700..704 {
+            f.cards
+                .push(card(&n.to_string(), "Done piece", "maintain", |c| {
+                    c.parent = Some("0143".into());
+                    c.attention = Some("done".into());
+                }));
+        }
+        app.rebuild();
+        select(&mut app, "0143");
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('j'));
+        let focus = |app: &App| match &app.mode {
+            Mode::Card { focus, .. } => focus.clone(),
+            m => panic!("{m:?}"),
+        };
+        assert_eq!(focus(&app), "group:done");
+        // One piece goes: three left, so the group unfolds and its heading can't be selected.
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .retain(|c| c.id != "700");
+        app.rebuild();
+        assert_eq!(focus(&app), "group:done");
+        assert_eq!(app.sel.key, None);
+        assert_eq!(press(&mut app, KeyCode::Char('X')), Action::None);
+        assert!(matches!(app.mode, Mode::Card { .. }), "{:?}", app.mode);
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
+        assert_eq!(focus(&app), "group:done", "Enter opened nothing");
+        // All of them go.
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .retain(|c| !c.id.starts_with('7'));
+        app.rebuild();
+        assert_eq!(app.sel.key, None);
+    }
+
+    #[test]
+    fn a_long_chain_is_summed_once_per_board() {
+        let mut app = families(Some("w2K:t1"));
+        let f = app.machines[0].feed.as_mut().unwrap();
+        for n in 1000..4000 {
+            f.cards.push(card(&n.to_string(), "Link", "build", |c| {
+                if n > 1000 {
+                    c.parent = Some((n - 1).to_string());
+                }
+            }));
+        }
+        let at = std::time::Instant::now();
+        app.rebuild();
+        let top = app.card_index(&key(&app, "1000")).unwrap();
+        assert_eq!(app.holds(top).count, 2999);
+        let _ = app.columns();
+        assert!(
+            at.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            at.elapsed()
+        );
     }
 }
