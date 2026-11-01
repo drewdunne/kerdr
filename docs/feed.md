@@ -78,7 +78,7 @@ know rather than guessing.
 | `lane` | `background` adds a `bg` tag. |
 | `home` | The machine and session the work belongs to. A record with no home can still name the machine alone, with no `session`, where its work is (the one holding its agent's conversation, say): that copy wins over copies that name none, and `Enter` sends its reopen there. When copies name different machines, one that gives `resume` wins over one that doesn't. |
 | `workspace` | The herdr workspace it runs in, on the machine the feed ran on. Without it, Kerdr looks in `home` for one workspace whose label starts with the id's last two digits and a dash (`41-...`). Add `"tab": "w1:t2"` when the work runs in one tab of a workspace other work shares, such as a helper in a tab of the workspace that started it: `Enter` lands on that tab (on the workspace alone once the tab has closed), the card shows only that tab's agents, and the card the workspace belongs to leaves that tab's agents out. |
-| `attention` | Your records' view: `needs_you`, `waiting`, `running`, `blocked`, `idle` or `done`. Kerdr combines it with herdr's agent state: an agent asking something always needs you, and an agent that stopped while the record says it's running needs you too, since nothing says what it's waiting on. |
+| `attention` | Your records' view: `needs_you`, `waiting`, `running`, `blocked`, `idle` or `done`. Kerdr combines it with herdr's agent state: an agent asking something always needs you, and an agent that stopped while the record says it's running needs you too, since nothing says what it's waiting on. A card's own agent at work never needs you, even while the record still says `needs_you`: you've answered it, or it never needed you (an agent in a pane with herdr's `role=helper` token, a reviewer's, isn't its own unless the card names that tab). |
 | `status`, `needs`, `message`, `blockers` | Shown on the card and in its peek: what it's doing, what it needs from you, its last update, what's in its way. |
 | `waits_on` | Work it can't start before; shown in the backlog and the peek. |
 | `criteria` | Done-when criteria. With any `met` set, the peek shows progress, such as 2 of 3 met. |
@@ -307,7 +307,8 @@ kerdr report --clear
 These are herdr workspace tokens (`kerdr_stage`, `kerdr_status`, `kerdr_note`,
 `kerdr_progress`), so they need nothing but herdr. herdr keeps them until they change, the
 workspace closes or its server restarts. A feed's card for the same workspace takes precedence,
-except that a reported status still applies.
+except that a reported status still applies. A reported `needs-you` gives way while the
+workspace's own agent is working, since nothing takes the token down when you answer it.
 
 `kerdr cards` identifies unlinked conversations with `"stage": "misc"`. Misc is a separate
 view (`i`, or `Ctrl+Space m`), not a lifecycle column. A matching feed record moves the

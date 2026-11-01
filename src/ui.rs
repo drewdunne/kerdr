@@ -944,14 +944,18 @@ fn strip(f: &mut Frame, rect: Rect, app: &App) {
         Span::raw("   "),
         Span::styled(
             format!("◐ {} running", s.running),
-            if s.running > 0 { fg(BLUE) } else { fg(DIM) },
+            if s.running > 0 { fg(GREEN) } else { fg(DIM) },
         ),
         Span::raw("   "),
-        Span::styled(
-            format!("■ {} blocked", s.blocked),
-            if s.blocked > 0 { bold(RED) } else { fg(DIM) },
-        ),
     ];
+    if s.waiting > 0 {
+        left.push(Span::styled(format!("◇ {} waiting", s.waiting), fg(BLUE)));
+        left.push(Span::raw("   "));
+    }
+    left.extend([Span::styled(
+        format!("■ {} blocked", s.blocked),
+        if s.blocked > 0 { bold(RED) } else { fg(DIM) },
+    )]);
     if s.cached > 0 {
         let since = s
             .cached_since
@@ -1395,7 +1399,7 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
                 .account_feed(c.machine_index)
                 .is_some_and(|f| !f.accounts.is_empty())
         {
-            BLUE
+            GREEN
         } else if c.attention == Attention::Blocked && !cached {
             RED
         } else {
@@ -2633,7 +2637,7 @@ fn hit_row(app: &App, hit: Hit, query: &str) -> (Vec<Span<'static>>, Vec<Span<'s
         Hit::Workspace(i) => {
             let w = &app.board.workspaces[i];
             let color = match w.status.as_str() {
-                "working" => BLUE,
+                "working" => GREEN,
                 "blocked" | "done" => ORANGE,
                 _ => DIM,
             };
