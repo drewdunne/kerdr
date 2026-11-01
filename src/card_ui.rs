@@ -351,16 +351,17 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App, key: &str, focus: &str, opened
         height: list.height.saturating_sub(1),
         ..list
     };
-    let sel_row = rows
+    // None when the selected piece has left the card: nothing is highlighted.
+    let found = rows
         .iter()
-        .position(|r| r.focus(app).as_deref() == Some(focus))
-        .unwrap_or(0);
+        .position(|r| r.focus(app).as_deref() == Some(focus));
+    let sel_row = found.unwrap_or(usize::MAX);
     let h = body.height as usize;
     let mut start = 0;
     if rows.len() > h {
         // Room for the "above" and "below" lines.
         let room = h.saturating_sub(2).max(1);
-        if sel_row >= room {
+        if found.is_some() && sel_row >= room {
             start = (sel_row + 1 - room).min(rows.len().saturating_sub(room));
         }
     }
@@ -542,6 +543,16 @@ fn details(
             out.push(Line::raw(""));
             out.push(Line::styled("⏎ opens the list here.", fg(DIM)));
         }
+        f.render_widget(Paragraph::new(out), d);
+        return;
+    }
+    if !rows.iter().any(|r| r.focus(app).as_deref() == Some(focus)) {
+        out.extend(wrapped(
+            "The row you were on has left this card: it closed out of its feed, or moved to another. Nothing is selected until j or k chooses a row.",
+            w,
+            fg(DIM),
+            None,
+        ));
         f.render_widget(Paragraph::new(out), d);
         return;
     }
@@ -727,7 +738,7 @@ fn footer(f: &mut Frame, rect: Rect, app: &App, holder: &Card, focus: &str) {
         let c = if focus.is_empty() {
             Some(holder)
         } else {
-            app.card(focus)
+            app.sel.key.as_deref().and_then(|k| app.card(k))
         };
         if let Some(c) = c {
             let color = if family::needs(c) {

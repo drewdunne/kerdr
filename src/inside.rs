@@ -102,18 +102,12 @@ impl App {
 
     /// The most urgent group among a card and everything inside it.
     fn subtree_group(&self, i: usize) -> Group {
-        let mut best = family::group(&self.board.cards[i]);
-        let mut stack = self.board.down.get(i).cloned().unwrap_or_default();
-        let mut seen = 0;
-        while let Some(k) = stack.pop() {
-            seen += 1;
-            if seen > self.board.cards.len() {
-                break;
-            }
-            best = best.min(family::group(&self.board.cards[k]));
-            stack.extend(self.board.down.get(k).cloned().unwrap_or_default());
-        }
-        best
+        self.board
+            .subtree
+            .get(i)
+            .copied()
+            .filter(|_| self.board.subtree.len() == self.board.cards.len())
+            .unwrap_or_else(|| family::group(&self.board.cards[i]))
     }
 
     /// Every card inside card i, nested ones too, each followed by its own.
@@ -125,7 +119,8 @@ impl App {
 
     fn walk(&self, i: usize, depth: usize, out: &mut Vec<(usize, usize)>) {
         for k in self.children(i) {
-            if out.len() > self.board.cards.len() || out.iter().any(|(o, _)| *o == k) {
+            // The tree has no loops; this only bounds a board changed under it.
+            if out.len() > self.board.cards.len() {
                 return;
             }
             out.push((k, depth));
@@ -135,7 +130,10 @@ impl App {
 
     /// What card i holds, for its line on the board.
     pub fn holds(&self, i: usize) -> Holds {
-        Holds::of(self.pieces(i).iter().map(|&k| &self.board.cards[k]))
+        match self.board.holds.get(i) {
+            Some(h) if self.board.holds.len() == self.board.cards.len() => h.clone(),
+            _ => Holds::of(self.pieces(i).iter().map(|&k| &self.board.cards[k])),
+        }
     }
 
     /// The lines of card i's own screen: itself, then what's inside by group. Done folds past
@@ -275,16 +273,19 @@ impl App {
             });
             match group {
                 Some(g) if !opened.contains(&g) => opened.push(g),
-                _ => focus = String::new(),
-            }
-            if !focusable(self, &opened).contains(&focus) {
-                focus = String::new();
+                // A folded group that's gone, or none: its card itself.
+                _ if focus.starts_with("group:") => focus = String::new(),
+                _ => {}
             }
         }
-        let selected = if focus.is_empty() {
-            Some(card.clone())
-        } else if focus.starts_with("group:") {
+        // A piece that has left this card (closed out of the feed, or moved to another family)
+        // stays the focus, with nothing selected, so no key acts on a card you didn't choose
+        // until you move.
+        let gone = !focusable(self, &opened).contains(&focus);
+        let selected = if gone || focus.starts_with("group:") {
             None
+        } else if focus.is_empty() {
+            Some(card.clone())
         } else {
             Some(focus.clone())
         };
@@ -380,11 +381,18 @@ impl App {
                     }
                     return Action::None;
                 }
+                if !foci.contains(&focus) {
+                    self.say(
+                        "That row has left this card; j and k choose another.",
+                        Tone::Info,
+                    );
+                    return Action::None;
+                }
                 let key = if focus.is_empty() { card } else { focus };
                 return self.jump_action(key);
             }
             KeyCode::Char('m' | ' ') => {
-                if !focus.starts_with("group:") {
+                if !focus.starts_with("group:") && self.sel.key.is_some() {
                     self.mode = Mode::Peek {
                         scroll: 0,
                         back: Box::new(self.mode.clone()),
@@ -519,9 +527,13 @@ impl App {
             col: card.stage.index(),
             key: Some(card.key.clone()),
         };
-        let leave = |mode: &Mode| match mode {
-            Mode::Card { back, .. } => (**back).clone(),
-            other => other.clone(),
+        // Out of every card screen at once, to where the first was opened from.
+        let leave = |mode: &Mode| {
+            let mut m = mode.clone();
+            while let Mode::Card { back, .. } = m {
+                m = *back;
+            }
+            m
         };
         match self.holder(i) {
             Some(h) if matches!(self.mode, Mode::Board | Mode::Card { .. }) => {
@@ -578,7 +590,8 @@ impl App {
         if let Some(tab) = &card.tab_id {
             (Some(tab.clone()), true)
         } else if let Some(tab) = &card.own_tab {
-            (Some(tab.clone()), !self.tabs_inside(card).is_empty())
+            // A recorded own tab is never guessed past: when it's gone, Enter offers a reopen.
+            (Some(tab.clone()), true)
         } else {
             (None, false)
         }
@@ -617,12 +630,13 @@ impl App {
             .map(|c| c.reference.clone())
             .collect();
         let tabs = match others.as_slice() {
+            [] => "other tabs".to_string(),
             [one] => format!("{one}'s tab"),
             many => format!("tabs for {}", many.join(", ")),
         };
         let reference = card.reference.clone();
         let said = format!(
-            "{reference}'s own agent {why}, and its workspace holds {tabs}: ⏎ won't open another's tab."
+            "{reference}'s own agent {why}; ⏎ won't open another tab in its workspace, which may hold {tabs}."
         );
         if !self.actions_on() || card.detail.is_none() {
             self.say(format!("{said} o shows what's inside."), Tone::Info);
@@ -1216,5 +1230,96 @@ mod tests {
             .filter(|id| *id == "0500" || *id == "0501")
             .count();
         assert_eq!(on_board, 1, "one heads the family, holding the other");
+    }
+
+    #[test]
+    fn a_recorded_own_tab_is_strict_even_with_no_other_cards_tabs_beside_it() {
+        let mut app = families(Some("w2K:t1"));
+        let f = app.machines[0].feed.as_mut().unwrap();
+        f.cards.retain(|c| c.id != "0262");
+        app.rebuild();
+        let card = app.card(&key(&app, "0256")).unwrap().clone();
+        assert!(app.tabs_inside(&card).is_empty());
+        assert_eq!(app.jump_tab(&card), (Some("w2K:t1".into()), true));
+        // Gone, it offers a reopen, never another tab.
+        app.tab_gone(&card.key);
+        assert!(
+            matches!(app.mode, Mode::Confirm { plain: true, .. }),
+            "{:?}",
+            app.mode
+        );
+    }
+
+    #[test]
+    fn n_from_a_nested_card_screen_to_a_card_on_the_board_leaves_every_screen() {
+        let mut app = families(Some("w2K:t1"));
+        let f = app.machines[0].feed.as_mut().unwrap();
+        f.cards.push(card("0400", "Piece of a piece", "build", |c| {
+            c.parent = Some("0262".into())
+        }));
+        f.cards
+            .push(card("0500", "Unrelated, asking", "build", |c| {
+                c.attention = Some("needs_you".into())
+            }));
+        app.rebuild();
+        select(&mut app, "0256");
+        press(&mut app, KeyCode::Char('o'));
+        press(&mut app, KeyCode::Char('j'));
+        assert_eq!(app.sel.key, Some(key(&app, "0262")));
+        // o on a row holding work opens its own screen, over its card's.
+        press(&mut app, KeyCode::Char('o'));
+        let Mode::Card { card, back, .. } = &app.mode else {
+            panic!("{:?}", app.mode)
+        };
+        assert_eq!(card, "ark-sdlc:0262");
+        assert!(matches!(**back, Mode::Card { .. }));
+        // N goes back to 0500, a card on the board: out of both screens, on it.
+        assert_eq!(app.step_needs_you(-1), Some(key(&app, "0500")));
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        assert_eq!(app.sel.key, Some(key(&app, "0500")));
+        // Enter acts on 0500 itself (no workspace: its reopen), not on the screen left behind.
+        let Action::Mutate { request, .. } = press(&mut app, KeyCode::Enter) else {
+            panic!()
+        };
+        assert_eq!(request["id"], "0500");
+    }
+
+    #[test]
+    fn a_selected_piece_that_leaves_its_card_leaves_nothing_selected() {
+        for change in ["gone", "moved"] {
+            let mut app = families(Some("w2K:t1"));
+            select(&mut app, "0256");
+            press(&mut app, KeyCode::Char('o'));
+            press(&mut app, KeyCode::Char('j'));
+            assert_eq!(app.sel.key, Some(key(&app, "0262")));
+            let f = app.machines[0].feed.as_mut().unwrap();
+            if change == "gone" {
+                f.cards.retain(|c| c.id != "0262");
+            } else if let Some(c) = f.cards.iter_mut().find(|c| c.id == "0262") {
+                c.parent = Some("0139".into());
+            }
+            app.rebuild();
+            let Mode::Card { card, focus, .. } = &app.mode else {
+                panic!("{:?}", app.mode)
+            };
+            assert_eq!(
+                (card.as_str(), focus.as_str()),
+                ("ark-sdlc:0256", "ark-sdlc:0262")
+            );
+            assert_eq!(app.sel.key, None, "{change}: not its parent");
+            // X and Enter act on nothing, rather than on the parent's whole workspace.
+            assert_eq!(press(&mut app, KeyCode::Char('X')), Action::None);
+            assert!(
+                matches!(app.mode, Mode::Card { .. }),
+                "{change}: {:?}",
+                app.mode
+            );
+            assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
+            let text = rendered(&mut app, 176, 44);
+            assert!(text.contains("has left this card"), "{text}");
+            // Moving chooses a row again.
+            press(&mut app, KeyCode::Char('k'));
+            assert_eq!(app.sel.key, Some(key(&app, "0256")));
+        }
     }
 }

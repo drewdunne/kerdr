@@ -123,6 +123,9 @@ pub struct Board {
     /// directly inside it.
     pub up: Vec<Option<usize>>,
     pub down: Vec<Vec<usize>>,
+    /// By card: the most urgent group among it and what's inside it, and what it holds.
+    pub subtree: Vec<crate::family::Group>,
+    pub holds: Vec<crate::family::Holds>,
     pub sessions: Vec<SessionRow>,
     pub workspaces: Vec<WorkspaceRow>,
     pub machine_order: Vec<String>,
@@ -775,10 +778,13 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         .collect();
 
     let (up, down) = crate::family::tree(&cards);
+    let (subtree, holds) = crate::family::summaries(&cards, &down);
     Board {
         cards,
         up,
         down,
+        subtree,
+        holds,
         sessions,
         workspaces,
         machine_order,

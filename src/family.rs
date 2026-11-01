@@ -127,6 +127,53 @@ pub fn tree(cards: &[Card]) -> (Vec<Option<usize>>, Vec<Vec<usize>>) {
     (up, down)
 }
 
+/// By card, computed once per board: the most urgent group among it and everything inside it,
+/// and what it holds (every card inside it, nested ones too).
+pub fn summaries(cards: &[Card], down: &[Vec<usize>]) -> (Vec<Group>, Vec<Holds>) {
+    let n = cards.len();
+    let mut subtree: Vec<Group> = cards.iter().map(group).collect();
+    let mut inside: Vec<Vec<usize>> = vec![Vec::new(); n];
+    // Children before parents: the tree has no loops (`link` broke them), so a post-order walk
+    // from every card with no parent reaches each card once.
+    let has_parent: Vec<bool> = {
+        let mut v = vec![false; n];
+        for kids in down {
+            for &k in kids {
+                v[k] = true;
+            }
+        }
+        v
+    };
+    let mut order = Vec::with_capacity(n);
+    for root in (0..n).filter(|&i| !has_parent[i]) {
+        let mut stack = vec![(root, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if expanded {
+                order.push(i);
+            } else {
+                stack.push((i, true));
+                for &k in down.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+                    stack.push((k, false));
+                }
+            }
+        }
+    }
+    for &i in &order {
+        for &k in down.get(i).map(Vec::as_slice).unwrap_or(&[]) {
+            subtree[i] = subtree[i].min(subtree[k]);
+            let nested = std::mem::take(&mut inside[k]);
+            inside[i].push(k);
+            inside[i].extend(nested.iter().copied());
+            inside[k] = nested;
+        }
+    }
+    let holds = inside
+        .iter()
+        .map(|ks| Holds::of(ks.iter().map(|&k| &cards[k])))
+        .collect();
+    (subtree, holds)
+}
+
 /// Where a piece of work stands, as its card's screen groups it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Group {

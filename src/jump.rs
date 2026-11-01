@@ -194,8 +194,19 @@ fn focus(
     if let Some(tab) = &jump.tab {
         let out = run(&herdr_args(&jump.session, &["tab", "focus", tab]));
         let in_place = out.ok() && tab_workspace(&out.stdout).is_some_and(|w| w == jump.workspace);
-        if jump.strict && tab_gone(&out) {
-            return Some(Outcome::TabGone);
+        if jump.strict && !in_place {
+            // Only that tab will do: anything short of herdr saying it focused it, in the card's
+            // workspace, stops the jump. Herdr is put back on the workspace in case the tab took
+            // it elsewhere, but nothing is opened.
+            let _ = run(&workspace);
+            if tab_gone(&out) {
+                return Some(Outcome::TabGone);
+            }
+            return Some(Outcome::Failed(format!(
+                "herdr couldn't open {}'s tab {tab}: {}",
+                jump.label,
+                first_line(&out)
+            )));
         }
         if !in_place {
             return focus_refused(t, jump, &run(&workspace));
@@ -713,7 +724,26 @@ mod tests {
         };
         let (outcome, calls) = focus_with(&strict, answer);
         assert_eq!(outcome, Some(Outcome::TabGone));
-        assert_eq!(calls, [FOCUS_W4, FOCUS_T2]);
+        assert_eq!(
+            calls,
+            [FOCUS_W4, FOCUS_T2, FOCUS_W4],
+            "herdr put back, nothing opened"
+        );
+        // Any other answer short of "focused, in its workspace" stops a strict jump too.
+        for (moves_to, answer) in [
+            (Some("w7"), says(0, TAB_ELSEWHERE)),
+            (None, says(0, "garbled")),
+            (None, says(1, "error: busy")),
+        ] {
+            let (answer_fn, focused) = herdr_with(moves_to, answer, says(0, WORKSPACE_FOCUSED));
+            let strict = Jump {
+                strict: true,
+                ..jump(Some("w4:t2"))
+            };
+            let outcome = focus_with(&strict, answer_fn).0;
+            assert!(matches!(outcome, Some(Outcome::Failed(_))), "{outcome:?}");
+            assert_eq!(*focused.borrow(), "w4");
+        }
         // A strict jump to a tab that's there goes in as any other.
         let (answer, _) = herdr_with(Some("w4"), says(0, TAB_FOCUSED), says(0, ""));
         let strict = Jump {

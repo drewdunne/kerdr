@@ -119,9 +119,9 @@ that card when it can.
 `o` opens a card's own screen: the card itself, then what's inside grouped as needs you, under way,
 not started and done, with the selected row's details beside the list (below it on a narrow
 screen). `Enter` on a row goes wherever that record runs, reopening one with no agent at it as
-`Enter` on the board does. `Enter` on a card goes to `workspace.own_tab`; when the workspace holds
-tabs other work runs in and that tab is unknown or has closed, Kerdr says so and offers to send
-`reopen` instead of landing on another tab. A Kerdr older than 0.15 ignores all of this: it shows
+`Enter` on the board does. `Enter` on a card goes to `workspace.own_tab`; when that tab has closed,
+or no tab is recorded while other cards' work runs in tabs of the workspace, Kerdr says so and
+offers to send `reopen` instead of landing on another tab. A Kerdr older than 0.15 ignores all of this: it shows
 every card in its own column and opens the workspace on `Enter`.
 
 ## Actions
