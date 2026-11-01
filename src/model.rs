@@ -493,6 +493,8 @@ impl Verdict {
 pub struct Summary {
     pub needs_you: usize,
     pub running: usize,
+    /// Cards waiting on something else (a review, CI): shown apart from running, in blue.
+    pub waiting: usize,
     pub blocked: usize,
     pub unreachable: usize,
     pub cached: usize,

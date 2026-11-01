@@ -947,11 +947,15 @@ fn strip(f: &mut Frame, rect: Rect, app: &App) {
             if s.running > 0 { fg(GREEN) } else { fg(DIM) },
         ),
         Span::raw("   "),
-        Span::styled(
-            format!("■ {} blocked", s.blocked),
-            if s.blocked > 0 { bold(RED) } else { fg(DIM) },
-        ),
     ];
+    if s.waiting > 0 {
+        left.push(Span::styled(format!("◇ {} waiting", s.waiting), fg(BLUE)));
+        left.push(Span::raw("   "));
+    }
+    left.extend([Span::styled(
+        format!("■ {} blocked", s.blocked),
+        if s.blocked > 0 { bold(RED) } else { fg(DIM) },
+    )]);
     if s.cached > 0 {
         let since = s
             .cached_since

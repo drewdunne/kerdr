@@ -854,7 +854,12 @@ pub fn summarize(board: &Board, scope: &Scope, machines: &[MachineState]) -> Sum
         running: cards
             .iter()
             .filter(open)
-            .filter(|c| matches!(c.attention, Attention::Running | Attention::Waiting))
+            .filter(|c| c.attention == Attention::Running)
+            .count(),
+        waiting: cards
+            .iter()
+            .filter(open)
+            .filter(|c| c.attention == Attention::Waiting)
             .count(),
         blocked: cards
             .iter()
@@ -1266,6 +1271,46 @@ mod tests {
         assert_eq!(attention_of("working", "idle"), Attention::Running);
         assert_eq!(attention_of("idle", "working"), Attention::NeedsYou);
         assert_eq!(attention_of("idle", "idle"), Attention::NeedsYou);
+
+        // A child in its parent's tab is a helper's pane, and still the child card's own agent.
+        let mut child = feed_card("0168", "build", "active");
+        child.attention = Some("needs_you".into());
+        child.workspace = Some(FeedWorkspace {
+            session: Some("default".into()),
+            id: Some("w4".into()),
+            label: None,
+            tab: Some("w4:t2".into()),
+        });
+        let mut waiting = feed_card("0169", "test", "active");
+        waiting.attention = Some("waiting".into());
+        waiting.status = Some("Waiting on Codex's review".into());
+        let snap = Snapshot {
+            workspaces: vec![ws("w4", "67-answered"), ws("w5", "69-waiting")],
+            agents: vec![
+                Agent {
+                    tab_id: Some("w4:t1".into()),
+                    ..agent("w4", "idle")
+                },
+                reviewer("working"),
+                agent("w5", "idle"),
+            ],
+            ..Default::default()
+        };
+        let machines = [live(
+            machine("build-box", true),
+            vec![("default", snap)],
+            Some(Feed {
+                kerdr_feed: 1,
+                cards: vec![child, waiting],
+                ..Default::default()
+            }),
+        )];
+        let board = build(&machines, &Config::default());
+        let c = board.cards.iter().find(|c| c.reference == "#168").unwrap();
+        assert_eq!(c.attention, Attention::Running);
+        // Waiting on something else is counted apart from running, in blue, not as running.
+        let s = summarize(&board, &Scope::All, &machines);
+        assert_eq!((s.running, s.waiting), (1, 1));
     }
 
     #[test]

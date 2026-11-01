@@ -264,10 +264,11 @@ fn doctor() -> anyhow::Result<()> {
     let s = board::summarize(&board, &Scope::All, &states);
     println!();
     println!(
-        "board: {} cards, {} need you, {} running, backlog {}{}",
+        "board: {} cards, {} need you, {} running, {} waiting, backlog {}{}",
         board.cards.len(),
         s.needs_you,
         s.running,
+        s.waiting,
         s.backlog,
         s.verdict
             .map(|v| format!(" · {}", v.text()))
