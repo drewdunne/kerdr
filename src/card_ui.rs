@@ -138,14 +138,13 @@ struct Cols {
 }
 
 fn cols(w: usize) -> Cols {
-    let stage = if w >= 70 { 8 } else { 0 };
-    let what = if w >= 60 { 18 } else { 0 };
-    let place = if w >= 100 {
-        30
-    } else if w >= 80 {
-        22
+    let stage = if w >= 60 { 8 } else { 0 };
+    let (what, place) = if w >= 100 {
+        (18, 30)
+    } else if w >= 64 {
+        (12, 18)
     } else {
-        0
+        (0, 0)
     };
     Cols {
         name: w.saturating_sub(stage + what + place),
@@ -658,9 +657,12 @@ fn details(
             } else {
                 "WHY IT WAS MADE"
             }));
-            for l in wrap(words, w.saturating_sub(2).max(10), 4) {
+            for (n, l) in wrap(words, w.saturating_sub(2).max(10), 4)
+                .into_iter()
+                .enumerate()
+            {
                 out.push(Line::from(vec![
-                    Span::styled("“ ", fg(DIM)),
+                    Span::styled(if n == 0 { "“ " } else { "  " }, fg(DIM)),
                     Span::styled(l, fg(FG2)),
                 ]));
             }

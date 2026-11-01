@@ -1541,12 +1541,15 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
             // The card's line: how many inside, a few marks, and what needs you, named. It uses
             // the card's whole inside width, one column in from its border.
             let w = rect.width.saturating_sub(2);
+            let line = held.line(w as usize);
+            let used: usize = line.iter().map(|(t, _)| width(t)).sum();
+            let gap = u16::from(used < w as usize);
             put(
                 buf,
-                rect.x + 1,
+                rect.x + 1 + gap,
                 note_y + 1,
-                w,
-                card_ui::holds_spans(held.line(w as usize)),
+                w - gap,
+                card_ui::holds_spans(line),
             );
         }
         y += h;
@@ -2866,6 +2869,36 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
         ],
     ),
     (
+        "WORK INSIDE A CARD",
+        &[
+            (
+                "o",
+                "open the card's own screen: itself, then what's inside",
+                "board, backlog, a peek",
+            ),
+            (
+                "⏎",
+                "on a card holding work: its own agent, in its own tab",
+                "never another's tab",
+            ),
+            (
+                "n  N",
+                "stop on work inside a card too, opening its screen on it",
+                "",
+            ),
+            (
+                "j k ⏎",
+                "on its screen: move, then go where that row runs",
+                "⏎ on a ▸ group opens it",
+            ),
+            (
+                "space  esc",
+                "on its screen: peek at the row / back, on the card",
+                "d y x C X s act on the row",
+            ),
+        ],
+    ),
+    (
         "SESSIONS AND MACHINES",
         &[
             (
@@ -2978,7 +3011,11 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
 /// Keys inside herdr, after herdr's prefix.
 pub const HERDR_KEYS: &[KeyRow] = &[
     ("q", "back to the board", "herdr's own detach"),
-    ("space", "next card that needs you, without the board", ""),
+    (
+        "space",
+        "next card that needs you, without the board",
+        "work inside cards too, straight to its tab",
+    ),
     ("backspace", "back to the board, as listed in herdr", ""),
     (
         "?",
@@ -4071,8 +4108,27 @@ mod tests {
     }
 
     fn modes(a: &App) -> Vec<Mode> {
+        let holder = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#41")
+            .map(|c| c.key.clone())
+            .unwrap_or_default();
         let mut modes = vec![
             Mode::Board,
+            Mode::Card {
+                card: holder.clone(),
+                focus: String::new(),
+                opened: vec![],
+                back: Box::new(Mode::Board),
+            },
+            Mode::Card {
+                card: holder,
+                focus: "group:done".into(),
+                opened: vec![],
+                back: Box::new(Mode::Board),
+            },
             Mode::Peek {
                 scroll: 0,
                 back: Box::new(Mode::Board),

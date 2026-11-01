@@ -130,7 +130,16 @@ pub fn machines(away: bool) -> Vec<MachineState> {
             ws("w4", "34-team-invites"),
         ],
         agents: vec![
-            agent("w1", "idle", "Retry copy for declined cards"),
+            // #41's own agent in its first tab, and the child it made, #48, in a second.
+            Agent {
+                tab_id: Some("w1:t1".into()),
+                ..agent("w1", "idle", "Retry copy for declined cards")
+            },
+            Agent {
+                pane_id: "w1:p2".into(),
+                tab_id: Some("w1:t2".into()),
+                ..agent("w1", "working", "Declined cards keep the basket")
+            },
             agent("w2", "blocked", "Two palettes for dark mode"),
             Agent {
                 // Handed over from a Claude Code agent whose account ran out (its feed says so).
@@ -313,6 +322,52 @@ pub fn machines(away: bool) -> Vec<MachineState> {
             session: "background",
             machine: "build-box",
             ws: Some(("w2", "42-invoice-pdfs")),
+        }),
+        // What #41's agent made: a child at work in a tab of its workspace, a follow-up waiting on
+        // it, and a child already done. And a follow-up of #36's, left with no agent at it.
+        card(C {
+            id: "48",
+            title: "Declined cards keep the basket",
+            stage: "build",
+            state: "active",
+            attention: Some("running"),
+            status: Some("Under way"),
+            session: "web",
+            machine: "laptop",
+            ws: Some(("w1", "41-checkout-expired-cards")),
+        }),
+        card(C {
+            id: "49",
+            title: "Card-expiry reminder emails",
+            stage: "backlog",
+            state: "queued",
+            attention: None,
+            status: None,
+            session: "web",
+            machine: "laptop",
+            ws: None,
+        }),
+        card(C {
+            id: "40",
+            title: "Card form passes the accessibility audit",
+            stage: "maintain",
+            state: "closed",
+            attention: Some("done"),
+            status: None,
+            session: "web",
+            machine: "laptop",
+            ws: None,
+        }),
+        card(C {
+            id: "51",
+            title: "Reset emails land in spam",
+            stage: "test",
+            state: "active",
+            attention: None,
+            status: Some("Its agent stopped"),
+            session: "web",
+            machine: "laptop",
+            ws: None,
         }),
         card(C {
             id: "52",
@@ -510,6 +565,36 @@ pub fn machines(away: bool) -> Vec<MachineState> {
                 c.words = Some(
                     "\"People with an expired card just see 'payment failed' and leave.\"".into(),
                 );
+                if let Some(w) = &mut c.workspace {
+                    w.own_tab = Some("w1:t1".into());
+                }
+            }
+            "48" => {
+                c.parent = Some("0041".into());
+                if let Some(w) = &mut c.workspace {
+                    w.tab = Some("w1:t2".into());
+                }
+                c.words = Some("Found while testing #41: a declined card empties the basket.".into());
+                c.message = Some("The basket now survives a decline; one flaky test left.".into());
+            }
+            "49" => {
+                c.from = Some("0041".into());
+                c.waits_on = vec![WaitsOn {
+                    reference: Some("#48".into()),
+                    title: Some("Declined cards keep the basket".into()),
+                    open: Some(true),
+                }];
+                c.words = Some("Remind people a month before their saved card expires.".into());
+            }
+            "40" => {
+                c.parent = Some("0041".into());
+                c.closed = Some("2026-10-20".into());
+                c.result = Some("The card form passes the audit with a screen reader.".into());
+            }
+            "51" => {
+                c.from = Some("0036".into());
+                c.no_agent = true;
+                c.words = Some("Some reset emails land in spam since the domain moved.".into());
             }
             "45" => {
                 c.needs = Some("Pick one of two palettes; both are in its pane.".into());
