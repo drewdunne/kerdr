@@ -194,6 +194,14 @@ fn herdr_status(w: &WsRef) -> Option<String> {
     None
 }
 
+/// Whether the agent you talk to there is working: any that isn't a helper's, or with `tab`, any
+/// in the card's own tab, whose agent may be a helper's (a child intent's).
+fn own_agent_working(w: &WsRef, tab: bool) -> bool {
+    w.agents
+        .iter()
+        .any(|a| a.agent_status.as_deref() == Some("working") && (tab || !a.helper))
+}
+
 fn running_title(w: &WsRef) -> Option<String> {
     w.agents
         .iter()
@@ -215,6 +223,10 @@ pub struct Signals<'a> {
     pub blocker: Option<&'a str>,
     pub running_title: Option<&'a str>,
     pub from_feed: bool,
+    /// The card's own agent is at work: herdr says one that isn't a helper is working, or, for a
+    /// card on a tab, the agent in that tab. Whatever the records said it waited on you for has had
+    /// its answer since, or never needed one.
+    pub at_work: bool,
 }
 
 pub fn attention(s: &Signals) -> (Attention, String) {
@@ -231,7 +243,9 @@ pub fn attention(s: &Signals) -> (Attention, String) {
             s.needs.unwrap_or("asking you something").to_string(),
         );
     }
-    if s.feed == Some(Attention::NeedsYou) {
+    // A working agent isn't waiting on you, whatever the feed last said: answering it shows at once,
+    // not a feed refresh later. Asking you something is herdr's blocked, above.
+    if s.feed == Some(Attention::NeedsYou) && !s.at_work {
         return (
             Attention::NeedsYou,
             s.needs
@@ -511,6 +525,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         let card_mi = ws.map(|w| w.mi).or(p.home_mi).unwrap_or(p.mi);
         let herdr = ws.and_then(herdr_status);
         let title = ws.and_then(running_title);
+        let at_work = ws.is_some_and(|w| own_agent_working(w, p.tab.is_some()));
         // What an agent reported for the workspace is the card's it belongs to, not a tab's.
         let token = ws
             .filter(|_| p.tab.is_none())
@@ -528,6 +543,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             blocker: fc.blockers.first().map(String::as_str),
             running_title: title.as_deref(),
             from_feed: true,
+            at_work,
         });
         let session = ws
             .map(|w| w.session.clone())
@@ -597,6 +613,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             blocker: note,
             running_title: title.as_deref(),
             from_feed: false,
+            at_work: own_agent_working(w, false),
         });
         let agent_title = w
             .agents
@@ -1099,6 +1116,7 @@ mod tests {
             blocker: None,
             running_title: None,
             from_feed: true,
+            at_work: false,
         });
         assert_eq!(att, Attention::NeedsYou);
         assert!(why.contains("turn ended"));
@@ -1118,6 +1136,7 @@ mod tests {
             blocker: None,
             running_title: None,
             from_feed: true,
+            at_work: false,
         };
         assert_eq!(attention(&signals).0, Attention::Waiting);
         signals.herdr = Some("blocked");
@@ -1149,6 +1168,7 @@ mod tests {
             blocker: None,
             running_title: None,
             from_feed: true,
+            at_work: false,
         });
         assert_eq!(att, Attention::Waiting);
         assert_eq!(why, "Waiting on Codex's review");
@@ -1168,8 +1188,84 @@ mod tests {
             blocker: None,
             running_title: None,
             from_feed: true,
+            at_work: false,
         });
         assert_eq!(att, Attention::NeedsYou);
+    }
+
+    #[test]
+    fn an_answered_agent_at_work_stops_needing_you_at_once() {
+        // The feed still says needs_you from before you answered; herdr already sees it working.
+        let mut signals = Signals {
+            usage_waiting: false,
+            account_problem: None,
+            closed: false,
+            token: None,
+            herdr: Some("working"),
+            feed: Some(Attention::NeedsYou),
+            feed_status: Some("Waiting on Andrew"),
+            needs: None,
+            blocker: None,
+            running_title: Some("merging it"),
+            from_feed: true,
+            at_work: true,
+        };
+        assert_eq!(
+            attention(&signals),
+            (Attention::Running, "merging it".into())
+        );
+        // Only a helper is working: its own agent still waits on you.
+        signals.at_work = false;
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+        // Asking you something always needs you.
+        signals.at_work = true;
+        signals.herdr = Some("blocked");
+        assert_eq!(attention(&signals).0, Attention::NeedsYou);
+    }
+
+    #[test]
+    fn a_feed_card_needing_you_is_running_once_its_own_agent_works_but_not_its_helper() {
+        let mut card = feed_card("0167", "build", "active");
+        card.attention = Some("needs_you".into());
+        card.status = Some("Waiting on Andrew".into());
+        let feed = Feed {
+            kerdr_feed: 1,
+            cards: vec![card],
+            ..Default::default()
+        };
+        let reviewer = |status: &str| Agent {
+            pane_id: "w4:p2".into(),
+            tab_id: Some("w4:t2".into()),
+            helper: true,
+            ..agent("w4", status)
+        };
+        let attention_of = |own: &str, helper: &str| {
+            let snap = Snapshot {
+                workspaces: vec![ws("w4", "67-answered")],
+                agents: vec![
+                    Agent {
+                        tab_id: Some("w4:t1".into()),
+                        ..agent("w4", own)
+                    },
+                    reviewer(helper),
+                ],
+                ..Default::default()
+            };
+            let board = build(
+                &[live(
+                    machine("build-box", true),
+                    vec![("default", snap)],
+                    Some(feed.clone()),
+                )],
+                &Config::default(),
+            );
+            let c = board.cards.iter().find(|c| c.reference == "#167").unwrap();
+            assert_eq!(c.workspace_id.as_deref(), Some("w4"));
+            c.attention
+        };
+        assert_eq!(attention_of("working", "idle"), Attention::Running);
+        assert_eq!(attention_of("idle", "working"), Attention::NeedsYou);
+        assert_eq!(attention_of("idle", "idle"), Attention::NeedsYou);
     }
 
     #[test]

@@ -35,7 +35,10 @@ pub fn attention_color(a: Attention) -> Color {
     match a {
         Attention::NeedsYou => ORANGE,
         Attention::Blocked => RED,
-        Attention::Running | Attention::Waiting => BLUE,
+        // An agent at work is green, Andrew's choice over blue (intent 0367); waiting on something
+        // else stays blue.
+        Attention::Running => GREEN,
+        Attention::Waiting => BLUE,
         Attention::Idle | Attention::Unreachable => DIM,
         Attention::Done => GREEN,
     }

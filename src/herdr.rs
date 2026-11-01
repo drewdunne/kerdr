@@ -38,6 +38,27 @@ pub struct Snapshot {
     pub workspaces: Vec<Workspace>,
     #[serde(default)]
     pub agents: Vec<Agent>,
+    /// Every pane, for the tokens herdr keeps on it: `role=helper` marks a helper's pane.
+    #[serde(default)]
+    pub panes: Vec<Pane>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq)]
+pub struct Pane {
+    #[serde(default)]
+    pub pane_id: String,
+    #[serde(default)]
+    pub tokens: Option<BTreeMap<String, String>>,
+}
+
+impl Pane {
+    /// A helper's pane (a reviewer, a tester, a child intent's agent), labeled so by whoever opened
+    /// it: not the agent you talk to.
+    pub fn is_helper(&self) -> bool {
+        self.tokens
+            .as_ref()
+            .is_some_and(|t| t.get("role").map(String::as_str) == Some("helper"))
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -80,6 +101,9 @@ pub struct Agent {
     /// The conversation herdr sees in the pane (`agent_session.value`), when it knows it.
     #[serde(default)]
     pub agent_session: Option<AgentSession>,
+    /// Its pane is a helper's (`role=helper` among the pane's tokens), from the snapshot's panes.
+    #[serde(skip)]
+    pub helper: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, PartialEq)]
@@ -135,7 +159,17 @@ pub fn parse_sessions(text: &str) -> Result<Vec<SessionInfo>, String> {
 pub fn parse_snapshot(text: &str) -> Result<Snapshot, String> {
     let env: Envelope<SnapshotResult> = serde_json::from_str(json_part(text)?)
         .map_err(|_| first_line_or(text, "herdr's snapshot couldn't be read"))?;
-    Ok(env.result.snapshot)
+    let mut snapshot = env.result.snapshot;
+    let helpers: std::collections::HashSet<String> = snapshot
+        .panes
+        .iter()
+        .filter(|p| p.is_helper())
+        .map(|p| p.pane_id.clone())
+        .collect();
+    for a in &mut snapshot.agents {
+        a.helper = helpers.contains(&a.pane_id);
+    }
+    Ok(snapshot)
 }
 
 pub fn parse_workspace_list(text: &str) -> Result<Vec<Workspace>, String> {
@@ -197,6 +231,15 @@ mod tests {
             "build"
         );
         assert_eq!(snap.agents_in("w7").count(), 1);
+        assert!(!snap.agents[0].helper);
+    }
+
+    #[test]
+    fn knows_a_helpers_agent_by_its_panes_token() {
+        let text = r#"{"result":{"snapshot":{"agents":[{"agent_status":"idle","pane_id":"wB:p1","tab_id":"wB:t1","workspace_id":"wB"},{"agent_status":"working","pane_id":"wB:p2","tab_id":"wB:t2","workspace_id":"wB"}],"panes":[{"pane_id":"wB:p1","tokens":null},{"pane_id":"wB:p2","tokens":{"role":"helper"}},{"pane_id":"wB:p3","tokens":{"role":"helper"}}],"workspaces":[{"workspace_id":"wB","label":"60-x"}]}}}"#;
+        let snap = parse_snapshot(text).unwrap();
+        let helper: Vec<bool> = snap.agents.iter().map(|a| a.helper).collect();
+        assert_eq!(helper, [false, true]);
     }
 
     #[test]

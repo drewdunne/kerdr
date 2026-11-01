@@ -195,7 +195,7 @@ own record system validate and persist changes. Without an adapter, Kerdr remain
 ### Accounts and ordered models
 
 With an account-aware feed, each card shows its account at the bottom left and one status
-at the top right: yellow ▲ needs you, red ⏸︎ waits for usage, blue ● running, grey ■ idle.
+at the top right: yellow ▲ needs you, red ⏸︎ waits for usage, green ● running, grey ■ idle.
 The bottom line names the first ready account for new work in the session you are viewing.
 Older feeds retain the original board layout.
 
@@ -295,7 +295,8 @@ Account features work through the optional [feed and action contract](docs/feed.
 **herdr under the hood.** Kerdr uses only herdr's public command line. Each read runs one short
 shell script on the machine: herdr's version, `herdr session list`, and
 `herdr --session NAME api snapshot` for every running session, which returns its workspaces,
-agents and their states in one call. Jumping in runs `herdr workspace focus`, then herdr itself
+agents and their states in one call, and which panes are helpers' (a `role=helper` token), whose
+work doesn't count as the card's own agent at work. Jumping in runs `herdr workspace focus`, then herdr itself
 as Kerdr's child process, with a copy of your herdr config that hides the sidebar. Settings you
 change inside a window Kerdr opened last until it opens the next one; change them in herdr's own
 config to keep them.
