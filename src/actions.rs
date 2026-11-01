@@ -24,6 +24,9 @@ pub struct Response {
     pub ticket: Option<String>,
     #[serde(default)]
     pub needs_code: bool,
+    /// For a sign-in typed on the provider's page: the code to type there, and when it expires.
+    pub user_code: Option<String>,
+    pub expires: Option<String>,
 
     pub used: Option<u32>,
     pub limit: Option<u32>,
@@ -59,6 +62,19 @@ pub fn parse_response(text: &str) -> Result<Response, serde_json::Error> {
 
 /// Metadata returned to the UI after sending; credentials never enter its result queue, and a
 /// new intent's images are only counted there.
+/// The statuses actions answer with (docs/feed.md), kept as they are by the credential scrub.
+const KNOWN_STATUSES: &[&str] = &[
+    "waiting",
+    "done",
+    "failed",
+    "cancelled",
+    "starting",
+    "ready",
+    "queued",
+    "stale",
+    "moved",
+];
+
 pub fn request_metadata(request: &Value) -> Value {
     let mut value = request.clone();
     if value["action"] == "account-signin"
@@ -123,8 +139,13 @@ fn run_with_deadline(
     // so parse it before interpreting process status.
     parse_response(&output.stdout).map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.user_code, &mut response.expires].into_iter().flatten() {
             *text = redact(text);
+        }
+        // A status the protocol knows stays as it is, even when it matches what was sent (a code
+        // "done"); anything else is scrubbed like the rest.
+        if let Some(status) = response.status.as_mut().filter(|s| !KNOWN_STATUSES.contains(&s.as_str())) {
+            *status = redact(status);
         }
         response
     }).map_err(|error| {
@@ -192,6 +213,27 @@ mod tests {
         let response = run(&machine(), &command, &request).unwrap();
         assert!(!response.message.contains(secret));
         assert!(response.message.contains("[redacted]"));
+        // Nor into a sign-in's code to type, or its expiry.
+        let reply = r#"{"ok":true,"status":"waiting","message":"m","user_code":"fixture-private-credential","expires":"until fixture-private-credential"}"#;
+        let command = fixture(
+            dir.path(),
+            &format!("cat >/dev/null\nprintf '%s' '{reply}'\n"),
+            &format!("[Console]::In.ReadToEnd() | Out-Null; Write-Output '{reply}'"),
+        );
+        let response = run(&machine(), &command, &request).unwrap();
+        assert_eq!(response.user_code.as_deref(), Some("[redacted]"));
+        assert!(!format!("{response:?}").contains(secret));
+        // A code that happens to be a status word leaves the status as the protocol's.
+        let reply = r#"{"ok":true,"status":"done","message":"signed in"}"#;
+        let command = fixture(
+            dir.path(),
+            &format!("cat >/dev/null\nprintf '%s' '{reply}'\n"),
+            &format!("[Console]::In.ReadToEnd() | Out-Null; Write-Output '{reply}'"),
+        );
+        let finish =
+            json!({"action":"account-signin","step":"finish","ticket":"t","page_code":"done"});
+        let response = run(&machine(), &command, &finish).unwrap();
+        assert_eq!(response.status.as_deref(), Some("done"));
     }
 
     #[test]
@@ -296,6 +338,31 @@ mod tests {
         )
         .unwrap();
         assert_eq!(agents.ticket.as_deref(), Some("fixture-ticket"));
+        // A provider whose page takes a code answers with it and asks nothing back.
+        let device = run(
+            &machine(),
+            &command,
+            &json!({"action":"account-signin","step":"start","code":"DEVICE_X"}),
+        )
+        .unwrap();
+        assert!(device.ok && !device.needs_code);
+        assert_eq!(device.user_code.as_deref(), Some("K7QD-3MPWX"));
+        assert_eq!(device.expires.as_deref(), Some("2026-10-31T18:15:00Z"));
+        // A move to an account of another program is a hand-over, asked first.
+        let move_to = |confirm: Option<&str>| {
+            let mut request = json!({"action":"account-move","pane":"w1:p1","session":"web","conversation":"fixture-conversation","to":"HAND_X"});
+            if let Some(token) = confirm {
+                request["confirm"] = json!(token);
+            }
+            run(&machine(), &command, &request).unwrap()
+        };
+        let asked = move_to(None);
+        assert!(asked.confirmation);
+        assert_eq!(asked.yes.as_deref(), Some("hand it over"));
+        assert_eq!(asked.confirm.as_deref(), Some("fixture-handover"));
+        let queued = move_to(Some("fixture-handover"));
+        assert!(queued.ok && !queued.confirmation);
+        assert_eq!(queued.message, "handing over to HAND_X");
     }
 
     #[test]

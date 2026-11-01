@@ -79,10 +79,26 @@ impl App {
     pub fn provider_label(&self) -> String {
         match self.provider.as_deref() {
             None => "All agents".into(),
-            Some("claude") => "Claude".into(),
-            Some("codex") => "Codex".into(),
-            Some(other) => other.into(),
+            Some(id) => self.all_providers().program_label(id),
         }
+    }
+
+    /// The programs the agents filter cycles through: those the feeds' providers and accounts
+    /// name, in their order, then any other agent herdr reports on a card, alphabetically.
+    pub(crate) fn agent_programs(&self) -> Vec<String> {
+        let mut programs = self.all_providers().programs();
+        let mut others: Vec<String> = self
+            .board
+            .cards
+            .iter()
+            .flat_map(|card| card.agents.iter())
+            .map(|agent| agent.agent.clone())
+            .filter(|name| !name.is_empty() && !programs.contains(name))
+            .collect();
+        others.sort();
+        others.dedup();
+        programs.extend(others);
+        programs
     }
 
     /// Whether f's filters (owner, project, agents or background) hide any work.
@@ -110,20 +126,7 @@ impl App {
     }
 
     fn cycle_provider(&mut self) {
-        let mut others: Vec<_> = self
-            .board
-            .cards
-            .iter()
-            .flat_map(|card| card.agents.iter())
-            .map(|agent| agent.agent.clone())
-            .filter(|name| !name.is_empty() && name != "claude" && name != "codex")
-            .collect();
-        others.sort();
-        others.dedup();
-        let providers: Vec<String> = ["claude".to_string(), "codex".to_string()]
-            .into_iter()
-            .chain(others)
-            .collect();
+        let providers = self.agent_programs();
         self.provider = match self
             .provider
             .as_ref()
@@ -835,7 +838,7 @@ impl App {
             [] => "whatever runs there".to_string(),
             [a] => format!(
                 "its {} agent{}",
-                crate::accounts::provider_name(&a.agent),
+                self.providers(machine).program_label(&a.agent),
                 match a.status.as_str() {
                     "working" => " (mid-step)",
                     "blocked" => " (at a question)",

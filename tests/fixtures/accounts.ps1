@@ -3,6 +3,9 @@ $request = [Console]::In.ReadToEnd() | ConvertFrom-Json
 switch ($request.action) {
   'account-move' {
     if ($request.conversation -eq 'stale-conversation') { @{ok=$true;state='stale';message='the conversation changed'} | ConvertTo-Json -Compress }
+    # An account another program runs: a hand-over, asked first.
+    elseif ($request.to -eq 'HAND_X' -and $request.confirm -eq 'fixture-handover') { @{ok=$true;state='queued';account='HAND_X';message='handing over to HAND_X'} | ConvertTo-Json -Compress }
+    elseif ($request.to -eq 'HAND_X') { @{ok=$false;message='move?';confirmation='This agent runs one program and HAND_X another: a fresh agent picks up from the log. Hand it over?';yes='hand it over';no='leave it';confirm='fixture-handover'} | ConvertTo-Json -Compress }
     elseif ($request.confirm -eq 'fixture-confirm') { @{ok=$true;state='queued';account='ARK';message='moving to ARK'} | ConvertTo-Json -Compress }
     else { @{ok=$false;message='move?';confirmation='Mid-step; move when idle and end background jobs?';yes='move when it stops';no='leave it';confirm='fixture-confirm'} | ConvertTo-Json -Compress }
   }
@@ -11,6 +14,8 @@ switch ($request.action) {
     # A copy other than the agents' one gets its own ticket, and refuses a pasted token.
     if ($request.copy -eq 'tenants' -and $request.step -eq 'start') { @{ok=$true;message='Authorize the tenants copy';status='waiting';ticket='fixture-tenants-ticket';url='https://example.com/signin';needs_code=$true} | ConvertTo-Json -Compress; break }
     if ($request.copy -eq 'tenants' -and $request.step -eq 'paste') { @{ok=$false;message='The tenants copy signs in on its machine, not by paste';status='failed'} | ConvertTo-Json -Compress; break }
+    # A provider whose page takes a code: the code to type, and nothing to paste back.
+    if ($request.code -eq 'DEVICE_X' -and $request.step -eq 'start') { @{ok=$true;message='Type the code on the page';status='waiting';ticket='fixture-device-ticket';url='https://example.com/device';needs_code=$false;user_code='K7QD-3MPWX';expires='2026-10-31T18:15:00Z'} | ConvertTo-Json -Compress; break }
     switch ($request.step) {
       'start' { @{ok=$true;message='Authorize in your browser';status='waiting';ticket='fixture-ticket';url='https://example.com/signin';needs_code=$true} | ConvertTo-Json -Compress }
       'poll' { @{ok=$true;message='Waiting';status='waiting'} | ConvertTo-Json -Compress }

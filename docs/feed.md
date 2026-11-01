@@ -289,8 +289,11 @@ workspace that closes stop too and stay open with no agent; `x` or `C` ends them
 `s` on a card moves that card's agent, and only that agent, to another account, resuming its
 conversation there; the session's other agents and its owner's list stay as they are. It's
 `account-move` (see [Account actions](#account-actions)), keyed by the card's pane. A card an
-agent is at says so on the board's bottom line (`s move its agent off KBZ`), in its peek, and in
-the `Ctrl+Space` menu. `S` edits the list new agents start on, and moves no agent that's running:
+agent is at says so on the board's bottom line (`s move its agent off KBZ_C`), in its peek, and in
+the `Ctrl+Space` menu. An agent is movable when the feed records it or herdr reports it running a
+program the machine's accounts run (a provider's `programs`, or an account's `runs`). A move to
+an account another program runs is a hand-over; the backend asks first, and Kerdr titles its
+question so ("Hand #45 over to Codex?"). `S` edits the list new agents start on, and moves no agent that's running:
 saved unchanged while an agent there could move, it says that `s` on its card is the key and names
 those cards, those off the list's first account first.
 
@@ -346,20 +349,73 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
 
 ```json
 {
-  "accounts": [{"code":"KBZ","name":"Personal","provider":"claude","kind":"login",
-    "runs":"claude","status":"out","until":"2026-10-22T09:00:00-05:00","pool":"week",
-    "usage":{"five":86,"five_at":null,"week":100,"week_at":"2026-10-22T09:00:00-05:00","seen":"2026-10-21T17:46:00-05:00"}}],
-  "owners": [{"id":"studio","kind":"organization","name":"Studio","parent":null,
-    "models":["KBZ"],"own":true,"sessions":["default"]},
-    {"id":"shop","kind":"tenant","name":"Shop","parent":"studio",
-    "models":["KBZ"],"own":false,"sessions":["web","shop-bg"]}],
+  "providers": [{"id":"claude","label":"Claude","letter":"C","kinds":["token","login"],
+    "kind_labels":{"token":"a token per machine","login":"the machine's saved sign-in"},
+    "programs":["claude"],"program_labels":{"claude":"Claude Code"},
+    "signin":"page_code","windows":["five","week"],"fields":[]},
+    {"id":"codex","label":"Codex","letter":"X","kinds":["login","token"],
+    "kind_labels":{"login":"this machine's own Codex sign-in","token":"a sign-in of its own, per machine"},
+    "programs":["codex"],"program_labels":{"codex":"Codex"},
+    "signin":"device_code","windows":["five","week"],"fields":[]}],
+  "accounts": [{"code":"KBZ_C","name":"Personal","provider":"claude","kind":"login",
+    "runs":"claude","provider_label":"Claude","program_label":"Claude Code","paste":false,
+    "status":"out","until":"2026-10-22T09:00:00-05:00","pool":"week",
+    "usage":{"five":86,"five_at":null,"week":100,"week_at":"2026-10-22T09:00:00-05:00","seen":"2026-10-21T17:46:00-05:00"}},
+    {"code":"KBZ_X","name":"Personal Codex","provider":"codex","kind":"login","runs":"codex",
+    "status":"ready","usage":{"week":7,"week_at":"2026-10-28T01:48:00-05:00","seen":"2026-10-21T17:44:00-05:00"}}],
+  "owners": [{"id":"studio","kind":"organization","name":"Studio","code":"KBZ","parent":null,
+    "models":["KBZ_C","KBZ_X"],"own":true,"sessions":["default"]},
+    {"id":"shop","kind":"tenant","name":"Shop","code":"SHP","parent":"studio",
+    "models":["KBZ_C","KBZ_X"],"own":false,"sessions":["web","shop-bg"]}],
   "owners_source":"mock",
   "machine_owner":"studio",
   "unowned_sessions":[],
-  "agents":[{"pane":"w1:p1","session":"web","conversation":"conversation-id",
-    "account":"KBZ","how":"list","problem":null,"waiting":{"why":"usage","until":"2026-10-22T09:00:00-05:00"}}]
+  "agents":[{"pane":"w1:p1","session":"web","conversation":"conversation-id","program":"claude",
+    "account":"KBZ_C","how":"list","problem":null,"waiting":{"why":"usage","until":"2026-10-22T09:00:00-05:00"}},
+    {"pane":"w2:p1","session":"web","conversation":"another-id","program":"codex","account":"KBZ_X",
+    "how":"next","handed_from":{"account":"KBZ_C","program":"claude","conversation":"conversation-id",
+    "why":"usage_limit","at":"2026-10-21T17:44:00-05:00"}}]
 }
 ```
+
+### Providers
+
+`providers` describes every provider the backend knows, so Kerdr names none in its code and a
+provider added later (a local model, say) is listed, added, signed in and shown with no Kerdr
+release:
+
+- `label` names it; `letter` is the last letter of its accounts' codes, which are the owner's
+  code, `_`, then that letter (`KBZ_C`, `KBZ_X`; up to six characters).
+- `kinds` are its kinds of account, the one to offer first first, with `kind_labels` saying each
+  in its own words, for the accounts screen and the add form.
+- `programs` are the programs that run its accounts, the usual one first, named for people by
+  `program_labels`. A program's id is the agent name herdr reports for it (`claude`, `codex`),
+  which is how Kerdr knows what a card's agent runs. `s` moves agents of any program the
+  machine's own providers (or its accounts' `runs`) name, and the agents filter (`a`) cycles
+  through every program the feeds name, then any other agent herdr reports.
+- `signin` is how an account signs in: `page_code` (a link; the page then shows a code to paste
+  back), `device_code` (a link and a code to type on the provider's page; nothing comes back),
+  or `null` (no sign-in: adding one starts no sign-in, and Enter on its line tests it).
+- `windows` are the usage windows its accounts can report. An account shows the windows its
+  reading has; with no reading, it shows these as unknown.
+- `fields` are anything else its accounts need when added, `[{"id","label","required"}]`, which
+  the add form asks after the name and sends with `account-add`.
+
+A feed without `providers` (an older backend) still works as before: each account's `provider`
+is named by its `provider_label`, else the id with a capital; kinds read "saved sign-in" and
+"token per machine"; usage always shows the five-hour and weekly windows; and `+` adds a token
+account of a provider its accounts name, with a code of 2–4 capitals. Names come from any
+machine's feed (the viewed one's first), so a machine whose feed predates `providers` still shows
+the words another's gives. What a machine can do comes from its own feed alone: the providers
+`+` offers there, their code rules, how its accounts sign in and take a paste, and the programs
+`s` moves, since another machine's newer backend may know more than this one's. The add form ticks only
+machines whose own feed offers that provider, and each machine's sign-in takes a pasted token by
+its own feed's answer.
+
+An owner's optional `code` (`KBZ`) is what `+` suggests a new account's code from: the viewed
+session's owner's, else the machine owner's, else the first organization's whose code with the
+provider's letter isn't taken. An account's optional `paste` says whether its sign-in takes a
+pasted token; missing, a `token` account takes one unless its provider signs in by `device_code`.
 
 An account may also list `copies`: the separate stored sign-ins of it on this machine, in the
 order to show them, such as your agents' copy and the one root holds for tenants:
@@ -381,20 +437,25 @@ before Enter signs it in again. With two or more copies the accounts screen show
 copy under the account; with none or one it is unchanged. The account's own `status` stays the
 copy that launches use. Copies change nothing on the board, the usage line or card badges.
 
-Account status is `ready`, `out`, `sign_in`, or `missing`. Usage values are percentages;
-missing or null usage displays as unknown. Usage belongs to the account rather than the machine,
+Account status is `ready`, `out`, `sign_in`, or `missing`. Usage values are percentages, one
+per window: `five` and `week`, and any other length as `w<minutes>` with `w<minutes>_at`. Kerdr
+shows the windows a reading has, shortest first: `86│100` for both, `7` for a plan with only a
+weekly limit (`7 this week` where there's room). Missing or null usage displays as unknown. Usage belongs to the account rather than the machine,
 so wherever Kerdr shows an account's figures, on any machine tab or on All, it uses the reading
 with the newest `seen` among every machine's feed for that account code; a reading without `seen`
-counts as oldest, and a tie goes to the first machine in the board's order on every tab. A figure whose `five_at` or `week_at` has passed displays as unknown (`—`)
-until a newer reading arrives, and the accounts screen says which window reset and when. Providers, kinds, and runner names are strings
-so other programs and local endpoints can be represented. Creating accounts currently uses
-`provider: "claude"` and `kind: "token"`; the engine validates what it supports.
+counts as oldest, and a tie goes to the first machine in the board's order on every tab. A figure whose window's reset time (`five_at`, `week_at`, `w<minutes>_at`) has passed displays as unknown (`—`)
+until a newer reading arrives, and the accounts screen says which window reset and when. Creating
+an account sends the provider and kind chosen in the add form; the backend validates them.
 An owner’s `models` contains its effective ordered list; `own: false` denotes inheritance.
 Sessions are explicitly assigned to owners, with `default` falling back to `machine_owner`.
 Unowned sessions are marked on the accounts screen. `owners_source: "mock"` is shown as such.
 
 Cards join their herdr agents to the feed’s agents by **machine, session, and pane**, including
-child cards that name a tab. `how` is `list`, `manual`, `next`, or `handed_over`. A usage wait
+child cards that name a tab. `how` is `list`, `manual`, `next`, or `handed_over`. An agent's
+`program` is what it runs (one of a provider's `programs`). `handed_from` marks an agent that
+took over from another program: the account and program before, the conversation left there,
+`why` (`usage_limit`, `sign_in`, `manual`, or anything else, shown as words) and `at`. Its card
+shows `⇄` beside its code, and its peek says from which account and program, why and when. A usage wait
 suppresses the ordinary “turn ended” attention for that card. Conversation IDs bind a move
 and its confirmation; backend checks must also reject stale generations and enforce authorization.
 An optional `problem` string reports a failed move. It draws attention to the card and appears
@@ -412,7 +473,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, or the question below |
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
-| `account-add` | `code`, `name`, `provider`, `kind` | adds, or renames the existing code |
+| `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
 | `account-test` | `code`, optional `copy` | status and message |
 | `account-remove` | `code` | removes after Kerdr’s local confirmation |
 
@@ -424,6 +485,10 @@ saved successfully. Unreachable machines are reported rather than silently claim
  "yes":"move when it stops","no":"leave it","confirm":"opaque-ticket","message":"Move needs a decision"}
 ```
 
+A move to an account another program runs answers with a question too, whose `yes` says it's a
+hand-over ("hand it over", or "hand over when it stops" for an agent mid-step); Kerdr titles it
+"Hand #45 over to Codex?" when the agent's `program` and the target's `runs` differ.
+
 For account moves, `confirmation` is the question text (ordinary card actions keep their
 boolean field). Kerdr shows it only after selection, waits for a fresh `y`, then resends the
 original machine, pane, session, conversation and target with `confirm`. It does **not** add `override`,
@@ -431,17 +496,33 @@ original machine, pane, session, conversation and target with `confirm`. It does
 
 Moves send the feed's `agents[].conversation`. A changed conversation answers
 `{"ok":true,"state":"stale","message":"the conversation changed"}`. An accepted move answers
-`{"ok":true,"state":"queued","account":"ARK","message":"moving to ARK"}` promptly, then restarts
+`{"ok":true,"state":"queued","account":"ARK_C","message":"moving to ARK_C"}` promptly, then restarts
 in a detached worker. Kerdr displays the message; the feed changes the account badge when the
 move finishes. An unavailable target answers `ok: false` before stopping anything.
 
 ### Signing in
 
 ```json
-{"action":"account-signin","code":"ARK","step":"start"}
+{"action":"account-signin","code":"ARK_C","step":"start"}
 {"ok":true,"message":"Authorize in your browser","status":"waiting","ticket":"opaque-ticket",
  "url":"https://example.com/authorize","needs_code":true}
 ```
+
+For a provider whose `signin` is `device_code`, `start` answers with the code to type on its
+page, when it expires, and `needs_code: false`:
+
+```json
+{"ok":true,"message":"Type the code on OpenAI's page","status":"waiting","ticket":"opaque-ticket",
+ "url":"https://auth.example.com/codex/device","needs_code":false,"user_code":"K7QD-3MPWX",
+ "expires":"2026-10-31T18:15:00Z"}
+```
+
+Kerdr shows the code in a box with how long it lasts and no code field; `c` copies the code,
+`l` the link, and `o` opens the page again. Polling finishes it as usual; once `expires` has
+passed, `r` cancels that ticket and starts again. A `user_code` that isn't 4–32 letters, digits
+and dashes is never shown or copied: Kerdr stops that sign-in, cancelling its ticket, and says
+so. `user_code` and `expires` go through the same credential scrub as the rest of an answer; a
+`status` the protocol knows (`waiting`, `done`, `failed`, …) is kept as it is.
 
 Enter starts this on the machine the accounts screen is viewing, which opens on the board's
 machine tab or else on the machine Kerdr runs on, then, one after another as below, on every
@@ -452,7 +533,7 @@ in again there; each `start` goes to its own machine. By each later machine's tu
 feed no longer says `sign_in` or `missing` is skipped (machines ticked when adding an account
 aren't). A `cancel` for a machine not answering is kept and sent once it answers.
 
-On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK","step":"start","copy":"tenants"}`.
+On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK_C","step":"start","copy":"tenants"}`.
 Kerdr sends the line's `id` for every copy, the first included; a request without `copy` means
 the account's default copy, as before. The ticket `start` returns belongs to that copy, so poll,
 finish and cancel need nothing new. Signing in one copy must never change another, and
@@ -476,9 +557,13 @@ a ticket returned after Escape is also cancelled, without opening a browser. Aft
 adding an account proceeds to the next selected machine with a **new** start and ticket.
 A `paste` step instead sends `code` and a `token` string (and `copy`, when pasting for one),
 and answers `done` or a refusal; a backend refuses a paste for a copy it can't take one for.
-Kerdr offers it (`p`) only for a `token` account, or a copy whose `paste` is `true`. The
-`page_code` a `finish` sends is the long code the page shows after Authorize; Kerdr keeps back
-an entry of 4–10 digits alone, which is claude.ai's emailed sign-in code, and says where it goes.
+Kerdr offers it (`p`) only for an account or copy whose `paste` is `true`, or, without `paste`, a `token` account whose provider doesn't sign in by `device_code`. The
+`page_code` a `finish` sends is the code the page shows once you allow it. A backend that
+describes its providers checks it: refusing one, it answers `ok: false` with no `status` and its
+sign-in waits on, and Kerdr keeps the code box open with the backend's message under it (a
+refusal that ends the sign-in says `status: "failed"`). For a provider no feed describes, whose
+older backend ends a sign-in on a wrong code, Kerdr keeps back an entry of 4–10 digits alone, a
+sign-in page's emailed code, and says where it goes.
 The token never enters the result queue or saved settings. The backend must not echo it and
 must own its secure storage. Kerdr also removes submitted credential text from adapter output.
 Adapter output is captured in temporary files before parsing, so backends must never echo credentials.

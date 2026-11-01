@@ -232,14 +232,17 @@ fn main() {
         "account-copies",
         "move-account",
         "move-confirmation",
+        "hand-over",
         "paste-token",
         "default-accounts",
         "add-model",
+        "add-provider",
         "add-account",
         "rename-account",
         "sign-in",
         "sign-in-again",
         "sign-in-code",
+        "sign-in-device",
         "sign-in-where",
         "sign-in-copy",
         "paste-token-copy",
@@ -282,6 +285,14 @@ fn main() {
         back: Box::new(Mode::Board),
     };
     rasterize(&render(&peek), &fonts, &out.join("peek.png"));
+    // A card handed over to another program: ⇄ beside its account, and its peek says why.
+    let mut handed = app(false);
+    select(&mut handed, "#47");
+    handed.mode = Mode::Peek {
+        scroll: 0,
+        back: Box::new(Mode::Board),
+    };
+    rasterize(&render(&handed), &fonts, &out.join("peek-handed-over.png"));
 
     let mut road = app(true);
     select(&mut road, "#41");
