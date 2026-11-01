@@ -1391,6 +1391,10 @@ mod tests {
         assert!(matches!(app.mode, Mode::Card { .. }), "{:?}", app.mode);
         assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
         assert_eq!(focus(&app), "group:done", "Enter opened nothing");
+        let text = rendered(&mut app, 176, 44);
+        assert!(text.contains("has left this card"), "{text}");
+        assert!(text.contains("nothing selected"), "{text}");
+        assert!(!text.contains("opens the list"), "{text}");
         // All of them go.
         app.machines[0]
             .feed
@@ -1400,6 +1404,9 @@ mod tests {
             .retain(|c| !c.id.starts_with('7'));
         app.rebuild();
         assert_eq!(app.sel.key, None);
+        let text = rendered(&mut app, 176, 44);
+        assert!(text.contains("has left this card"), "{text}");
+        assert!(!text.contains("opens the list"), "{text}");
     }
 
     #[test]

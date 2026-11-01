@@ -488,7 +488,7 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App, key: &str, focus: &str, opened
     }
 
     details(f, detail, app, card, &rows, focus, side);
-    footer(f, rows_area[4], app, card, focus);
+    footer(f, rows_area[4], app, card, focus, found.is_some());
     let _ = rows_area[3];
 }
 
@@ -519,6 +519,16 @@ fn details(
     let w = d.width as usize;
     let now = app.now();
     let mut out: Vec<Line> = Vec::new();
+    if !rows.iter().any(|r| r.focus(app).as_deref() == Some(focus)) {
+        out.extend(wrapped(
+            "The row you were on has left this card: it closed out of its feed, or moved to another. Nothing is selected until j or k chooses a row.",
+            w,
+            fg(DIM),
+            None,
+        ));
+        f.render_widget(Paragraph::new(out), d);
+        return;
+    }
     if let Some(id) = focus.strip_prefix("group:") {
         if let Some(Row::Heading { group, members, .. }) = rows
             .iter()
@@ -543,16 +553,6 @@ fn details(
             out.push(Line::raw(""));
             out.push(Line::styled("⏎ opens the list here.", fg(DIM)));
         }
-        f.render_widget(Paragraph::new(out), d);
-        return;
-    }
-    if !rows.iter().any(|r| r.focus(app).as_deref() == Some(focus)) {
-        out.extend(wrapped(
-            "The row you were on has left this card: it closed out of its feed, or moved to another. Nothing is selected until j or k chooses a row.",
-            w,
-            fg(DIM),
-            None,
-        ));
         f.render_widget(Paragraph::new(out), d);
         return;
     }
@@ -729,10 +729,13 @@ fn details(
     f.render_widget(Paragraph::new(out), d);
 }
 
-fn footer(f: &mut Frame, rect: Rect, app: &App, holder: &Card, focus: &str) {
+fn footer(f: &mut Frame, rect: Rect, app: &App, holder: &Card, focus: &str, here: bool) {
     let mut spans = Vec::new();
     let mut hints: Vec<(String, String)> = Vec::new();
-    if focus.starts_with("group:") {
+    if !here {
+        // The row it was on has left the card: nothing to act on until j or k chooses one.
+        spans.push(Span::styled("nothing selected   ", fg(DIM)));
+    } else if focus.starts_with("group:") {
         hints.push(("⏎".into(), "opens the list".into()));
     } else {
         let c = if focus.is_empty() {
