@@ -509,6 +509,7 @@ fn jump_workspace(
         session,
         workspace: id,
         tab: None,
+        strict: false,
         label,
         others: app.needs_you_order().len(),
         via,
@@ -529,7 +530,7 @@ fn jump_workspace(
     match &outcome {
         Outcome::Failed(e) => app.say(e.clone(), Tone::Warn),
         Outcome::Closed => app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn),
-        Outcome::Board | Outcome::Next => {}
+        Outcome::Board | Outcome::Next | Outcome::TabGone => {}
     }
     Some(outcome)
 }
@@ -596,11 +597,14 @@ fn jump_cards(
         };
         let others = app.needs_you_order().iter().filter(|k| **k != key).count();
         let via = via_for(app, mi, &session);
+        // Its own tab, never another's: a child's, or the card's own agent's (intent 0349).
+        let (tab, strict) = app.jump_tab(&card);
         let j = Jump {
             machine: app.machines[mi].machine.clone(),
             session,
             workspace,
-            tab: card.tab_id.clone(),
+            tab,
+            strict,
             label: card
                 .workspace_label
                 .clone()
@@ -637,6 +641,12 @@ fn jump_cards(
                 return;
             }
             Outcome::Closed => closed_on_the_way.push(key.clone()),
+            // The tab you picked has closed: a piece's reopens, a card's own asks to reopen it.
+            Outcome::TabGone if yours => {
+                app.tab_gone(&key);
+                return;
+            }
+            Outcome::TabGone => closed_on_the_way.push(key.clone()),
             Outcome::Next => {}
         }
         match app.next_needs_you_after(&key, &closed_on_the_way) {

@@ -31,6 +31,9 @@ pub struct Jump {
     pub workspace: String,
     /// The tab in that workspace to land on, when the card's work runs in one tab of it.
     pub tab: Option<String>,
+    /// Only that tab will do: when it has closed, the jump stops (`Outcome::TabGone`) rather
+    /// than land on whichever tab the workspace shows, which may be other work's.
+    pub strict: bool,
     pub label: String,
     /// How many other cards need you, for the hint shown inside herdr.
     pub others: usize,
@@ -137,6 +140,8 @@ pub enum Outcome {
     Next,
     /// herdr says the workspace isn't there: it closed after the board last read it.
     Closed,
+    /// herdr says the tab a strict jump was for isn't there; nothing was opened.
+    TabGone,
     Failed(String),
 }
 
@@ -189,6 +194,9 @@ fn focus(
     if let Some(tab) = &jump.tab {
         let out = run(&herdr_args(&jump.session, &["tab", "focus", tab]));
         let in_place = out.ok() && tab_workspace(&out.stdout).is_some_and(|w| w == jump.workspace);
+        if jump.strict && tab_gone(&out) {
+            return Some(Outcome::TabGone);
+        }
         if !in_place {
             return focus_refused(t, jump, &run(&workspace));
         }
@@ -216,6 +224,14 @@ fn focus_refused(t: &Target, jump: &Jump, out: &transport::Output) -> Option<Out
         )));
     }
     None
+}
+
+/// Whether herdr refused because the tab no longer exists.
+fn tab_gone(out: &transport::Output) -> bool {
+    !out.ok()
+        && [&out.stdout, &out.stderr]
+            .iter()
+            .any(|s| s.contains("\"tab_not_found\""))
 }
 
 /// Whether herdr refused because the workspace no longer exists.
@@ -582,6 +598,7 @@ mod tests {
             session: "web".into(),
             workspace: "w4".into(),
             tab: tab.map(Into::into),
+            strict: false,
             label: "41-checkout".into(),
             others: 0,
             via: Via::Local,
@@ -685,6 +702,25 @@ mod tests {
         assert_eq!(outcome, None);
         assert_eq!(calls, [FOCUS_W4, FOCUS_T2, FOCUS_W4]);
         assert_eq!(*focused.borrow(), "w4");
+    }
+
+    #[test]
+    fn a_strict_jump_to_a_tab_that_has_closed_stops_instead_of_landing_on_another() {
+        let (answer, _) = herdr_with(None, says(1, TAB_GONE), says(0, WORKSPACE_FOCUSED));
+        let strict = Jump {
+            strict: true,
+            ..jump(Some("w4:t2"))
+        };
+        let (outcome, calls) = focus_with(&strict, answer);
+        assert_eq!(outcome, Some(Outcome::TabGone));
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2]);
+        // A strict jump to a tab that's there goes in as any other.
+        let (answer, _) = herdr_with(Some("w4"), says(0, TAB_FOCUSED), says(0, ""));
+        let strict = Jump {
+            strict: true,
+            ..jump(Some("w4:t2"))
+        };
+        assert_eq!(focus_with(&strict, answer).0, None);
     }
 
     #[test]

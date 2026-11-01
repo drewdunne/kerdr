@@ -351,7 +351,7 @@ fn main() {
     rasterize(&render(&compose), &fonts, &out.join("new-intent.png"));
 
     let mut confirmation = app(false);
-    confirmation.mode = Mode::Confirm { machine: 0,
+    confirmation.mode = Mode::Confirm { plain: false, machine: 0,
         request: serde_json::json!({"action":"dispatch","id":"40","override":true}),
         title: "Start #40 in web?".into(),
         message: "web has 3 active workspaces. The usual limit is 3. Starting this makes 4; the maximum is 5.".into(),

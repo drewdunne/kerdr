@@ -119,6 +119,10 @@ pub struct WorkspaceRow {
 #[derive(Clone, Debug, Default)]
 pub struct Board {
     pub cards: Vec<Card>,
+    /// By card: the index of the card it sits inside (`Card::inside`), and of the cards that sit
+    /// directly inside it.
+    pub up: Vec<Option<usize>>,
+    pub down: Vec<Vec<usize>>,
     pub sessions: Vec<SessionRow>,
     pub workspaces: Vec<WorkspaceRow>,
     pub machine_order: Vec<String>,
@@ -390,6 +394,8 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         ws: Option<usize>,
         /// The tab of that workspace the feed says the work runs in.
         tab: Option<String>,
+        /// The tab of that workspace its own agent runs in, for Enter.
+        own_tab: Option<String>,
     }
     let ws_key = |w: &WsRef| (w.mi, w.session.clone(), w.ws.workspace_id.clone());
     let mut pending: Vec<Pending> = Vec::new();
@@ -415,7 +421,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                     .iter()
                     .position(|m| m.is_shown() && m.answers_to(h))
             });
-        let (mut ws, mut tab) = (None, None);
+        let (mut ws, mut tab, mut own_tab) = (None, None, None);
         if let Some(fw) = &fc.workspace
             && let (Some(session), Some(id)) = (&fw.session, &fw.id)
         {
@@ -423,6 +429,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 .iter()
                 .position(|w| w.mi == *mi && &w.session == session && &w.ws.workspace_id == id);
             tab = ws.and(fw.tab.clone()).filter(|t| !t.trim().is_empty());
+            own_tab = ws.and(fw.own_tab.clone()).filter(|t| !t.trim().is_empty());
         }
         // Work in one tab of a workspace doesn't make the workspace its own: the workspace's card
         // can still be found by name, and agents in its other tabs still show.
@@ -441,6 +448,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             home_session: fc.home.as_ref().and_then(|h| h.session.clone()),
             ws,
             tab,
+            own_tab,
         });
     }
 
@@ -586,6 +594,9 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             agents: ws.map(agent_infos).unwrap_or_default(),
             source: Source::Feed,
             progress: fc.criteria_progress(),
+            own_tab: p.own_tab.clone(),
+            inside: None,
+            link: None,
         });
     }
 
@@ -662,10 +673,14 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 .tokens
                 .get("kerdr_progress")
                 .and_then(|p| parse_progress(p)),
+            own_tab: None,
+            inside: None,
+            link: None,
         });
     }
 
     sort_cards(&mut cards);
+    crate::family::link(&mut cards);
 
     // Sessions and their slots: the feed's count when it gives one, else Kerdr's own.
     let mut sessions = Vec::new();
@@ -759,8 +774,11 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         })
         .collect();
 
+    let (up, down) = crate::family::tree(&cards);
     Board {
         cards,
+        up,
+        down,
         sessions,
         workspaces,
         machine_order,
@@ -1289,6 +1307,7 @@ mod tests {
         let mut child = feed_card("0168", "build", "active");
         child.attention = Some("needs_you".into());
         child.workspace = Some(FeedWorkspace {
+            own_tab: None,
             session: Some("default".into()),
             id: Some("w4".into()),
             label: None,
@@ -1444,6 +1463,7 @@ mod tests {
     #[test]
     fn a_card_in_a_tab_reads_that_tabs_agents_and_the_workspaces_card_the_rest() {
         let in_w1 = |tab: Option<&str>| FeedWorkspace {
+            own_tab: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
@@ -1547,6 +1567,7 @@ mod tests {
         };
         let mut child = feed_card("0246", "test", "active");
         child.workspace = Some(FeedWorkspace {
+            own_tab: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
@@ -1606,6 +1627,7 @@ mod tests {
         }
         let mut child = feed_card("0246", "build", "active");
         child.workspace = Some(FeedWorkspace {
+            own_tab: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
@@ -1648,6 +1670,7 @@ mod tests {
         let mut near = far.clone();
         near.status = Some("from the laptop".into());
         near.workspace = Some(FeedWorkspace {
+            own_tab: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,

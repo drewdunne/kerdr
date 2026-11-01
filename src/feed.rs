@@ -126,6 +126,12 @@ pub struct FeedCard {
     pub path: Option<String>,
     #[serde(default)]
     pub parent: Option<String>,
+    /// The record this one came out of, for a follow-up that isn't a child: its card holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// For an undertaker: the record whose agents it sees through, whose card holds it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub undertaker_for: Option<String>,
     /// For work under way: the agent conversation that worked it, which a reopen resumes.
     #[serde(default)]
     pub resume: Option<Resume>,
@@ -165,6 +171,10 @@ pub struct FeedWorkspace {
     /// helper in a tab of the workspace that started it). Enter lands on that tab.
     #[serde(default)]
     pub tab: Option<String>,
+    /// The tab the card's own agent runs in, as its records say: Enter on the card lands there,
+    /// never on a tab work inside the card runs in. `tab` keeps meaning work confined to one tab.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_tab: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

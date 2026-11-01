@@ -6,6 +6,7 @@ pub mod app;
 pub mod board;
 pub mod config;
 pub mod demo;
+pub mod family;
 pub mod feed;
 pub mod herdr;
 pub mod herdr_keys;

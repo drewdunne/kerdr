@@ -1016,10 +1016,14 @@ impl App {
         {
             return None;
         }
-        if !matches!(
-            self.mode,
-            Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
-        ) {
+        // On a card's own screen, only s: its selected row's agent.
+        let card_screen = matches!(self.mode, Mode::Card { .. }) && key.code == KeyCode::Char('s');
+        if !card_screen
+            && !matches!(
+                self.mode,
+                Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
+            )
+        {
             return None;
         }
         match key.code {

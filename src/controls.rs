@@ -617,7 +617,11 @@ impl App {
     fn still_on(&self, from: &CardSnapshot, made: Option<&str>) -> bool {
         matches!(
             self.mode,
-            Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
+            Mode::Board
+                | Mode::Peek { .. }
+                | Mode::Backlog { .. }
+                | Mode::Misc { .. }
+                | Mode::Card { .. }
         ) && self
             .selected_for_control()
             .is_some_and(|c| c.key == from.key && from.same_work_or(c, made))
@@ -769,6 +773,7 @@ impl App {
                 target: Some(Box::new(CardSnapshot::of(&card))),
                 queue: false,
                 ready_at: None,
+                plain: false,
             };
             Action::None
         } else {
@@ -891,6 +896,7 @@ impl App {
             target: Some(Box::new(CardSnapshot::of(&card))),
             queue: false,
             ready_at: None,
+            plain: false,
         };
         Action::None
     }
@@ -974,7 +980,7 @@ impl App {
     }
 
     /// The keys that change the selected backlog intent, the same wherever one is selected.
-    fn card_action(&mut self, key: char, count: i64) -> Action {
+    pub(super) fn card_action(&mut self, key: char, count: i64) -> Action {
         match key {
             'd' => self.intent_action("dispatch", json!({})),
             'y' => self.intent_action("refresh", json!({})),
@@ -1269,6 +1275,7 @@ impl App {
                 target,
                 queue,
                 ready_at,
+                plain,
                 ..
             } => {
                 // A question that just appeared, or a key held down, never answers it.
@@ -1307,7 +1314,9 @@ impl App {
                             );
                             return Some(Action::None);
                         }
-                        if matches!(request["action"].as_str(), Some("dispatch" | "reopen")) {
+                        if !plain
+                            && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+                        {
                             request["override"] = json!(true);
                         }
                         let action = self.emit_mutation(machine, request);
@@ -1512,6 +1521,7 @@ impl App {
                     target: from.map(Box::new),
                     queue: is_reopen && full,
                     ready_at: Some(Instant::now() + Duration::from_millis(500)),
+                    plain: false,
                 };
             }
             Ok(response) => {
