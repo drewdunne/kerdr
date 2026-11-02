@@ -556,14 +556,21 @@ impl App {
         }
     }
 
+    /// Where a refusal said a card's record lives now, while the feed still shows the home it had
+    /// when the refusal came; once the feed says anything else about its home, the feed wins.
+    pub(super) fn moved_target(&self, card: &Card) -> Option<usize> {
+        let (id, to) = self.moved_home.as_ref()?;
+        let detail = card.detail.as_ref()?;
+        let home = detail.home.as_ref().and_then(|h| h.machine.as_deref());
+        (&detail.id == id && home == self.moved_from.as_deref()).then_some(*to)
+    }
+
     /// The machine a card's record lives on, where its actions run: its home, or the machine its
     /// card came from. None, said, when its home isn't one of Kerdr's machines.
     pub(super) fn home_machine(&mut self, card: &Card) -> Option<usize> {
         // A refusal said it lives elsewhere now, before the board has caught up.
-        if let Some((id, to)) = &self.moved_home
-            && card.detail.as_ref().is_some_and(|d| &d.id == id)
-        {
-            return Some(*to);
+        if let Some(to) = self.moved_target(card) {
+            return Some(to);
         }
         let target = card
             .detail
@@ -1576,6 +1583,14 @@ impl App {
                     return;
                 }
                 Some(to) => {
+                    self.moved_from = self
+                        .board
+                        .cards
+                        .iter()
+                        .filter_map(|c| c.detail.as_ref())
+                        .find(|d| d.id == id)
+                        .and_then(|d| d.home.as_ref())
+                        .and_then(|h| h.machine.clone());
                     self.moved_home = Some((id.clone(), to));
                     let name = self.machines[to].name();
                     if !self.machines[to].conn.is_live() {
@@ -1780,15 +1795,11 @@ impl App {
         };
         let name = self.machines.get(machine).map(|m| m.name());
         // Asked where a refusal said it lives now, though the board still shows the old home.
-        let moved_here = self
-            .moved_home
-            .as_ref()
-            .is_some_and(|(m_id, m)| m_id == id && *m == machine);
         self.board.cards.iter().any(|c| {
             target.is_none_or(|t| c.key == t.key)
                 && c.detail.as_ref().is_some_and(|d| {
                     d.id == id
-                        && (moved_here
+                        && (self.moved_target(c) == Some(machine)
                             || c.machine_index == machine
                             || d.home.as_ref().and_then(|h| h.machine.as_deref())
                                 == name.as_deref())

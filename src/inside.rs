@@ -589,8 +589,10 @@ impl App {
     }
 
     /// With no own tab on record (herdr doesn't know its agent's conversation), the one tab in the
-    /// card's workspace holding an agent that is neither a helper's nor a card's inside it. None
-    /// for no such tab or several, where Enter asks instead of guessing (intent 0411).
+    /// card's workspace holding an agent that is neither a helper's nor a card's inside it, and
+    /// only when it is also the workspace's first tab with any agent in it, since the agent you
+    /// talk to starts first and children and helpers open after it. None otherwise, where Enter
+    /// asks instead of guessing (intent 0411).
     fn live_own_tab(&self, card: &Card) -> Option<String> {
         let ws = card.workspace_id.as_deref()?;
         let snap = self
@@ -611,10 +613,17 @@ impl App {
             .collect();
         tabs.sort_unstable();
         tabs.dedup();
-        match tabs.as_slice() {
-            [one] => Some((*one).to_string()),
-            _ => None,
-        }
+        let [one] = tabs.as_slice() else {
+            return None;
+        };
+        let number = |t: &str| t.rsplit_once(":t").and_then(|(_, n)| n.parse::<u32>().ok());
+        let first = snap
+            .agents
+            .iter()
+            .filter(|a| a.workspace_id == ws)
+            .filter_map(|a| a.tab_id.as_deref().and_then(number))
+            .min()?;
+        (number(one)? == first).then(|| (*one).to_string())
     }
 
     /// Enter on a card whose workspace holds other work's tabs while its records name no tab of
@@ -1138,6 +1147,27 @@ mod tests {
         app.rebuild();
         select(&mut app, "0256");
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k));
+        // The parent's own agent has ended and a child the feed doesn't show yet runs in a later
+        // tab: that tab isn't the first with an agent, so Enter asks rather than going there.
+        let mut app = families(None);
+        let data = app.machines[0].data.as_mut().unwrap();
+        let snap = data
+            .snapshots
+            .values_mut()
+            .next()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        snap.agents
+            .retain(|a| a.tab_id.as_deref() != Some("w2K:t1"));
+        snap.agents.push(agent("w2K:p3", "w2K:t3", "working"));
+        app.rebuild();
+        select(&mut app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("{:?}", app.mode)
+        };
+        assert_eq!(title, "Reopen #256's own agent?");
     }
 
     #[test]

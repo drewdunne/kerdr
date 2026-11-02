@@ -459,6 +459,9 @@ pub struct App {
     /// A record a refusal said lives on another machine, and that machine: its actions go there,
     /// and a question that machine asks can be answered yes, even before the board catches up.
     pub moved_home: Option<(String, usize)>,
+    /// The home the board's feed still showed for that record when the refusal came: the override
+    /// holds only while the feed still says so, and fresh news of its home ends it.
+    pub moved_from: Option<String>,
     /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
@@ -521,6 +524,7 @@ impl App {
             outside_warned: None,
             pending_past_outside: false,
             moved_home: None,
+            moved_from: None,
             answered_at: None,
             width: 200,
             demo: false,
@@ -1154,6 +1158,15 @@ impl App {
         if card.is_open_workspace() {
             if let Some(action) = self.own_tab_unknown(&card) {
                 return action;
+            }
+            // Going into another card now: a ⏎ or reopen still waiting its turn would take you
+            // away from it later, so it's dropped.
+            if self.pending_enter.as_ref().is_some_and(|k| *k != key)
+                || self.pending_reopen.as_ref().is_some_and(|k| *k != key)
+            {
+                self.pending_enter = None;
+                self.pending_reopen = None;
+                self.pending_past_outside = false;
             }
             return Action::Jump(key);
         }
@@ -5458,6 +5471,39 @@ mod tests {
     }
 
     #[test]
+    fn going_into_another_card_drops_the_enter_waiting_its_turn() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate { request: first, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &first);
+        let (b, _) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
+        // Enter on a card whose workspace is open goes in at once, and B no longer waits to
+        // take you away from it later.
+        let c = app
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                c.is_open_workspace()
+                    && c.key != a
+                    && c.key != b
+                    && (c.tab_id.is_some() || c.own_tab.is_some() || app.tabs_inside(c).is_empty())
+            })
+            .map(|c| c.key.clone())
+            .expect("an open card");
+        select_key(&mut app, &c);
+        assert_eq!(enter(&mut app), Action::Jump(c));
+        assert_eq!(app.pending_enter, None);
+        assert_eq!(app.pending_reopen, None);
+    }
+
+    #[test]
     fn enter_on_other_card_while_busy_queues_it_and_opens_it_after() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
@@ -5730,6 +5776,14 @@ mod tests {
         assert_eq!(app.moved_home, Some((id.clone(), 1)));
         let card = app.card(&key).cloned().unwrap();
         assert_eq!(app.home_machine(&card), Some(1));
+        // Once the feed says something new about its home, the feed wins over the refusal.
+        let mut later = card.clone();
+        later.detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some("somewhere-new".into()),
+            session: Some("ARK".into()),
+        });
+        assert_eq!(app.moved_target(&later), None);
+        assert_eq!(app.moved_target(&card), Some(1));
         // That machine's answer naming yet another home is never sent on again: Kerdr says the
         // copies disagree, and stops guessing.
         app.busy = true;
