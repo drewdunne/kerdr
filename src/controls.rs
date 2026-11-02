@@ -10,6 +10,18 @@ use serde_json::{Value, json};
 /// The most the new-intent box holds, kept under the actions' 64 KiB request limit.
 const MAX_WORDS: usize = 48_000;
 
+/// The most of an action's answer the board shows: a backend's error can run to thousands of
+/// characters, which would fill the screen (intent 0411).
+const MAX_ANSWER: usize = 300;
+
+/// An action's answer cut to what the board shows, ending in "…" when it was longer.
+fn short(text: String) -> String {
+    match text.char_indices().nth(MAX_ANSWER) {
+        Some((at, _)) => format!("{}…", text[..at].trim_end()),
+        None => text,
+    }
+}
+
 /// Work waiting to start: the only cards d, y, x, J, K and t change, so the bottom line, the
 /// menu and the keys themselves agree.
 pub(crate) fn waiting_work(card: &Card) -> bool {
@@ -544,9 +556,22 @@ impl App {
         }
     }
 
+    /// Where a refusal said a card's record lives now, while the feed still shows the home it had
+    /// when the refusal came; once the feed says anything else about its home, the feed wins.
+    pub(super) fn moved_target(&self, card: &Card) -> Option<usize> {
+        let (id, to) = self.moved_home.as_ref()?;
+        let detail = card.detail.as_ref()?;
+        let home = detail.home.as_ref().and_then(|h| h.machine.as_deref());
+        (&detail.id == id && home == self.moved_from.as_deref()).then_some(*to)
+    }
+
     /// The machine a card's record lives on, where its actions run: its home, or the machine its
     /// card came from. None, said, when its home isn't one of Kerdr's machines.
-    fn home_machine(&mut self, card: &Card) -> Option<usize> {
+    pub(super) fn home_machine(&mut self, card: &Card) -> Option<usize> {
+        // A refusal said it lives elsewhere now, before the board has caught up.
+        if let Some(to) = self.moved_target(card) {
+            return Some(to);
+        }
         let target = card
             .detail
             .as_ref()
@@ -634,7 +659,7 @@ impl App {
 
     /// Whether a list view's search is being typed: its letters are words, so no question may
     /// take them over as answers.
-    fn typing_view_search(&self) -> bool {
+    pub(super) fn typing_view_search(&self) -> bool {
         matches!(self.mode, Mode::Backlog { .. } | Mode::Misc { .. })
             && self.view_search.as_ref().is_some_and(|s| s.typing)
     }
@@ -666,6 +691,9 @@ impl App {
         } else if request["action"] == "close" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Marking {} done…", self.reference_for(id))
+        } else if request["action"] == "dispatch" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Starting {}…", self.reference_for(id))
         } else if request["action"] == "cancel" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Cancelling {}: stopping its agent…", self.reference_for(id))
@@ -675,7 +703,7 @@ impl App {
     }
 
     /// How a message names the record with this id: its card's reference, or the id.
-    fn reference_for(&self, id: &str) -> String {
+    pub(super) fn reference_for(&self, id: &str) -> String {
         self.board
             .cards
             .iter()
@@ -723,6 +751,18 @@ impl App {
                 Tone::Info,
             );
             return Action::None;
+        }
+        // d on work in a working column that no agent has run and nothing records a state for
+        // (another agent's note in its log moved it there): it does what ⏎ does, whose backend
+        // starts it when it never ran and resumes it when it did, so d and ⏎ agree (intent 0411).
+        if action == "dispatch"
+            && started
+            && card.no_agent()
+            && card.state.is_none()
+            && card.under_way()
+            && card.outside_herdr().is_none()
+        {
+            return self.reopen_action(&card);
         }
         if started && !(ends && card.closable()) {
             let reference = &card.reference;
@@ -1491,6 +1531,9 @@ impl App {
         result: Result<Response, String>,
     ) {
         self.busy = false;
+        self.busy_id = None;
+        self.busy_since = None;
+        self.busy_label.clear();
         if request["action"]
             .as_str()
             .is_some_and(|a| a.starts_with("account-"))
@@ -1498,7 +1541,79 @@ impl App {
             self.finish_account_action(machine, request, result);
             return;
         }
+        self.answered_at = Some(Instant::now());
         let from = self.action_from.take();
+        let id = request["id"].as_str().map(str::to_string);
+        let was_resent = self
+            .resent
+            .take()
+            .is_some_and(|(m, r)| m == machine && Some(r) == id);
+        // Refused because the intent lives on another machine than the one asked (a copy that
+        // was behind named the wrong home): the same request goes there, once, and its actions
+        // go there from now on. When it can't go, Kerdr says why in its own words, since the
+        // backend's "⏎ again opens it there" holds only when Kerdr sends it on (intent 0411).
+        if let Ok(response) = &result
+            && !response.ok
+            && !response.confirmation
+            && let Some(id) = id
+            && let Some(home) = response.home.as_deref()
+        {
+            let (host, session) = home.split_once('/').unwrap_or((home, ""));
+            let reference = self.reference_for(&id);
+            let asked = self
+                .machines
+                .get(machine)
+                .map(|m| m.name())
+                .unwrap_or_default();
+            match self.machine_index(host) {
+                None => {
+                    self.say(
+                        format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't open it there."),
+                        Tone::Warn,
+                    );
+                    return;
+                }
+                Some(to) if to == machine => {}
+                Some(_) if was_resent => {
+                    self.moved_home = None;
+                    self.say(
+                        format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then press ⏎ again."),
+                        Tone::Warn,
+                    );
+                    return;
+                }
+                Some(to) => {
+                    self.moved_from = self
+                        .board
+                        .cards
+                        .iter()
+                        .filter_map(|c| c.detail.as_ref())
+                        .find(|d| d.id == id)
+                        .and_then(|d| d.home.as_ref())
+                        .and_then(|h| h.machine.clone());
+                    self.moved_home = Some((id.clone(), to));
+                    let name = self.machines[to].name();
+                    if !self.machines[to].conn.is_live() {
+                        self.say(
+                            format!("{reference} lives on {name} now, and {name} isn't answering; ⏎ opens it there once it's back."),
+                            Tone::Warn,
+                        );
+                        return;
+                    }
+                    let mut request = request;
+                    if request["action"] == "reopen" && !session.is_empty() {
+                        request["session"] = json!(session);
+                    }
+                    self.say(
+                        format!("{reference} lives on {name} now; asking there."),
+                        Tone::Info,
+                    );
+                    self.resent = Some((to, id));
+                    self.resend = Some((to, request, from));
+                    return;
+                }
+            }
+        }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {
             response.confirmation
@@ -1543,7 +1658,20 @@ impl App {
                 let session = response.session.as_deref().unwrap_or("its home session");
                 let (is_reopen, full) = (request["action"] == "reopen", response.used.is_some());
                 // A reopen's answer says every reason itself: a copy open elsewhere, a full session.
-                let (title, message) = if request["action"] == "reopen" {
+                // At the most a session holds, a yes can't open it there: w, its queue, is the
+                // answer the question offers, so its title says so.
+                let at_most = is_reopen
+                    && response.used.is_some_and(|used| {
+                        self.machines
+                            .get(machine)
+                            .and_then(|m| m.feed.as_ref())
+                            .and_then(|f| f.sessions.get(session))
+                            .and_then(|s| s.max)
+                            .is_some_and(|most| used >= most)
+                    });
+                let (title, message) = if at_most {
+                    (format!("Queue {reference} in {session}?"), response.message)
+                } else if request["action"] == "reopen" {
                     (
                         format!("Reopen {reference} in {session}?"),
                         response.message,
@@ -1621,6 +1749,7 @@ impl App {
                                 label: response.label.clone().unwrap_or_else(|| workspace.clone()),
                                 session,
                                 workspace,
+                                tab: response.tab.clone(),
                                 from,
                             })
                         }
@@ -1632,7 +1761,10 @@ impl App {
                         "Your new intent wasn't saved: {message} c opens it again with your words."
                     );
                 }
-                self.say(message, if response.ok { Tone::Good } else { Tone::Warn });
+                self.say(
+                    short(message),
+                    if response.ok { Tone::Good } else { Tone::Warn },
+                );
             }
             Err(error) => {
                 if request["action"] == "create" {
@@ -1645,7 +1777,7 @@ impl App {
                         Tone::Warn,
                     );
                 }
-                self.say(error, Tone::Warn)
+                self.say(short(error), Tone::Warn)
             }
         }
     }
@@ -1662,11 +1794,13 @@ impl App {
             return false;
         };
         let name = self.machines.get(machine).map(|m| m.name());
+        // Asked where a refusal said it lives now, though the board still shows the old home.
         self.board.cards.iter().any(|c| {
             target.is_none_or(|t| c.key == t.key)
                 && c.detail.as_ref().is_some_and(|d| {
                     d.id == id
-                        && (c.machine_index == machine
+                        && (self.moved_target(c) == Some(machine)
+                            || c.machine_index == machine
                             || d.home.as_ref().and_then(|h| h.machine.as_deref())
                                 == name.as_deref())
                 })

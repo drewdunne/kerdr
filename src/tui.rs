@@ -169,6 +169,7 @@ fn event_loop(
                 open.session,
                 open.workspace,
                 Some(open.label),
+                open.tab,
             );
             if outcome == Some(Outcome::Next) {
                 // Choose from the board as it is now, as jump_cards does, not as it was on the way in.
@@ -188,12 +189,25 @@ fn event_loop(
                 }
             }
         }
-        // A card whose workspace closed as you went in: work under way reopens instead.
-        if let Some(key) = app.pending_reopen.take()
-            && let Some(card) = app.card(&key).cloned()
-            && let Action::Mutate { machine, request } = app.reopen_action(&card)
-        {
-            start_action(app, &action_tx, machine, request);
+        // Once nothing runs: a card whose workspace closed as you went in reopens, or a ⏎ pressed
+        // while another action ran opens its card (intent 0411).
+        if !app.demo {
+            match app.next_owed() {
+                Action::Mutate { machine, request } => {
+                    start_action(app, &action_tx, machine, request)
+                }
+                Action::Jump(key) => jump_cards(
+                    terminal,
+                    flags,
+                    app,
+                    live.as_deref_mut(),
+                    inbox,
+                    client_config.as_ref(),
+                    key,
+                    true,
+                ),
+                _ => {}
+            }
         }
         for ev in inbox.take() {
             app.apply(ev);
@@ -306,6 +320,7 @@ fn event_loop(
                     mi,
                     session,
                     id,
+                    None,
                     None,
                 );
             }
@@ -461,8 +476,11 @@ fn start_action(
     };
     let tx = tx.clone();
     app.busy = true;
+    app.busy_id = request["id"].as_str().map(str::to_string);
+    app.busy_since = Some(Instant::now());
+    app.busy_label = app.working_on(&request);
     if request["action"] != "account-signin" {
-        app.say(app.working_on(&request), Tone::Info);
+        app.say(app.busy_label.clone(), Tone::Info);
     }
     std::thread::spawn(move || {
         let result = crate::actions::run(&target, &command, &request);
@@ -473,7 +491,8 @@ fn start_action(
 }
 
 /// Opens herdr full screen on one workspace by its id, whether or not a card claims it yet: a
-/// workspace no card claims, or one a reopen just made. The outcome, when herdr opened.
+/// workspace no card claims, or one a reopen just made, on the tab it opened when it names one.
+/// The outcome, when herdr opened.
 #[allow(clippy::too_many_arguments)]
 fn jump_workspace(
     terminal: &mut DefaultTerminal,
@@ -485,6 +504,7 @@ fn jump_workspace(
     session: String,
     id: String,
     label: Option<String>,
+    tab: Option<String>,
 ) -> Option<Outcome> {
     let machine = app.machines[mi].name();
     if !app.machines[mi].conn.is_live() {
@@ -504,35 +524,71 @@ fn jump_workspace(
         })
         .unwrap_or_else(|| id.clone());
     let via = via_for(app, mi, &session);
-    let j = Jump {
-        machine: app.machines[mi].machine.clone(),
-        session,
-        workspace: id,
-        tab: None,
-        strict: false,
-        label,
-        others: app.needs_you_order().len(),
-        via,
-        prefix: app.prefix.clone(),
-        keys: keys_on(app, mi),
-    };
-    let outcome = jump::run(
-        terminal,
-        flags,
-        &j,
-        client_config
-            .map(|p| p.as_path())
-            .unwrap_or(std::path::Path::new("")),
-    );
+    let j = workspace_jump(app, mi, session, id, label, tab, via);
+    let outcome = run_jump(terminal, flags, app, &j, client_config);
     if let Some(l) = live.as_deref() {
         l.wake(mi);
     }
     match &outcome {
         Outcome::Failed(e) => app.say(e.clone(), Tone::Warn),
         Outcome::Closed => app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn),
-        Outcome::Board | Outcome::Next | Outcome::TabGone => {}
+        Outcome::Stopped => app.say(stopped(&j.session, &j.machine.name), Tone::Warn),
+        Outcome::TabGone => app.say(
+            format!("{}'s new tab closed before Kerdr got there.", j.label),
+            Tone::Warn,
+        ),
+        Outcome::Board | Outcome::Next => {}
     }
     Some(outcome)
+}
+
+/// The jump into one workspace by its id: onto the tab a reopen opened there, and only that tab,
+/// when it names one, since the workspace's active tab is still whatever was there before.
+fn workspace_jump(
+    app: &App,
+    mi: usize,
+    session: String,
+    id: String,
+    label: String,
+    tab: Option<String>,
+    via: jump::Via,
+) -> Jump {
+    Jump {
+        machine: app.machines[mi].machine.clone(),
+        session,
+        workspace: id,
+        strict: tab.is_some(),
+        tab,
+        label,
+        others: app.needs_you_order().len(),
+        via,
+        prefix: app.prefix.clone(),
+        keys: keys_on(app, mi),
+    }
+}
+
+/// Goes into herdr, saying first that it's opening the card, since herdr's own calls can take
+/// seconds on a slow connection and the board would look frozen meanwhile (intent 0411).
+fn run_jump(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    j: &Jump,
+    client_config: Option<&PathBuf>,
+) -> Outcome {
+    let opening = jump::opening(&j.label, &j.machine.name, j.machine.ssh.is_none());
+    app.say(opening.clone(), Tone::Info);
+    let _ = terminal.draw(|f| crate::ui::draw(f, app));
+    let outcome = jump::run(
+        terminal,
+        flags,
+        j,
+        client_config
+            .map(|p| p.as_path())
+            .unwrap_or(std::path::Path::new("")),
+    );
+    app.unsay(&opening);
+    outcome
 }
 
 /// Whether Kerdr's two keys are installed in that machine's herdr config.
@@ -614,15 +670,8 @@ fn jump_cards(
             prefix: app.prefix.clone(),
             keys: keys_on(app, mi),
         };
-        let outcome = jump::run(
-            terminal,
-            flags,
-            &j,
-            client_config
-                .map(|p| p.as_path())
-                .unwrap_or(std::path::Path::new("")),
-        );
-        let choosing_next = matches!(outcome, Outcome::Next | Outcome::Closed);
+        let outcome = run_jump(terminal, flags, app, &j, client_config);
+        let choosing_next = matches!(outcome, Outcome::Next | Outcome::Closed | Outcome::Stopped);
         read_again(app, live.as_deref(), inbox, mi, choosing_next);
         match outcome {
             Outcome::Board => return,
@@ -641,6 +690,15 @@ fn jump_cards(
                 return;
             }
             Outcome::Closed => closed_on_the_way.push(key.clone()),
+            // Its herdr session has stopped: work under way or done reopens, which starts the
+            // session again; otherwise say so.
+            Outcome::Stopped if yours => {
+                if !app.closed_under_you(&key, card.workspace_id.as_deref()) {
+                    app.say(stopped(&j.session, &app.machines[mi].name()), Tone::Warn);
+                }
+                return;
+            }
+            Outcome::Stopped => closed_on_the_way.push(key.clone()),
             // The tab you picked has closed: a piece's reopens, a card's own asks to reopen it.
             Outcome::TabGone if yours => {
                 app.tab_gone(&key);
@@ -688,6 +746,11 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
     }
 }
 
+/// What the board says when herdr's session there isn't running.
+fn stopped(session: &str, machine: &str) -> String {
+    format!("herdr session {session} on {machine} has stopped since the board last read it.")
+}
+
 /// What the board says when herdr finds that a workspace has closed.
 fn closed(workspace: &str) -> String {
     format!("{workspace} has closed since the board last read it.")
@@ -715,5 +778,38 @@ fn open_signin(app: &mut App, url: &str) {
             format!("Could not open the browser: {error}. Copy the link instead (c, or l where the page takes a code)."),
             Tone::Warn,
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_reopen_that_opened_a_tab_lands_on_that_tab_only() {
+        let app = App::new(
+            crate::config::Config::default(),
+            crate::demo::machines(false),
+        );
+        let j = workspace_jump(
+            &app,
+            0,
+            "web".into(),
+            "w4".into(),
+            "41-checkout".into(),
+            Some("w4:t2".into()),
+            jump::Via::Local,
+        );
+        assert_eq!((j.tab.as_deref(), j.strict), (Some("w4:t2"), true));
+        let j = workspace_jump(
+            &app,
+            0,
+            "web".into(),
+            "w4".into(),
+            "41-checkout".into(),
+            None,
+            jump::Via::Local,
+        );
+        assert_eq!((j.tab, j.strict), (None, false));
     }
 }

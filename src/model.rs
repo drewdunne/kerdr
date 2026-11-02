@@ -330,6 +330,15 @@ impl Card {
             && self.agents.is_empty()
     }
 
+    /// Where the conversation working it runs, when that's a terminal outside herdr and no
+    /// workspace is open on it: ⏎ says so rather than offer a second copy (intent 0411).
+    pub fn outside_herdr(&self) -> Option<&crate::feed::OutsideHerdr> {
+        if self.is_open_workspace() {
+            return None;
+        }
+        self.detail.as_ref()?.outside_herdr.as_ref()
+    }
+
     /// Open work that `C` can mark done, and `x` set aside, without starting anything: a record
     /// that isn't done, dismissed or still being written up, with no workspace open. The action
     /// backend still refuses one it finds an agent at (intent 0289).

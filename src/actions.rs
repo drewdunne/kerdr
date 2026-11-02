@@ -39,6 +39,11 @@ pub struct Response {
     pub label: Option<String>,
     /// With a confirmation: a token of what it asked about, sent back with the yes.
     pub confirm: Option<String>,
+    /// The tab in `workspace` to land on, when a reopen opened one in a workspace already open.
+    pub tab: Option<String>,
+    /// With a refusal: the intent's home, `<Machine>/<Session>`, when it lives on another machine
+    /// than the one asked. Kerdr asks that machine instead, once (intent 0411).
+    pub home: Option<String>,
 }
 
 fn confirmation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -99,7 +104,36 @@ fn most_bytes(request: &Value) -> usize {
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
-    run_with_deadline(machine, command, request, Duration::from_secs(120))
+    run_with_deadline(machine, command, request, deadline_for(request))
+}
+
+/// How long an action may take before Kerdr stops waiting. Starting or reopening work can take
+/// minutes: a start on another machine waits up to four for it there, so those two get five, and
+/// the backend always answers first (intent 0411).
+pub fn deadline_for(request: &Value) -> Duration {
+    if starts_work(request) {
+        Duration::from_secs(300)
+    } else {
+        Duration::from_secs(120)
+    }
+}
+
+/// Whether a request starts work: a start (d) or a reopen (⏎).
+fn starts_work(request: &Value) -> bool {
+    matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+}
+
+/// How a message names the record a request is for: `#391` for `0391`.
+fn reference(request: &Value) -> String {
+    let id = request["id"].as_str().unwrap_or_default();
+    let trimmed = id.trim_start_matches('0');
+    if id.is_empty() {
+        "this work".into()
+    } else if trimmed.is_empty() || !trimmed.chars().all(|c| c.is_ascii_digit()) {
+        id.to_string()
+    } else {
+        format!("#{trimmed}")
+    }
 }
 
 fn run_with_deadline(
@@ -130,6 +164,24 @@ fn run_with_deadline(
     let output = transport::run_adapter(&target, command, Some(&json), deadline);
     let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
+        if starts_work(request) {
+            let verb = if request["action"] == "reopen" {
+                "Reopening"
+            } else {
+                "Starting"
+            };
+            let minutes = deadline.as_secs().div_ceil(60);
+            let how_long = match minutes {
+                0 | 1 => "a minute".to_string(),
+                2 => "two minutes".into(),
+                5 => "five minutes".into(),
+                n => format!("{n} minutes"),
+            };
+            return Err(format!(
+                "{verb} {} is taking more than {how_long}; it may still open. Look at its card before trying again.",
+                reference(request)
+            ));
+        }
         return Err("the action timed out; its result is unknown. Check the canonical record before trying again. Do not retry automatically.".into());
     }
     if output.stdout.len() > MAX_JSON_BYTES {
@@ -139,7 +191,7 @@ fn run_with_deadline(
     // so parse it before interpreting process status.
     parse_response(&output.stdout).map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.user_code, &mut response.expires].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.user_code, &mut response.expires].into_iter().flatten() {
             *text = redact(text);
         }
         // A status the protocol knows stays as it is, even when it matches what was sent (a code
@@ -448,13 +500,71 @@ mod tests {
         let error = run_with_deadline(
             &machine(),
             &command,
-            &json!({"action":"dispatch","id":"4"}),
+            &json!({"action":"refresh","id":"4"}),
             Duration::from_millis(60),
         )
         .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
         assert!(error.contains("result is unknown"), "{error}");
         assert!(error.contains("Do not retry automatically"), "{error}");
+    }
+
+    #[test]
+    fn starting_or_reopening_work_gets_five_minutes_and_says_it_may_still_open() {
+        assert_eq!(
+            deadline_for(&json!({"action":"dispatch","id":"4"})),
+            Duration::from_secs(300)
+        );
+        assert_eq!(
+            deadline_for(&json!({"action":"reopen","id":"4"})),
+            Duration::from_secs(300)
+        );
+        for action in ["close", "create", "refresh", "account-test"] {
+            assert_eq!(
+                deadline_for(&json!({"action":action})),
+                Duration::from_secs(120),
+                "{action}"
+            );
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\nsleep 5\n",
+            "[Console]::In.ReadToEnd() | Out-Null; Start-Sleep 5",
+        );
+        for (action, verb) in [("dispatch", "Starting #391"), ("reopen", "Reopening #391")] {
+            let error = run_with_deadline(
+                &machine(),
+                &command,
+                &json!({"action":action,"id":"0391"}),
+                Duration::from_millis(60),
+            )
+            .unwrap_err();
+            assert!(error.starts_with(verb), "{error}");
+            assert!(error.contains("is taking more than"), "{error}");
+            assert!(error.contains("may still open"), "{error}");
+            assert!(!error.contains("canonical record"), "{error}");
+            assert!(!error.contains("Do not retry"), "{error}");
+        }
+    }
+
+    #[test]
+    fn a_reopen_names_its_new_tab_and_a_refusal_the_intents_home() {
+        let reopened = parse_response(
+            r#"{"ok":true,"message":"m","session":"S","workspace":"w4","tab":"w4:t2"}"#,
+        )
+        .unwrap();
+        assert_eq!(reopened.tab.as_deref(), Some("w4:t2"));
+        let plain =
+            parse_response(r#"{"ok":true,"message":"m","session":"S","workspace":"w4"}"#).unwrap();
+        assert_eq!(plain.tab, None);
+        assert_eq!(plain.home, None);
+        let moved = parse_response(
+            r##"{"ok":false,"message":"#7 lives on build-box now (ARK); ⏎ again opens it there.","home":"build-box/ARK"}"##,
+        )
+        .unwrap();
+        assert!(!moved.ok);
+        assert_eq!(moved.home.as_deref(), Some("build-box/ARK"));
     }
 
     #[test]

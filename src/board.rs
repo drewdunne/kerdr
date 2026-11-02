@@ -339,9 +339,11 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     let mut claimed: HashSet<(usize, String, String)> = HashSet::new();
     let mut cards = Vec::new();
 
-    // One copy of each feed card: the one from its home machine; when copies name different homes
-    // (a record with none, whose machines each name themselves where its work is), the one that
-    // can resume its agent's conversation; else one that's live.
+    // One copy of each feed card: first the one whose workspace is open on its machine, since a
+    // copy that hasn't caught up with a move can't name the moved work's live workspace (intent
+    // 0411); then the one from its home machine; when copies name different homes (a record with
+    // none, or two copies a moment apart, each naming itself), the one that can resume its
+    // agent's conversation; else one that's live.
     let mut chosen: BTreeMap<String, (usize, &FeedCard, &Feed)> = BTreeMap::new();
     for (mi, m) in machines.iter().enumerate() {
         if !m.is_shown() {
@@ -367,12 +369,27 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                     .is_some_and(|h| machines[mi].answers_to(h))
             };
             let resumes = |c: &FeedCard| c.resume.is_some();
+            // Whether the workspace a copy names is open in its machine's herdr right now.
+            // A machine that isn't answering shows its last snapshot, which proves nothing now.
+            let open_here = |c: &FeedCard, mi: usize| {
+                machines[mi].conn.is_live()
+                    && c.workspace.as_ref().is_some_and(|w| {
+                        all_ws.iter().any(|r| {
+                            r.mi == mi
+                                && Some(r.session.as_str()) == w.session.as_deref()
+                                && Some(r.ws.workspace_id.as_str()) == w.id.as_deref()
+                        })
+                    })
+            };
             let better = match chosen.get(&key) {
                 None => true,
                 Some((pmi, pfc, _)) => {
+                    let (open, was_open) = (open_here(fc, mi), open_here(pfc, *pmi));
                     let (here, there) = (home_here(fc, mi), home_here(pfc, *pmi));
-                    (here && !there)
-                        || (here == there
+                    (open && !was_open)
+                        || (open == was_open && here && !there)
+                        || (open == was_open
+                            && here == there
                             && ((resumes(fc) && !resumes(pfc))
                                 || (resumes(fc) == resumes(pfc)
                                     && m.conn.is_live()
@@ -1822,6 +1839,135 @@ mod tests {
                     "server first: {server_first}, server resumes: {server_resumes}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_cached_workspace_on_a_silent_machine_never_beats_the_live_home() {
+        // The laptop's last snapshot still shows the workspace, but the laptop isn't answering;
+        // build-box, live and home, says the work's workspace has closed. Its copy wins either
+        // way round, so Enter offers to reopen it there (intent 0411).
+        for laptop_first in [true, false] {
+            let named = |c: &mut FeedCard, home: &str| {
+                c.home = Some(Home {
+                    machine: Some(home.into()),
+                    session: Some("ARK".into()),
+                });
+            };
+            let mut old = feed_card("0255", "build", "active");
+            named(&mut old, "laptop");
+            old.workspace = Some(FeedWorkspace {
+                session: Some("ARK".into()),
+                id: Some("w11".into()),
+                label: Some("55-themes".into()),
+                ..Default::default()
+            });
+            let mut home = feed_card("0255", "build", "active");
+            named(&mut home, "build-box");
+            let feed = |c: FeedCard| {
+                Some(Feed {
+                    kerdr_feed: 1,
+                    cards: vec![c],
+                    ..Default::default()
+                })
+            };
+            let mut laptop = live(
+                machine("laptop", laptop_first),
+                vec![(
+                    "ARK",
+                    Snapshot {
+                        workspaces: vec![ws("w11", "55-themes")],
+                        ..Default::default()
+                    },
+                )],
+                feed(old),
+            );
+            laptop.last_ok = Some(Local::now());
+            laptop.conn = Conn::Reconnecting {
+                since: Local::now(),
+                attempt: 1,
+                retry_at: Local::now(),
+                detail: "timed out".into(),
+            };
+            let server = live(
+                machine("build-box", !laptop_first),
+                vec![("ARK", Snapshot::default())],
+                feed(home),
+            );
+            let machines = if laptop_first {
+                [laptop, server]
+            } else {
+                [server, laptop]
+            };
+            let board = build(&machines, &Config::default());
+            let card = board.cards.iter().find(|c| c.reference == "#255").unwrap();
+            assert_eq!(card.machine, "build-box", "laptop first: {laptop_first}");
+            assert_eq!(card.workspace_id, None, "laptop first: {laptop_first}");
+        }
+    }
+
+    #[test]
+    fn a_copy_with_its_workspace_open_beats_a_stale_home_copy() {
+        // The work moved from the laptop to build-box and started there; the laptop's copy hasn't
+        // caught up and still names the laptop as home, with no workspace. Wherever the laptop
+        // is listed, the copy whose workspace is open wins (intent 0411).
+        for laptop_first in [true, false] {
+            let mut stale = feed_card("0255", "backlog", "queued");
+            stale.home = Some(Home {
+                machine: Some("laptop".into()),
+                session: Some("default".into()),
+            });
+            let mut fresh = feed_card("0255", "build", "background");
+            fresh.home = Some(Home {
+                machine: Some("build-box".into()),
+                session: Some("ARK".into()),
+            });
+            fresh.workspace = Some(FeedWorkspace {
+                session: Some("ARK".into()),
+                id: Some("w11".into()),
+                label: Some("55-themes".into()),
+                ..Default::default()
+            });
+            let feed = |c: FeedCard| {
+                Some(Feed {
+                    kerdr_feed: 1,
+                    cards: vec![c],
+                    ..Default::default()
+                })
+            };
+            let laptop = live(
+                machine("laptop", laptop_first),
+                vec![("default", Snapshot::default())],
+                feed(stale),
+            );
+            let server = live(
+                machine("build-box", !laptop_first),
+                vec![(
+                    "ARK",
+                    Snapshot {
+                        workspaces: vec![ws("w11", "55-themes")],
+                        ..Default::default()
+                    },
+                )],
+                feed(fresh),
+            );
+            let machines = if laptop_first {
+                [laptop, server]
+            } else {
+                [server, laptop]
+            };
+            let board = build(&machines, &Config::default());
+            let card = board.cards.iter().find(|c| c.reference == "#255").unwrap();
+            assert_eq!(card.machine, "build-box", "laptop first: {laptop_first}");
+            assert_eq!(card.workspace_id.as_deref(), Some("w11"));
+            assert_eq!(card.stage, Stage::Build);
+            assert_eq!(
+                card.detail
+                    .as_ref()
+                    .and_then(|d| d.home.as_ref())
+                    .and_then(|h| h.machine.as_deref()),
+                Some("build-box")
+            );
         }
     }
 

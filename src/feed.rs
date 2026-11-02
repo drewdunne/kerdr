@@ -140,6 +140,47 @@ pub struct FeedCard {
     /// starting nothing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_agent: bool,
+    /// The conversation working it runs in a terminal outside herdr, so no workspace shows it:
+    /// which terminal, and since when (intent 0411).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outside_herdr: Option<OutsideHerdr>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct OutsideHerdr {
+    /// The terminal it runs in, as its process is named (`foot`, `kitty`, `sshd`).
+    #[serde(default)]
+    pub terminal: Option<String>,
+    /// When its process started, as an ISO time.
+    #[serde(default)]
+    pub since: Option<String>,
+}
+
+impl OutsideHerdr {
+    /// Where it runs, in a word or two for a card: "foot", "SSH", "terminal".
+    pub fn short(&self) -> String {
+        match self
+            .terminal
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            Some("sshd") => "SSH".into(),
+            Some(t) if t.starts_with("tmux") => "tmux".into(),
+            Some("code") => "editor".into(),
+            Some(t) => t.trim_end_matches('-').to_string(),
+            None => "terminal".into(),
+        }
+    }
+
+    /// Where it runs, for a sentence: "a foot window", "an SSH login", "a terminal window".
+    pub fn place(&self) -> String {
+        match self.short().as_str() {
+            "SSH" => "an SSH login".into(),
+            "editor" => "an editor window".into(),
+            t => format!("a {t} window"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

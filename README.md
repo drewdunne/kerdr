@@ -133,6 +133,26 @@ Kerdr takes you straight in. The backend asks first when that would go past the 
 workspace limit or the conversation may still be open somewhere else. See
 [docs/feed.md](docs/feed.md#reopening-work-whose-workspace-closed).
 
+Kerdr runs one reopen, start or other change at a time, but `Enter` is never dropped while one
+runs. On the card already being reopened it says how long that has taken; on any other card it
+waits its turn, says so ("#41 opens once #39's answer is in"), and opens it as soon as the
+running one answers, after its answer has been on screen a moment. A newer `Enter` replaces the
+waiting one, and `Esc` on the board drops it (elsewhere `Esc` keeps its own job, such as saying no
+to a question, and the waiting one keeps waiting). While herdr
+gets ready on a card, the board says "Opening …", and keys pressed meanwhile are thrown away
+rather than reaching the agent's prompt.
+
+When `Enter` can't open a card, Kerdr says why in plain words. If herdr's window closes as soon as
+it opens (SSH failing, herdr updating itself, versions that don't match), herdr's own message stays
+on the screen until you press Enter. A herdr session that has stopped counts as a closed workspace,
+so work under way reopens. A reopen that opened a new tab lands on that tab. When a card's
+conversation runs in a terminal outside herdr, `Enter` says which and sends nothing; a second
+`Enter` within five seconds goes on to ask about a second copy, even when it has to wait its turn.
+When the machine asked turns out not to be the work's home any more, Kerdr asks its home instead,
+once, and sends that work's actions there until the board catches up; when it can't (a machine it
+doesn't list, or one not answering), it says so in its own words. Answers longer than 300
+characters are cut short.
+
 Done work isn't a dead end either. When an agent finishes and wraps itself before you're done
 talking about it, `Enter` on its card in Maintain asks to reopen it: the backend always asks
 first, saying it's done, and only your yes opens it again and resumes its conversation. See
