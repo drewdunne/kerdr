@@ -26,8 +26,11 @@ const SETTLED_READS: u8 = 2;
 /// What the board shows for a change while its command runs.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Effect {
-    /// `dispatch`: out of the backlog and starting.
+    /// `dispatch`, unanswered: where it is, saying it's starting. It stays put, so a question the
+    /// backend asks first still finds it where it was.
     Starting,
+    /// `dispatch`, answered yes: out of the backlog, under way.
+    Started,
     /// `reopen`: where it is, saying so.
     Reopening,
     /// `close`: done.
@@ -48,6 +51,10 @@ impl Effect {
     fn apply(&self, fc: &mut FeedCard, key: &str) {
         match self {
             Effect::Starting => {
+                fc.status = Some("Starting…".into());
+                fc.no_agent = false;
+            }
+            Effect::Started => {
                 fc.state = Some("active".into());
                 if !fc
                     .stage
@@ -103,7 +110,7 @@ impl Effect {
     fn shown(&self, fc: &FeedCard, feed: &Feed) -> bool {
         let state = fc.state.as_deref().unwrap_or("active");
         match self {
-            Effect::Starting => !matches!(state, "queued" | "shelved" | "none"),
+            Effect::Starting | Effect::Started => !matches!(state, "queued" | "shelved" | "none"),
             Effect::Reopening => fc.workspace.as_ref().is_some_and(|w| w.id.is_some()),
             Effect::Close => state == "closed",
             Effect::SetAside => fc.disposition.as_deref() == Some("wont_do"),
@@ -153,6 +160,12 @@ impl Job {
     pub fn starts(&self) -> bool {
         matches!(self.request["action"].as_str(), Some("dispatch" | "reopen"))
     }
+
+    /// Whether it reorders a backlog: moves on one machine reach it one at a time, since each
+    /// is shown, and saved, as a change to the order the one before left.
+    fn moves(&self) -> bool {
+        self.request["action"] == "move"
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -196,10 +209,11 @@ impl Resolver {
             if job.running.is_some() || job.settled.is_some() {
                 continue;
             }
-            let ahead = job.record().is_some_and(|id| {
-                self.jobs[..i].iter().any(|j| {
-                    j.settled.is_none() && j.record() == Some(id) && j.machine == job.machine
-                })
+            let ahead = self.jobs[..i].iter().any(|j| {
+                j.settled.is_none()
+                    && j.machine == job.machine
+                    && ((job.record().is_some() && j.record() == job.record())
+                        || (job.moves() && j.moves()))
             });
             if ahead {
                 continue;
@@ -223,35 +237,70 @@ impl Resolver {
             return;
         }
         job.settled = Some((Instant::now(), 0));
-        self.jobs.push(job);
+        if job.effect == Some(Effect::Starting) {
+            job.effect = Some(Effect::Started);
+        }
+        // Back in its place: effects are laid over the board in the order they were made.
+        let at = self.jobs.partition_point(|j| j.n < job.n);
+        self.jobs.insert(at, job);
+    }
+
+    /// A move on `machine` failed: the moves made after it showed orders that counted on it, so
+    /// they show nothing more; the feed shows what they did once it has it.
+    pub fn forget_moves_after(&mut self, machine: usize, n: u64) {
+        for j in self
+            .jobs
+            .iter_mut()
+            .filter(|j| j.n > n && j.machine == machine && j.moves())
+        {
+            j.effect = None;
+        }
+        self.jobs
+            .retain(|j| j.settled.is_none() || j.effect.is_some());
     }
 
     /// A read of `machine` came in: settled effects it shows, or that have waited long enough, go.
     /// Whether any went.
     pub fn read(&mut self, machine: usize, feed: Option<&Feed>) -> bool {
         let before = self.jobs.len();
+        let shown = |j: &Job| {
+            feed.is_some_and(|feed| {
+                let (Some(key), Some(effect)) = (&j.key, &j.effect) else {
+                    return true;
+                };
+                let source = feed.source.as_deref().unwrap_or("feed");
+                feed.cards
+                    .iter()
+                    .find(|c| &format!("{source}:{}", c.id) == key)
+                    .is_some_and(|c| effect.shown(c, feed))
+            })
+        };
+        // A later change to a record the feed shows speaks for the ones before it: a dismiss then
+        // a restore, both saved, mustn't leave the dismiss up once the restore is read.
+        let latest: Vec<(String, u64)> = self
+            .jobs
+            .iter()
+            .filter(|j| j.settled.is_some() && j.machine == machine && shown(j))
+            .filter_map(|j| j.key.clone().map(|k| (k, j.n)))
+            .collect();
         self.jobs.retain_mut(|j| {
             let Some((at, reads)) = j.settled.as_mut() else {
                 return true;
             };
             if j.machine == machine {
                 *reads = reads.saturating_add(1);
-                let shown = feed.is_some_and(|feed| {
-                    let (Some(key), Some(effect)) = (&j.key, &j.effect) else {
-                        return true;
-                    };
-                    let source = feed.source.as_deref().unwrap_or("feed");
-                    feed.cards
-                        .iter()
-                        .find(|c| &format!("{source}:{}", c.id) == key)
-                        .is_some_and(|c| effect.shown(c, feed))
-                });
-                if shown || *reads >= SETTLED_READS {
+                let superseded = latest
+                    .iter()
+                    .any(|(k, n)| Some(k) == j.key.as_ref() && *n > j.n);
+                if superseded || *reads >= SETTLED_READS {
                     return false;
                 }
             }
             at.elapsed() < SETTLED_MOST
         });
+        // What the feed shows now speaks for itself.
+        self.jobs
+            .retain(|j| !(j.settled.is_some() && j.machine == machine && shown(j)));
         self.jobs.len() != before
     }
 
@@ -306,11 +355,12 @@ impl Resolver {
         any
     }
 
-    /// The unanswered change to this record that starts work, if one is on its way.
+    /// The change to this record that starts work, while it's on its way or answered but not yet
+    /// in the feed: another start or reopen meanwhile would be a second copy.
     pub fn starting(&self, id: &str) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.settled.is_none() && j.starts() && j.record() == Some(id))
+            .find(|j| j.starts() && j.record() == Some(id))
     }
 
     /// The unanswered change sending this action for this record, oldest first.
@@ -532,25 +582,169 @@ mod tests {
         let job = r.take(n).unwrap();
         r.settle(job);
         assert!(
-            r.starting("7").is_none(),
-            "answered: the feed and the start guard take over"
+            r.starting("7").is_some(),
+            "answered but not in the feed yet: still no second start"
         );
-        let mut fc: FeedCard = serde_json::from_value(
-            json!({"id":"7","title":"t","state":"queued","stage":"backlog"}),
-        )
-        .unwrap();
+        r.read(
+            0,
+            Some(&feed(json!([{"id":"7","title":"t","state":"active"}]))),
+        );
+        assert!(r.starting("7").is_none(), "the feed has it");
+        let queued = json!({"id":"7","title":"t","state":"queued","stage":"backlog"});
+        let mut fc: FeedCard = serde_json::from_value(queued.clone()).unwrap();
         Effect::Starting.apply(&mut fc, "s:7");
+        assert_eq!(
+            (
+                fc.state.as_deref(),
+                fc.stage.as_deref(),
+                fc.status.as_deref()
+            ),
+            (Some("queued"), Some("backlog"), Some("Starting…")),
+            "unanswered, it stays where a question would find it"
+        );
+        let mut fc: FeedCard = serde_json::from_value(queued).unwrap();
+        Effect::Started.apply(&mut fc, "s:7");
         assert_eq!(
             (fc.state.as_deref(), fc.stage.as_deref()),
             (Some("active"), Some("build"))
         );
         let mut fc: FeedCard =
             serde_json::from_value(json!({"id":"7","title":"t","stage":"design"})).unwrap();
-        Effect::Starting.apply(&mut fc, "s:7");
+        Effect::Started.apply(&mut fc, "s:7");
         assert_eq!(
             fc.stage.as_deref(),
             Some("design"),
             "a working column it names stays"
+        );
+    }
+
+    #[test]
+    fn moves_on_one_machine_go_one_at_a_time_whatever_the_card() {
+        let mut r = Resolver::default();
+        let a = r.add(
+            0,
+            json!({"action":"move","id":"1","delta":1}),
+            None,
+            None,
+            None,
+        );
+        r.add(
+            0,
+            json!({"action":"move","id":"2","delta":1}),
+            None,
+            None,
+            None,
+        );
+        let other = r.add(
+            1,
+            json!({"action":"move","id":"3","delta":1}),
+            None,
+            None,
+            None,
+        );
+        let first: Vec<u64> = r.ready().into_iter().map(|(n, ..)| n).collect();
+        assert_eq!(
+            first,
+            vec![a, other],
+            "another machine's backlog is its own"
+        );
+    }
+
+    #[test]
+    fn an_answered_change_keeps_its_place_among_the_effects() {
+        // J then K on one card: J's answer mustn't put its order over K's.
+        let mut r = Resolver::default();
+        let down = Effect::Order(vec![("s:2".into(), 0), ("s:1".into(), 1)]);
+        let up = Effect::Order(vec![("s:1".into(), 0), ("s:2".into(), 1)]);
+        let j = r.add(
+            0,
+            json!({"action":"move","id":"1","delta":1}),
+            None,
+            Some("s:1".into()),
+            Some(down),
+        );
+        r.add(
+            0,
+            json!({"action":"move","id":"1","delta":-1}),
+            None,
+            Some("s:1".into()),
+            Some(up),
+        );
+        r.ready();
+        let job = r.take(j).unwrap();
+        r.settle(job);
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(json!([{"id":"1","title":"a"},{"id":"2","title":"b"}])));
+        let shown = r.overlay(std::slice::from_ref(&m));
+        let ranks: Vec<_> = shown[0]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .map(|c| c.backlog_rank)
+            .collect();
+        assert_eq!(ranks, vec![Some(0), Some(1)], "K, made last, still shows");
+    }
+
+    #[test]
+    fn a_failed_move_takes_the_later_moves_effects_with_it() {
+        let mut r = Resolver::default();
+        let order = || Some(Effect::Order(vec![("s:1".into(), 0)]));
+        let a = r.add(
+            0,
+            json!({"action":"move","id":"1","delta":1}),
+            None,
+            Some("s:1".into()),
+            order(),
+        );
+        r.add(
+            0,
+            json!({"action":"move","id":"2","delta":1}),
+            None,
+            Some("s:2".into()),
+            order(),
+        );
+        r.add(
+            1,
+            json!({"action":"move","id":"3","delta":1}),
+            None,
+            Some("s:3".into()),
+            order(),
+        );
+        r.ready();
+        r.take(a);
+        r.forget_moves_after(0, a);
+        assert_eq!(
+            r.jobs.iter().filter(|j| j.effect.is_some()).count(),
+            1,
+            "only the other machine's"
+        );
+        assert_eq!(r.unanswered(), 2, "the later move still runs");
+    }
+
+    #[test]
+    fn the_feed_showing_a_later_change_retires_the_earlier_ones() {
+        let mut r = Resolver::default();
+        for (action, effect) in [("dismiss", Effect::SetAside), ("restore", Effect::Restore)] {
+            let n = r.add(
+                0,
+                json!({"action":action,"id":"1"}),
+                None,
+                Some("s:1".into()),
+                Some(effect),
+            );
+            r.ready();
+            let job = r.take(n).unwrap();
+            r.settle(job);
+        }
+        r.read(
+            0,
+            Some(&feed(json!([{"id":"1","title":"t","state":"queued"}]))),
+        );
+        assert!(
+            !r.shows(),
+            "the restore is read, so the dismiss before it goes too"
         );
     }
 }

@@ -1626,8 +1626,13 @@ impl App {
         if result.as_ref().is_ok_and(|r| r.ok && !r.confirmation) {
             // It stays as shown until the feed has it.
             self.resolver.settle(job);
-        } else if job.effect.is_some() {
-            self.rebuild();
+        } else {
+            if job.request["action"] == "move" {
+                self.resolver.forget_moves_after(machine, job.n);
+            }
+            if job.effect.is_some() {
+                self.rebuild();
+            }
         }
         self.finish_action(machine, request, result);
         // Not asked or taken anywhere: nothing else is owed to that card.
@@ -1698,10 +1703,18 @@ impl App {
         self.answered_at = Some(Instant::now());
         let from = self.action_from.take();
         let id = request["id"].as_str().map(str::to_string);
-        let was_resent = self
+        // Only this answer's own resend: another record's, still on its way, stays guarded.
+        let was_resent = match self
             .resent
-            .take()
-            .is_some_and(|(m, r)| m == machine && Some(r) == id);
+            .iter()
+            .position(|(m, r)| *m == machine && Some(r) == id.as_ref())
+        {
+            Some(i) => {
+                self.resent.remove(i);
+                true
+            }
+            None => false,
+        };
         // Refused because the intent lives on another machine than the one asked (a copy that
         // was behind named the wrong home): the same request goes there, once, and its actions
         // go there from now on. When it can't go, Kerdr says why in its own words, since the
@@ -1756,8 +1769,8 @@ impl App {
                         request["session"] = json!(session);
                     }
                     // Sent on quietly: the card still shows the change while it goes there.
-                    self.resent = Some((to, id));
-                    self.resend = Some((to, request, from));
+                    self.resent.push((to, id));
+                    self.resend.push_back((to, request, from));
                     return;
                 }
             }

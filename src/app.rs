@@ -445,6 +445,8 @@ pub struct App {
     pub sel: Selection,
     pub mode: Mode,
     pub message: Option<(String, Tone, Instant)>,
+    /// The latest thing said while a failure was up, shown once it's taken down.
+    pub held: Option<(String, Tone)>,
     /// A card to jump into as soon as its machine answers.
     pub pending_jump: Option<PendingJump>,
     /// The workspace a reopen just made, to go into now.
@@ -461,12 +463,13 @@ pub struct App {
     /// A card ⏎ was pressed on while another action ran: it opens, as ⏎ would, once that action
     /// has answered. One deep; a newer ⏎ replaces it, and Esc drops it (intent 0411).
     pub pending_enter: Option<String>,
-    /// An action refused because its intent lives on another machine than the one asked: the
-    /// same request, to send there next, and the card it was asked from (intent 0411).
-    pub resend: Option<(usize, serde_json::Value, Option<CardSnapshot>)>,
-    /// The machine and record of the last such resend: its answer is shown as it is, never
-    /// sent on again, so one ⏎ asks two machines at most.
-    pub resent: Option<(usize, String)>,
+    /// Actions refused because their intent lives on another machine than the one asked: each
+    /// request, to send there next, and the card it was asked from (intent 0411). Several can
+    /// answer at once now that changes run side by side (intent 0416), so they wait in order.
+    pub resend: std::collections::VecDeque<(usize, serde_json::Value, Option<CardSnapshot>)>,
+    /// The machine and record of each such resend still unanswered: its answer is shown as it
+    /// is, never sent on again, so one ⏎ asks two machines at most.
+    pub resent: Vec<(usize, String)>,
     /// A card whose conversation runs outside herdr, and when ⏎ said so: a second ⏎ on it soon
     /// after goes on to the reopen question (intent 0411).
     pub outside_warned: Option<(String, Instant)>,
@@ -531,14 +534,15 @@ impl App {
             sel: Selection::default(),
             mode: Mode::Board,
             message: None,
+            held: None,
             pending_jump: None,
             open_after: None,
             started: None,
             action_from: None,
             pending_reopen: None,
             pending_enter: None,
-            resend: None,
-            resent: None,
+            resend: Default::default(),
+            resent: vec![],
             outside_warned: None,
             pending_past_outside: false,
             moved_home: None,
@@ -572,8 +576,10 @@ impl App {
     }
 
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
-        // A failure stays up until it has been seen: anything else said meanwhile gives way to it.
+        // A failure stays up until it has been seen: the latest thing said meanwhile waits, and
+        // shows once the failure is taken down.
         if tone != Tone::Fail && self.failing() {
+            self.held = Some((text.into(), tone));
             return;
         }
         self.message = Some((text.into(), tone, Instant::now()));
@@ -583,13 +589,9 @@ impl App {
     /// come together stay together, the newest last.
     pub fn fail(&mut self, text: impl Into<String>) {
         let text = text.into();
+        // Every failure not yet seen stays, the newest last; the box shows as many as fit.
         let text = match &self.message {
-            Some((old, Tone::Fail, _)) if self.failing() => {
-                let mut lines: Vec<&str> = old.lines().collect();
-                let keep = lines.len().saturating_sub(2);
-                lines.drain(..keep);
-                format!("{}\n{text}", lines.join("\n"))
-            }
+            Some((old, Tone::Fail, _)) => format!("{old}\n{text}"),
             _ => text,
         };
         self.message = Some((text, Tone::Fail, Instant::now()));
@@ -600,13 +602,24 @@ impl App {
         matches!(self.message, Some((_, Tone::Fail, _)))
     }
 
-    /// A key was pressed: a failure that has been up long enough to be seen goes.
-    fn seen_failure(&mut self) {
-        if let Some((_, Tone::Fail, at)) = &self.message
-            && at.elapsed() >= FAIL_SEEN
-        {
+    /// A key was pressed while a failure is up: once it has been up long enough to be seen, the
+    /// key takes it down and does nothing else, and what was said meanwhile shows. Before then a
+    /// key already on its way does what it was for, except answer a question under the box.
+    /// Whether the key is used up.
+    fn seen_failure(&mut self) -> bool {
+        let Some((_, Tone::Fail, at)) = &self.message else {
+            return false;
+        };
+        if at.elapsed() >= FAIL_SEEN {
             self.message = None;
+            if let Some((text, tone)) = self.held.take() {
+                self.say(text, tone);
+            }
+            return true;
         }
+        matches!(self.mode, Mode::Confirm { .. })
+            || matches!(&self.mode, Mode::Accounts { screen, .. }
+                if matches!(screen, account_controls::AccountScreen::Confirm { .. }))
     }
 
     /// Takes back a message, but only if it's still the one on screen: something said since
@@ -1077,7 +1090,7 @@ impl App {
     /// or anywhere but the board, a peek, a list or a card's own screen.
     pub fn next_owed(&mut self) -> Action {
         // A refusal that named the intent's home elsewhere: ask there, straight away.
-        if let Some((machine, request, from)) = self.resend.take() {
+        if let Some((machine, request, from)) = self.resend.pop_front() {
             self.action_from = from;
             return Action::Mutate { machine, request };
         }
@@ -1343,7 +1356,9 @@ impl App {
         }
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
         self.closed_on_send = false;
-        self.seen_failure();
+        if self.seen_failure() {
+            return Action::None;
+        }
         // Esc on the board lets a running action's answer go: it still finishes, but neither asks
         // nor takes you anywhere, and a reopen or ⏎ waiting its turn is dropped. Anywhere else Esc
         // has its own job (no to a question, back from a peek), so waiting work keeps waiting.
@@ -6141,7 +6156,7 @@ mod tests {
             last_said(&app).unwrap().0,
             format!("{reference} didn't reopen: refused: laptop/web")
         );
-        assert_eq!(app.resend, None);
+        assert!(app.resend.is_empty());
         let refused = |home: &str| {
             Ok(crate::actions::Response {
                 ok: false,
@@ -6157,7 +6172,7 @@ mod tests {
                 "{reference} lives on elsewhere now, which isn't one of this board's machines, so Kerdr can't change it there."
             )
         );
-        assert_eq!(app.resend, None);
+        assert!(app.resend.is_empty());
         app.machines[1].conn = Conn::Unreachable {
             since: Local::now(),
             retry_at: Local::now(),
@@ -6170,7 +6185,7 @@ mod tests {
                 "{reference} lives on build-box now, and build-box isn't answering; nothing changed. Try again once it's back."
             )
         );
-        assert_eq!(app.resend, None);
+        assert!(app.resend.is_empty());
         assert_eq!(
             app.moved_home,
             Some((id.clone(), 1)),
@@ -6618,7 +6633,8 @@ mod tests {
         assert_eq!(m, machine);
         app.queue_action(m, request.clone());
         let card = app.card(&key).unwrap();
-        assert_eq!(card.stage, Stage::Build);
+        // It stays where it is until the backend answers: a question still finds it.
+        assert_eq!(card.stage, Stage::Backlog);
         assert_eq!(
             card.detail.as_ref().unwrap().status.as_deref(),
             Some("Starting…")
@@ -6743,5 +6759,69 @@ mod tests {
             "{:?}",
             app.board.cards.iter().map(|c| &c.key).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn a_started_card_moves_on_and_takes_no_second_start_until_the_feed_has_it() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        let request = serde_json::json!({"action": "dispatch", "id": id});
+        app.queue_action(machine, request.clone());
+        let n = app.resolver.ready()[0].0;
+        app.finish_job(n, request, done("Started."));
+        app.rebuild();
+        let card = app.card(&key).cloned().unwrap();
+        assert_eq!(card.stage, Stage::Build, "started: out of the backlog");
+        select_key(&mut app, &key);
+        assert_eq!(
+            enter(&mut app),
+            Action::None,
+            "no reopen of work just started"
+        );
+        assert!(app.message().unwrap().0.contains("is starting"));
+    }
+
+    #[test]
+    fn a_failure_over_a_question_never_answers_it() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        select_key(&mut app, &key);
+        press(&mut app, 'C');
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        settle(&mut app);
+        app.fail("#9 didn't start: refused.");
+        // A key on its way as the box appeared: it doesn't answer the question under it.
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        if let Some(m) = app.message.as_mut() {
+            m.2 = m.2.checked_sub(FAIL_SEEN).unwrap();
+        }
+        // Seen: the next key only takes the box down.
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(!app.failing());
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = press(&mut app, 'y')
+        else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!((m, request["id"].as_str()), (machine, Some(id.as_str())));
+    }
+
+    #[test]
+    fn what_is_said_while_a_failure_is_up_shows_once_it_goes() {
+        let mut app = demo_app();
+        app.fail("#9 didn't start: refused.");
+        app.say("That image is too big.", Tone::Warn);
+        assert!(app.failing());
+        if let Some(m) = app.message.as_mut() {
+            m.2 = m.2.checked_sub(FAIL_SEEN).unwrap();
+        }
+        press(&mut app, 'j');
+        assert_eq!(app.message(), Some(("That image is too big.", Tone::Warn)));
     }
 }

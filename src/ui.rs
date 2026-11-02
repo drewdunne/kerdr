@@ -56,10 +56,25 @@ fn failure(f: &mut Frame, area: Rect, app: &App) {
     };
     let w = area.width.saturating_sub(4).min(100);
     let inner = w.saturating_sub(4) as usize;
-    let mut lines = vec![Line::from(Span::styled("Not done".to_string(), bold(RED)))];
-    for line in text.lines() {
-        lines.extend(wrapped(line, inner, fg(FG), Some(("✗ ", RED))));
+    // As many failures as fit, the newest last; the ones that don't are counted, not dropped.
+    let room = area.height.saturating_sub(8) as usize;
+    let mut body: Vec<Vec<Line>> = text
+        .lines()
+        .map(|line| wrapped(line, inner, fg(FG), Some(("✗ ", RED))))
+        .collect();
+    let mut earlier = 0;
+    while body.len() > 1 && body.iter().map(Vec::len).sum::<usize>() + 1 > room {
+        body.remove(0);
+        earlier += 1;
     }
+    let mut lines = vec![Line::from(Span::styled("Not done".to_string(), bold(RED)))];
+    if earlier > 0 {
+        lines.push(Line::from(Span::styled(
+            format!("…and {earlier} earlier, not shown for want of room"),
+            fg(DIM),
+        )));
+    }
+    lines.extend(body.into_iter().flatten());
     lines.push(Line::from(Span::styled(
         "The board shows it as it really is. Any key closes this.".to_string(),
         fg(DIM),
