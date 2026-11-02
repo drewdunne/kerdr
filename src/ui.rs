@@ -1204,6 +1204,13 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
         if is_sel {
             buf.set_style(line_rect, Style::default().bg(SEL));
         }
+        // On a narrow column the note on the right gives way before the card's number does: the
+        // glyph's colour still says it.
+        if width(glyph) + 1 + width(&c.reference) + width(marker) + 1 + width(&meta)
+            > body.width as usize
+        {
+            meta.clear();
+        }
         put_lr(
             buf,
             line_rect,
