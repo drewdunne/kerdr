@@ -212,7 +212,7 @@ unknown. Kerdr does not retry it automatically; for a start or a reopen it says 
 open and to look at its card before trying again. After success, the next feed read reflects the
 saved changes.
 
-Kerdr doesn't wait for an action before going on (since 0.20). It shows the change on the board at
+Kerdr doesn't wait for an action before going on (since 0.21). It shows the change on the board at
 once, laid over the feed as Kerdr expects your backend to save it: `dispatch` marks the card
 starting where it is, and moves it out of the backlog once it's answered yes, `close` shows it done, `dismiss` and `cancel` put it in Won't do,
 `restore` takes it out, `refresh` dates it today, and `move` (with `delta`, `top` or `bottom`) reorders its group (open backlog work
