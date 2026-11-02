@@ -1327,6 +1327,10 @@ fn list_glyph(
                 ("✓", GREEN, when, DIM)
             }
         }
+        // A start on its way (intent 0416): shown the moment d or ⏎ sends it.
+        _ if c.detail.as_ref().and_then(|d| d.status.as_deref()) == Some("Starting…") => {
+            ("◐", BLUE, "starting".into(), BLUE)
+        }
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
         _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
         // Not started, but waiting on you all the same: questions asked before it starts.
