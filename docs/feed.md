@@ -212,6 +212,23 @@ unknown. Kerdr does not retry it automatically; for a start or a reopen it says 
 open and to look at its card before trying again. After success, the next feed read reflects the
 saved changes.
 
+Kerdr doesn't wait for an action before going on (since 0.21). It shows the change on the board at
+once, laid over the feed as Kerdr expects your backend to save it: `dispatch` marks the card
+starting where it is, and moves it out of the backlog once it's answered yes, `close` shows it done, `dismiss` and `cancel` put it in Won't do,
+`restore` takes it out, `refresh` dates it today, and `move` (with `delta`, `top` or `bottom`) reorders its group (open backlog work
+of the same owner from the same feed) as `0, 1, 2…` by `backlog_rank` and then id. The command runs
+in the background: requests for one record go one at a time, in the order they were made, and so
+do `move`s to one machine, whatever their record, since each reorders what the one before left;
+other requests for different records may run at the same time, so a backend must keep concurrent
+requests for different records safe. A success shows from the feed itself once a read has it (or
+after two reads, or a minute). Anything else (`ok: false`, a confirmation, a timeout, an invalid
+response) takes the change off the board at once, so the card is as the feed last said, and Kerdr
+says what didn't happen in a red box that stays until a key is pressed, or asks the question.
+While a `dispatch` or `reopen` is unanswered, or answered but not yet in the feed, Kerdr sends
+nothing else for that record. A later change the feed shows retires the earlier ones to the same
+record, and a failed `move` takes the later moves' shown orders with it. Account
+actions still wait for their answer, one at a time.
+
 When a request is refused because the record lives on another machine than the one asked (a copy
 there that was behind named the wrong home), answer `ok: false` with `home`, the record's home as
 `<Machine>/<Session>`:

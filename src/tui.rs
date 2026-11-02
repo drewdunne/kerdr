@@ -149,17 +149,25 @@ fn event_loop(
         while let Ok((id, loading)) = image_rx.try_recv() {
             app.images_loaded(id, loading);
         }
-        while let Ok((machine, request, result)) = action_rx.try_recv() {
+        while let Ok((job, machine, request, result)) = action_rx.try_recv() {
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
                 r.ok && !(request["action"] == "account-signin"
                     && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
             });
-            app.finish_action(machine, request, result);
+            match job {
+                Some(n) => app.finish_job(n, request, result),
+                None => app.finish_action(machine, request, result),
+            }
             if succeeded && let Some(l) = live.as_deref() {
                 for poller in l.pollers.iter().flatten() {
                     let _ = poller.wake.send(Wake::Feed);
                 }
             }
+        }
+        // Changes to cards whose turn has come run now, each on its own (intent 0416).
+        run_ready(app, &action_tx);
+        if app.resolver.expire() {
+            app.rebuild();
         }
         if let Some(url) = app.signin_open.take() {
             open_signin(app, &url);
@@ -171,7 +179,10 @@ fn event_loop(
         }
         // A reopen answered with its workspace while you're still on its card: go in, and on
         // ctrl+space space carry on to the next card that needs you, as from any other.
-        if let Some(open) = app.open_after.take() {
+        // Not while a failure is up: going into herdr would hide it before it's read.
+        if !app.failing()
+            && let Some(open) = app.open_after.take()
+        {
             let outcome = jump_workspace(
                 terminal,
                 flags,
@@ -274,9 +285,19 @@ fn event_loop(
             }
             Action::OpenLink(url) => open_signin(app, &url),
             Action::Quit => {
-                if app.busy || !app.account_queue.is_empty() {
+                let changes = app.resolver.unanswered();
+                if changes > 0 {
                     app.say(
-                        "An intent change is still running. Wait for its result before quitting.",
+                        if changes == 1 {
+                            "A change is still being saved. Wait for it before quitting.".to_string()
+                        } else {
+                            format!("{changes} changes are still being saved. Wait for them before quitting.")
+                        },
+                        Tone::Warn,
+                    );
+                } else if app.busy || !app.account_queue.is_empty() {
+                    app.say(
+                        "An account change is still running. Wait for its result before quitting.",
                         Tone::Warn,
                     );
                 } else {
@@ -289,9 +310,6 @@ fn event_loop(
                         "This is the demo: intent controls change your real board only.",
                         Tone::Info,
                     );
-                    continue;
-                }
-                if app.busy {
                     continue;
                 }
                 start_action(app, &action_tx, machine, request);
@@ -458,13 +476,18 @@ fn event_loop(
     }
 }
 
+/// An answer: its change in the action resolution tool (None for an account action), its machine,
+/// the request without credentials, and what came back.
 type ActionResult = (
+    Option<u64>,
     usize,
     serde_json::Value,
     Result<crate::actions::Response, String>,
 );
 
-/// Runs an action in the background; its answer comes back on the channel.
+/// Runs an action in the background; its answer comes back on the channel. A change to a card goes
+/// to the action resolution tool, which shows it at once and runs it in its turn (intent 0416); an
+/// account action waits for its answer, one at a time.
 fn start_action(
     app: &mut App,
     tx: &mpsc::Sender<ActionResult>,
@@ -476,6 +499,14 @@ fn start_action(
             "This is the demo: intent controls change your real board only.",
             Tone::Info,
         );
+        return;
+    }
+    if !request["action"]
+        .as_str()
+        .is_some_and(|a| a.starts_with("account-"))
+    {
+        app.queue_action(machine, request);
+        run_ready(app, tx);
         return;
     }
     if app.busy {
@@ -499,8 +530,32 @@ fn start_action(
         let result = crate::actions::run(&target, &command, &request);
         let metadata = crate::actions::request_metadata(&request);
         drop(request);
-        let _ = tx.send((machine, metadata, result));
+        let _ = tx.send((None, machine, metadata, result));
     });
+}
+
+/// Starts every change to a card whose turn has come, each on a thread of its own.
+fn run_ready(app: &mut App, tx: &mpsc::Sender<ActionResult>) {
+    for (n, machine, request) in app.resolver.ready() {
+        let command = app.cfg.actions.command.clone();
+        let target = app.machines.get(machine).map(|m| m.machine.clone());
+        let (Some(command), Some(target)) = (command, target) else {
+            let metadata = crate::actions::request_metadata(&request);
+            app.finish_job(
+                n,
+                metadata,
+                Err("actions are disabled; configure [actions] command".into()),
+            );
+            continue;
+        };
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::actions::run(&target, &command, &request);
+            let metadata = crate::actions::request_metadata(&request);
+            drop(request);
+            let _ = tx.send((Some(n), machine, metadata, result));
+        });
+    }
 }
 
 /// Opens herdr full screen on one workspace by its id, whether or not a card claims it yet: a

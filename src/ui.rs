@@ -41,9 +41,45 @@ fn draw_screen(f: &mut Frame, app: &App) {
         return;
     }
     draw_mode(f, area, app, &app.mode);
-    if !matches!(app.mode, Mode::Board) {
+    if app.failing() {
+        failure(f, area, app);
+    } else if !matches!(app.mode, Mode::Board) {
         action_status(f, area, app);
     }
+}
+
+/// A change that didn't happen (intent 0416): a red box over whatever is up, every failure that
+/// came together on a line of its own, until a key is pressed once it has been seen.
+fn failure(f: &mut Frame, area: Rect, app: &App) {
+    let Some((text, _)) = app.message() else {
+        return;
+    };
+    let w = area.width.saturating_sub(4).min(100);
+    let inner = w.saturating_sub(4) as usize;
+    // The oldest few failures; a key takes them down and the rest come up next.
+    let all: Vec<&str> = text.lines().collect();
+    let mut lines = vec![Line::from(Span::styled("Not done".to_string(), bold(RED)))];
+    for line in all.iter().take(crate::app::FAIL_PAGE) {
+        lines.extend(wrapped(line, inner, fg(FG), Some(("✗ ", RED))));
+    }
+    let more = all.len().saturating_sub(crate::app::FAIL_PAGE);
+    lines.push(Line::from(Span::styled(
+        if more > 0 {
+            format!("The board shows them as they really are. Any key shows {more} more.")
+        } else {
+            "The board shows it as it really is. Any key closes this.".to_string()
+        },
+        fg(DIM),
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.bottom().saturating_sub(h + 2),
+        width: w,
+        height: h,
+    };
+    dialog(f, rect, RED);
+    f.render_widget(Paragraph::new(lines), pad(rect, 2, 1));
 }
 
 fn action_status(f: &mut Frame, area: Rect, app: &App) {
@@ -59,6 +95,7 @@ fn action_status(f: &mut Frame, area: Rect, app: &App) {
         Tone::Info => FG2,
         Tone::Good => GREEN,
         Tone::Warn => YELLOW,
+        Tone::Fail => RED,
     };
     // While an action runs, anything said since it started shows (a refusal, a ⏎ waiting its
     // turn, its own working line); otherwise what it's doing and for how long (intent 0411).
@@ -527,11 +564,11 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     }
     if let Some(line) = pending {
         put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
-    } else if let Some((text, tone)) = message {
+    } else if let Some((text, tone)) = message.filter(|(_, t)| *t != Tone::Fail) {
         let color = match tone {
             Tone::Info => FG2,
             Tone::Good => GREEN,
-            Tone::Warn => YELLOW,
+            Tone::Warn | Tone::Fail => YELLOW,
         };
         put(
             f.buffer_mut(),
@@ -1263,6 +1300,12 @@ fn list_glyph(
     String,
     ratatui::style::Color,
 ) {
+    // A start or a reopen on its way (intent 0416): shown the moment it's sent, whatever the column.
+    match c.detail.as_ref().and_then(|d| d.status.as_deref()) {
+        Some("Starting…") => return ("◐", BLUE, "starting".into(), BLUE),
+        Some("Reopening…") => return ("◐", BLUE, "reopening".into(), BLUE),
+        _ => {}
+    }
     match c.stage {
         Stage::Maintain => {
             let when = c
@@ -5727,5 +5770,24 @@ mod tests {
         let screen = rendered(&a, 176, 44);
         assert!(screen.contains("Claude · saved sign-in"), "{screen}");
         assert!(screen.contains("Claude · token per machine"), "{screen}");
+    }
+
+    #[test]
+    fn a_row_shows_a_start_or_reopen_on_its_way_whatever_its_column() {
+        let a = crate::app::App::new(
+            crate::config::Config::default(),
+            crate::demo::machines(false),
+        );
+        let mut done = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Maintain && c.detail.is_some())
+            .cloned()
+            .expect("a done card in the demo");
+        done.detail.as_mut().unwrap().status = Some("Reopening…".into());
+        assert_eq!(list_glyph(&done, a.now()).2, "reopening");
+        done.detail.as_mut().unwrap().status = Some("Starting…".into());
+        assert_eq!(list_glyph(&done, a.now()).2, "starting");
     }
 }
