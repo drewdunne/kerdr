@@ -209,7 +209,7 @@ peek alike:
   creation when it has never been reviewed. Agent updates do not reset this age. Creation stays
   visible in expanded details.
 - `J` / `K` moves it down or up; in the backlog and a peek, `10K` moves it up ten places. `t`
-  moves it to the top of its owner/project backlog. Priority stays separate from order.
+  moves it to the top of its owner/project backlog, and `B` to the bottom. Priority stays separate from order.
 - `x` moves it to **Won't do**, after confirmation. `w` opens that separate view; `u` brings the
   selected intent back. Its record and original creation date are retained.
 
@@ -356,7 +356,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
 | `/` | search everything; in the backlog, Won't do or Misc, search only that list (`Esc` clears it) |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
-| `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
+| `d` `y` `x` `u` `J` `K` `t` `B` | start, still want it, won't do, bring back, move down / up, to the top, to the bottom (the selected backlog intent) |
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
 | `X` | cancel: stop the selected card's agent, close its workspace (or only a child's tab), and set it aside in Won't do (work an agent is at; asks first) |
 | `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |

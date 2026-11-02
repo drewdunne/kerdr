@@ -998,7 +998,7 @@ impl App {
         self.mode = (*back).clone();
         let card_key = matches!(
             key.code,
-            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X' | 's')
+            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X' | 's')
         );
         // A refresh while the menu was open may have moved or removed the card it opened on;
         // its keys then act on nothing rather than on whatever took its place.
@@ -1009,7 +1009,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Char('c') => self.new_intent(),
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X')) => {
                 return self.card_action(c, 1);
             }
             // The menu's s is the board's: the selected card's agent to another account.
@@ -1047,6 +1047,7 @@ impl App {
             'X' => self.cancel_action(),
             'u' => self.intent_action("restore", json!({})),
             't' => self.intent_action("move", json!({"top":true})),
+            'B' => self.intent_action("move", json!({"bottom":true})),
             'J' => self.intent_action("move", json!({"delta":count})),
             'K' => self.intent_action("move", json!({"delta":-count})),
             _ => Action::None,
@@ -1492,7 +1493,7 @@ impl App {
         }
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X')) => {
                 return Some(self.card_action(c, count));
             }
             KeyCode::Char('{') | KeyCode::Char('}')
