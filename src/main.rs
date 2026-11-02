@@ -171,14 +171,8 @@ fn read_all(cfg: &Config) -> Vec<MachineState> {
     for (s, h) in states.iter_mut().zip(handles) {
         let (conn, data) = h.join().unwrap_or((Conn::Connecting, None));
         s.conn = conn;
-        if let Some(mut data) = data {
-            match data.feed.take() {
-                Some(Ok(feed)) => s.feed = Some(feed),
-                Some(Err(e)) => s.feed_error = Some(e),
-                None => {}
-            }
-            s.data = Some(data);
-            s.last_ok = Some(chrono::Local::now());
+        if let Some(data) = data {
+            s.take(data, chrono::Local::now());
         }
     }
     states

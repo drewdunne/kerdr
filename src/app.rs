@@ -600,17 +600,8 @@ impl App {
             return;
         }
         m.conn = ev.conn;
-        if let Some(mut data) = ev.data {
-            match data.feed.take() {
-                Some(Ok(feed)) => {
-                    m.feed = Some(feed);
-                    m.feed_error = data.feed_failed_after.take();
-                }
-                Some(Err(e)) => m.feed_error = Some(e),
-                None => {}
-            }
-            m.data = Some(data);
-            m.last_ok = Some(ev.at);
+        if let Some(data) = ev.data {
+            m.take(data, ev.at);
         }
         self.rebuild();
     }
@@ -697,12 +688,16 @@ impl App {
         }
     }
 
-    /// Columns drawn at this width: Backlog and Maintain give way first on a narrow screen.
+    /// Columns drawn at this width: Backlog and Maintain give way first on a narrow screen, the
+    /// Backlog only while nothing in it waits on you.
     pub fn visible_columns(&self) -> [bool; 7] {
         let narrow = self.width < 100;
         let mut v = [true; 7];
         if narrow {
-            v[Stage::Backlog.index()] = false;
+            let backlog_needs_you = self.columns()[Stage::Backlog.index()]
+                .iter()
+                .any(|&i| self.backlog_needs_you(i));
+            v[Stage::Backlog.index()] = backlog_needs_you;
             v[Stage::Maintain.index()] = false;
         }
         v

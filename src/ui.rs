@@ -1174,13 +1174,18 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     for (row, &i) in items.iter().enumerate().skip(start).take(visible) {
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
-        let (glyph, gcolor, mut meta, mut mcolor) = list_glyph(c, now);
+        let (mut glyph, mut gcolor, mut meta, mut mcolor) = list_glyph(c, now);
         // A card holding work says so with ▸; a done one with work still open says how much,
         // yellow only when some of it needs you. One whose card is out of view names that card.
         let holds = app.holds(i);
         if holds.open > 0 && c.stage == Stage::Maintain {
             meta = format!("{} open", holds.open);
             mcolor = if holds.needs > 0 { YELLOW } else { FG2 };
+        }
+        // Not started, but holding a piece that waits on you.
+        if c.stage == Stage::Backlog && holds.needs > 0 && !c.dismissed() {
+            (glyph, gcolor) = (Attention::NeedsYou.glyph(), YELLOW);
+            (meta, mcolor) = (Attention::NeedsYou.label().into(), YELLOW);
         }
         if let Some(r) = app.held_elsewhere(i) {
             meta = format!("in {r}");
@@ -1203,6 +1208,13 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
         };
         if is_sel {
             buf.set_style(line_rect, Style::default().bg(SEL));
+        }
+        // On a narrow column the note on the right gives way before the card's number does: the
+        // glyph's colour still says it.
+        if width(glyph) + 1 + width(&c.reference) + width(marker) + 1 + width(&meta)
+            > body.width as usize
+        {
+            meta.clear();
         }
         put_lr(
             buf,
@@ -1266,6 +1278,13 @@ fn list_glyph(
         }
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
         _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
+        // Not started, but waiting on you all the same: questions asked before it starts.
+        _ if c.needs_you() && !c.dismissed() => (
+            Attention::NeedsYou.glyph(),
+            YELLOW,
+            Attention::NeedsYou.label().into(),
+            YELLOW,
+        ),
         _ => {
             let (glyph, color) = if c.dismissed() {
                 ("×", DIM)
@@ -4235,6 +4254,26 @@ mod tests {
         a.fixed_now = Some(crate::demo::now());
         a.rebuild();
         a
+    }
+
+    #[test]
+    fn a_backlog_row_waiting_on_you_says_so_in_yellow() {
+        let a = demo(false);
+        let mut c = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Backlog && !c.dismissed())
+            .unwrap()
+            .clone();
+        let quiet = list_glyph(&c, a.now());
+        assert_ne!(quiet.2, "needs you");
+        c.attention = Attention::NeedsYou;
+        let (glyph, color, meta, mcolor) = list_glyph(&c, a.now());
+        assert_eq!(
+            (glyph, color, meta.as_str(), mcolor),
+            ("●", YELLOW, "needs you", YELLOW)
+        );
     }
 
     fn modes(a: &App) -> Vec<Mode> {

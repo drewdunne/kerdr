@@ -197,7 +197,9 @@ it; the next `Esc` leaves the list. Leaving the list ends its search.
 
 ### The backlog
 
-`b` shows work waiting to start, in your chosen order. With an action adapter configured, these
+`b` shows work waiting to start, in your chosen order. On the board's Backlog column, work that
+waits on you before it starts (questions asked first, or a piece inside it asking) comes first, marked yellow, counts with what
+waits on you, and keeps the column on screen when a narrow one would drop it. With an action adapter configured, these
 keys change the selected backlog intent, on the board's Backlog column, in the backlog and in a
 peek alike:
 
