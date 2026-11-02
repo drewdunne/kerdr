@@ -1468,43 +1468,28 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
         let c = &app.board.cards[*i];
         let is_sel = Some(c.key.as_str()) == selected;
         let cached = c.cached_at.is_some();
-        let border = if is_sel {
-            CYAN
-        } else if (c.attention == Attention::Waiting && c.why == "waiting for usage") && !cached {
-            RED
-        } else if (c.attention == Attention::NeedsYou || held.needs > 0) && !cached {
-            YELLOW
-        } else if c.attention == Attention::Running
-            && !cached
-            && app
-                .account_feed(c.machine_index)
-                .is_some_and(|f| !f.accounts.is_empty())
-        {
-            GREEN
-        } else if c.attention == Attention::Blocked && !cached {
-            RED
-        } else {
-            BORDER
-        };
-        let fill = if is_sel {
-            SEL
-        } else if cached {
-            BG
-        } else {
-            PANEL
-        };
+        // A box means it's selected or waiting on you, and nothing else does (intent 0401).
+        let on_you = crate::family::on_you(c, held);
         let rect = Rect {
             x: body.x,
             y,
             width: body.width,
             height: h,
         };
-        let kind = if is_sel {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        };
-        panel(f, rect, border, fill, kind);
+        if is_sel || on_you.is_some() {
+            let border = match on_you {
+                _ if is_sel => CYAN,
+                Some(crate::family::OnYou::Asking) => YELLOW,
+                Some(crate::family::OnYou::Blocked) => RED,
+                _ => DIM,
+            };
+            let (fill, kind) = if is_sel {
+                (SEL, BorderType::Thick)
+            } else {
+                (PANEL, BorderType::Rounded)
+            };
+            panel(f, rect, border, fill, kind);
+        }
         let inner = pad(rect, 2, 1);
         let buf = f.buffer_mut();
         put_lr(buf, inner, inner.y, cl.head.clone(), cl.badge.clone());
@@ -4672,6 +4657,118 @@ mod tests {
         assert!(text.contains("u bring it back"));
     }
 
+    /// A box means selected or waiting on you: an agent at work or waiting on something else has
+    /// none, and what waits on you comes first in its column (intent 0401).
+    #[test]
+    fn only_the_selected_card_and_cards_waiting_on_you_have_boxes() {
+        let mut a = demo(false);
+        let build: Vec<usize> = a.columns()[Stage::Build.index()].clone();
+        assert!(build.len() >= 3, "the demo's Build column is too short");
+        for &i in &build {
+            a.board.cards[i].attention = Attention::Running;
+            a.board.cards[i].cached_at = None;
+            if let Some(d) = a.board.cards[i].detail.as_mut() {
+                d.no_agent = false;
+            }
+        }
+        let (asking, quiet) = (*build.last().unwrap(), build[build.len() - 2]);
+        a.board.cards[asking].attention = Attention::NeedsYou;
+        a.board.cards[quiet].attention = Attention::Idle;
+        // Waiting on something else: no box either.
+        let elsewhere = build[0];
+        a.board.cards[elsewhere].attention = Attention::Waiting;
+        a.board.holds.clear();
+        let order = a.columns()[Stage::Build.index()].clone();
+        assert_eq!(&order[..2], &[asking, quiet]);
+
+        let area = Rect::new(0, 0, 40, 60);
+        let corners = |a: &App, items: &[usize], selected: Option<&str>, want: &str| {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|f| cards(f, area, a, items, selected))
+                .unwrap();
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|c| c.symbol() == want)
+                .map(|c| c.fg)
+                .collect::<Vec<_>>()
+        };
+        // Yellow first, then an easy-to-see grey, and nothing else.
+        assert_eq!(corners(&a, &order, None, "╭"), vec![YELLOW, DIM]);
+        assert!(corners(&a, &order, None, "┏").is_empty());
+
+        // A selected card that isn't waiting on you has a box while it's selected.
+        let key = a.board.cards[elsewhere].key.clone();
+        assert_eq!(corners(&a, &order, Some(&key), "┏"), vec![CYAN]);
+        assert_eq!(corners(&a, &order, Some(&key), "╭"), vec![YELLOW, DIM]);
+
+        // As last seen from a machine out of reach: no box, and after what's live.
+        a.board.cards[asking].cached_at = Some(chrono::Local::now());
+        let order = a.columns()[Stage::Build.index()].clone();
+        assert_eq!(order[0], quiet);
+        assert_eq!(*order.last().unwrap(), asking);
+        assert_eq!(corners(&a, &order, None, "╭"), vec![DIM]);
+    }
+
+    /// A grey piece inside a card at work makes the card grey, unless it hasn't started yet.
+    #[test]
+    fn a_quiet_piece_inside_a_card_at_work_puts_the_card_on_you() {
+        use crate::family::{Holds, OnYou, on_you};
+        let a = demo(false);
+        let mut parent = a.board.cards[a.columns()[Stage::Build.index()][0]].clone();
+        parent.attention = Attention::Running;
+        parent.cached_at = None;
+        if let Some(d) = parent.detail.as_mut() {
+            d.no_agent = false;
+        }
+        let mut piece = parent.clone();
+        assert_eq!(on_you(&parent, &Holds::of([&piece])), None);
+        piece.attention = Attention::Idle;
+        assert_eq!(on_you(&parent, &Holds::of([&piece])), Some(OnYou::Quiet));
+        piece.stage = Stage::Backlog;
+        assert_eq!(on_you(&parent, &Holds::of([&piece])), None);
+    }
+
+    /// j and k walk the column in the order it's shown, and the selection stays on its card when
+    /// that card's turn comes up to the top (intent 0401).
+    #[test]
+    fn j_and_k_follow_a_column_as_what_waits_on_you_moves_up() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut a = demo(false);
+        let build: Vec<usize> = a.columns()[Stage::Build.index()].clone();
+        for &i in &build {
+            a.board.cards[i].attention = Attention::Running;
+            a.board.cards[i].cached_at = None;
+            if let Some(d) = a.board.cards[i].detail.as_mut() {
+                d.no_agent = false;
+            }
+        }
+        a.board.holds.clear();
+        let last = *build.last().unwrap();
+        let key = a.board.cards[last].key.clone();
+        a.sel = Selection {
+            col: Stage::Build.index(),
+            key: Some(key.clone()),
+        };
+        a.board.cards[last].attention = Attention::Idle;
+        let order = a.columns()[Stage::Build.index()].clone();
+        assert_eq!(order[0], last);
+        assert_eq!(a.selected().map(|c| c.key.clone()), Some(key));
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            a.selected().map(|c| c.key.clone()),
+            Some(a.board.cards[order[1]].key.clone())
+        );
+        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            a.selected().map(|c| c.key.clone()),
+            Some(a.board.cards[order[0]].key.clone())
+        );
+    }
+
     /// Intent 0289: work its agent left open says "no agent" on its card, and the bottom line,
     /// a peek, the menu and the keys list name C and x for it.
     #[test]
@@ -5119,7 +5216,8 @@ mod tests {
         assert!(rendered(&a, 176, 44).contains("KBZ_X ⇄"));
         // Narrow, the whole code stays and the mark and the age give way.
         let narrow = rendered(&a, 80, 30);
-        assert!(narrow.contains("KBZ_X  │"), "{narrow}");
+        assert!(narrow.contains("KBZ_X"), "{narrow}");
+        assert!(!narrow.contains("KBZ_X ⇄"), "{narrow}");
         let c = a.board.cards.iter().find(|c| c.reference == "#47").unwrap();
         a.sel = Selection {
             col: c.stage.index(),

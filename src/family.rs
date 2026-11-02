@@ -254,6 +254,48 @@ pub fn needs(c: &Card) -> bool {
         && c.cached_at.is_none()
 }
 
+/// Why a card on the board is waiting on you, the most urgent first. A box means this or that the
+/// card is selected (intent 0401).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum OnYou {
+    /// It or a piece inside it asks you something: yellow.
+    Asking,
+    /// Something stops it: red.
+    Blocked,
+    /// Nothing is moving it until you do: no agent at it, or the records can't say. Grey.
+    Quiet,
+}
+
+/// `held` is what's inside the card. A card as last seen from a machine out of reach is never
+/// waiting on you: nobody knows.
+pub fn on_you(c: &Card, held: &Holds) -> Option<OnYou> {
+    if c.cached_at.is_some() {
+        None
+    } else if held.needs > 0 {
+        Some(OnYou::Asking)
+    } else if finished(c) {
+        None
+    } else if c.needs_you() {
+        Some(OnYou::Asking)
+    } else if c.attention == Attention::Blocked {
+        Some(OnYou::Blocked)
+    } else if c.no_agent() || c.attention == Attention::Idle || held.quiet > 0 {
+        Some(OnYou::Quiet)
+    } else {
+        None
+    }
+}
+
+/// A started piece nothing moves until you do, short of needing you: grey on the card holding it.
+/// One not started yet (in the backlog) isn't waiting on you.
+fn quiet(c: &Card) -> bool {
+    !finished(c)
+        && !needs(c)
+        && c.cached_at.is_none()
+        && c.attention == Attention::Idle
+        && c.stage != Stage::Backlog
+}
+
 /// Open work waiting on another intent that isn't done.
 pub fn waits(c: &Card) -> bool {
     c.detail
@@ -345,6 +387,8 @@ pub struct Holds {
     /// How many need you, and the first of them.
     pub needs: usize,
     pub first_needing: Option<String>,
+    /// How many started pieces sit with nothing moving them, short of needing you.
+    pub quiet: usize,
     /// How many pieces show each mark, in `Mark::ALL`'s order, the most urgent first.
     pub marks: [usize; 8],
 }
@@ -370,6 +414,9 @@ impl Holds {
         if needs(p) {
             self.needs += 1;
         }
+        if quiet(p) {
+            self.quiet += 1;
+        }
         self.marks[mark(p) as usize] += 1;
     }
 
@@ -378,6 +425,7 @@ impl Holds {
         self.count += other.count;
         self.open += other.open;
         self.needs += other.needs;
+        self.quiet += other.quiet;
         for (a, b) in self.marks.iter_mut().zip(other.marks) {
             *a += b;
         }

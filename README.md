@@ -7,7 +7,9 @@
 Kerdr is a full-screen board for people who run many coding agents at once in herdr. Every
 record of work becomes a card, in a column for the stage its work is at. Agent conversations
 without a linked record live in **Misc**, opened with `i` or `Ctrl+Space i`.
-What needs you sorts to the top. Press Enter and herdr opens full screen on that card's
+What needs you sorts to the top, and a box around a card means it's selected or waiting on you:
+yellow when it asks you something, red when it's blocked, grey when nothing moves it until you do.
+An agent at work has no box. Press Enter and herdr opens full screen on that card's
 workspace. Press herdr's prefix and then `q`, herdr's own detach, and you're back on the board,
 which has kept up while you were away.
 
