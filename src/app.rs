@@ -403,6 +403,10 @@ pub struct App {
     pub submission: Option<Submission>,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
     pub new_intent_id: Option<(usize, String)>,
+    /// The screen the new-intent box closed to when Enter sent its words: while that's still the
+    /// screen when the answer comes, the backlog opens on the new card; once you've moved on,
+    /// nothing pulls you away.
+    pub(crate) closed_on_send: Option<std::mem::Discriminant<Mode>>,
     backlog_focus: Option<String>,
     /// `/` in a list view: what narrows it, kept while you peek or act from it, and dropped
     /// once you leave the view.
@@ -460,6 +464,7 @@ impl App {
             image_loads: 0,
             image_at: 0,
             new_intent_id: None,
+            closed_on_send: None,
             submission: None,
             backlog_focus: None,
             view_search: None,
@@ -496,6 +501,11 @@ impl App {
 
     pub fn scope(&self) -> &Scope {
         self.tabs.get(self.tab).unwrap_or(&Scope::All)
+    }
+
+    /// Which screen is up, whatever is selected on it.
+    pub(crate) fn mode_kind(&self) -> std::mem::Discriminant<Mode> {
+        std::mem::discriminant(&self.mode)
     }
 
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
@@ -2892,6 +2902,9 @@ mod tests {
         assert_eq!(request["words"], app.draft.trim());
         assert_eq!(request["session"], "default");
         assert!(request.get("title").is_none() && request.get("tenant").is_none());
+        // The box closed the moment Enter sent them; the save carries on behind it.
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(app.message(), Some(("Saving your new intent…", Tone::Info)));
         // It worked: the words are gone and the new intent is picked out in the backlog.
         app.finish_action(
             0,
@@ -3049,8 +3062,13 @@ mod tests {
                 .unwrap(),
             png
         );
+        // Enter closed the box, keeping the words and images until they're saved.
+        assert!(!matches!(app.mode, Mode::Compose { .. }));
+        assert_eq!(app.draft, "Moving failed: image one [Image #2] ");
+        assert_eq!(app.draft_images.len(), 2);
         // A different image is new work: it gets a submission of its own.
         let first = request["submission"].clone();
+        press(&mut app, 'c');
         if let Mode::Compose { draft, .. } = &mut app.mode {
             draft.images[1].bytes = std::sync::Arc::new([png.clone(), vec![1]].concat());
         }
@@ -3101,6 +3119,58 @@ mod tests {
         };
         assert_eq!(draft.images.len(), crate::images::MAX_IMAGES);
         assert!(app.message().unwrap().0.contains("at most 20 images"));
+    }
+
+    #[test]
+    fn a_failed_save_after_the_box_closed_says_so_and_keeps_the_words() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let request = send_words(&mut app, "Back up the NAS");
+        assert!(matches!(app.mode, Mode::Board));
+        app.finish_action(0, request, answer(false, None));
+        settle(&mut app);
+        let (text, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(text.contains("wasn't saved: The store is locked"), "{text}");
+        assert!(text.contains("c opens it again with your words"), "{text}");
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(app.draft, "Back up the NAS");
+        press(&mut app, 'c');
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Back up the NAS")
+        );
+        // No answer at all: it may have been saved, and he's told so, words kept.
+        let again = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let Action::Mutate { request, .. } = again else {
+            panic!("Enter didn't send")
+        };
+        app.finish_action(0, request, Err("timed out".into()));
+        settle(&mut app);
+        let (text, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            text.contains("may not have been saved (timed out)"),
+            "{text}"
+        );
+        assert_eq!(app.draft, "Back up the NAS");
+    }
+
+    #[test]
+    fn a_save_that_lands_after_you_moved_on_leaves_you_where_you_are() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let request = send_words(&mut app, "Back up the NAS");
+        press(&mut app, '?');
+        assert!(matches!(app.mode, Mode::Keys { .. }));
+        app.finish_action(0, request, answer(true, Some("9004")));
+        settle(&mut app);
+        assert!(
+            matches!(app.mode, Mode::Keys { .. }),
+            "the answer pulled him into the backlog"
+        );
+        assert!(app.draft.is_empty());
+        assert_eq!(app.new_intent_id, Some((0, "9004".to_string())));
+        assert_eq!(app.message().map(|(_, t)| t), Some(Tone::Good));
     }
 
     #[test]

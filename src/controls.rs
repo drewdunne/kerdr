@@ -1081,8 +1081,16 @@ impl App {
                     if !images.is_empty() {
                         request["images"] = Value::Array(images::request_images(&words, &images));
                     }
+                    // The box closes at once; the save carries on behind it. The words are kept,
+                    // as Escape keeps them, until the adapter says they're saved, so a failure
+                    // loses nothing: c opens the box again with them.
                     let machine = draft.machine;
-                    self.mode = Mode::Compose { draft, back };
+                    self.draft = draft.words;
+                    self.draft_images = draft.images;
+                    self.image_load = None;
+                    self.mode = *back;
+                    self.closed_on_send = Some(self.mode_kind());
+                    self.say("Saving your new intent…", Tone::Info);
                     return self.emit_mutation(machine, request);
                 }
             }
@@ -1567,11 +1575,20 @@ impl App {
                 }
                 // A failure that names an intent still made one (saved here but not pushed,
                 // say), so its words must not be sent again.
+                // Where the box closed from: still there, the backlog opens on the new card; moved
+                // on, nothing pulls you away, and the message says where it went.
+                let still = request["action"] == "create"
+                    && self
+                        .closed_on_send
+                        .take()
+                        .is_none_or(|k| k == self.mode_kind());
                 if request["action"] == "create" && (response.ok || response.id.is_some()) {
                     self.draft.clear();
                     self.draft_images.clear();
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
-                    self.enter_backlog(false);
+                    if still {
+                        self.enter_backlog(false);
+                    }
                     if self.filtering() {
                         message.push_str(
                             " A filter may hide it until it's written up: F shows everything.",
@@ -1601,13 +1618,23 @@ impl App {
                         None => message.push_str(" ⏎ on its card goes in."),
                     }
                 }
+                if request["action"] == "create" && !response.ok && response.id.is_none() {
+                    message = format!(
+                        "Your new intent wasn't saved: {message} c opens it again with your words."
+                    );
+                }
                 self.say(message, if response.ok { Tone::Good } else { Tone::Warn });
             }
             Err(error) => {
-                if request["action"] == "create"
-                    && let Some(s) = self.submission.as_mut()
-                {
-                    s.unknown = true;
+                if request["action"] == "create" {
+                    self.closed_on_send = None;
+                    if let Some(s) = self.submission.as_mut() {
+                        s.unknown = true;
+                    }
+                    return self.say(
+                        format!("Your new intent may not have been saved ({error}). c opens it again with your words; sending them again never makes a second one."),
+                        Tone::Warn,
+                    );
                 }
                 self.say(error, Tone::Warn)
             }
