@@ -1,4 +1,4 @@
-//! Account layouts, using the same Tokyo Night palette and panels as the board.
+//! Account layouts, using the same palette and panels as the board.
 use super::*;
 use crate::accounts::{Account, AccountCopy, Figures, pause_glyph};
 use crate::app::account_controls::{AccountScreen, AddAccount, Row};

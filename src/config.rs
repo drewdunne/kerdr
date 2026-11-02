@@ -14,6 +14,7 @@ pub struct Config {
     pub feed: FeedConfig,
     pub actions: ActionsConfig,
     pub machines: MachinesConfig,
+    pub theme: ThemeConfig,
     #[serde(rename = "machine")]
     pub machine: Vec<MachineConfig>,
 }
@@ -94,6 +95,14 @@ impl Default for FeedConfig {
 pub struct ActionsConfig {
     /// An opt-in command that receives one JSON action on standard input (docs/feed.md).
     pub command: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct ThemeConfig {
+    /// A colors.toml to take Kerdr's colours from, followed while Kerdr is open. None (the
+    /// default): Omarchy's current theme where there is one, else Tokyo Night. "": Tokyo Night.
+    pub colors: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]

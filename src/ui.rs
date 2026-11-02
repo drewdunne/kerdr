@@ -21,6 +21,11 @@ mod account_ui;
 mod card_ui;
 
 pub fn draw(f: &mut Frame, app: &App) {
+    draw_screen(f, app);
+    crate::palette::recolor_active(f.buffer_mut());
+}
+
+fn draw_screen(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     if area.width < 32 || area.height < 10 {
