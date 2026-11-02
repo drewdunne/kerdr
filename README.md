@@ -359,7 +359,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `Enter` | jump in; on work nobody started, start it, as `d` does; on work whose workspace closed, reopen it; on done work, ask to reopen it (all three with actions) |
 | `m` or `Space` | peek |
 | `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
-| `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`) |
+| `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`; in the backlog and Done too) |
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |

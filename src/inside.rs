@@ -532,8 +532,9 @@ impl App {
             }
             m
         };
+        let lists = matches!(self.mode, Mode::Backlog { .. } | Mode::Done { .. });
         match self.holder(i) {
-            Some(h) if matches!(self.mode, Mode::Board | Mode::Card { .. }) => {
+            Some(h) if lists || matches!(self.mode, Mode::Board | Mode::Card { .. }) => {
                 if let Mode::Card { card, opened, .. } = &mut self.mode
                     && *card == self.board.cards[h].key
                 {
@@ -552,27 +553,35 @@ impl App {
                 self.open_card(h, Some(key.to_string()), back);
             }
             // A card in a column the config hides: its own screen, the backlog's or Done's, on it.
-            None if matches!(self.mode, Mode::Board | Mode::Card { .. })
+            None if (lists || matches!(self.mode, Mode::Board | Mode::Card { .. }))
                 && self.cfg.board.hides(self.board.cards[i].stage) =>
             {
                 let key = key.to_string();
-                if self.board.cards[i].stage == Stage::Backlog {
+                let backlog = self.board.cards[i].stage == Stage::Backlog;
+                if backlog {
                     self.enter_backlog(false);
-                    let at = self
-                        .backlog_cards()
-                        .iter()
-                        .position(|&j| self.board.cards[j].key == key);
-                    if let Some(sel) = at {
-                        self.backlog_focus = Some(key.clone());
-                        self.mode = Mode::Backlog { sel };
-                    }
                 } else {
                     self.enter_done();
-                    let at = self
-                        .done_cards()
-                        .iter()
-                        .position(|&j| self.board.cards[j].key == key);
-                    if let Some(sel) = at {
+                }
+                let place = |app: &App| {
+                    let items = if backlog {
+                        app.backlog_cards()
+                    } else {
+                        app.done_cards()
+                    };
+                    items.iter().position(|&j| app.board.cards[j].key == key)
+                };
+                // A search left in the list that hides it gives way, so you land on it.
+                let mut at = place(self);
+                if at.is_none() && self.view_search.is_some() {
+                    self.view_search = None;
+                    at = place(self);
+                }
+                if let Some(sel) = at {
+                    if backlog {
+                        self.backlog_focus = Some(key.clone());
+                        self.mode = Mode::Backlog { sel };
+                    } else {
                         self.mode = Mode::Done { sel };
                     }
                 }
@@ -581,9 +590,9 @@ impl App {
                     key: Some(key),
                 };
             }
-            // A card on the board, from a card's screen: the board itself, on it, wherever the
-            // screens were opened from.
-            None if matches!(self.mode, Mode::Card { .. }) => {
+            // A card on the board, from a card's screen or the backlog's or Done's: the board
+            // itself, on it, wherever the screens were opened from.
+            None if lists || matches!(self.mode, Mode::Card { .. }) => {
                 self.mode = Mode::Board;
                 self.sel = Selection {
                     col: self.board.cards[i].stage.index(),
@@ -1202,6 +1211,120 @@ mod tests {
         assert!(matches!(app.mode, Mode::Done { .. }), "{:?}", app.mode);
         press(&mut app, 'D');
         assert!(matches!(app.mode, Mode::Board));
+    }
+
+    fn hidden_board(extra: impl FnOnce(&mut Vec<FeedCard>)) -> App {
+        let mut cfg = Config::default();
+        cfg.board.hide_columns = vec!["backlog".into(), "maintain".into()];
+        let mut cards = vec![
+            card("0101", "Queued, asking", "backlog", |c| {
+                c.backlog_rank = Some(1);
+                c.attention = Some("needs_you".into());
+            }),
+            card("0102", "Queued, asking too", "backlog", |c| {
+                c.backlog_rank = Some(2);
+                c.attention = Some("needs_you".into());
+            }),
+            card("0110", "Building, asking", "build", |c| {
+                c.attention = Some("needs_you".into());
+            }),
+            card("0120", "Finished", "maintain", |c| {
+                c.closed = Some("2026-10-30".into())
+            }),
+            card("0121", "Finished, holding open work", "maintain", |c| {
+                c.closed = Some("2026-10-29".into())
+            }),
+            card("0122", "Its piece, asking", "test", |c| {
+                c.parent = Some("0121".into());
+                c.attention = Some("needs_you".into());
+            }),
+        ];
+        extra(&mut cards);
+        let laptop = machine("AMD-LZM4", false, "KBZ", Snapshot::default(), cards);
+        let mut app = App::new(cfg, vec![laptop]);
+        app.width = 180;
+        app.rebuild();
+        app
+    }
+
+    /// Intent 0444, from Codex's review: n and N go on from a hidden column's screen, through
+    /// its cards, the board's, and a piece inside done work, both ways round.
+    #[test]
+    fn n_and_n_back_cycle_through_hidden_columns_and_the_board() {
+        let mut app = hidden_board(|_| {});
+        let step = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE));
+            app.sel.key.clone().unwrap()
+        };
+        assert_eq!(
+            app.needs_you_order(),
+            ["0101", "0102", "0110", "0122"].map(|id| key(&app, id))
+        );
+        // The board opens on the first card there that needs you.
+        assert_eq!(app.sel.key, Some(key(&app, "0110")));
+        step(&mut app, 'n');
+        let on_piece = |app: &App| {
+            matches!(&app.mode, Mode::Card { card, focus, .. }
+                if *card == key(app, "0121") && *focus == key(app, "0122"))
+        };
+        assert!(on_piece(&app), "{:?}", app.mode);
+        assert_eq!(step(&mut app, 'n'), key(&app, "0101"));
+        assert!(
+            matches!(app.mode, Mode::Backlog { sel: 0 }),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(step(&mut app, 'n'), key(&app, "0102"));
+        assert!(
+            matches!(app.mode, Mode::Backlog { sel: 1 }),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(step(&mut app, 'n'), key(&app, "0110"));
+        assert!(matches!(app.mode, Mode::Board));
+        // And back the other way.
+        assert_eq!(step(&mut app, 'N'), key(&app, "0102"));
+        assert!(matches!(app.mode, Mode::Backlog { sel: 1 }));
+        assert_eq!(step(&mut app, 'N'), key(&app, "0101"));
+        assert!(matches!(app.mode, Mode::Backlog { sel: 0 }));
+        step(&mut app, 'N');
+        assert!(on_piece(&app), "{:?}", app.mode);
+        assert_eq!(step(&mut app, 'N'), key(&app, "0110"));
+        assert!(matches!(app.mode, Mode::Board));
+        // From Done, n goes on too.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Done { .. }));
+        step(&mut app, 'n');
+        assert!(!matches!(app.mode, Mode::Done { .. }), "{:?}", app.mode);
+    }
+
+    /// Intent 0444, from Codex's review: a done card's screen, opened from Done, whose card leaves
+    /// the feed hands back to Done on done work, never on a board card the keys would then act on.
+    #[test]
+    fn a_done_card_gone_from_under_its_screen_leaves_done_on_done_work() {
+        let mut app = hidden_board(|_| {});
+        app.on_key(KeyEvent::new(KeyCode::Char('D'), KeyModifiers::NONE));
+        assert_eq!(app.sel.key, Some(key(&app, "0121")));
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Card { .. }));
+        for m in &mut app.machines {
+            m.feed
+                .as_mut()
+                .unwrap()
+                .cards
+                .retain(|c| c.id != "0121" && c.id != "0122");
+        }
+        app.rebuild();
+        assert!(matches!(app.mode, Mode::Done { sel: 0 }), "{:?}", app.mode);
+        assert_eq!(app.sel.key, Some(key(&app, "0120")));
+        // What an action says shows over Done, as over every screen but the board.
+        app.say(
+            "0120 is done; with [actions] configured, ⏎ reopens it.",
+            Tone::Info,
+        );
+        let screen = crate::ui::tests_render(&app, 120, 30);
+        assert!(screen.contains("with [actions] configured"), "{screen}");
     }
 
     /// Launching a Tinyhost world (ark-sdlc 0408, intent 0420): queued with two questions for you

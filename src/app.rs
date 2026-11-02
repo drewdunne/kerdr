@@ -756,7 +756,14 @@ impl App {
             }
             return;
         }
+        let on_card = matches!(self.mode, Mode::Card { .. });
         if self.fix_card_screen() {
+            return;
+        }
+        // A card screen whose card has gone hands back to the list it was opened from: Misc and
+        // Done keep their selection their own way, never the board's.
+        if on_card && misc_selection(&self.mode).is_some() {
+            self.fix_selection();
             return;
         }
         // A question over a card's screen keeps its row selected until it's answered, as a
@@ -2059,6 +2066,19 @@ impl App {
         let items = self.backlog_cards();
         let n = items.len();
         match key.code {
+            // The next that needs you, from the card selected here: it may be in this list (a
+            // hidden Backlog column's work, intent 0444) or anywhere on the board.
+            KeyCode::Char('n' | 'N') if !self.wont_do => {
+                if let Some(&i) = items.get(sel) {
+                    self.sel.key = Some(self.board.cards[i].key.clone());
+                }
+                self.step_needs_you(if key.code == KeyCode::Char('n') {
+                    1
+                } else {
+                    -1
+                });
+                return Action::None;
+            }
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('b') => self.mode = Mode::Board,
             KeyCode::Char('j') | KeyCode::Down => {
                 self.mode = Mode::Backlog {
@@ -2183,6 +2203,17 @@ impl App {
             KeyCode::Char('D') if done => {
                 self.mode = Mode::Board;
                 self.fix_selection();
+                return Action::None;
+            }
+            KeyCode::Char('n' | 'N') if done => {
+                if let Some(&i) = items.get(selected) {
+                    self.sel.key = Some(self.board.cards[i].key.clone());
+                }
+                self.step_needs_you(if key.code == KeyCode::Char('n') {
+                    1
+                } else {
+                    -1
+                });
                 return Action::None;
             }
             KeyCode::Char('o') if done => {
