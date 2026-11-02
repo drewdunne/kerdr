@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::RwLock;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant};
 
 use ratatui::buffer::Buffer;
 use ratatui::style::Color;
@@ -96,7 +96,11 @@ impl Palette {
         let get = |keys: &[&str]| keys.iter().find_map(|k| raw.get(*k).copied());
         let bg = get(&["background", "bg", "color0"])?;
         let fg2 = get(&["foreground", "fg", "color7"])?;
-        let fg = get(&["bright_foreground", "bright_fg", "color15"]).unwrap_or(fg2);
+        // The brightest text, unless it reads worse than the ordinary foreground (a light theme's
+        // color15 is often white).
+        let fg = get(&["bright_foreground", "bright_fg", "color15"])
+            .filter(|b| contrast(*b, bg) >= contrast(fg2, bg))
+            .unwrap_or(fg2);
         let faint = get(&["dark_foreground", "dark_fg", "color8"]).unwrap_or(mix(bg, fg2, 0.36));
         let lighter = get(&["lighter_background", "lighter_bg"]).filter(|c| *c != bg);
         let raised = lighter.unwrap_or(mix(bg, fg2, 0.06));
@@ -111,14 +115,19 @@ impl Palette {
         let cyan = get(&["cyan", "color6"]).unwrap_or(theme::CYAN);
         let orange = get(&["orange"]).unwrap_or(yellow);
 
+        let fg = legible(fg, bg, fg, 4.5);
         let readable = |c: Color, ratio: f64| legible(c, bg, fg, ratio);
+        // Text is drawn on the raised, panel and selected surfaces too, so each is moved back
+        // toward the background until the main text reads on it.
+        let surface = |c: Color| behind(c, bg, fg, 4.5);
+        let raised = surface(raised);
         Some(Palette {
             bg,
-            panel: mix(bg, raised, 0.5),
+            panel: surface(mix(bg, raised, 0.5)),
             raised,
-            sel,
+            sel: surface(sel),
             border,
-            fg: readable(fg, 4.5),
+            fg,
             fg2: readable(fg2, 4.5),
             dim: readable(mix(fg2, faint, 0.3), 3.0),
             faint: readable(faint, 2.0),
@@ -220,24 +229,36 @@ fn contrast(a: Color, b: Color) -> f64 {
     (la.max(lb) + 0.05) / (la.min(lb) + 0.05)
 }
 
-/// `c`, or `c` moved toward the foreground until it stands `ratio` apart from the background
-/// (as far as the foreground itself does, at most).
+/// `c`, or `c` moved toward the foreground (or, when even that's too faint, toward black or
+/// white) until it stands `ratio` apart from the background.
 fn legible(c: Color, bg: Color, fg: Color, ratio: f64) -> Color {
-    let target = ratio.min(contrast(fg, bg));
-    if contrast(c, bg) >= target {
+    if contrast(c, bg) >= ratio {
         return c;
     }
-    let toward = if contrast(fg, bg) >= target {
-        fg
-    } else if luminance(bg) < 0.5 {
+    let extreme = if contrast(Color::Rgb(255, 255, 255), bg) >= contrast(Color::Rgb(0, 0, 0), bg) {
         Color::Rgb(255, 255, 255)
     } else {
         Color::Rgb(0, 0, 0)
     };
+    let toward = if contrast(fg, bg) >= ratio {
+        fg
+    } else {
+        extreme
+    };
     (1..=20)
         .map(|step| mix(c, toward, step as f64 / 20.0))
-        .find(|m| contrast(*m, bg) >= target)
+        .find(|m| contrast(*m, bg) >= ratio)
         .unwrap_or(toward)
+}
+
+/// A surface text is drawn on, moved toward the background until `fg` stands `ratio` apart from
+/// it (or as far as it does from the background itself).
+fn behind(surface: Color, bg: Color, fg: Color, ratio: f64) -> Color {
+    let target = ratio.min(contrast(fg, bg));
+    (0..=20)
+        .map(|step| mix(surface, bg, step as f64 / 20.0))
+        .find(|m| contrast(fg, *m) >= target)
+        .unwrap_or(bg)
 }
 
 /// Omarchy's current theme's colours, where this machine has Omarchy.
@@ -278,7 +299,8 @@ pub struct ThemeWatch {
     /// The file named in the config; None means look for Omarchy's each time.
     named: Option<PathBuf>,
     off: bool,
-    seen: Option<(PathBuf, Option<SystemTime>, u64)>,
+    /// The theme file's text as last read; None when there was none.
+    seen: Option<String>,
     checked: Option<Instant>,
 }
 
@@ -309,29 +331,35 @@ impl ThemeWatch {
         }
     }
 
-    /// Reads the theme again when its file changed; at most once a second unless `now`.
+    /// Reads the theme again, at most once a second unless `now`, and sets the palette screens
+    /// are drawn in when it changed.
     pub fn check(&mut self, now: bool) {
         if !now && self.checked.is_some_and(|t| t.elapsed() < EVERY) {
             return;
         }
         self.checked = Some(Instant::now());
-        let found = self.path().and_then(|p| {
-            let meta = std::fs::metadata(&p).ok()?;
-            Some((p, meta.modified().ok(), meta.len()))
-        });
-        if found == self.seen {
-            return;
+        if let Some(change) = self.poll() {
+            set_active(change);
         }
-        // A theme being swapped in can be half-written for a moment; keep the last good palette
-        // until a full one reads, but drop it when the file is gone for good.
-        match &found {
-            Some((p, _, _)) => match Palette::from_file(p) {
-                Some(palette) => set_active(Some(palette)),
-                None => return,
-            },
-            None => set_active(None),
+    }
+
+    /// The new palette when the theme changed (None inside: back to Tokyo Night), else None.
+    ///
+    /// It compares the file's text, which is small, rather than its time and size: a theme
+    /// switched in can carry the same of both.
+    fn poll(&mut self) -> Option<Option<Palette>> {
+        let text = self.path().and_then(|p| std::fs::read_to_string(p).ok());
+        if text == self.seen {
+            return None;
         }
-        self.seen = found;
+        let change = match &text {
+            // A theme being swapped in can be half-written for a moment; keep the last good
+            // palette until a full one reads.
+            Some(t) => Some(Palette::from_colors_toml(t)?),
+            None => None,
+        };
+        self.seen = text;
+        Some(change)
     }
 }
 
@@ -420,6 +448,33 @@ color15 = "#e3a68c"
     }
 
     #[test]
+    fn a_white_bright_foreground_on_white_isnt_used() {
+        let p = Palette::from_colors_toml(
+            "background = \"#ffffff\"\nforeground = \"#222222\"\ncolor15 = \"#ffffff\"\n",
+        )
+        .unwrap();
+        assert_eq!(p.fg, Color::Rgb(0x22, 0x22, 0x22));
+        assert!(contrast(p.fg, p.bg) >= 4.5);
+    }
+
+    #[test]
+    fn text_reads_on_every_surface() {
+        // A white selection under white text, on a dark theme.
+        let p = Palette::from_colors_toml(
+            "background = \"#101010\"\nforeground = \"#ffffff\"\nselection = \"#ffffff\"\nlighter_background = \"#eeeeee\"\n",
+        )
+        .unwrap();
+        for surface in [p.sel, p.raised, p.panel] {
+            assert!(contrast(p.fg, surface) >= 4.5, "{:?} on {surface:?}", p.fg);
+        }
+        // A selected card's title, drawn and recoloured.
+        let mut buf = Buffer::empty(Rect::new(0, 0, 1, 1));
+        buf[(0, 0)].set_style(Style::default().fg(theme::FG).bg(theme::SEL));
+        p.recolor(&mut buf);
+        assert!(contrast(buf[(0, 0)].fg, buf[(0, 0)].bg) >= 4.5);
+    }
+
+    #[test]
     fn needs_a_background_and_foreground() {
         assert_eq!(Palette::from_colors_toml("red = \"#ff0000\""), None);
         assert_eq!(Palette::from_colors_toml("not a theme"), None);
@@ -453,12 +508,30 @@ color15 = "#e3a68c"
         let path = dir.path().join("colors.toml");
         let mut w = ThemeWatch::new(Some(path.to_str().unwrap()));
         assert_eq!(w.path(), Some(path.clone()));
-        w.check(true);
-        assert!(w.seen.is_none());
+        // No file yet: nothing changes.
+        assert_eq!(w.poll(), None);
         std::fs::write(&path, LEGACY).unwrap();
-        // check() sets the shared palette, which other tests' drawings would see, so this test
-        // reads the file the way check() does instead.
-        assert_eq!(Palette::from_file(&path), Palette::from_colors_toml(LEGACY));
+        assert_eq!(w.poll(), Some(Palette::from_colors_toml(LEGACY)));
+        assert_eq!(w.poll(), None);
+        // Another theme of the same length, its time set back to the first's: still seen.
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let other = LEGACY.replace("#c24f57", "#57c24f");
+        assert_eq!(other.len(), LEGACY.len());
+        std::fs::write(&path, &other).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        let changed = w.poll().unwrap().unwrap();
+        assert_eq!(changed.red, Color::Rgb(0x57, 0xc2, 0x4f));
+        // Half-written: the last good palette stays.
+        std::fs::write(&path, "background = ").unwrap();
+        assert_eq!(w.poll(), None);
+        // Gone: back to Tokyo Night.
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(w.poll(), Some(None));
         assert!(ThemeWatch::new(Some("")).path().is_none());
     }
 }
