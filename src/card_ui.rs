@@ -48,6 +48,12 @@ fn place(app: &App, c: &Card, holder: &Card, itself: bool) -> (String, Color) {
             None => ("closed".into(), DIM),
         };
     }
+    if let Some(outside) = c.outside_herdr() {
+        return (
+            format!("running in {}, outside herdr", outside.place()),
+            CYAN,
+        );
+    }
     if c.no_agent() {
         return ("no agent at it".into(), YELLOW);
     }

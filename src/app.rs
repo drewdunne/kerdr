@@ -360,6 +360,10 @@ pub struct OpenAfter {
     pub session: String,
     pub workspace: String,
     pub label: String,
+    /// The tab in it to land on, when the reopen opened a new tab in a workspace already open
+    /// (beside its parent's agent, or the tab still open there): herdr leaves its active tab as
+    /// it was.
+    pub tab: Option<String>,
     /// The card it was reopened from, for going on to the next that needs you.
     pub from: String,
 }
@@ -436,6 +440,15 @@ pub struct App {
     /// A card ⏎ was pressed on while another action ran: it opens, as ⏎ would, once that action
     /// has answered. One deep; a newer ⏎ replaces it, and Esc drops it (intent 0411).
     pub pending_enter: Option<String>,
+    /// An action refused because its intent lives on another machine than the one asked: the
+    /// same request, to send there next, and the card it was asked from (intent 0411).
+    pub resend: Option<(usize, serde_json::Value, Option<CardSnapshot>)>,
+    /// The machine and record of the last such resend: its answer is shown as it is, never
+    /// sent on again, so one ⏎ asks two machines at most.
+    pub resent: Option<(usize, String)>,
+    /// A card whose conversation runs outside herdr, and when ⏎ said so: a second ⏎ on it soon
+    /// after goes on to the reopen question (intent 0411).
+    pub outside_warned: Option<(String, Instant)>,
     pub width: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
@@ -490,6 +503,9 @@ impl App {
             action_from: None,
             pending_reopen: None,
             pending_enter: None,
+            resend: None,
+            resent: None,
+            outside_warned: None,
             width: 200,
             demo: false,
             fixed_now: None,
@@ -929,6 +945,13 @@ impl App {
     /// whose workspace opened meanwhile is gone into, not reopened). It waits while you're typing
     /// or anywhere but the board, a peek, a list or a card's own screen.
     pub fn next_owed(&mut self) -> Action {
+        // A refusal that named the intent's home elsewhere: ask there, straight away.
+        if !self.busy
+            && let Some((machine, request, from)) = self.resend.take()
+        {
+            self.action_from = from;
+            return Action::Mutate { machine, request };
+        }
         if self.busy
             || self.open_after.is_some()
             || (self.pending_reopen.is_none() && self.pending_enter.is_none())
@@ -1066,6 +1089,9 @@ impl App {
             }
             return Action::Jump(key);
         }
+        if let Some(action) = self.outside_first(&card) {
+            return action;
+        }
         // Work under way whose workspace closed, or done work: reopen it rather than leave a dead
         // end. Done work is opened again only after a yes to the question its backend asks.
         if card.reopenable() {
@@ -1121,6 +1147,52 @@ impl App {
         );
         self.say(msg, Tone::Info);
         Action::None
+    }
+
+    /// ⏎ on open work whose conversation runs in a terminal outside herdr: says where, and sends
+    /// nothing, since a reopen here would start a second copy of it. A second ⏎ on it within five
+    /// seconds goes on as ⏎ would, to the question the reopen asks (intent 0411).
+    fn outside_first(&mut self, card: &Card) -> Option<Action> {
+        let outside = card.outside_herdr()?;
+        if card.done() || !self.actions_on() {
+            return None;
+        }
+        if self
+            .outside_warned
+            .take()
+            .is_some_and(|(k, at)| k == card.key && at.elapsed() < Duration::from_secs(5))
+        {
+            return None;
+        }
+        let since = outside
+            .since
+            .as_deref()
+            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| format!(" since {}", self.when(t.with_timezone(&Local))))
+            .unwrap_or_default();
+        self.outside_warned = Some((card.key.clone(), Instant::now()));
+        self.say(
+            format!(
+                "{}'s conversation is running outside herdr, in {}{since}. Go to that window, or end it there and press ⏎ again. ⏎ again now asks to start a second copy here.",
+                card.reference,
+                outside.place()
+            ),
+            Tone::Info,
+        );
+        Some(Action::None)
+    }
+
+    /// A time for a sentence: "13:02" today, "yesterday 13:02", else "Mon 2 Nov 13:02".
+    fn when(&self, t: DateTime<Local>) -> String {
+        let today = self.now().date_naive();
+        let clock = t.format("%H:%M");
+        if t.date_naive() == today {
+            clock.to_string()
+        } else if today.pred_opt() == Some(t.date_naive()) {
+            format!("yesterday {clock}")
+        } else {
+            t.format("%a %-d %b %H:%M").to_string()
+        }
     }
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
@@ -1464,7 +1536,20 @@ impl App {
                 };
                 if card.is_open_workspace() {
                     self.mode = Mode::Board;
+                    // As ⏎ on the board: never onto a child's tab when its own is unknown.
+                    if let Some(action) = self.own_tab_unknown(&card) {
+                        return action;
+                    }
                     Action::Jump(card.key)
+                } else if card.outside_herdr().is_some()
+                    && !card.done()
+                    && self.actions_on()
+                    && let Some(action) = {
+                        self.mode = Mode::Board;
+                        self.outside_first(&card)
+                    }
+                {
+                    action
                 } else if card.can_reopen() || (card.can_reopen_done() && self.actions_on()) {
                     self.mode = Mode::Board;
                     if self.busy && self.actions_on() {
@@ -4770,6 +4855,7 @@ mod tests {
                 session: "web".into(),
                 workspace: "w7".into(),
                 label: "41-checkout-expired-cards".into(),
+                tab: None,
                 from: key.clone(),
             })
         );
@@ -5372,6 +5458,7 @@ mod tests {
             label: "w7".into(),
             session: "web".into(),
             workspace: "w7".into(),
+            tab: None,
             from: a,
         });
         assert_eq!(app.next_owed(), Action::None);
@@ -5475,5 +5562,219 @@ mod tests {
             app.message().unwrap().0,
             "Couldn't reach LAB-Server: timed out"
         );
+    }
+
+    #[test]
+    fn a_reopen_into_a_new_tab_goes_onto_that_tab() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        let mut reply = reopen_reply("web", true, false, "").unwrap();
+        reply.tab = Some("w7:t2".into());
+        app.finish_action(0, request, Ok(reply));
+        assert_eq!(app.open_after.take().unwrap().tab.as_deref(), Some("w7:t2"));
+        // One into a new workspace names none.
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        assert_eq!(app.open_after.take().unwrap().tab, None);
+    }
+
+    #[test]
+    fn a_refusal_naming_another_home_is_sent_there_once() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let request = reopen_by_enter(&mut app);
+        let moved = || {
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "It lives on build-box now (ARK); ⏎ again opens it there.".into(),
+                home: Some("build-box/ARK".into()),
+                ..Default::default()
+            })
+        };
+        app.finish_action(0, request.clone(), moved());
+        assert!(!app.busy);
+        assert_eq!(
+            app.message().unwrap().0,
+            format!("{reference} lives on build-box now; asking there.")
+        );
+        let Action::Mutate {
+            machine,
+            request: again,
+        } = app.next_owed()
+        else {
+            panic!("nothing was sent on")
+        };
+        assert_eq!(machine, 1);
+        assert_eq!(again["action"], "reopen");
+        assert_eq!(again["id"].as_str(), Some(id.as_str()));
+        assert_eq!(again["session"], "ARK");
+        assert_eq!(
+            app.action_from.as_ref().map(|f| f.key.as_str()),
+            Some(key.as_str()),
+            "its answer may still take you in"
+        );
+        // That machine's answer is shown, whatever it says: never sent on again.
+        app.busy = true;
+        let back = || {
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "It lives on laptop now.".into(),
+                home: Some("laptop/web".into()),
+                ..Default::default()
+            })
+        };
+        app.finish_action(1, again, back());
+        assert_eq!(app.message().unwrap().0, "It lives on laptop now.");
+        assert_eq!(app.next_owed(), Action::None);
+        // A home that's the machine asked, or one Kerdr doesn't know, is only said.
+        for home in ["laptop/web", "elsewhere/ARK"] {
+            app.busy = true;
+            let reply = Ok(crate::actions::Response {
+                ok: false,
+                message: format!("refused: {home}"),
+                home: Some(home.into()),
+                ..Default::default()
+            });
+            app.finish_action(0, request.clone(), reply);
+            assert_eq!(app.message().unwrap().0, format!("refused: {home}"));
+            assert_eq!(app.resend, None);
+        }
+    }
+
+    #[test]
+    fn enter_on_work_running_outside_herdr_says_where_before_a_second_copy() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.fixed_now = Some(
+            chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 11, 2, 9, 0, 0)
+                .single()
+                .unwrap(),
+        );
+        let (key, _) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        let since = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 11, 1, 13, 2, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        app.board.cards[i].detail.as_mut().unwrap().outside_herdr =
+            Some(crate::feed::OutsideHerdr {
+                terminal: Some("foot".into()),
+                since: Some(since),
+            });
+        assert_eq!(enter(&mut app), Action::None, "nothing is sent");
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.starts_with(&format!(
+                "{reference}'s conversation is running outside herdr, in a foot window since yesterday 13:02."
+            )),
+            "{said}"
+        );
+        assert!(!said.contains("pid") && !said.contains("--"), "{said}");
+        // ⏎ again soon after goes on to the reopen, whose backend asks before a second copy.
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the second ⏎ sent nothing")
+        };
+        assert_eq!(request["action"], "reopen");
+        // Search's ⏎ says the same.
+        app.outside_warned = None;
+        app.mode = Mode::Board;
+        app.sel.key = Some(key.clone());
+        let search = || Search {
+            query: reference.clone(),
+            filter: SearchFilter::Everything,
+            sel: 0,
+        };
+        let hit = app
+            .search_hits(&search())
+            .into_iter()
+            .find(|(h, _)| matches!(h, Hit::Card(c) if *c == i))
+            .map(|(h, _)| h)
+            .unwrap();
+        assert_eq!(app.open_hit(hit, search()), Action::None);
+        assert!(app.message().unwrap().0.contains("outside herdr"));
+        // Done work asks its own question as ever.
+        app.outside_warned = None;
+        app.board.cards[i].stage = Stage::Maintain;
+        assert!(matches!(enter(&mut app), Action::Mutate { .. }));
+    }
+
+    #[test]
+    fn d_on_unstarted_work_in_a_working_column_does_what_enter_does() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].state = None;
+        app.board.cards[i].agents.clear();
+        app.board.cards[i].detail.as_mut().unwrap().no_agent = true;
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        let Action::Mutate {
+            request: by_enter, ..
+        } = enter(&mut app)
+        else {
+            panic!("⏎ sent nothing")
+        };
+        assert_eq!(request, by_enter);
+        // Work with a state of its own is still under way to d.
+        app.board.cards[i].state = Some("active".into());
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert!(app.message().unwrap().0.contains("already under way"));
+    }
+
+    #[test]
+    fn a_reopen_at_a_sessions_most_asks_to_queue_it() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        app.machines[0].feed.as_mut().unwrap().sessions.insert(
+            "web".into(),
+            crate::feed::FeedSlots {
+                used: 5,
+                limit: Some(3),
+                max: Some(5),
+            },
+        );
+        let request = reopen_by_enter(&mut app);
+        let reply = Ok(crate::actions::Response {
+            ok: false,
+            message: "web holds 5 workspaces, its most. w queues it.".into(),
+            confirmation: true,
+            confirm: Some("t".into()),
+            used: Some(5),
+            limit: Some(5),
+            session: Some("web".into()),
+            ..Default::default()
+        });
+        app.finish_action(0, request, reply);
+        settle(&mut app);
+        let Mode::Confirm { title, queue, .. } = &app.mode else {
+            panic!("no question")
+        };
+        assert_eq!(title, &format!("Queue {reference} in web?"));
+        assert!(queue);
+        let Action::Mutate { request, .. } = press(&mut app, 'w') else {
+            panic!("w sent nothing")
+        };
+        assert_eq!(request["queue"], true);
+        assert_eq!(request["confirm"], "t");
+        assert!(request.get("override").is_none());
+        // Past only the usual limit, it's still a reopen's question.
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(0, request, reopen_reply("web", false, true, "t2"));
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question")
+        };
+        assert_eq!(title, &format!("Reopen {reference} in web?"));
     }
 }

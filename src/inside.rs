@@ -592,7 +592,7 @@ impl App {
         if card.tab_id.is_some() || card.own_tab.is_some() || self.tabs_inside(card).is_empty() {
             return None;
         }
-        Some(self.offer_own_reopen(card, "has no tab of its own on record"))
+        Some(self.offer_own_reopen(card, false))
     }
 
     /// herdr found the tab Enter was for has closed. A piece's reopens, as a card whose workspace
@@ -608,11 +608,13 @@ impl App {
                 self.say(format!("{}'s tab has closed.", card.reference), Tone::Warn);
             }
         } else {
-            self.offer_own_reopen(&card, "has closed its tab");
+            self.offer_own_reopen(&card, true);
         }
     }
 
-    fn offer_own_reopen(&mut self, card: &Card, why: &str) -> Action {
+    /// Offers to reopen a card's own agent: its tab has `closed`, or Kerdr can't tell which tab
+    /// is its own (herdr doesn't know that agent's conversation).
+    fn offer_own_reopen(&mut self, card: &Card, closed: bool) -> Action {
         let others: Vec<String> = self
             .tabs_inside(card)
             .iter()
@@ -624,9 +626,15 @@ impl App {
             many => format!("tabs for {}", many.join(", ")),
         };
         let reference = card.reference.clone();
-        let said = format!(
-            "{reference}'s own agent {why}; ⏎ won't open another tab in its workspace, which may hold {tabs}."
-        );
+        let said = if closed {
+            format!(
+                "{reference}'s own agent has closed its tab; ⏎ won't open another tab in its workspace, which may hold {tabs}."
+            )
+        } else {
+            format!(
+                "Kerdr can't tell which tab is {reference}'s own agent's (herdr doesn't know that agent's conversation), and it won't open {tabs} instead."
+            )
+        };
         if !self.actions_on() || card.detail.is_none() {
             self.say(format!("{said} o shows what's inside."), Tone::Info);
             return Action::None;
@@ -1019,8 +1027,39 @@ mod tests {
         };
         assert_eq!(title, "Reopen #256's own agent?");
         assert!(message.contains("#262's tab"), "{message}");
+        assert!(message.contains("can't tell which tab"), "{message}");
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn search_enter_on_a_parent_with_no_own_tab_asks_as_the_board_does() {
+        let mut app = families(None);
+        let i = app
+            .board
+            .cards
+            .iter()
+            .position(|c| c.detail.as_ref().is_some_and(|d| d.id == "0256"))
+            .unwrap();
+        let search = Search {
+            query: "#256".into(),
+            filter: SearchFilter::Everything,
+            sel: 0,
+        };
+        assert_eq!(app.open_hit(Hit::Card(i), search), Action::None);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("{:?}", app.mode)
+        };
+        assert_eq!(title, "Reopen #256's own agent?");
+        // With its own tab on record, search goes in as the board does.
+        let mut app = families(Some("w2K:t1"));
+        let search = Search {
+            query: "#256".into(),
+            filter: SearchFilter::Everything,
+            sel: 0,
+        };
+        let k = key(&app, "0256");
+        assert_eq!(app.open_hit(Hit::Card(i), search), Action::Jump(k));
     }
 
     #[test]

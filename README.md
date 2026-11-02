@@ -140,6 +140,14 @@ running one answers. A newer `Enter` replaces the waiting one, and `Esc` drops i
 gets ready on a card, the board says "Opening …", and keys pressed meanwhile are thrown away
 rather than reaching the agent's prompt.
 
+When `Enter` can't open a card, Kerdr says why in plain words. If herdr's window closes as soon as
+it opens (SSH failing, herdr updating itself, versions that don't match), herdr's own message stays
+on the screen until you press Enter. A herdr session that has stopped counts as a closed workspace,
+so work under way reopens. A reopen that opened a new tab lands on that tab. When a card's
+conversation runs in a terminal outside herdr, `Enter` says which and sends nothing; a second
+`Enter` goes on to ask about a second copy. When the machine asked turns out not to be the work's
+home any more, Kerdr asks its home instead, once.
+
 Done work isn't a dead end either. When an agent finishes and wraps itself before you're done
 talking about it, `Enter` on its card in Maintain asks to reopen it: the backend always asks
 first, saying it's done, and only your yes opens it again and resumes its conversation. See

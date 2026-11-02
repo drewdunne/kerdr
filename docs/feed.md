@@ -95,7 +95,8 @@ know rather than guessing.
 | `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
-| `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. |
+| `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
+| `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it says where it runs and sends nothing; a second `Enter` within five seconds goes on to the reopen, whose backend asks before starting a second copy. |
 
 ## Work inside a card
 
@@ -194,7 +195,7 @@ exactly one JSON response to standard output. Send diagnostic output to standard
 
 `ok` (boolean) and `message` (string) are required. Optional fields are `confirmation` (boolean,
 default false), `used` and `limit` (nonnegative integers or null), and `session`, `id`,
-`workspace`, `label` and `confirm` (strings or null). Unknown response fields are allowed for future additions. A valid JSON response is
+`workspace`, `label`, `tab`, `home` and `confirm` (strings or null). Unknown response fields are allowed for future additions. A valid JSON response is
 read even if the command exits nonzero, allowing the backend to explain a refused action or ask
 for confirmation:
 
@@ -204,9 +205,24 @@ for confirmation:
 
 A confirmation is a separate user decision before sending a new request with `override: true`.
 Kerdr asks it for `dispatch` and `reopen`.
-Actions have a 120-second deadline. A timeout or an invalid response does not prove the mutation
-failed: its result is unknown. Kerdr does not retry it automatically; check the canonical record
-before trying again. After success, the next feed read reflects the saved changes.
+Actions have a 120-second deadline, and `dispatch` and `reopen` five minutes, since a start on
+another machine can wait minutes for it there; keep your own limits under those, so your answer
+comes first. A timeout or an invalid response does not prove the mutation failed: its result is
+unknown. Kerdr does not retry it automatically; for a start or a reopen it says the work may still
+open and to look at its card before trying again. After success, the next feed read reflects the
+saved changes.
+
+When a request is refused because the record lives on another machine than the one asked (a copy
+there that was behind named the wrong home), answer `ok: false` with `home`, the record's home as
+`<Machine>/<Session>`:
+
+```json
+{"ok":false,"message":"#41 lives on build-box now (ARK); ⏎ again opens it there.","home":"build-box/ARK"}
+```
+
+When that machine is one of Kerdr's, other than the one asked, and is answering, Kerdr sends the
+same request there once (a `reopen` with `session` set to that session), and shows whatever that
+machine answers, even another such refusal. Otherwise it shows the message.
 
 ## Starting work nobody started
 
@@ -238,9 +254,12 @@ conversation running in another pane, say), it answers with it, and Kerdr goes s
 {"ok":true,"message":"Reopened #41 in web, resuming its Claude conversation.","id":"0041","session":"web","workspace":"w12","label":"41-checkout-expired-cards"}
 ```
 
-`workspace` is a herdr workspace id in `session` on the machine the action ran on. Kerdr goes in
-only while you're still on that card; if you've moved on, or pressed `Esc`, it says the work is
-open again instead.
+`workspace` is a herdr workspace id in `session` on the machine the action ran on. When the reopen
+opened a new tab in a workspace already open (beside its parent's agent, or beside a tab still
+open there), add `tab`, that tab's id: herdr leaves a workspace's active tab as it was, so Kerdr
+goes onto that tab, and only that tab. Create the tab without focusing it, so nobody else's screen
+moves. Kerdr goes in only while you're still on that card; if you've moved on, or pressed `Esc`,
+it says the work is open again instead.
 
 To ask first (the session is at its usual limit, the conversation may still be open somewhere
 else), answer with `"confirmation": true`, a `message` that names every reason, and optionally
@@ -253,7 +272,9 @@ card has the same home and conversation and no new workspace.
 
 When the question says the session is full (it carries `used`), it also offers `w`: the request
 again with `queue: true` and that `confirm` token, for the backend to queue the work in that session instead, as starting
-new work would be. Without `[actions]`, `Enter` says the card has no workspace and sends nothing.
+new work would be. At the most a session holds (`used` reaching the feed's `max` for it), a yes
+can't open it there, so ask with a question all the same, saying `w` queues it: Kerdr titles it
+"Queue #41 in web?". Without `[actions]`, `Enter` says the card has no workspace and sends nothing.
 
 ### Reopening done work
 

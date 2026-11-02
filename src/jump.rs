@@ -143,6 +143,9 @@ pub enum Outcome {
     Closed,
     /// herdr says the tab a strict jump was for isn't there; nothing was opened.
     TabGone,
+    /// herdr says the session's server isn't running: it stopped since the board last read it,
+    /// so the workspace is gone with it, as `Closed`, but for a reason worth saying.
+    Stopped,
     Failed(String),
 }
 
@@ -167,6 +170,36 @@ fn first_line(out: &transport::Output) -> String {
         .find(|l| !l.is_empty())
         .unwrap_or("no answer")
         .to_string()
+}
+
+/// herdr's own refusal, from the JSON it prints on a failed command (`{"error":{"code","message"}}`,
+/// on stderr since 0.9.1): its code and its message.
+fn herdr_error(out: &transport::Output) -> Option<(String, String)> {
+    out.stderr
+        .lines()
+        .chain(out.stdout.lines())
+        .filter_map(|line| line.find('{').map(|i| &line[i..]))
+        .filter_map(|text| serde_json::from_str::<serde_json::Value>(text).ok())
+        .find_map(|v| {
+            let error = v.get("error")?;
+            Some((
+                error["code"].as_str().unwrap_or_default().to_string(),
+                error["message"].as_str().unwrap_or_default().to_string(),
+            ))
+        })
+}
+
+/// Why herdr refused, in its own words: its error's message rather than the JSON around it.
+fn why(out: &transport::Output) -> String {
+    match herdr_error(out) {
+        Some((_, message)) if !message.trim().is_empty() => message.trim().to_string(),
+        _ => first_line(out),
+    }
+}
+
+/// What the board says when herdr on a machine didn't answer a focus in time.
+fn no_answer(machine: &str) -> String {
+    format!("herdr on {machine} didn't answer in 12 s; ⏎ tries again.")
 }
 
 /// The workspace herdr says a tab it focused is in, from `tab focus`'s answer.
@@ -200,13 +233,26 @@ fn focus(
             // workspace, stops the jump. Herdr is put back on the workspace in case the tab took
             // it elsewhere, but nothing is opened.
             let _ = run(&workspace);
+            if out.timed_out {
+                return Some(Outcome::Failed(no_answer(&jump.machine.name)));
+            }
+            if let Some(problem) = transport::classify(t, &out) {
+                return Some(Outcome::Failed(format!(
+                    "Couldn't reach {}: {}",
+                    jump.machine.name,
+                    problem.detail()
+                )));
+            }
             if tab_gone(&out) {
                 return Some(Outcome::TabGone);
             }
+            if session_stopped(&out) {
+                return Some(Outcome::Stopped);
+            }
             return Some(Outcome::Failed(format!(
-                "herdr couldn't open {}'s tab {tab}: {}",
+                "herdr couldn't open {}'s tab: {}",
                 jump.label,
-                first_line(&out)
+                why(&out)
             )));
         }
         if !in_place {
@@ -218,6 +264,9 @@ fn focus(
 
 /// Why herdr's answer to focusing the card's workspace stops the jump, if it does.
 fn focus_refused(t: &Target, jump: &Jump, out: &transport::Output) -> Option<Outcome> {
+    if out.timed_out {
+        return Some(Outcome::Failed(no_answer(&jump.machine.name)));
+    }
     if let Some(problem) = transport::classify(t, out) {
         return Some(Outcome::Failed(format!(
             "Couldn't reach {}: {}",
@@ -229,10 +278,13 @@ fn focus_refused(t: &Target, jump: &Jump, out: &transport::Output) -> Option<Out
         if workspace_gone(out) {
             return Some(Outcome::Closed);
         }
+        if session_stopped(out) {
+            return Some(Outcome::Stopped);
+        }
         return Some(Outcome::Failed(format!(
             "herdr couldn't open {}: {}",
             jump.label,
-            first_line(out)
+            why(out)
         )));
     }
     None
@@ -248,9 +300,20 @@ fn tab_gone(out: &transport::Output) -> bool {
 
 /// Whether herdr refused because the workspace no longer exists.
 fn workspace_gone(out: &transport::Output) -> bool {
-    [&out.stdout, &out.stderr]
-        .iter()
-        .any(|s| s.contains("\"workspace_not_found\""))
+    herdr_error(out).is_some_and(|(code, _)| code == "workspace_not_found")
+        || [&out.stdout, &out.stderr]
+            .iter()
+            .any(|s| s.contains("\"workspace_not_found\""))
+}
+
+/// Whether herdr refused because the session's server isn't running: it stopped (a restart, an
+/// update, a crash) since the board last read it, and every workspace in it with it.
+fn session_stopped(out: &transport::Output) -> bool {
+    !out.ok()
+        && (herdr_error(out).is_some_and(|(code, _)| code == "server_not_running")
+            || [&out.stdout, &out.stderr]
+                .iter()
+                .any(|s| s.contains("\"server_not_running\"")))
 }
 
 pub struct TerminalFlags {
@@ -399,6 +462,7 @@ pub fn run(
     let ctrl_c = CtrlCToHerdr::new();
     drop_pending_keys();
     leave(flags);
+    let spawned = std::time::Instant::now();
     #[cfg(windows)]
     let console_modes = crate::windows::ConsoleModes::capture();
     let mut child = match cmd.spawn() {
@@ -508,21 +572,76 @@ pub fn run(
     stop.store(true, Ordering::Relaxed);
     #[cfg(windows)]
     drop(console_modes);
+    let result = *request.lock().unwrap();
+    // herdr's own words on why its window closed (SSH failing, an update under way, versions
+    // that don't match) are on the plain screen: they stay there until you've read them, since
+    // the board would cover them (intent 0411).
+    let outcome = finish_client(
+        status.map(|s| s.code()),
+        spawned.elapsed(),
+        result,
+        &jump.machine.name,
+        |text| {
+            println!("\n{text}");
+            let mut line = String::new();
+            let _ = std::io::stdin().read_line(&mut line);
+        },
+    );
     enter(terminal, flags);
     drop(ctrl_c);
-    let result = *request.lock().unwrap();
-    match result {
-        Some(Request::Next) => Outcome::Next,
-        Some(Request::Board) => Outcome::Board,
-        None => match status {
-            Some(s) if !s.success() => Outcome::Failed(format!(
-                "herdr closed unexpectedly ({}). The board is as it was.",
-                s.code()
-                    .map(|c| format!("exit code {c}"))
-                    .unwrap_or_else(|| "stopped by a signal".into())
-            )),
-            _ => Outcome::Board,
-        },
+    outcome
+}
+
+/// A herdr window that closes sooner than this, with no request of Kerdr's, failed to open.
+const AT_ONCE: Duration = Duration::from_secs(2);
+
+/// What a herdr window's end means. `exit` is None when its status couldn't be read, and
+/// Some(None) when a signal stopped it; `lasted` is how long it ran. When it failed, `pause` is
+/// given what to say on the plain screen, under herdr's own words, before the board comes back.
+fn finish_client(
+    exit: Option<Option<i32>>,
+    lasted: Duration,
+    request: Option<Request>,
+    machine: &str,
+    pause: impl FnOnce(&str),
+) -> Outcome {
+    let outcome = outcome_of(exit, lasted, request, machine);
+    if let Outcome::Failed(_) = outcome {
+        let how = match exit {
+            Some(Some(0)) => "at once".to_string(),
+            Some(Some(c)) => format!("with exit code {c}"),
+            Some(None) => "when a signal stopped it".to_string(),
+            None => "and Kerdr couldn't read why".to_string(),
+        };
+        pause(&format!(
+            "herdr's window on {machine} closed {how}. What it said is above. Press Enter to go back to Kerdr."
+        ));
+    }
+    outcome
+}
+
+fn outcome_of(
+    exit: Option<Option<i32>>,
+    lasted: Duration,
+    request: Option<Request>,
+    machine: &str,
+) -> Outcome {
+    match (request, exit) {
+        (Some(Request::Next), _) => Outcome::Next,
+        (Some(Request::Board), _) => Outcome::Board,
+        (None, Some(Some(0))) if lasted < AT_ONCE => Outcome::Failed(format!(
+            "herdr's window on {machine} closed at once without saying why; ⏎ tries again."
+        )),
+        (None, Some(Some(0))) => Outcome::Board,
+        (None, Some(Some(c))) => Outcome::Failed(format!(
+            "herdr's window on {machine} closed with exit code {c}; its own message is on the screen you just saw. The board is as it was."
+        )),
+        (None, Some(None)) => Outcome::Failed(format!(
+            "herdr's window on {machine} was stopped by a signal. The board is as it was."
+        )),
+        (None, None) => Outcome::Failed(format!(
+            "herdr's window on {machine} closed, and Kerdr couldn't read how. The board is as it was."
+        )),
     }
 }
 
@@ -838,6 +957,131 @@ mod tests {
         let (outcome, calls) = focus_with(&jump(Some("w4:t2")), |_| says(1, WORKSPACE_GONE));
         assert_eq!(outcome, Some(Outcome::Closed));
         assert_eq!(calls, [FOCUS_W4]);
+    }
+
+    fn says_err(status: i32, stderr: &str) -> transport::Output {
+        transport::Output {
+            status: Some(status),
+            stderr: stderr.into(),
+            ..Default::default()
+        }
+    }
+
+    // What herdr 0.9.1 prints on stderr when the session's server isn't running.
+    const NOT_RUNNING: &str = r#"{"id":"cli:workspace:focus","error":{"code":"server_not_running","message":"no herdr server is running at /x/sessions/web/herdr.sock; run `herdr session attach web` to start or attach it"}}"#;
+
+    #[test]
+    fn herdr_refusals_on_stderr_are_read_as_on_stdout() {
+        let (outcome, calls) = focus_with(&jump(None), |_| says_err(1, WORKSPACE_GONE));
+        assert_eq!(outcome, Some(Outcome::Closed));
+        assert_eq!(calls, [FOCUS_W4]);
+        let (answer, _) = herdr_with(None, says_err(1, TAB_GONE), says(0, WORKSPACE_FOCUSED));
+        let strict = Jump {
+            strict: true,
+            ..jump(Some("w4:t2"))
+        };
+        assert_eq!(focus_with(&strict, answer).0, Some(Outcome::TabGone));
+    }
+
+    #[test]
+    fn a_stopped_session_is_told_apart_from_a_failure() {
+        let (outcome, calls) = focus_with(&jump(None), |_| says_err(1, NOT_RUNNING));
+        assert_eq!(outcome, Some(Outcome::Stopped));
+        assert_eq!(calls, [FOCUS_W4]);
+    }
+
+    #[test]
+    fn an_unknown_herdr_refusal_is_said_in_plain_words() {
+        let refusal = r#"{"id":"cli:workspace:focus","error":{"code":"some_new_code","message":"something broke"}}"#;
+        let (outcome, _) = focus_with(&jump(None), |_| says_err(1, refusal));
+        let Some(Outcome::Failed(m)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(m.contains("something broke"), "{m}");
+        assert!(!m.contains('{') && !m.contains("some_new_code"), "{m}");
+        // Words that aren't herdr's JSON are said as they are.
+        let (outcome, _) = focus_with(&jump(None), |_| says_err(1, "error: busy"));
+        assert_eq!(
+            outcome,
+            Some(Outcome::Failed(
+                "herdr couldn't open 41-checkout: error: busy".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_focus_that_times_out_says_herdr_didnt_answer_and_enter_tries_again() {
+        let lost = || transport::Output {
+            timed_out: true,
+            ..Default::default()
+        };
+        let (outcome, _) = focus_with(&jump(None), |_| lost());
+        let Some(Outcome::Failed(m)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(m.contains("didn't answer in 12 s"), "{m}");
+        assert!(m.contains("⏎ tries again"), "{m}");
+        // A strict tab whose focus timed out says the same, with herdr put back.
+        let (answer, _) = herdr_with(None, lost(), says(0, WORKSPACE_FOCUSED));
+        let strict = Jump {
+            strict: true,
+            ..jump(Some("w4:t2"))
+        };
+        let (outcome, calls) = focus_with(&strict, answer);
+        let Some(Outcome::Failed(m)) = outcome else {
+            panic!("{outcome:?}")
+        };
+        assert!(m.contains("didn't answer in 12 s"), "{m}");
+        assert!(!m.contains("no answer"), "{m}");
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2, FOCUS_W4]);
+    }
+
+    #[test]
+    fn a_herdr_window_that_fails_says_so_and_waits_on_the_plain_screen() {
+        let quick = Duration::from_millis(200);
+        let long = Duration::from_secs(30);
+        let failed = |o: Outcome| match o {
+            Outcome::Failed(m) => m,
+            other => panic!("{other:?}"),
+        };
+        let m = failed(outcome_of(Some(Some(1)), quick, None, "LAB-Server"));
+        assert!(
+            m.contains("exit code 1") && m.contains("its own message"),
+            "{m}"
+        );
+        assert!(m.contains("LAB-Server"), "{m}");
+        let m = failed(outcome_of(
+            Some(Some(0)),
+            Duration::from_millis(300),
+            None,
+            "m",
+        ));
+        assert!(m.contains("closed at once"), "{m}");
+        assert_eq!(outcome_of(Some(Some(0)), long, None, "m"), Outcome::Board);
+        assert_eq!(
+            outcome_of(Some(Some(1)), long, Some(Request::Board), "m"),
+            Outcome::Board
+        );
+        assert_eq!(
+            outcome_of(Some(Some(0)), quick, Some(Request::Next), "m"),
+            Outcome::Next
+        );
+        let m = failed(outcome_of(Some(None), long, None, "m"));
+        assert!(m.contains("stopped by a signal"), "{m}");
+        // A failure waits for Enter on the plain screen, where herdr's own words are.
+        let mut paused = vec![];
+        finish_client(Some(Some(1)), quick, None, "m", |t| {
+            paused.push(t.to_string())
+        });
+        assert_eq!(paused.len(), 1);
+        assert!(paused[0].contains("exit code 1"), "{}", paused[0]);
+        assert!(paused[0].contains("Press Enter"), "{}", paused[0]);
+        // Leaving herdr as usual doesn't.
+        let mut paused = 0;
+        let outcome = finish_client(Some(Some(0)), Duration::from_secs(3), None, "m", |_| {
+            paused += 1
+        });
+        assert_eq!((outcome, paused), (Outcome::Board, 0));
     }
 
     #[cfg(unix)]

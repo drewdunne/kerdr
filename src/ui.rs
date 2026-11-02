@@ -1397,7 +1397,10 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
     }
     // Open work its agent left, or whose workspace closed under it: say so where it shows
     // (intent 0289). C marks it done and x sets it aside, each starting nothing.
-    let note = if c.no_agent() && !cached {
+    // Its conversation runs in a terminal outside herdr, so no workspace shows it (intent 0411).
+    let note = if let Some(outside) = c.outside_herdr().filter(|_| !cached) {
+        (format!("outside herdr · {}", outside.short()), CYAN)
+    } else if c.no_agent() && !cached {
         ("no agent".to_string(), YELLOW)
     } else {
         (note, DIM)
@@ -4985,6 +4988,28 @@ mod tests {
 
     /// Intent 0289: work its agent left open says "no agent" on its card, and the bottom line,
     /// a peek, the menu and the keys list name C and x for it.
+    #[test]
+    fn work_running_outside_herdr_says_where_on_its_card() {
+        let mut a = demo(false);
+        a.cfg.actions.command = Some("test-adapter".into());
+        let i = a
+            .board
+            .cards
+            .iter()
+            .position(|c| c.detail.is_some() && c.stage == Stage::Build)
+            .unwrap();
+        let card = &mut a.board.cards[i];
+        card.workspace_id = None;
+        card.session = None;
+        card.agents.clear();
+        card.detail.as_mut().unwrap().outside_herdr = Some(crate::feed::OutsideHerdr {
+            terminal: Some("foot".into()),
+            since: None,
+        });
+        let board = rendered(&a, 220, 44);
+        assert!(board.contains("outside herdr · foot"), "{board}");
+    }
+
     #[test]
     fn work_with_no_agent_says_so_and_names_c_and_x() {
         let mut a = demo(false);

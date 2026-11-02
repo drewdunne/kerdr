@@ -727,6 +727,18 @@ impl App {
             );
             return Action::None;
         }
+        // d on work in a working column that no agent has run and nothing records a state for
+        // (another agent's note in its log moved it there): it does what ⏎ does, whose backend
+        // starts it when it never ran and resumes it when it did, so d and ⏎ agree (intent 0411).
+        if action == "dispatch"
+            && started
+            && card.no_agent()
+            && card.state.is_none()
+            && card.under_way()
+            && card.outside_herdr().is_none()
+        {
+            return self.reopen_action(&card);
+        }
         if started && !(ends && card.closable()) {
             let reference = &card.reference;
             let said = if ends && card.done() || card.state.as_deref() == Some("closed") {
@@ -1505,6 +1517,38 @@ impl App {
             return;
         }
         let from = self.action_from.take();
+        let id = request["id"].as_str().map(str::to_string);
+        let was_resent = self
+            .resent
+            .take()
+            .is_some_and(|(m, r)| m == machine && Some(r) == id);
+        // Refused because the intent lives on another machine than the one asked (a copy that
+        // was behind named the wrong home): the same request goes there, once (intent 0411).
+        if let Ok(response) = &result
+            && !response.ok
+            && !response.confirmation
+            && !was_resent
+            && let Some(id) = id
+            && let Some(home) = response.home.as_deref()
+            && let Some((host, session)) = home.split_once('/').or(Some((home, "")))
+            && let Some(to) = self.machine_index(host)
+            && to != machine
+            && self.machines[to].conn.is_live()
+        {
+            let mut request = request;
+            if request["action"] == "reopen" && !session.is_empty() {
+                request["session"] = json!(session);
+            }
+            let reference = self.reference_for(&id);
+            let name = self.machines[to].name();
+            self.say(
+                format!("{reference} lives on {name} now; asking there."),
+                Tone::Info,
+            );
+            self.resent = Some((to, id));
+            self.resend = Some((to, request, from));
+            return;
+        }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {
             response.confirmation
@@ -1549,7 +1593,20 @@ impl App {
                 let session = response.session.as_deref().unwrap_or("its home session");
                 let (is_reopen, full) = (request["action"] == "reopen", response.used.is_some());
                 // A reopen's answer says every reason itself: a copy open elsewhere, a full session.
-                let (title, message) = if request["action"] == "reopen" {
+                // At the most a session holds, a yes can't open it there: w, its queue, is the
+                // answer the question offers, so its title says so.
+                let at_most = is_reopen
+                    && response.used.is_some_and(|used| {
+                        self.machines
+                            .get(machine)
+                            .and_then(|m| m.feed.as_ref())
+                            .and_then(|f| f.sessions.get(session))
+                            .and_then(|s| s.max)
+                            .is_some_and(|most| used >= most)
+                    });
+                let (title, message) = if at_most {
+                    (format!("Queue {reference} in {session}?"), response.message)
+                } else if request["action"] == "reopen" {
                     (
                         format!("Reopen {reference} in {session}?"),
                         response.message,
@@ -1627,6 +1684,7 @@ impl App {
                                 label: response.label.clone().unwrap_or_else(|| workspace.clone()),
                                 session,
                                 workspace,
+                                tab: response.tab.clone(),
                                 from,
                             })
                         }
