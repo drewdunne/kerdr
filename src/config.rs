@@ -30,6 +30,9 @@ pub struct BoardConfig {
     pub only: Vec<String>,
     /// Never show these sessions.
     pub skip: Vec<String>,
+    /// Columns the board leaves out, giving their room to the others: `backlog`, `maintain`, or
+    /// both. Only these two can go, since each has a screen of its own (`b` and `D`).
+    pub hide_columns: Vec<String>,
 }
 
 impl BoardConfig {
@@ -55,6 +58,29 @@ impl BoardConfig {
         })
     }
 
+    /// Whether the config leaves this stage's column off the board.
+    pub fn hides(&self, stage: crate::model::Stage) -> bool {
+        self.hide_columns
+            .iter()
+            .any(|c| crate::model::Stage::parse(c) == Some(stage))
+    }
+
+    /// A column name that can't be hidden, as the error to show.
+    fn check_hidden(&self) -> Result<(), String> {
+        use crate::model::Stage;
+        for c in &self.hide_columns {
+            match Stage::parse(c) {
+                Some(Stage::Backlog | Stage::Maintain) => {}
+                _ => {
+                    return Err(format!(
+                        "[board] hide_columns: \"{c}\" can't be hidden; only \"backlog\" and \"maintain\" can, since each has a screen of its own (b and D)"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
     pub fn wants(&self, session: &str) -> bool {
         (self.only.is_empty() || self.only.iter().any(|s| s == session))
             && !self.skip.iter().any(|s| s == session)
@@ -68,6 +94,7 @@ impl Default for BoardConfig {
             unlimited: vec!["background".to_string()],
             only: vec![],
             skip: vec![],
+            hide_columns: vec![],
         }
     }
 }
@@ -236,7 +263,14 @@ impl Config {
 
     pub fn load_from(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display())),
+            Ok(text) => {
+                let cfg: Config =
+                    toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
+                cfg.board
+                    .check_hidden()
+                    .map_err(|e| format!("{}: {e}", path.display()))?;
+                Ok(cfg)
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(format!("{}: {e}", path.display())),
         }
@@ -333,6 +367,28 @@ mod tests {
 
     fn cfg(text: &str) -> Config {
         toml::from_str(text).unwrap()
+    }
+
+    #[test]
+    fn hide_columns_takes_backlog_and_maintain_and_refuses_the_rest() {
+        use crate::model::Stage;
+        let dir = std::env::temp_dir().join(format!("kerdr-hide-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        std::fs::write(&path, "[board]\nhide_columns = ['backlog', 'done']\n").unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert!(c.board.hides(Stage::Backlog) && c.board.hides(Stage::Maintain));
+        assert!(!c.board.hides(Stage::Build));
+        assert!(
+            !Config::default().board.hides(Stage::Backlog),
+            "every column shows by default"
+        );
+        for bad in ["build", "nonsense"] {
+            std::fs::write(&path, format!("[board]\nhide_columns = ['{bad}']\n")).unwrap();
+            let err = Config::load_from(&path).unwrap_err();
+            assert!(err.contains(bad) && err.contains("hide_columns"), "{err}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

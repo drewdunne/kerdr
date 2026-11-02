@@ -50,7 +50,9 @@ question, something stuck. Everything else keeps running without you.
 - **The stages are Anthropic's.** The columns are the six stages of Anthropic's
   [AI-native SDLC playbook](https://claude.com/resources/articles/the-ai-native-sdlc-playbook):
   Plan, Design, Build, Test, Deploy and Maintain, with a Backlog in front for work that hasn't
-  started. Finished work lands in Maintain.
+  started. Finished work lands in Maintain. If you'd rather give the cards more room, the config
+  can leave the Backlog and Maintain columns off the board (`hide_columns`); their work stays a
+  key away, in the backlog (`b`) and Done (`D`).
 - **What needs you comes first,** in every column.
 - **Work-in-progress limits.** Each herdr session holds three workspaces with an agent before
   Kerdr calls it full (change it in the config). A lane for background agents has no limit.
@@ -77,7 +79,7 @@ you, its done-when criteria, the agent's last update, and the latest lines of it
 What an agent made for a card (its children, its undertaker, the follow-ups that came out of its
 work) lives inside that card, not in a column of its own. The card's last line counts it, marks
 each piece, and names the one that needs you, and its border turns yellow while one does. A done
-card with work still open inside stays at the top of Maintain, saying "3 open". `o` opens the card's
+card with work still open inside stays at the top of Maintain (and of Done), saying "3 open". `o` opens the card's
 own screen: the card itself first, then what's inside, grouped as needs you, under way, not started
 and done, with the selected row's details beside it. `Enter` on a row goes where that work runs: a
 child's tab, a follow-up's own workspace, or another machine. `Enter` on the board goes to the
@@ -154,7 +156,7 @@ doesn't list, or one not answering), it says so in its own words. Answers longer
 characters are cut short.
 
 Done work isn't a dead end either. When an agent finishes and wraps itself before you're done
-talking about it, `Enter` on its card in Maintain asks to reopen it: the backend always asks
+talking about it, `Enter` on its card in Maintain or Done asks to reopen it: the backend always asks
 first, saying it's done, and only your yes opens it again and resumes its conversation. See
 [docs/feed.md](docs/feed.md#reopening-done-work).
 
@@ -189,11 +191,18 @@ that's already done. Session and workspace results follow the same filters; swit
 
 ### Search the list you're in
 
-`/` in the backlog, in Won't do or in Misc searches only that list, where it is: the list narrows
+`/` in the backlog, in Won't do, in Done or in Misc searches only that list, where it is: the list narrows
 as you type, each backlog card keeping its place number. Enter does what Enter does in that
 list (peeks in the backlog, jumps in from Misc) on the card selected, and the search stays while
 you peek or act on the cards it left, with the list's own keys. `/` changes it, and `Esc` clears
 it; the next `Esc` leaves the list. Leaving the list ends its search.
+
+### Done
+
+`D` lists finished work on a screen of its own, as the Maintain column does: a done card with
+work still open inside comes first, saying how much. `Enter` asks to reopen the selected card, `o`
+opens what's inside it, `Space` peeks, and `D` or `Esc` goes back to the board. It works whether or
+not the board shows Maintain, and is how you reach done work when it doesn't.
 
 ### The backlog
 
@@ -350,11 +359,11 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `Enter` | jump in; on work nobody started, start it, as `d` does; on work whose workspace closed, reopen it; on done work, ask to reopen it (all three with actions) |
 | `m` or `Space` | peek |
 | `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
-| `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`) |
+| `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`; in the backlog and Done too) |
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
-| `/` | search everything; in the backlog, Won't do or Misc, search only that list (`Esc` clears it) |
+| `/` | search everything; in the backlog, Won't do, Done or Misc, search only that list (`Esc` clears it) |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` `B` | start, still want it, won't do, bring back, move down / up, to the top, to the bottom (the selected backlog intent) |
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
@@ -364,6 +373,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `a` | cycle agents: all, each program the feeds name, then any other herdr reports |
 | `b` | backlog |
 | `w` | toggle Won't do view |
+| `D` | Done: finished work, where `Enter` asks to reopen it and `o` opens what's inside |
 | `i` | Misc: workspaces with no record |
 | `Ctrl+Space` | a menu of the work and view keys, with the same letters |
 | `M` | machines |
@@ -473,6 +483,7 @@ slots = 3                   # workspaces with an agent per session before it's f
 unlimited = ["*-bg", "background"] # sessions with no limit; * matches any text
 skip = []                   # sessions never shown
 only = []                   # show only these sessions
+hide_columns = []           # "backlog", "maintain" or both: left off the board, for more room
 
 [[machine]]
 name = "build-box"          # the name on the board
@@ -487,6 +498,11 @@ ssh = "laptop"
 anywhere in the name. For example, `"*-bg"` includes `pick4me-bg` and `arknet-bg`, but not
 `pick4me`; `"background"` remains an exact match. Other characters are literal, and matching
 is case-sensitive. A feed's explicit slot counts and limits still take precedence.
+
+`[board] hide_columns` leaves the Backlog or Maintain column, or both, off the board, and the
+other columns share the room. Only those two can go, since each has a screen of its own: the
+backlog (`b`) and Done (`D`). `n` still reaches a backlog card that needs you, opening the backlog
+on it.
 
 The same file works on every machine: the machine whose hostname matches a `name` is "this
 machine", and Kerdr reaches the others over SSH. If you use the herdr session picker for

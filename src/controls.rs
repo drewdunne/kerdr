@@ -650,6 +650,7 @@ impl App {
                 | Mode::Peek { .. }
                 | Mode::Backlog { .. }
                 | Mode::Misc { .. }
+                | Mode::Done { .. }
                 | Mode::Card { .. }
         ) && !self.typing_view_search()
             && self
@@ -660,8 +661,10 @@ impl App {
     /// Whether a list view's search is being typed: its letters are words, so no question may
     /// take them over as answers.
     pub(super) fn typing_view_search(&self) -> bool {
-        matches!(self.mode, Mode::Backlog { .. } | Mode::Misc { .. })
-            && self.view_search.as_ref().is_some_and(|s| s.typing)
+        matches!(
+            self.mode,
+            Mode::Backlog { .. } | Mode::Misc { .. } | Mode::Done { .. }
+        ) && self.view_search.as_ref().is_some_and(|s| s.typing)
     }
 
     /// Whether intent actions are configured, so ⏎ can reopen and d start work.
@@ -1021,6 +1024,7 @@ impl App {
             KeyCode::Char('b') => self.enter_backlog(false),
             KeyCode::Char('w') => self.enter_backlog(!self.wont_do),
             KeyCode::Char('i') => self.enter_misc(),
+            KeyCode::Char('D') => self.enter_done(),
             KeyCode::Char('f') => self.enter_filter(),
             KeyCode::Char('F') => self.clear_filters(),
             KeyCode::Char('a') => self.cycle_provider(),
@@ -1425,7 +1429,11 @@ impl App {
         if leader
             && matches!(
                 self.mode,
-                Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
+                Mode::Board
+                    | Mode::Peek { .. }
+                    | Mode::Backlog { .. }
+                    | Mode::Misc { .. }
+                    | Mode::Done { .. }
             )
         {
             let target = self.card_for_keys().map(|c| c.key.clone());
@@ -1446,7 +1454,7 @@ impl App {
         }
         let lists = matches!(
             self.mode,
-            Mode::Board | Mode::Backlog { .. } | Mode::Misc { .. }
+            Mode::Board | Mode::Backlog { .. } | Mode::Misc { .. } | Mode::Done { .. }
         );
         match key.code {
             KeyCode::Char('c') if lists || matches!(self.mode, Mode::Peek { .. }) => {
