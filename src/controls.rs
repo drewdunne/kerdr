@@ -1060,6 +1060,17 @@ impl App {
                         .filter(|i| words.contains(&images::tag(i.tag)))
                         .cloned()
                         .collect();
+                    // Words whose last send went unanswered may be saved already: they go again
+                    // where they went then, with the same submission, wherever you are now, so the
+                    // adapter finds the first one rather than making a second.
+                    if let Some(s) = self
+                        .submission
+                        .as_ref()
+                        .filter(|s| s.unknown && s.words == words && s.images == images)
+                    {
+                        draft.machine = s.machine;
+                        draft.session = s.session.clone();
+                    }
                     let same = self.submission.as_ref().is_some_and(|s| {
                         s.words == words
                             && s.images == images
@@ -1089,7 +1100,7 @@ impl App {
                     self.draft_images = draft.images;
                     self.image_load = None;
                     self.mode = *back;
-                    self.closed_on_send = Some(self.mode_kind());
+                    self.closed_on_send = true;
                     self.say("Saving your new intent…", Tone::Info);
                     return self.emit_mutation(machine, request);
                 }
@@ -1130,6 +1141,7 @@ impl App {
     /// In the new-intent box, a paste that is only an image file's path attaches that image,
     /// and an empty one (a terminal pasting a clipboard that holds only an image) looks for one.
     pub fn on_paste(&mut self, text: &str) -> Action {
+        self.closed_on_send = false;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.account_paste(&text) {
             return Action::None;
@@ -1573,15 +1585,12 @@ impl App {
                     // these words went unheard. The next words get an id of their own.
                     self.submission = None;
                 }
+                // Nothing pressed since the box closed: the backlog opens on the new card. Moved
+                // on, nothing pulls you away.
+                let still =
+                    request["action"] == "create" && std::mem::take(&mut self.closed_on_send);
                 // A failure that names an intent still made one (saved here but not pushed,
                 // say), so its words must not be sent again.
-                // Where the box closed from: still there, the backlog opens on the new card; moved
-                // on, nothing pulls you away, and the message says where it went.
-                let still = request["action"] == "create"
-                    && self
-                        .closed_on_send
-                        .take()
-                        .is_none_or(|k| k == self.mode_kind());
                 if request["action"] == "create" && (response.ok || response.id.is_some()) {
                     self.draft.clear();
                     self.draft_images.clear();
@@ -1627,7 +1636,7 @@ impl App {
             }
             Err(error) => {
                 if request["action"] == "create" {
-                    self.closed_on_send = None;
+                    self.closed_on_send = false;
                     if let Some(s) = self.submission.as_mut() {
                         s.unknown = true;
                     }

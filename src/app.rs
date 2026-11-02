@@ -403,10 +403,10 @@ pub struct App {
     pub submission: Option<Submission>,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
     pub new_intent_id: Option<(usize, String)>,
-    /// The screen the new-intent box closed to when Enter sent its words: while that's still the
-    /// screen when the answer comes, the backlog opens on the new card; once you've moved on,
+    /// The new-intent box closed when Enter sent its words, and nothing has been pressed or pasted
+    /// since: when the answer comes, the backlog opens on the new card. Once you've moved on,
     /// nothing pulls you away.
-    pub(crate) closed_on_send: Option<std::mem::Discriminant<Mode>>,
+    pub(crate) closed_on_send: bool,
     backlog_focus: Option<String>,
     /// `/` in a list view: what narrows it, kept while you peek or act from it, and dropped
     /// once you leave the view.
@@ -464,7 +464,7 @@ impl App {
             image_loads: 0,
             image_at: 0,
             new_intent_id: None,
-            closed_on_send: None,
+            closed_on_send: false,
             submission: None,
             backlog_focus: None,
             view_search: None,
@@ -501,11 +501,6 @@ impl App {
 
     pub fn scope(&self) -> &Scope {
         self.tabs.get(self.tab).unwrap_or(&Scope::All)
-    }
-
-    /// Which screen is up, whatever is selected on it.
-    pub(crate) fn mode_kind(&self) -> std::mem::Discriminant<Mode> {
-        std::mem::discriminant(&self.mode)
     }
 
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
@@ -1003,6 +998,8 @@ impl App {
         if key.kind == KeyEventKind::Release {
             return Action::None;
         }
+        // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
+        self.closed_on_send = false;
         // Esc anywhere lets a running action's answer go: it still finishes, but neither asks nor
         // takes you anywhere, and a reopen waiting its turn is dropped.
         let stopped = key.code == KeyCode::Esc
@@ -3252,6 +3249,28 @@ mod tests {
         settle(&mut app);
         let fourth = send_words(&mut app, "Back up the NAS");
         assert_ne!(fourth["submission"], id.as_str());
+    }
+
+    #[test]
+    fn a_retry_after_a_lost_answer_goes_where_the_first_send_went() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let first = send_words(&mut app, "Back up the NAS");
+        app.finish_action(0, first.clone(), Err("timed out".into()));
+        settle(&mut app);
+        // He moves to another session's view before trying again: the retry still names the first
+        // send's session and submission, so the adapter finds what it may have made.
+        press(&mut app, 'c');
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.session = "elsewhere".into();
+        }
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        assert_eq!(request["submission"], first["submission"]);
+        assert_eq!(request["session"], first["session"]);
     }
 
     #[test]
