@@ -186,7 +186,10 @@ impl App {
                     2
                 }
             }),
-            Stage::Backlog | Stage::Misc => {}
+            // Your order, but what waits on you before it (a question asked before the work
+            // starts): far down the list, nobody sees it (intent 0420).
+            Stage::Backlog => col.sort_by_key(|&i| !self.board.cards[i].needs_you()),
+            Stage::Misc => {}
             // What's waiting on you first, then the rest as the board sorted it, cards as last
             // seen from a machine out of reach at the end (intent 0401).
             _ => col.sort_by_key(|&i| {
@@ -938,6 +941,173 @@ mod tests {
         let mut app = App::new(cfg, vec![laptop, one]);
         app.fixed_now = Some(crate::demo::now());
         app
+    }
+
+    fn live() -> Conn {
+        Conn::Live {
+            latency: Default::default(),
+        }
+    }
+
+    /// A read of `m`'s session `session` as `snap`, made at `at`, with no feed this time.
+    fn read(
+        m: &MachineState,
+        session: &str,
+        snap: Snapshot,
+        at: chrono::DateTime<chrono::Local>,
+        i: usize,
+    ) -> crate::poll::Event {
+        let mut data = m.data.clone().unwrap();
+        data.snapshots = [(session.to_string(), Ok(snap))].into_iter().collect();
+        crate::poll::Event {
+            machine: i,
+            conn: live(),
+            data: Some(data),
+            at,
+        }
+    }
+
+    /// Heimdall (ark-sdlc 0328, intent 0420): its agent's turn ended on questions for you, its
+    /// pinboard said Waiting on Andrew, and a workflow in its pane kept herdr saying working.
+    #[test]
+    fn a_card_waiting_on_you_stays_yours_while_a_workflow_keeps_its_agent_working() {
+        let label = "28-screen-watch-flywheel";
+        let snap = |heimdall: &str| Snapshot {
+            workspaces: vec![
+                Workspace {
+                    workspace_id: "w2P".into(),
+                    label: label.into(),
+                    ..Default::default()
+                },
+                Workspace {
+                    workspace_id: "w3A".into(),
+                    label: "29-busy".into(),
+                    ..Default::default()
+                },
+            ],
+            agents: vec![
+                agent("w2P:p1", "w2P:t1", heimdall),
+                agent("w3A:p1", "w3A:t1", "working"),
+            ],
+            ..Default::default()
+        };
+        let t0 = chrono::Local::now();
+        let mut laptop = machine(
+            "AMD-LZM4",
+            false,
+            "KBZ",
+            snap("working"),
+            vec![
+                card("0329", "Busy", "build", |c| {
+                    c.attention = Some("running".into());
+                    c.workspace = in_ws("w3A", "29-busy", None, Some("w3A:t1"));
+                }),
+                card(
+                    "0328",
+                    "Screen-watching improvement flywheel",
+                    "build",
+                    |c| {
+                        c.attention = Some("needs_you".into());
+                        c.status = Some("Waiting on Andrew".into());
+                        c.workspace = in_ws("w2P", label, None, Some("w2P:t1"));
+                    },
+                ),
+            ],
+        );
+        laptop.feed.as_mut().unwrap().generated_at =
+            Some((t0 - chrono::Duration::seconds(30)).to_rfc3339());
+        let mut app = App::new(Config::default(), vec![laptop]);
+        // A later read: still working, as it was before the feed said it waits on you.
+        let ev = read(&app.machines[0], "KBZ", snap("working"), t0, 0);
+        app.apply(ev);
+        let heimdall = key(&app, "0328");
+        assert_eq!(app.card(&heimdall).unwrap().attention, Attention::NeedsYou);
+        // A yellow box at the top of its column, and the next to jump to.
+        assert_eq!(column_ids(&app)[Stage::Build.index()][0], "0328");
+        assert_eq!(
+            app.next_needs_you_after(&key(&app, "0329"), &[]),
+            Some(heimdall.clone())
+        );
+        let s = crate::board::summarize(&app.board, &Scope::All, &app.machines);
+        assert_eq!(s.needs_you, 1);
+
+        // You answer: its turn ends, then it goes to work on your answer. That shows at once.
+        let ev = read(
+            &app.machines[0],
+            "KBZ",
+            snap("idle"),
+            t0 + chrono::Duration::seconds(2),
+            0,
+        );
+        app.apply(ev);
+        assert_eq!(app.card(&heimdall).unwrap().attention, Attention::NeedsYou);
+        let ev = read(
+            &app.machines[0],
+            "KBZ",
+            snap("working"),
+            t0 + chrono::Duration::seconds(4),
+            0,
+        );
+        app.apply(ev);
+        assert_eq!(app.card(&heimdall).unwrap().attention, Attention::Running);
+    }
+
+    /// Launching a Tinyhost world (ark-sdlc 0408, intent 0420): queued with two questions for you
+    /// before it starts, homed on another machine, 76th of 80 in the backlog.
+    #[test]
+    fn a_queued_card_with_questions_for_you_tops_the_backlog_and_counts() {
+        let empty = Snapshot::default();
+        let mut cards: Vec<FeedCard> = (1..=12)
+            .map(|n| {
+                card(&format!("{:04}", 100 + n), "Queued", "backlog", |c| {
+                    c.backlog_rank = Some(n);
+                })
+            })
+            .collect();
+        let world = card("0408", "Launch a Tinyhost world", "backlog", |c| {
+            c.backlog_rank = Some(408);
+            c.attention = Some("needs_you".into());
+            c.needs = Some("2 questions before it starts".into());
+            c.home = Some(Home {
+                machine: Some("LAB-Server".into()),
+                session: Some("TNY".into()),
+            });
+        });
+        cards.push(world.clone());
+        let laptop = machine("AMD-LZM4", false, "KBZ", empty.clone(), cards);
+        let lab = machine("LAB-Server", true, "default", empty, vec![world]);
+        let mut app = App::new(Config::default(), vec![laptop, lab]);
+        app.rebuild();
+        let k = key(&app, "0408");
+        let c = app.card(&k).unwrap();
+        assert_eq!(c.attention, Attention::NeedsYou);
+        assert_eq!(c.why, "2 questions before it starts");
+        assert_eq!(c.machine, "LAB-Server");
+        // First in the backlog column; the backlog's own list keeps your order.
+        let backlog = &column_ids(&app)[Stage::Backlog.index()];
+        assert_eq!(backlog[0], "0408");
+        assert_eq!(backlog[1], "0101");
+        let order: Vec<String> = app
+            .backlog_order()
+            .iter()
+            .map(|&i| app.board.cards[i].detail.as_ref().unwrap().id.clone())
+            .collect();
+        assert_eq!(order.last().map(String::as_str), Some("0408"));
+        // Counted with what waits on you, and n reaches it.
+        let s = crate::board::summarize(&app.board, &Scope::All, &app.machines);
+        assert_eq!(s.needs_you, 1);
+        assert_eq!(s.verdict, Some(crate::model::Verdict::FinishFirst(1)));
+        assert_eq!(app.step_needs_you(1), Some(k.clone()));
+        // A narrow screen keeps the Backlog column while something in it waits on you.
+        app.width = 80;
+        assert!(app.visible_columns()[Stage::Backlog.index()]);
+        for m in &mut app.machines {
+            for c in &mut m.feed.as_mut().unwrap().cards {
+                c.attention = None;
+            }
+        }
+        app.rebuild();
+        assert!(!app.visible_columns()[Stage::Backlog.index()]);
     }
 
     fn key(app: &App, id: &str) -> String {

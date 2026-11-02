@@ -1266,6 +1266,13 @@ fn list_glyph(
         }
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
         _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
+        // Not started, but waiting on you all the same: questions asked before it starts.
+        _ if c.needs_you() && !c.dismissed() => (
+            Attention::NeedsYou.glyph(),
+            YELLOW,
+            Attention::NeedsYou.label().into(),
+            YELLOW,
+        ),
         _ => {
             let (glyph, color) = if c.dismissed() {
                 ("×", DIM)
@@ -4235,6 +4242,26 @@ mod tests {
         a.fixed_now = Some(crate::demo::now());
         a.rebuild();
         a
+    }
+
+    #[test]
+    fn a_backlog_row_waiting_on_you_says_so_in_yellow() {
+        let a = demo(false);
+        let mut c = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Backlog && !c.dismissed())
+            .unwrap()
+            .clone();
+        let quiet = list_glyph(&c, a.now());
+        assert_ne!(quiet.2, "needs you");
+        c.attention = Attention::NeedsYou;
+        let (glyph, color, meta, mcolor) = list_glyph(&c, a.now());
+        assert_eq!(
+            (glyph, color, meta.as_str(), mcolor),
+            ("●", YELLOW, "needs you", YELLOW)
+        );
     }
 
     fn modes(a: &App) -> Vec<Mode> {
