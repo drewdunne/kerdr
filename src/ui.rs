@@ -56,27 +56,19 @@ fn failure(f: &mut Frame, area: Rect, app: &App) {
     };
     let w = area.width.saturating_sub(4).min(100);
     let inner = w.saturating_sub(4) as usize;
-    // As many failures as fit, the newest last; the ones that don't are counted, not dropped.
-    let room = area.height.saturating_sub(8) as usize;
-    let mut body: Vec<Vec<Line>> = text
-        .lines()
-        .map(|line| wrapped(line, inner, fg(FG), Some(("✗ ", RED))))
-        .collect();
-    let mut earlier = 0;
-    while body.len() > 1 && body.iter().map(Vec::len).sum::<usize>() + 1 > room {
-        body.remove(0);
-        earlier += 1;
-    }
+    // The oldest few failures; a key takes them down and the rest come up next.
+    let all: Vec<&str> = text.lines().collect();
     let mut lines = vec![Line::from(Span::styled("Not done".to_string(), bold(RED)))];
-    if earlier > 0 {
-        lines.push(Line::from(Span::styled(
-            format!("…and {earlier} earlier, not shown for want of room"),
-            fg(DIM),
-        )));
+    for line in all.iter().take(crate::app::FAIL_PAGE) {
+        lines.extend(wrapped(line, inner, fg(FG), Some(("✗ ", RED))));
     }
-    lines.extend(body.into_iter().flatten());
+    let more = all.len().saturating_sub(crate::app::FAIL_PAGE);
     lines.push(Line::from(Span::styled(
-        "The board shows it as it really is. Any key closes this.".to_string(),
+        if more > 0 {
+            format!("The board shows them as they really are. Any key shows {more} more.")
+        } else {
+            "The board shows it as it really is. Any key closes this.".to_string()
+        },
         fg(DIM),
     )));
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
@@ -1308,6 +1300,12 @@ fn list_glyph(
     String,
     ratatui::style::Color,
 ) {
+    // A start or a reopen on its way (intent 0416): shown the moment it's sent, whatever the column.
+    match c.detail.as_ref().and_then(|d| d.status.as_deref()) {
+        Some("Starting…") => return ("◐", BLUE, "starting".into(), BLUE),
+        Some("Reopening…") => return ("◐", BLUE, "reopening".into(), BLUE),
+        _ => {}
+    }
     match c.stage {
         Stage::Maintain => {
             let when = c
@@ -1326,10 +1324,6 @@ fn list_glyph(
             } else {
                 ("✓", GREEN, when, DIM)
             }
-        }
-        // A start on its way (intent 0416): shown the moment d or ⏎ sends it.
-        _ if c.detail.as_ref().and_then(|d| d.status.as_deref()) == Some("Starting…") => {
-            ("◐", BLUE, "starting".into(), BLUE)
         }
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
         _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
@@ -5776,5 +5770,24 @@ mod tests {
         let screen = rendered(&a, 176, 44);
         assert!(screen.contains("Claude · saved sign-in"), "{screen}");
         assert!(screen.contains("Claude · token per machine"), "{screen}");
+    }
+
+    #[test]
+    fn a_row_shows_a_start_or_reopen_on_its_way_whatever_its_column() {
+        let a = crate::app::App::new(
+            crate::config::Config::default(),
+            crate::demo::machines(false),
+        );
+        let mut done = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Maintain && c.detail.is_some())
+            .cloned()
+            .expect("a done card in the demo");
+        done.detail.as_mut().unwrap().status = Some("Reopening…".into());
+        assert_eq!(list_glyph(&done, a.now()).2, "reopening");
+        done.detail.as_mut().unwrap().status = Some("Starting…".into());
+        assert_eq!(list_glyph(&done, a.now()).2, "starting");
     }
 }

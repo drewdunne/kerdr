@@ -75,6 +75,10 @@ pub enum Tone {
 /// appeared mustn't.
 pub const FAIL_SEEN: Duration = Duration::from_millis(1500);
 
+/// How many failures one box shows: a key takes those down, and the rest come up next, so none
+/// goes unseen.
+pub const FAIL_PAGE: usize = 3;
+
 /// The background filter (b in the filter screen): every card, only background work (the cards
 /// marked bg), or none of it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -445,8 +449,8 @@ pub struct App {
     pub sel: Selection,
     pub mode: Mode,
     pub message: Option<(String, Tone, Instant)>,
-    /// The latest thing said while a failure was up, shown once it's taken down.
-    pub held: Option<(String, Tone)>,
+    /// What was said while a failure was up, shown once it's taken down.
+    pub held: Vec<(String, Tone)>,
     /// A card to jump into as soon as its machine answers.
     pub pending_jump: Option<PendingJump>,
     /// The workspace a reopen just made, to go into now.
@@ -476,12 +480,12 @@ pub struct App {
     /// Whether the waiting ⏎ was pressed past the outside-herdr warning: it goes on to the
     /// reopen when its turn comes, rather than warning again.
     pub pending_past_outside: bool,
-    /// A record a refusal said lives on another machine, and that machine: its actions go there,
-    /// and a question that machine asks can be answered yes, even before the board catches up.
-    pub moved_home: Option<(String, usize)>,
-    /// The home the board's feed still showed for that record when the refusal came: the override
-    /// holds only while the feed still says so, and fresh news of its home ends it.
-    pub moved_from: Option<String>,
+    /// Each record a refusal said lives on another machine, that machine, and the home the
+    /// board's feed still showed for it when the refusal came: its actions go there, and a
+    /// question that machine asks can be answered yes, even before the board catches up. Each
+    /// holds only while the feed still shows that old home; fresh news of its home ends it. One
+    /// for each record, since several can be refused at once (intent 0416).
+    pub moved_home: Vec<(String, usize, Option<String>)>,
     /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
@@ -534,7 +538,7 @@ impl App {
             sel: Selection::default(),
             mode: Mode::Board,
             message: None,
-            held: None,
+            held: vec![],
             pending_jump: None,
             open_after: None,
             started: None,
@@ -545,8 +549,7 @@ impl App {
             resent: vec![],
             outside_warned: None,
             pending_past_outside: false,
-            moved_home: None,
-            moved_from: None,
+            moved_home: vec![],
             answered_at: None,
             width: 200,
             demo: false,
@@ -579,7 +582,10 @@ impl App {
         // A failure stays up until it has been seen: the latest thing said meanwhile waits, and
         // shows once the failure is taken down.
         if tone != Tone::Fail && self.failing() {
-            self.held = Some((text.into(), tone));
+            let text = text.into();
+            if !self.held.iter().any(|(t, _)| *t == text) {
+                self.held.push((text, tone));
+            }
             return;
         }
         self.message = Some((text.into(), tone, Instant::now()));
@@ -606,18 +612,49 @@ impl App {
     /// key takes it down and does nothing else, and what was said meanwhile shows. Before then a
     /// key already on its way does what it was for, except answer a question under the box.
     /// Whether the key is used up.
-    fn seen_failure(&mut self) -> bool {
+    fn seen_failure(&mut self, key: &KeyEvent) -> bool {
         let Some((_, Tone::Fail, at)) = &self.message else {
             return false;
         };
         if at.elapsed() >= FAIL_SEEN {
-            self.message = None;
-            if let Some((text, tone)) = self.held.take() {
-                self.say(text, tone);
+            // The failures shown go; any that didn't fit come up next.
+            let rest: Vec<String> = self
+                .message
+                .take()
+                .map(|(t, ..)| t.lines().skip(FAIL_PAGE).map(str::to_string).collect())
+                .unwrap_or_default();
+            if !rest.is_empty() {
+                self.message = Some((rest.join("\n"), Tone::Fail, Instant::now()));
+                return true;
+            }
+            // Then everything said meanwhile, together, in the strongest tone among it.
+            let held = std::mem::take(&mut self.held);
+            if !held.is_empty() {
+                let tone = [Tone::Warn, Tone::Good]
+                    .into_iter()
+                    .find(|t| held.iter().any(|(_, h)| h == t))
+                    .unwrap_or(Tone::Info);
+                let text: Vec<String> = held.into_iter().map(|(t, _)| t).collect();
+                self.say(text.join("  ·  "), tone);
             }
             return true;
         }
-        matches!(self.mode, Mode::Confirm { .. })
+        // Too soon to have been read: nothing that answers a question under it, leaves the
+        // screen or quits gets through.
+        let quits = key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL)
+            || (key.code == KeyCode::Char('q')
+                && matches!(
+                    self.mode,
+                    Mode::Board
+                        | Mode::Backlog { .. }
+                        | Mode::Misc { .. }
+                        | Mode::Card { .. }
+                        | Mode::Peek { .. }
+                )
+                && !self.typing_view_search());
+        key.code == KeyCode::Esc
+            || quits
+            || matches!(self.mode, Mode::Confirm { .. })
             || matches!(&self.mode, Mode::Accounts { screen, .. }
                 if matches!(screen, account_controls::AccountScreen::Confirm { .. }))
     }
@@ -1356,7 +1393,7 @@ impl App {
         }
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
         self.closed_on_send = false;
-        if self.seen_failure() {
+        if self.seen_failure(&key) {
             return Action::None;
         }
         // Esc on the board lets a running action's answer go: it still finishes, but neither asks
@@ -1546,7 +1583,10 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.message = None;
+                // A failure goes only by being seen (seen_failure), never with the rest.
+                if !self.failing() {
+                    self.message = None;
+                }
                 if self.pending_jump.take().is_some() {
                     self.say("Stopped waiting.", Tone::Info);
                 }
@@ -6093,24 +6133,24 @@ mod tests {
         assert!(!app.busy);
         // Sent on quietly: nothing is said unless it fails there too.
         assert_eq!(app.message(), None);
-        let Action::Mutate {
-            machine,
-            request: again,
-        } = app.next_owed()
-        else {
+        // Sent on in its own place in the queue, to the machine the refusal named.
+        let Some((_, machine, again)) = app.resolver.ready().into_iter().next() else {
             panic!("nothing was sent on")
         };
         assert_eq!(machine, 1);
         assert_eq!(again["action"], "reopen");
         assert_eq!(again["id"].as_str(), Some(id.as_str()));
         assert_eq!(again["session"], "ARK");
-        assert_eq!(
-            app.action_from.as_ref().map(|f| f.key.as_str()),
-            Some(key.as_str()),
-            "its answer may still take you in"
-        );
+        assert!(app.resolver.holds_you(), "its answer may still take you in");
+        let _ = &key;
         // Until the board catches up, its next actions go there too.
-        assert_eq!(app.moved_home, Some((id.clone(), 1)));
+        assert_eq!(
+            app.moved_home
+                .iter()
+                .map(|(i, t, _)| (i.clone(), *t))
+                .collect::<Vec<_>>(),
+            vec![(id.clone(), 1)]
+        );
         let card = app.card(&key).cloned().unwrap();
         assert_eq!(app.home_machine(&card), Some(1));
         // Once the feed says something new about its home, the feed wins over the refusal.
@@ -6141,7 +6181,7 @@ mod tests {
             )
         );
         assert_eq!(app.next_owed(), Action::None);
-        assert_eq!(app.moved_home, None);
+        assert!(app.moved_home.is_empty());
         // A home that's the machine asked is only said; one Kerdr doesn't know, or one that isn't
         // answering, is said in Kerdr's words, never with a "⏎ again" that would ask the same copy.
         app.busy = true;
@@ -6187,8 +6227,11 @@ mod tests {
         );
         assert!(app.resend.is_empty());
         assert_eq!(
-            app.moved_home,
-            Some((id.clone(), 1)),
+            app.moved_home
+                .iter()
+                .map(|(i, t, _)| (i.clone(), *t))
+                .collect::<Vec<_>>(),
+            vec![(id.clone(), 1)],
             "⏎ goes there once it's back"
         );
     }
@@ -6363,11 +6406,8 @@ mod tests {
                 ..Default::default()
             }),
         );
-        let Action::Mutate {
-            machine,
-            request: again,
-        } = app.next_owed()
-        else {
+        // Sent on in its own place in the queue, to the machine the refusal named.
+        let Some((_, machine, again)) = app.resolver.ready().into_iter().next() else {
             panic!("nothing was sent on")
         };
         assert_eq!(machine, 1);
@@ -6823,5 +6863,50 @@ mod tests {
         }
         press(&mut app, 'j');
         assert_eq!(app.message(), Some(("That image is too big.", Tone::Warn)));
+    }
+
+    #[test]
+    fn esc_and_q_never_slip_past_a_failure_not_yet_read() {
+        let mut app = demo_app();
+        app.fail("#9 didn't start: refused.");
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(app.failing());
+        assert_eq!(press(&mut app, 'q'), Action::None);
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        assert_eq!(app.on_key(ctrl_c), Action::None);
+        assert!(app.failing());
+    }
+
+    #[test]
+    fn failures_come_up_a_few_at_a_time_and_none_goes_unseen() {
+        let mut app = demo_app();
+        for i in 1..=4 {
+            app.fail(format!("#{i} didn't start."));
+        }
+        app.say("That image is too big.", Tone::Warn);
+        app.say("Showing laptop again.", Tone::Info);
+        let read = |app: &mut App| {
+            if let Some(m) = app.message.as_mut() {
+                m.2 = m.2.checked_sub(FAIL_SEEN).unwrap();
+            }
+            press(app, 'j');
+        };
+        read(&mut app);
+        assert_eq!(
+            app.message(),
+            Some(("#4 didn't start.", Tone::Fail)),
+            "the one that didn't fit"
+        );
+        read(&mut app);
+        assert_eq!(
+            app.message(),
+            Some((
+                "That image is too big.  ·  Showing laptop again.",
+                Tone::Warn
+            ))
+        );
     }
 }

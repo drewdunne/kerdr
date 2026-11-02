@@ -553,10 +553,12 @@ impl App {
     /// Where a refusal said a card's record lives now, while the feed still shows the home it had
     /// when the refusal came; once the feed says anything else about its home, the feed wins.
     pub(super) fn moved_target(&self, card: &Card) -> Option<usize> {
-        let (id, to) = self.moved_home.as_ref()?;
         let detail = card.detail.as_ref()?;
         let home = detail.home.as_ref().and_then(|h| h.machine.as_deref());
-        (&detail.id == id && home == self.moved_from.as_deref()).then_some(*to)
+        self.moved_home
+            .iter()
+            .find(|(id, _, from)| *id == detail.id && from.as_deref() == home)
+            .map(|(_, to, _)| *to)
     }
 
     /// The machine a card's record lives on, where its actions run: its home, or the machine its
@@ -1623,18 +1625,45 @@ impl App {
         };
         let machine = job.machine;
         self.action_from = job.from.clone();
+        let mut refused = None;
         if result.as_ref().is_ok_and(|r| r.ok && !r.confirmation) {
             // It stays as shown until the feed has it.
             self.resolver.settle(job);
         } else {
-            if job.request["action"] == "move" {
-                self.resolver.forget_moves_after(machine, job.n);
+            refused = Some(job);
+        }
+        let resends = self.resend.len();
+        let moved_on = refused
+            .as_ref()
+            .is_some_and(|j| j.request["action"] == "move");
+        let shown = refused.as_ref().is_some_and(|j| j.effect.is_some());
+        let redirected = result
+            .as_ref()
+            .is_ok_and(|r| !r.ok && !r.confirmation && r.home.is_some());
+        if !redirected {
+            if moved_on {
+                self.resolver.forget_moves_after(machine, n);
             }
-            if job.effect.is_some() {
+            if shown {
                 self.rebuild();
             }
         }
         self.finish_action(machine, request, result);
+        // Sent on to the machine its refusal named: back in its place in the queue, still shown,
+        // so a later change to the same record can't overtake it (intent 0416).
+        if self.resend.len() > resends
+            && let Some(job) = refused
+            && let Some((to, request, from)) = self.resend.pop_back()
+        {
+            self.resolver.retarget(job, to, request, from);
+        } else if redirected {
+            if moved_on {
+                self.resolver.forget_moves_after(machine, n);
+            }
+            if shown {
+                self.rebuild();
+            }
+        }
         // Not asked or taken anywhere: nothing else is owed to that card.
         self.action_from = None;
     }
@@ -1741,14 +1770,14 @@ impl App {
                 }
                 Some(to) if to == machine => {}
                 Some(_) if was_resent => {
-                    self.moved_home = None;
+                    self.moved_home.retain(|(i, ..)| *i != id);
                     self.fail(
                         format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again."),
                     );
                     return;
                 }
                 Some(to) => {
-                    self.moved_from = self
+                    let old_home = self
                         .board
                         .cards
                         .iter()
@@ -1756,7 +1785,8 @@ impl App {
                         .find(|d| d.id == id)
                         .and_then(|d| d.home.as_ref())
                         .and_then(|h| h.machine.clone());
-                    self.moved_home = Some((id.clone(), to));
+                    self.moved_home.retain(|(i, ..)| *i != id);
+                    self.moved_home.push((id.clone(), to, old_home));
                     let name = self.machines[to].name();
                     if !self.machines[to].conn.is_live() {
                         self.fail(

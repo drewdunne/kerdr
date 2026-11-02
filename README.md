@@ -260,7 +260,8 @@ command behind it carries on in the background, so the board, and other cards' c
 wait for it; changes to one card reach your adapter in the order you made them. When it succeeds
 nothing more is said. When it fails, the card goes back to how it really is and a red **Not done**
 box says what didn't happen and why, staying up until you press a key; that key does nothing
-else, and no key answers a question hidden under the box. A question your adapter
+else, and no key answers a question hidden under the box. Several failures show three at a time,
+and anything said meanwhile shows once they're read. A question your adapter
 asks first (a full session, reopening done work) is still asked while you're on that card. `q`
 waits until every change has been saved.
 

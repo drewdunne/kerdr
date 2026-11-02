@@ -179,7 +179,10 @@ fn event_loop(
         }
         // A reopen answered with its workspace while you're still on its card: go in, and on
         // ctrl+space space carry on to the next card that needs you, as from any other.
-        if let Some(open) = app.open_after.take() {
+        // Not while a failure is up: going into herdr would hide it before it's read.
+        if !app.failing()
+            && let Some(open) = app.open_after.take()
+        {
             let outcome = jump_workspace(
                 terminal,
                 flags,
