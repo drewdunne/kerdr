@@ -677,6 +677,12 @@ impl App {
             self.say("Select an intent first.", Tone::Info);
             return Action::None;
         };
+        self.intent_action_on(card, action, extra)
+    }
+
+    /// An intent action on this card, which needn't be the selected one: ⏎ on a search hit, a
+    /// row inside a card or the misc list starts that card's work (intent 0404).
+    pub(super) fn intent_action_on(&mut self, card: Card, action: &str, extra: Value) -> Action {
         let Some(detail) = &card.detail else {
             self.say("This workspace has no intent record to change.", Tone::Info);
             return Action::None;

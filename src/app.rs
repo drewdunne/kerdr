@@ -898,6 +898,19 @@ impl App {
             );
             return Action::None;
         }
+        // Work nobody has started: ⏎ starts it, as d does, asking past the usual limit (intent
+        // 0404). A peek opened from the backlog screen, whose ⏎ peeks, leaves that to d.
+        if waiting_work(&card) && self.actions_on() {
+            if matches!(&self.mode, Mode::Peek { back, .. } if matches!(**back, Mode::Backlog { .. }))
+            {
+                self.say(
+                    format!("{} hasn't started: d starts it.", card.reference),
+                    Tone::Info,
+                );
+                return Action::None;
+            }
+            return self.intent_action_on(card, "dispatch", serde_json::json!({}));
+        }
         let what = match card.stage {
             Stage::Backlog => "it hasn't started",
             Stage::Maintain => "it's done",
@@ -1243,6 +1256,9 @@ impl App {
                 } else if card.can_reopen() || (card.can_reopen_done() && self.actions_on()) {
                     self.mode = Mode::Board;
                     self.reopen_action(&card)
+                } else if waiting_work(&card) && self.actions_on() {
+                    self.mode = Mode::Board;
+                    self.intent_action_on(card, "dispatch", serde_json::json!({}))
                 } else {
                     self.mode = Mode::Peek {
                         scroll: 0,
@@ -1965,6 +1981,121 @@ mod tests {
         assert_eq!(machine, home);
         assert_eq!(request["id"], id.as_str());
         assert_eq!(request["override"], true);
+    }
+
+    /// Intent 0404: ⏎ on work nobody started starts it, sending what d sends, and past the usual
+    /// limit asks the same question, whose yes overrides it.
+    #[test]
+    fn enter_on_work_nobody_started_starts_it_as_d_does() {
+        let mut app = demo_app();
+        let (key, id) = waiting_backlog_card(&app);
+        let home = app.card(&key).unwrap().machine_index;
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        // With no intent actions there's nothing to start it with.
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("nothing to jump into"));
+        app.cfg.actions.command = Some("test-adapter".into());
+        let by_d = press(&mut app, 'd');
+        app.busy = false;
+        let by_enter = enter(&mut app);
+        assert_eq!(by_enter, by_d);
+        let Action::Mutate { machine, request } = by_enter else {
+            panic!("{:?}", app.message())
+        };
+        assert_eq!(machine, home);
+        assert_eq!(request, serde_json::json!({"action":"dispatch","id":id}));
+        // Past the usual limit: the question, and its yes overrides.
+        let response = crate::actions::Response {
+            ok: false,
+            message: "3 of 3 slots used".into(),
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            id: Some(id.clone()),
+            ..Default::default()
+        };
+        app.finish_action(home, request, Ok(response));
+        settle(&mut app);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("{:?}", app.mode)
+        };
+        assert!(title.starts_with("Start "), "{title}");
+        assert!(message.contains("the usual limit is 3"), "{message}");
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("expected the yes to go out")
+        };
+        assert_eq!(machine, home);
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"], id.as_str());
+        assert_eq!(request["override"], true);
+    }
+
+    /// Intent 0404: the backlog screen's ⏎ still peeks, and ⏎ again in that peek leaves starting
+    /// to d; a peek from the board starts it, as the board's ⏎ does.
+    #[test]
+    fn the_backlog_screens_enter_still_peeks() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        let sel = app
+            .backlog_cards()
+            .iter()
+            .position(|&i| app.board.cards[i].key == key)
+            .unwrap();
+        app.mode = Mode::Backlog { sel };
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("d starts it"));
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        app.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        assert!(matches!(enter(&mut app), Action::Mutate { .. }));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    /// Intent 0404: ⏎ on a search hit nobody started starts that card, not the one selected.
+    #[test]
+    fn enter_on_a_search_hit_nobody_started_starts_that_card() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key)
+            .unwrap()
+            .clone();
+        app.sel = Selection {
+            col: other.stage.index(),
+            key: Some(other.key.clone()),
+        };
+        let title = app.card(&key).unwrap().title.clone();
+        let mut s = Search {
+            query: title,
+            filter: SearchFilter::Cards,
+            sel: 0,
+        };
+        s.sel = app
+            .search_hits(&s)
+            .iter()
+            .position(|(h, _)| matches!(h, Hit::Card(i) if app.board.cards[*i].key == key))
+            .expect("the card among the hits");
+        app.mode = Mode::Search(s);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("{:?}", app.message())
+        };
+        assert_eq!(request, serde_json::json!({"action":"dispatch","id":id}));
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
     }
 
     #[test]

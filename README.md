@@ -93,6 +93,8 @@ you too. Feeds say which card a record sits in with `parent`, `undertaker_for` o
   hidden, since the board does that job now. A card whose feed names a tab, for work running in
   one tab of a shared workspace, lands on that tab, and a card holding work lands on its own
   agent's tab; when that tab has closed, Kerdr offers to reopen it rather than open another.
+  On backlog work nobody has started, `Enter` starts it, sending what `d` sends, so the key that
+  gets you into work always gets you there; the backlog screen's `Enter` still peeks.
 - `prefix q` is herdr's own detach. Inside Kerdr it brings you back to the board.
 - `prefix Space` jumps straight to the next card that needs you, without stopping at the board,
   so you can answer several agents in a row.
@@ -313,7 +315,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | On the board | |
 |---|---|
 | `h j k l` or arrows | move between columns and cards |
-| `Enter` | jump in; on work whose workspace closed, reopen it; on done work, ask to reopen it (both with actions) |
+| `Enter` | jump in; on work nobody started, start it, as `d` does; on work whose workspace closed, reopen it; on done work, ask to reopen it (all three with actions) |
 | `m` or `Space` | peek |
 | `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
 | `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`) |

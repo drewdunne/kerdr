@@ -1077,6 +1077,39 @@ mod tests {
         assert_eq!(app.sel.key, Some(key(&app, "0256")));
     }
 
+    /// Intent 0404: ⏎ on a row nobody started starts that row's work, as d does, never the
+    /// card the screen is for.
+    #[test]
+    fn enter_on_a_not_started_row_starts_that_work() {
+        let mut app = families(Some("w2K:t1"));
+        select(&mut app, "0256");
+        press(&mut app, KeyCode::Char('o'));
+        let want = key(&app, "0332");
+        for _ in 0..12 {
+            let Mode::Card { focus, .. } = &app.mode else {
+                panic!("{:?}", app.mode)
+            };
+            if *focus == want {
+                break;
+            }
+            let code = if focus.starts_with("group:") {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char('j')
+            };
+            press(&mut app, code);
+        }
+        assert_eq!(app.sel.key.as_deref(), Some(want.as_str()));
+        let Action::Mutate { machine, request } = press(&mut app, KeyCode::Enter) else {
+            panic!("{:?}", app.message())
+        };
+        assert_eq!(app.machines[machine].name(), "AMD-LZM4");
+        assert_eq!(
+            request,
+            serde_json::json!({"action":"dispatch","id":"0332"})
+        );
+    }
+
     #[test]
     fn a_done_cards_screen_lists_its_follow_ups_and_c_and_x_act_on_them() {
         let mut app = families(Some("w2K:t1"));

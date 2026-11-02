@@ -208,6 +208,15 @@ Actions have a 120-second deadline. A timeout or an invalid response does not pr
 failed: its result is unknown. Kerdr does not retry it automatically; check the canonical record
 before trying again. After success, the next feed read reflects the saved changes.
 
+## Starting work nobody started
+
+`Enter` on a card for backlog work nobody has started (no workspace open, its state not
+`active`, `background` or `closed`, not in won't do) sends the `dispatch` request `d` sends, to
+the card's home machine, and a `confirmation` answer asks the same question before an
+`override: true`. On a search hit, a row inside a card or the misc list it starts that card,
+not the selected one. The backlog screen's `Enter` peeks, and in that peek `Enter` leaves starting
+to `d`.
+
 ## Reopening work whose workspace closed
 
 `Enter` on a card for work under way (a record in Plan, Design, Build, Test or Deploy that isn't
