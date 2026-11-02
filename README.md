@@ -164,8 +164,16 @@ anything), and hidden.
 
 ### Search everything
 
-`/` searches cards in the current machine, owner and project view, including work that's
-already done. Session and workspace results follow the same filters; switch to All to search across machines.
+`/` on the board searches cards in the current machine, owner and project view, including work
+that's already done. Session and workspace results follow the same filters; switch to All to search across machines.
+
+### Search the list you're in
+
+`/` in the backlog, in Won't do or in Misc searches only that list, where it is: the list narrows
+as you type, each backlog card keeping its place number. Enter does what Enter does in that
+list (peeks in the backlog, jumps in from Misc) on the card selected, and the search stays while
+you peek or act on the cards it left, with the list's own keys. `/` changes it, and `Esc` clears
+it; the next `Esc` leaves the list. Leaving the list ends its search.
 
 ### The backlog
 
@@ -322,7 +330,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
 | `0`, `1`..`9` | every session, or session tab 1 to 9 |
-| `/` | search |
+| `/` | search everything; in the backlog, Won't do or Misc, search only that list (`Esc` clears it) |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` | start, still want it, won't do, bring back, move down / up, to the top (the selected backlog intent) |
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
