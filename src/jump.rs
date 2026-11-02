@@ -436,6 +436,9 @@ pub fn run(
         transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
     });
     if let Some(outcome) = focused {
+        // Keys pressed while herdr didn't answer (another ⏎) mustn't start a second try before
+        // the reason is read.
+        drop_pending_keys();
         return outcome;
     }
 
@@ -448,6 +451,7 @@ pub fn run(
         (Some(host), Via::Ssh) => {
             let out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
             if !out.ok() {
+                drop_pending_keys();
                 return Outcome::Failed(format!(
                     "Couldn't prepare herdr's window on {}: {}",
                     jump.machine.name,

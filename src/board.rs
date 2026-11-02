@@ -370,14 +370,16 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             };
             let resumes = |c: &FeedCard| c.resume.is_some();
             // Whether the workspace a copy names is open in its machine's herdr right now.
+            // A machine that isn't answering shows its last snapshot, which proves nothing now.
             let open_here = |c: &FeedCard, mi: usize| {
-                c.workspace.as_ref().is_some_and(|w| {
-                    all_ws.iter().any(|r| {
-                        r.mi == mi
-                            && Some(r.session.as_str()) == w.session.as_deref()
-                            && Some(r.ws.workspace_id.as_str()) == w.id.as_deref()
+                machines[mi].conn.is_live()
+                    && c.workspace.as_ref().is_some_and(|w| {
+                        all_ws.iter().any(|r| {
+                            r.mi == mi
+                                && Some(r.session.as_str()) == w.session.as_deref()
+                                && Some(r.ws.workspace_id.as_str()) == w.id.as_deref()
+                        })
                     })
-                })
             };
             let better = match chosen.get(&key) {
                 None => true,
@@ -1837,6 +1839,70 @@ mod tests {
                     "server first: {server_first}, server resumes: {server_resumes}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_cached_workspace_on_a_silent_machine_never_beats_the_live_home() {
+        // The laptop's last snapshot still shows the workspace, but the laptop isn't answering;
+        // build-box, live and home, says the work's workspace has closed. Its copy wins either
+        // way round, so Enter offers to reopen it there (intent 0411).
+        for laptop_first in [true, false] {
+            let named = |c: &mut FeedCard, home: &str| {
+                c.home = Some(Home {
+                    machine: Some(home.into()),
+                    session: Some("ARK".into()),
+                });
+            };
+            let mut old = feed_card("0255", "build", "active");
+            named(&mut old, "laptop");
+            old.workspace = Some(FeedWorkspace {
+                session: Some("ARK".into()),
+                id: Some("w11".into()),
+                label: Some("55-themes".into()),
+                ..Default::default()
+            });
+            let mut home = feed_card("0255", "build", "active");
+            named(&mut home, "build-box");
+            let feed = |c: FeedCard| {
+                Some(Feed {
+                    kerdr_feed: 1,
+                    cards: vec![c],
+                    ..Default::default()
+                })
+            };
+            let mut laptop = live(
+                machine("laptop", laptop_first),
+                vec![(
+                    "ARK",
+                    Snapshot {
+                        workspaces: vec![ws("w11", "55-themes")],
+                        ..Default::default()
+                    },
+                )],
+                feed(old),
+            );
+            laptop.last_ok = Some(Local::now());
+            laptop.conn = Conn::Reconnecting {
+                since: Local::now(),
+                attempt: 1,
+                retry_at: Local::now(),
+                detail: "timed out".into(),
+            };
+            let server = live(
+                machine("build-box", !laptop_first),
+                vec![("ARK", Snapshot::default())],
+                feed(home),
+            );
+            let machines = if laptop_first {
+                [laptop, server]
+            } else {
+                [server, laptop]
+            };
+            let board = build(&machines, &Config::default());
+            let card = board.cards.iter().find(|c| c.reference == "#255").unwrap();
+            assert_eq!(card.machine, "build-box", "laptop first: {laptop_first}");
+            assert_eq!(card.workspace_id, None, "laptop first: {laptop_first}");
         }
     }
 
