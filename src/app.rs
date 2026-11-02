@@ -4929,4 +4929,66 @@ mod tests {
             "{screen}"
         );
     }
+
+    #[test]
+    fn a_question_that_arrives_while_a_list_search_is_typed_never_takes_its_letters() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        press(&mut app, 'b');
+        let sel = app
+            .backlog_cards()
+            .iter()
+            .position(|&i| app.board.cards[i].key == key)
+            .unwrap();
+        app.mode = Mode::Backlog { sel };
+        app.backlog_focus = Some(key.clone());
+        let Action::Mutate { request, machine } = press(&mut app, 'd') else {
+            panic!("d sent nothing")
+        };
+        app.busy = true;
+        // Typing a search before its answer comes: the question doesn't take over.
+        press(&mut app, '/');
+        let reference = app.card(&key).unwrap().reference.clone();
+        type_in(&mut app, &reference);
+        let asks = crate::actions::Response {
+            ok: false,
+            message: "web has 3 workspaces. Start anyway?".into(),
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            ..Default::default()
+        };
+        app.finish_action(machine, request, Ok(asks));
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(query(&app).is_some_and(|(q, typing)| q.ends_with('y') && typing));
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    #[test]
+    fn a_paste_goes_into_a_list_search() {
+        let mut app = demo_app();
+        press(&mut app, 'b');
+        let (key, reference) = last_backlog_card(&app);
+        press(&mut app, '/');
+        app.on_paste(&format!("{reference}\r\n"));
+        assert_eq!(query(&app), Some((format!("{reference} "), true)));
+        let shown = app.backlog_cards();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(app.board.cards[shown[0]].key, key);
+        assert!(matches!(app.mode, Mode::Backlog { sel: 0 }));
+        app.on_paste(&"x".repeat(100));
+        assert_eq!(query(&app).unwrap().0.chars().count(), 64);
+        esc(&mut app);
+        esc(&mut app);
+        press(&mut app, 'i');
+        let title = app.board.cards[app.misc_cards()[0]].title.clone();
+        press(&mut app, '/');
+        app.on_paste(&title);
+        assert_eq!(query(&app), Some((title, true)));
+        assert!(!app.misc_cards().is_empty());
+    }
 }

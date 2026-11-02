@@ -626,9 +626,17 @@ impl App {
                 | Mode::Backlog { .. }
                 | Mode::Misc { .. }
                 | Mode::Card { .. }
-        ) && self
-            .selected_for_control()
-            .is_some_and(|c| c.key == from.key && from.same_work_or(c, made))
+        ) && !self.typing_view_search()
+            && self
+                .selected_for_control()
+                .is_some_and(|c| c.key == from.key && from.same_work_or(c, made))
+    }
+
+    /// Whether a list view's search is being typed: its letters are words, so no question may
+    /// take them over as answers.
+    fn typing_view_search(&self) -> bool {
+        matches!(self.mode, Mode::Backlog { .. } | Mode::Misc { .. })
+            && self.view_search.as_ref().is_some_and(|s| s.typing)
     }
 
     /// Whether intent actions are configured, so ⏎ can reopen and d start work.
@@ -1127,6 +1135,14 @@ impl App {
             if let Some(paths) = images::paths_in_paste(&text) {
                 return Action::LoadImages(images::Source::Files(paths));
             }
+        }
+        if self.typing_view_search() {
+            if let Some(s) = self.view_search.as_mut() {
+                let room = 64usize.saturating_sub(s.query.chars().count());
+                s.query.extend(text.replace('\n', " ").chars().take(room));
+            }
+            self.settle_view_selection(false);
+            return Action::None;
         }
         match &mut self.mode {
             Mode::Compose { draft, .. } if !busy => {
