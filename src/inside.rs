@@ -191,7 +191,7 @@ impl App {
             // seen from a machine out of reach at the end (intent 0401).
             _ => col.sort_by_key(|&i| {
                 let c = &self.board.cards[i];
-                let on_you = crate::family::on_you(c, self.holds(i).needs);
+                let on_you = crate::family::on_you(c, &self.holds(i));
                 (on_you.is_none(), on_you, c.cached_at.is_some())
             }),
         }

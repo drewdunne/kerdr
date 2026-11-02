@@ -266,12 +266,12 @@ pub enum OnYou {
     Quiet,
 }
 
-/// `held_needs` is how many pieces inside the card need you. A card as last seen from a machine out
-/// of reach is never waiting on you: nobody knows.
-pub fn on_you(c: &Card, held_needs: usize) -> Option<OnYou> {
+/// `held` is what's inside the card. A card as last seen from a machine out of reach is never
+/// waiting on you: nobody knows.
+pub fn on_you(c: &Card, held: &Holds) -> Option<OnYou> {
     if c.cached_at.is_some() {
         None
-    } else if held_needs > 0 {
+    } else if held.needs > 0 {
         Some(OnYou::Asking)
     } else if finished(c) {
         None
@@ -279,11 +279,21 @@ pub fn on_you(c: &Card, held_needs: usize) -> Option<OnYou> {
         Some(OnYou::Asking)
     } else if c.attention == Attention::Blocked {
         Some(OnYou::Blocked)
-    } else if c.no_agent() || c.attention == Attention::Idle {
+    } else if c.no_agent() || c.attention == Attention::Idle || held.quiet > 0 {
         Some(OnYou::Quiet)
     } else {
         None
     }
+}
+
+/// A started piece nothing moves until you do, short of needing you: grey on the card holding it.
+/// One not started yet (in the backlog) isn't waiting on you.
+fn quiet(c: &Card) -> bool {
+    !finished(c)
+        && !needs(c)
+        && c.cached_at.is_none()
+        && c.attention == Attention::Idle
+        && c.stage != Stage::Backlog
 }
 
 /// Open work waiting on another intent that isn't done.
@@ -377,6 +387,8 @@ pub struct Holds {
     /// How many need you, and the first of them.
     pub needs: usize,
     pub first_needing: Option<String>,
+    /// How many started pieces sit with nothing moving them, short of needing you.
+    pub quiet: usize,
     /// How many pieces show each mark, in `Mark::ALL`'s order, the most urgent first.
     pub marks: [usize; 8],
 }
@@ -402,6 +414,9 @@ impl Holds {
         if needs(p) {
             self.needs += 1;
         }
+        if quiet(p) {
+            self.quiet += 1;
+        }
         self.marks[mark(p) as usize] += 1;
     }
 
@@ -410,6 +425,7 @@ impl Holds {
         self.count += other.count;
         self.open += other.open;
         self.needs += other.needs;
+        self.quiet += other.quiet;
         for (a, b) in self.marks.iter_mut().zip(other.marks) {
             *a += b;
         }

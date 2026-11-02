@@ -1469,7 +1469,7 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
         let is_sel = Some(c.key.as_str()) == selected;
         let cached = c.cached_at.is_some();
         // A box means it's selected or waiting on you, and nothing else does (intent 0401).
-        let on_you = crate::family::on_you(c, held.needs);
+        let on_you = crate::family::on_you(c, held);
         let rect = Rect {
             x: body.x,
             y,
@@ -4674,38 +4674,99 @@ mod tests {
         let (asking, quiet) = (*build.last().unwrap(), build[build.len() - 2]);
         a.board.cards[asking].attention = Attention::NeedsYou;
         a.board.cards[quiet].attention = Attention::Idle;
+        // Waiting on something else: no box either.
+        let elsewhere = build[0];
+        a.board.cards[elsewhere].attention = Attention::Waiting;
         a.board.holds.clear();
         let order = a.columns()[Stage::Build.index()].clone();
         assert_eq!(&order[..2], &[asking, quiet]);
 
-        // Away from the column, the two waiting on you are its only boxes.
-        a.sel = crate::app::Selection {
-            col: Stage::Plan.index(),
-            key: None,
-        };
         let area = Rect::new(0, 0, 40, 60);
-        let boxes = |a: &App, items: &[usize], selected: Option<&str>| {
+        let corners = |a: &App, items: &[usize], selected: Option<&str>, want: &str| {
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
             terminal
                 .draw(|f| cards(f, area, a, items, selected))
                 .unwrap();
-            let buf = terminal.backend().buffer().clone();
-            let corners = |want: &str| buf.content().iter().filter(|c| c.symbol() == want).count();
-            (corners("╭"), corners("┏"))
+            terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .filter(|c| c.symbol() == want)
+                .map(|c| c.fg)
+                .collect::<Vec<_>>()
         };
-        assert_eq!(boxes(&a, &order, None), (2, 0));
+        // Yellow first, then an easy-to-see grey, and nothing else.
+        assert_eq!(corners(&a, &order, None, "╭"), vec![YELLOW, DIM]);
+        assert!(corners(&a, &order, None, "┏").is_empty());
 
-        // A selected card at work has a box of its own while it's selected.
-        let running = order[2];
-        let key = a.board.cards[running].key.clone();
-        assert_eq!(boxes(&a, &order, Some(&key)), (2, 1));
+        // A selected card that isn't waiting on you has a box while it's selected.
+        let key = a.board.cards[elsewhere].key.clone();
+        assert_eq!(corners(&a, &order, Some(&key), "┏"), vec![CYAN]);
+        assert_eq!(corners(&a, &order, Some(&key), "╭"), vec![YELLOW, DIM]);
 
         // As last seen from a machine out of reach: no box, and after what's live.
         a.board.cards[asking].cached_at = Some(chrono::Local::now());
         let order = a.columns()[Stage::Build.index()].clone();
         assert_eq!(order[0], quiet);
         assert_eq!(*order.last().unwrap(), asking);
-        assert_eq!(boxes(&a, &order, None), (1, 0));
+        assert_eq!(corners(&a, &order, None, "╭"), vec![DIM]);
+    }
+
+    /// A grey piece inside a card at work makes the card grey, unless it hasn't started yet.
+    #[test]
+    fn a_quiet_piece_inside_a_card_at_work_puts_the_card_on_you() {
+        use crate::family::{Holds, OnYou, on_you};
+        let a = demo(false);
+        let mut parent = a.board.cards[a.columns()[Stage::Build.index()][0]].clone();
+        parent.attention = Attention::Running;
+        parent.cached_at = None;
+        if let Some(d) = parent.detail.as_mut() {
+            d.no_agent = false;
+        }
+        let mut piece = parent.clone();
+        assert_eq!(on_you(&parent, &Holds::of([&piece])), None);
+        piece.attention = Attention::Idle;
+        assert_eq!(on_you(&parent, &Holds::of([&piece])), Some(OnYou::Quiet));
+        piece.stage = Stage::Backlog;
+        assert_eq!(on_you(&parent, &Holds::of([&piece])), None);
+    }
+
+    /// j and k walk the column in the order it's shown, and the selection stays on its card when
+    /// that card's turn comes up to the top (intent 0401).
+    #[test]
+    fn j_and_k_follow_a_column_as_what_waits_on_you_moves_up() {
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut a = demo(false);
+        let build: Vec<usize> = a.columns()[Stage::Build.index()].clone();
+        for &i in &build {
+            a.board.cards[i].attention = Attention::Running;
+            a.board.cards[i].cached_at = None;
+            if let Some(d) = a.board.cards[i].detail.as_mut() {
+                d.no_agent = false;
+            }
+        }
+        a.board.holds.clear();
+        let last = *build.last().unwrap();
+        let key = a.board.cards[last].key.clone();
+        a.sel = Selection {
+            col: Stage::Build.index(),
+            key: Some(key.clone()),
+        };
+        a.board.cards[last].attention = Attention::Idle;
+        let order = a.columns()[Stage::Build.index()].clone();
+        assert_eq!(order[0], last);
+        assert_eq!(a.selected().map(|c| c.key.clone()), Some(key));
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_eq!(
+            a.selected().map(|c| c.key.clone()),
+            Some(a.board.cards[order[1]].key.clone())
+        );
+        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        assert_eq!(
+            a.selected().map(|c| c.key.clone()),
+            Some(a.board.cards[order[0]].key.clone())
+        );
     }
 
     /// Intent 0289: work its agent left open says "no agent" on its card, and the bottom line,
