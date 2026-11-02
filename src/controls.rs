@@ -780,11 +780,11 @@ impl App {
                 format!("{reference} is still being written up.")
             } else if card.closable() {
                 format!(
-                    "{reference} is already under way. d, y, J, K and t change backlog work; with no agent at it, C marks it done and x sets it aside."
+                    "{reference} is already under way. d, y, J, K, t and B change backlog work; with no agent at it, C marks it done and x sets it aside."
                 )
             } else {
                 format!(
-                    "{reference} is already under way or done. d, y, x, J, K and t change backlog work."
+                    "{reference} is already under way or done. d, y, x, J, K, t and B change backlog work."
                 )
             };
             self.say(said, Tone::Info);
