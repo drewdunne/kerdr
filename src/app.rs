@@ -219,11 +219,17 @@ pub enum Mode {
     Misc {
         sel: usize,
     },
+    /// Finished work, on a screen of its own (`D`): the Maintain column's cards, for a board that
+    /// hides that column or one too narrow to show it (intent 0444).
+    Done {
+        sel: usize,
+    },
 }
 
+/// The selection in Misc or Done, the list views whose selection is the board's own.
 fn misc_selection(mode: &Mode) -> Option<usize> {
     match mode {
-        Mode::Misc { sel } => Some(*sel),
+        Mode::Misc { sel } | Mode::Done { sel } => Some(*sel),
         Mode::Peek { back, .. }
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
@@ -236,7 +242,7 @@ fn misc_selection(mode: &Mode) -> Option<usize> {
 
 fn set_misc_selection(mode: &mut Mode, selected: usize) {
     match mode {
-        Mode::Misc { sel } => *sel = selected,
+        Mode::Misc { sel } | Mode::Done { sel } => *sel = selected,
         Mode::Peek { back, .. }
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
@@ -285,10 +291,10 @@ fn holds_card(mode: &Mode) -> bool {
     }
 }
 
-/// The list view (Backlog, Won't do or Misc) under this screen, if it was opened from one.
+/// The list view (Backlog, Won't do, Misc or Done) under this screen, if it was opened from one.
 fn list_view(mode: &Mode) -> Option<&Mode> {
     match mode {
-        Mode::Backlog { .. } | Mode::Misc { .. } => Some(mode),
+        Mode::Backlog { .. } | Mode::Misc { .. } | Mode::Done { .. } => Some(mode),
         Mode::Peek { back, .. }
         | Mode::Palette { back, .. }
         | Mode::Compose { back, .. }
@@ -640,7 +646,7 @@ impl App {
             .unwrap_or(0);
         self.tabs = tabs;
         if let Some(sel) = misc_selection(&self.mode) {
-            let items = self.misc_cards();
+            let items = self.list_cards();
             let found = self
                 .sel
                 .key
@@ -689,15 +695,18 @@ impl App {
     }
 
     /// Columns drawn at this width: Backlog and Maintain give way first on a narrow screen, the
-    /// Backlog only while nothing in it waits on you.
+    /// Backlog only while nothing in it waits on you. A column the config hides
+    /// (`[board] hide_columns`) never shows, its room going to the others (intent 0444).
     pub fn visible_columns(&self) -> [bool; 7] {
         let narrow = self.width < 100;
-        let mut v = [true; 7];
-        if narrow {
+        let mut v = Stage::ALL.map(|s| !self.cfg.board.hides(s));
+        if narrow && v[Stage::Backlog.index()] {
             let backlog_needs_you = self.columns()[Stage::Backlog.index()]
                 .iter()
                 .any(|&i| self.backlog_needs_you(i));
             v[Stage::Backlog.index()] = backlog_needs_you;
+        }
+        if narrow {
             v[Stage::Maintain.index()] = false;
         }
         v
@@ -733,7 +742,7 @@ impl App {
     fn fix_selection(&mut self) {
         if let Some(sel) = misc_selection(&self.mode) {
             if !holds_peek(&self.mode) {
-                let items = self.misc_cards();
+                let items = self.list_cards();
                 let selected = self
                     .sel
                     .key
@@ -1015,6 +1024,7 @@ impl App {
                     | Mode::Peek { .. }
                     | Mode::Backlog { .. }
                     | Mode::Misc { .. }
+                    | Mode::Done { .. }
                     | Mode::Card { .. }
             )
             || self.typing_view_search()
@@ -1337,7 +1347,7 @@ impl App {
             } => self.keys_key(key, filter, typing, scroll),
             Mode::Machines { sel } => self.machines_key(key, sel),
             Mode::Backlog { sel } => self.backlog_key(key, sel),
-            Mode::Misc { sel } => self.misc_key(key, sel),
+            Mode::Misc { sel } | Mode::Done { sel } => self.misc_key(key, sel),
             Mode::Card {
                 card,
                 focus,
@@ -1435,6 +1445,7 @@ impl App {
                 })
             }
             KeyCode::Char('b') => self.enter_backlog(false),
+            KeyCode::Char('D') => self.enter_done(),
             KeyCode::Char('M') => self.mode = Mode::Machines { sel: 0 },
             KeyCode::Char('r') => {
                 let target = self
@@ -1926,7 +1937,7 @@ impl App {
     /// again, on the cards it shows, `/` goes back to typing and Esc clears it.
     fn view_search_key(&mut self, key: KeyEvent) -> Option<Action> {
         let sel = match self.mode {
-            Mode::Backlog { sel } | Mode::Misc { sel } => sel,
+            Mode::Backlog { sel } | Mode::Misc { sel } | Mode::Done { sel } => sel,
             _ => return None,
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2005,7 +2016,7 @@ impl App {
 
     fn list_view_key(&mut self, key: KeyEvent, sel: usize) -> Action {
         match self.mode {
-            Mode::Misc { .. } => self.misc_key(key, sel),
+            Mode::Misc { .. } | Mode::Done { .. } => self.misc_key(key, sel),
             _ => self.backlog_key(key, sel),
         }
     }
@@ -2026,8 +2037,8 @@ impl App {
                 self.backlog_focus = items.get(sel).map(|&i| self.board.cards[i].key.clone());
                 self.mode = Mode::Backlog { sel };
             }
-            Mode::Misc { .. } => {
-                let items = self.misc_cards();
+            Mode::Misc { .. } | Mode::Done { .. } => {
+                let items = self.list_cards();
                 let sel = keep
                     .then(|| {
                         let key = self.sel.key.as_ref()?;
@@ -2036,7 +2047,7 @@ impl App {
                     .flatten()
                     .unwrap_or(0);
                 self.sel.key = items.get(sel).map(|&i| self.board.cards[i].key.clone());
-                self.mode = Mode::Misc { sel };
+                set_misc_selection(&mut self.mode, sel);
             }
             _ => {}
         }
@@ -2113,13 +2124,73 @@ impl App {
             .map(|&i| self.board.cards[i].key.clone());
     }
 
+    /// Finished work, as the Maintain column lists it (a done card with work still open inside
+    /// first), narrowed by the view's search: the Done screen's list (intent 0444).
+    pub fn done_cards(&self) -> Vec<usize> {
+        let mut cols = self.columns();
+        std::mem::take(&mut cols[Stage::Maintain.index()])
+            .into_iter()
+            .filter(|&i| self.matches_view_search(&self.board.cards[i]))
+            .collect()
+    }
+
+    /// The cards of the list view this screen is on or was opened from: Done's or Misc's.
+    pub fn list_cards(&self) -> Vec<usize> {
+        match list_view(&self.mode) {
+            Some(Mode::Done { .. }) => self.done_cards(),
+            _ => self.misc_cards(),
+        }
+    }
+
+    /// D: the Done screen, on its first card. Won't do is left, since done work isn't set aside.
+    pub(super) fn enter_done(&mut self) {
+        if !matches!(self.mode, Mode::Done { .. }) {
+            self.view_search = None;
+        }
+        self.wont_do = false;
+        self.mode = Mode::Done { sel: 0 };
+        self.sel.col = Stage::Maintain.index();
+        self.sel.key = self
+            .done_cards()
+            .first()
+            .map(|&i| self.board.cards[i].key.clone());
+    }
+
+    /// Keys in Misc and Done, which work alike: ⏎ goes in (on done work, asks to reopen it),
+    /// space peeks, and Done's o opens what's inside a card.
     fn misc_key(&mut self, key: KeyEvent, sel: usize) -> Action {
-        let items = self.misc_cards();
+        let done = matches!(self.mode, Mode::Done { .. });
+        let items = self.list_cards();
         let mut selected = sel.min(items.len().saturating_sub(1));
+        let here = |sel: usize| {
+            if done {
+                Mode::Done { sel }
+            } else {
+                Mode::Misc { sel }
+            }
+        };
         match key.code {
-            KeyCode::Esc | KeyCode::Char('q' | 'i') => {
+            KeyCode::Esc | KeyCode::Char('q') => {
                 self.mode = Mode::Board;
                 self.fix_selection();
+                return Action::None;
+            }
+            KeyCode::Char('i') if !done => {
+                self.mode = Mode::Board;
+                self.fix_selection();
+                return Action::None;
+            }
+            KeyCode::Char('D') if done => {
+                self.mode = Mode::Board;
+                self.fix_selection();
+                return Action::None;
+            }
+            KeyCode::Char('o') if done => {
+                if let Some(&i) = items.get(selected) {
+                    let key = self.board.cards[i].key.clone();
+                    self.sel.key = Some(key.clone());
+                    self.open_inside(&key);
+                }
                 return Action::None;
             }
             KeyCode::Char('j') | KeyCode::Down => {
@@ -2138,7 +2209,7 @@ impl App {
                     self.sel.key = Some(self.board.cards[items[selected]].key.clone());
                     self.mode = Mode::Peek {
                         scroll: 0,
-                        back: Box::new(Mode::Misc { sel: selected }),
+                        back: Box::new(here(selected)),
                     };
                 }
                 return Action::None;
@@ -2165,7 +2236,7 @@ impl App {
             }
             _ => {}
         }
-        self.mode = Mode::Misc { sel: selected };
+        self.mode = here(selected);
         self.sel.key = items
             .get(selected)
             .map(|&i| self.board.cards[i].key.clone());

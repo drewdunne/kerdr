@@ -1021,7 +1021,11 @@ impl App {
         if !card_screen
             && !matches!(
                 self.mode,
-                Mode::Board | Mode::Peek { .. } | Mode::Backlog { .. } | Mode::Misc { .. }
+                Mode::Board
+                    | Mode::Peek { .. }
+                    | Mode::Backlog { .. }
+                    | Mode::Misc { .. }
+                    | Mode::Done { .. }
             )
         {
             return None;

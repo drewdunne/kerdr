@@ -422,13 +422,14 @@ impl App {
     }
 
     /// Cards and the pieces inside them that need you, in board order: a card, then what inside
-    /// it needs you, in its screen's order.
+    /// it needs you, in its screen's order. A column the config hides still counts, in its
+    /// place: its cards open on their own screen (intent 0444).
     pub(super) fn needs_order(&self) -> Vec<String> {
         let cols = self.columns();
         let vis = self.visible_columns();
         let mut out = Vec::new();
         for ci in 0..7 {
-            if !vis[ci] {
+            if !vis[ci] && !self.cfg.board.hides(Stage::ALL[ci]) {
                 continue;
             }
             for &i in &cols[ci] {
@@ -549,6 +550,36 @@ impl App {
                 }
                 let back = leave(&self.mode);
                 self.open_card(h, Some(key.to_string()), back);
+            }
+            // A card in a column the config hides: its own screen, the backlog's or Done's, on it.
+            None if matches!(self.mode, Mode::Board | Mode::Card { .. })
+                && self.cfg.board.hides(self.board.cards[i].stage) =>
+            {
+                let key = key.to_string();
+                if self.board.cards[i].stage == Stage::Backlog {
+                    self.enter_backlog(false);
+                    let at = self
+                        .backlog_cards()
+                        .iter()
+                        .position(|&j| self.board.cards[j].key == key);
+                    if let Some(sel) = at {
+                        self.backlog_focus = Some(key.clone());
+                        self.mode = Mode::Backlog { sel };
+                    }
+                } else {
+                    self.enter_done();
+                    let at = self
+                        .done_cards()
+                        .iter()
+                        .position(|&j| self.board.cards[j].key == key);
+                    if let Some(sel) = at {
+                        self.mode = Mode::Done { sel };
+                    }
+                }
+                self.sel = Selection {
+                    col: self.board.cards[i].stage.index(),
+                    key: Some(key),
+                };
             }
             // A card on the board, from a card's screen: the board itself, on it, wherever the
             // screens were opened from.
@@ -1056,6 +1087,121 @@ mod tests {
         );
         app.apply(ev);
         assert_eq!(app.card(&heimdall).unwrap().attention, Attention::Running);
+    }
+
+    /// Intent 0444: a board whose config hides Backlog and Maintain gives their room to the
+    /// other five, and the work in them stays reachable: n opens a waiting backlog card on the
+    /// backlog's screen, and D lists done work, a done card with open work inside first.
+    #[test]
+    fn hidden_backlog_and_maintain_give_way_and_stay_reachable() {
+        let mut cfg = Config::default();
+        cfg.board.hide_columns = vec!["backlog".into(), "maintain".into()];
+        let cards = vec![
+            card("0101", "Queued, with a question", "backlog", |c| {
+                c.backlog_rank = Some(1);
+                c.attention = Some("needs_you".into());
+            }),
+            card("0102", "Queued", "backlog", |c| c.backlog_rank = Some(2)),
+            card("0110", "Building", "build", |_| {}),
+            card("0120", "Finished", "maintain", |c| {
+                c.closed = Some("2026-10-30".into())
+            }),
+            card("0121", "Finished, holding open work", "maintain", |c| {
+                c.closed = Some("2026-10-29".into())
+            }),
+            card("0122", "Its piece, still open", "test", |c| {
+                c.parent = Some("0121".into())
+            }),
+        ];
+        let laptop = machine("AMD-LZM4", false, "KBZ", Snapshot::default(), cards);
+        let mut app = App::new(cfg, vec![laptop]);
+        app.width = 180;
+        app.rebuild();
+        for w in [180, 80] {
+            app.width = w;
+            let vis = app.visible_columns();
+            assert!(
+                !vis[Stage::Backlog.index()],
+                "at {w}: backlog waits on you, still hidden"
+            );
+            assert!(!vis[Stage::Maintain.index()]);
+            if w >= 100 {
+                assert!(vis[1..6].iter().all(|&v| v), "the five working stages show");
+            }
+        }
+        app.width = 180;
+        let screen = crate::ui::tests_render(&app, 180, 30);
+        assert!(
+            screen.contains("BUILD") && screen.contains("PLAN"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("BACKLOG") && !screen.contains("MAINTAIN"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("D done"),
+            "the board names the Done key:\n{screen}"
+        );
+
+        // n reaches the card that waits on you, on the backlog's own screen.
+        let press = |app: &mut App, c: char| {
+            app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+        };
+        press(&mut app, 'n');
+        assert!(
+            matches!(app.mode, Mode::Backlog { sel: 0 }),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(app.sel.key.as_deref(), Some(key(&app, "0101").as_str()));
+        assert!(!app.wont_do);
+
+        // D: done work, the card holding open work first, saying how much.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        press(&mut app, 'D');
+        assert!(matches!(app.mode, Mode::Done { sel: 0 }));
+        let ids = |app: &App| -> Vec<String> {
+            app.done_cards()
+                .iter()
+                .map(|&i| app.board.cards[i].detail.as_ref().unwrap().id.clone())
+                .collect()
+        };
+        assert_eq!(ids(&app), ["0121", "0120"]);
+        let screen = crate::ui::tests_render(&app, 120, 30);
+        assert!(
+            screen.contains("DONE  2") && screen.contains("1 open"),
+            "{screen}"
+        );
+        // o opens what's inside, and Esc comes back to Done, still on it.
+        press(&mut app, 'o');
+        assert!(
+            matches!(&app.mode, Mode::Card { back, .. } if matches!(**back, Mode::Done { .. }))
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Done { sel: 0 }), "{:?}", app.mode);
+        // j moves, / searches only done work, and D goes back to the board.
+        press(&mut app, 'j');
+        assert_eq!(app.sel.key.as_deref(), Some(key(&app, "0120").as_str()));
+        press(&mut app, '/');
+        for c in "holding".chars() {
+            press(&mut app, c);
+        }
+        assert_eq!(ids(&app), ["0121"]);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(ids(&app).len(), 2);
+        // ⏎ on done work asks its home to reopen it, as it did in the Maintain column.
+        app.cfg.actions.command = Some("test-adapter".into());
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("⏎ on done work sent nothing")
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"], "0121");
+        assert!(matches!(app.mode, Mode::Done { .. }), "{:?}", app.mode);
+        press(&mut app, 'D');
+        assert!(matches!(app.mode, Mode::Board));
     }
 
     /// Launching a Tinyhost world (ark-sdlc 0408, intent 0420): queued with two questions for you

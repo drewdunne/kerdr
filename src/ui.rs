@@ -137,6 +137,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
         Mode::Machines { sel } => machines_view(f, area, app, *sel),
         Mode::Backlog { sel } => backlog_view(f, area, app, *sel),
         Mode::Misc { sel } => misc_view(f, area, app, *sel),
+        Mode::Done { sel } => done_view(f, area, app, *sel),
         Mode::Card {
             card,
             focus,
@@ -560,20 +561,25 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         hints.push(Span::raw("   "));
         hints.extend(backlog_hints);
     }
-    // With a backlog card's keys in front, the rest gives up what the menu already lists.
+    // With a backlog card's keys in front, the rest gives up what the menu already lists. A
+    // column the board leaves out names the key for its own screen.
+    let vis = app.visible_columns();
+    let shown = |s: Stage| vis[s.index()];
+    let mut full = vec![
+        ("c", "new intent"),
+        ("⏎", "jump in"),
+        ("space", "peek"),
+        ("n N", "next that needs you"),
+        ("/", "search everything"),
+        ("f", "filter"),
+        ("b", "backlog"),
+    ];
+    if !shown(Stage::Maintain) {
+        full.push(("D", "done"));
+    }
+    full.extend([("ctrl+space", "menu"), ("?", "keys"), ("q", "quit")]);
     hints.extend(key_hints(if hints.is_empty() {
-        &[
-            ("c", "new intent"),
-            ("⏎", "jump in"),
-            ("space", "peek"),
-            ("n N", "next that needs you"),
-            ("/", "search everything"),
-            ("f", "filter"),
-            ("b", "backlog"),
-            ("ctrl+space", "menu"),
-            ("?", "keys"),
-            ("q", "quit"),
-        ]
+        &full
     } else {
         &[
             ("c", "new intent"),
@@ -2132,7 +2138,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
             "what the board lists".into(),
             &[
                 ("b", "the backlog"),
-                ("w", "won’t do"),
+                ("w D", "won’t do / done work"),
                 ("i", "workspaces with no intent"),
                 ("f", "filter by who, agents or bg"),
                 ("a", "agents: all, then each one"),
@@ -3034,6 +3040,7 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
         &[
             ("b", "the backlog, in your order", ""),
             ("w", "the won’t do list", ""),
+            ("D", "done work, where ⏎ asks to reopen it", ""),
             ("i", "workspaces with no intent (misc)", ""),
             (
                 "f",
@@ -3816,6 +3823,121 @@ fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             },
             rows[5].width as usize,
         ),
+    );
+}
+
+/// The Done screen (`D`, intent 0444): finished work, listed as the Maintain column lists it, a
+/// done card with work still open inside first, saying how much.
+fn done_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
+    let inner = pad(area, 1, 0);
+    let rows = Layout::vertical([
+        Constraint::Length(1),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(2),
+        Constraint::Min(1),
+        Constraint::Length(1),
+    ])
+    .split(inner);
+    header(f.buffer_mut(), rows[0], app);
+    filters(f.buffer_mut(), rows[1], app);
+    strip(f, rows[2], app);
+    let items = app.done_cards();
+    let total = app.columns()[Stage::Maintain.index()].len();
+    put(
+        f.buffer_mut(),
+        rows[3].x,
+        rows[3].y,
+        rows[3].width,
+        vec![
+            Span::styled(format!("DONE  {total}"), bold(GREEN)),
+            Span::styled("   Finished work · ⏎ asks to reopen it", fg(FG2)),
+        ],
+    );
+    if let Some(line) = view_search_line(app, items.len(), total) {
+        put(
+            f.buffer_mut(),
+            rows[3].x,
+            rows[3].y + 1,
+            rows[3].width,
+            line,
+        );
+    }
+    if items.is_empty() {
+        put(
+            f.buffer_mut(),
+            rows[4].x,
+            rows[4].y,
+            rows[4].width,
+            vec![Span::styled(
+                if app
+                    .view_search
+                    .as_ref()
+                    .is_some_and(|s| !s.query.trim().is_empty())
+                {
+                    "No done work matches this search."
+                } else {
+                    "No done work in this view."
+                },
+                fg(DIM),
+            )],
+        );
+    } else {
+        let selected = items
+            .get(sel.min(items.len() - 1))
+            .map(|&i| app.board.cards[i].key.as_str());
+        list_rows(f.buffer_mut(), rows[4], app, &items, selected);
+    }
+    let card = app
+        .sel
+        .key
+        .as_deref()
+        .and_then(|k| app.card(k))
+        .filter(|c| c.stage == Stage::Maintain);
+    let mut hints: Vec<(&str, String)> = Vec::new();
+    match &app.view_search {
+        Some(s) if s.typing => {}
+        _ => {
+            if card.is_some_and(|c| c.can_reopen_done()) && app.actions_on() {
+                hints.push(("⏎", "ask to reopen it".into()));
+            }
+            if let Some(c) = card {
+                with_inside(app, c, &mut hints);
+            }
+        }
+    }
+    let rest: &[(&str, &str)] = match &app.view_search {
+        Some(s) if s.typing => &[],
+        Some(_) => &[
+            ("j k", "select"),
+            ("space", "peek"),
+            ("/", "change the search"),
+            ("esc", "clear the search"),
+        ],
+        None => &[
+            ("j k", "select"),
+            ("space", "peek"),
+            ("/", "search this list"),
+            ("[ ]", "session"),
+            ("{ }", "machine"),
+            ("f", "filter"),
+            ("D esc", "board"),
+        ],
+    };
+    let mut line = match &app.view_search {
+        Some(s) if s.typing => view_search_hints("ask to reopen it"),
+        _ => owned_hints(&hints),
+    };
+    if !hints.is_empty() && !rest.is_empty() {
+        line.push(Span::raw("   "));
+    }
+    line.extend(key_hints(rest));
+    put(
+        f.buffer_mut(),
+        rows[5].x,
+        rows[5].y,
+        rows[5].width,
+        fit(line, rows[5].width as usize),
     );
 }
 
@@ -5183,6 +5305,7 @@ mod tests {
                 "move to the top / bottom",
                 "new intent",
                 "the backlog",
+                "won’t do / done work",
                 "filter by who, agents or bg",
                 "agents: all, then each one",
                 "machines",
