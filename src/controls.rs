@@ -22,7 +22,7 @@ fn short(text: String) -> String {
     }
 }
 
-/// Work waiting to start: the only cards d, y, x, J, K and t change, so the bottom line, the
+/// Work waiting to start: the only cards d, y, x, J, K, t and B change, so the bottom line, the
 /// menu and the keys themselves agree.
 pub(crate) fn waiting_work(card: &Card) -> bool {
     card.detail.is_some()
