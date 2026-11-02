@@ -104,8 +104,6 @@ impl Palette {
         let faint = get(&["dark_foreground", "dark_fg", "color8"]).unwrap_or(mix(bg, fg2, 0.36));
         let lighter = get(&["lighter_background", "lighter_bg"]).filter(|c| *c != bg);
         let raised = lighter.unwrap_or(mix(bg, fg2, 0.06));
-        let sel =
-            get(&["selection", "selection_background", "color8"]).unwrap_or(mix(bg, fg2, 0.1));
         let border = get(&["muted", "color8"]).unwrap_or(mix(bg, fg2, 0.2));
         let red = get(&["red", "color1"]).unwrap_or(theme::RED);
         let green = get(&["green", "color2"]).unwrap_or(theme::GREEN);
@@ -114,8 +112,16 @@ impl Palette {
         let purple = get(&["magenta", "purple", "color5"]).unwrap_or(theme::PURPLE);
         let cyan = get(&["cyan", "color6"]).unwrap_or(theme::CYAN);
         let orange = get(&["orange"]).unwrap_or(yellow);
+        let accent = get(&["accent"]).unwrap_or(blue);
 
         let fg = legible(fg, bg, fg, 4.5);
+        // The selected card and row. A theme's `selection` is where text you select shows, and can
+        // come with a text colour of its own: Synthwave '84's is white, under white text. It's used
+        // only when Kerdr's text reads on it as it is and it stands off the background; otherwise
+        // the selection is the background tinted with the theme's accent.
+        let sel = get(&["selection", "selection_background"])
+            .filter(|s| contrast(fg, *s) >= 4.5 && contrast(*s, bg) >= 1.15)
+            .unwrap_or(mix(bg, accent, 0.22));
         let readable = |c: Color, ratio: f64| legible(c, bg, fg, ratio);
         // Text is drawn on the raised, panel and selected surfaces too, so each is moved back
         // toward the background until the main text reads on it.
@@ -445,6 +451,41 @@ color15 = "#e3a68c"
         .unwrap();
         assert!(contrast(p.yellow, p.bg) >= 3.0);
         assert!(luminance(p.yellow) < luminance(Color::Rgb(0xf0, 0xe6, 0x8c)));
+    }
+
+    /// Omarchy's Synthwave '84: white text, and a white `selection` meant for white-on-white.
+    const SYNTHWAVE_84: &str = r##"accent = "#0080ff"
+selection = "#ffffff"
+background = "#240037"
+foreground = "#ffffff"
+color0 = "#240037"
+color1 = "#ff0040"
+color2 = "#8f00ff"
+color3 = "#f3e70f"
+color4 = "#0080ff"
+color5 = "#ff00ff"
+color6 = "#03edf9"
+color7 = "#ffffff"
+color8 = "#614d85"
+color15 = "#ffffff"
+"##;
+
+    #[test]
+    fn a_selection_text_cant_read_on_isnt_a_selected_card() {
+        let p = Palette::from_colors_toml(SYNTHWAVE_84).unwrap();
+        // Not the washed-out grey a white selection pushed back toward the background made: the
+        // background tinted with the accent, under readable text.
+        assert_eq!(p.sel, mix(p.bg, Color::Rgb(0x00, 0x80, 0xff), 0.22));
+        assert!(contrast(p.fg, p.sel) >= 4.5);
+        assert!(contrast(p.sel, p.bg) >= 1.15);
+        let (r, g, b) = rgb(p.sel);
+        assert!(b > r && b > g, "tinted toward the blue accent: {:?}", p.sel);
+    }
+
+    #[test]
+    fn a_selection_text_reads_on_is_kept() {
+        let p = Palette::from_colors_toml(OMARCHY_TOKYO_NIGHT).unwrap();
+        assert_eq!(p.sel, Color::Rgb(0x29, 0x2e, 0x42));
     }
 
     #[test]

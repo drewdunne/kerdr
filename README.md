@@ -511,7 +511,9 @@ The file needs `background` and `foreground`, and Kerdr uses `red`, `green`, `ye
 `blue`, `magenta`, `cyan`, `selection`, `muted`, `lighter_background`, `dark_foreground` and
 `bright_foreground` when it has them, or `color0` to `color15`, as Omarchy's own themes do. A
 colour too close to the background to read is lightened (or, on a light theme, darkened) until it
-can be.
+can be. The selected card takes the theme's `selection` only when text reads on it as it is; a
+theme whose selection needs a text colour of its own (Synthwave '84's is white) gets its background
+tinted with its `accent` instead.
 
 ## Status
 
