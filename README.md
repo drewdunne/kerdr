@@ -191,9 +191,11 @@ peek alike:
 - `x` moves it to **Won't do**, after confirmation. `w` opens that separate view; `u` brings the
   selected intent back. Its record and original creation date are retained.
 
-`c` opens the new-intent box: one field for what you want, in your own words. Enter sends it;
-Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its line breaks. Escape
-keeps your words for the next time you open it. The adapter files it in the backlog of the
+`c` opens the new-intent box: one field for what you want, in your own words. Enter sends it and
+closes the box at once, while the save carries on behind it: once it's saved, the backlog opens on
+its card if you're still where the box closed, and if the save fails, Kerdr says so and keeps your
+words for the next `c`. Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its
+line breaks. Escape keeps your words for the next time you open it. The adapter files it in the backlog of the
 session you're looking at and writes it up (see [docs/feed.md](docs/feed.md#actions)); Kerdr
 shows it as being written up until that's done, and creating it never starts an agent by itself.
 
