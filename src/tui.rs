@@ -132,7 +132,11 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
+    // Colours from the desktop theme, read again when it changes (palette.rs).
+    let mut theme = crate::palette::ThemeWatch::new(app.cfg.theme.colors.as_deref());
+    theme.check(true);
     loop {
+        theme.check(false);
         while let Ok((id, loading)) = image_rx.try_recv() {
             app.images_loaded(id, loading);
         }

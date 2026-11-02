@@ -13,6 +13,7 @@ pub mod herdr_keys;
 pub mod images;
 pub mod jump;
 pub mod model;
+pub mod palette;
 pub mod poll;
 pub mod providers;
 pub mod report;

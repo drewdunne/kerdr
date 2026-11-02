@@ -494,6 +494,23 @@ Omarchy, Kerdr also reads its list of machines (`~/.config/herdr-sessions/machin
 SSH runs non-interactively (`BatchMode`), so use keys loaded in your agent. When SSH needs
 you, the machine shows *needs you*, and `M` then `Enter` lets you answer it.
 
+### Colours
+
+On Omarchy, Kerdr takes its colours from your current theme, and changes with it within a second
+or so when you pick another, while it's open. Anywhere else it uses Tokyo Night. To take them from
+another theme file, or to keep Tokyo Night on Omarchy:
+
+```toml
+[theme]
+colors = "~/my-theme/colors.toml"   # an Omarchy-style colors.toml; "" keeps Tokyo Night
+```
+
+The file needs `background` and `foreground`, and Kerdr uses `red`, `green`, `yellow`, `orange`,
+`blue`, `magenta`, `cyan`, `selection`, `muted`, `lighter_background`, `dark_foreground` and
+`bright_foreground` when it has them, or `color0` to `color15`, as Omarchy's own themes do. A
+colour too close to the background to read is lightened (or, on a light theme, darkened) until it
+can be.
+
 ## Status
 
 Kerdr is new (0.15). Reading and navigation work without an action adapter. Opting into

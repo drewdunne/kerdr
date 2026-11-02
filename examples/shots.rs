@@ -1,6 +1,8 @@
 //! Renders the README's screenshots from the demo board, through Kerdr's own drawing code.
 //!
 //!   cargo run --example shots -- <out-dir> <regular.ttf> <bold.ttf> [fallback.ttf...]
+//!
+//! KERDR_SHOTS_COLORS=<colors.toml> draws them in that theme's colours, as the board would.
 
 use std::path::{Path, PathBuf};
 
@@ -66,7 +68,13 @@ fn select(a: &mut App, reference: &str) {
 fn render(a: &App) -> Buffer {
     let mut t = Terminal::new(TestBackend::new(COLS, ROWS)).unwrap();
     t.draw(|f| ui::draw(f, a)).unwrap();
-    t.backend().buffer().clone()
+    let mut buf = t.backend().buffer().clone();
+    if let Some(path) = std::env::var_os("KERDR_SHOTS_COLORS") {
+        let palette = kerdr::palette::Palette::from_file(Path::new(&path))
+            .unwrap_or_else(|| panic!("no theme colours in {}", path.to_string_lossy()));
+        palette.recolor(&mut buf);
+    }
+    buf
 }
 
 fn rgb(c: Color, fallback: Color) -> [u8; 3] {
@@ -176,7 +184,7 @@ fn rasterize(buf: &Buffer, fonts: &Fonts, out: &Path) {
     let pad = 18;
     let w = COLS as i32 * cw + pad * 2;
     let h = ROWS as i32 * chh + pad * 2;
-    let bg0 = rgb(theme::BG, theme::BG);
+    let bg0 = rgb(buf[(0, 0)].bg, theme::BG);
     let mut img = RgbImage::from_pixel(w as u32, h as u32, Rgb(bg0));
     for y in 0..ROWS {
         for x in 0..COLS {

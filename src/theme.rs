@@ -1,4 +1,5 @@
-//! Colours (Tokyo Night, like the design) and the small text helpers every screen uses.
+//! Colours and the small text helpers every screen uses. The colours are Tokyo Night, as the
+//! design was; palette.rs swaps them for your desktop theme's as each frame is drawn.
 
 use chrono::{DateTime, Datelike, Local};
 use ratatui::style::{Color, Modifier, Style};
