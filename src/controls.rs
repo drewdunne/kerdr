@@ -5,6 +5,7 @@ use super::*;
 use crate::actions::Response;
 use crate::images;
 use crate::model::{CardSnapshot, Summary};
+use crate::resolve::Effect;
 use serde_json::{Value, json};
 
 /// The most the new-intent box holds, kept under the actions' 64 KiB request limit.
@@ -518,13 +519,6 @@ impl App {
     }
 
     pub(super) fn can_write(&mut self, machine: usize) -> bool {
-        if self.busy {
-            self.say(
-                "An action is still running. Wait for its result before another change.",
-                Tone::Info,
-            );
-            return false;
-        }
         if self
             .cfg
             .actions
@@ -596,6 +590,9 @@ impl App {
         let Some(detail) = &card.detail else {
             return Action::None;
         };
+        if self.still_changing(card) {
+            return Action::None;
+        }
         if self
             .cfg
             .actions
@@ -730,6 +727,9 @@ impl App {
             self.say("This workspace has no intent record to change.", Tone::Info);
             return Action::None;
         };
+        if self.still_changing(&card) {
+            return Action::None;
+        }
         self.backlog_focus = Some(card.key.clone());
         if action == "restore" && !card.dismissed() {
             self.say(
@@ -963,9 +963,9 @@ impl App {
     }
 
     fn new_intent(&mut self) {
-        if self.busy {
+        if self.resolver.creating() {
             self.say(
-                "Wait for the current intent change before creating another.",
+                "Your last new intent is still being saved; c opens the box once it is.",
                 Tone::Info,
             );
             return;
@@ -1069,7 +1069,7 @@ impl App {
             self.mode = *back;
             return Action::None;
         }
-        if self.busy {
+        if self.resolver.creating() {
             return Action::None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -1191,7 +1191,7 @@ impl App {
         if self.account_paste(&text) {
             return Action::None;
         }
-        let busy = self.busy;
+        let busy = self.resolver.creating();
         if matches!(self.mode, Mode::Compose { .. }) && !busy {
             // Spaces and blank lines are words; only a paste with nothing in it means an image.
             if text.is_empty() {
@@ -1248,7 +1248,7 @@ impl App {
         let Mode::Compose { draft, .. } = &self.mode else {
             return None;
         };
-        if self.busy {
+        if self.resolver.creating() {
             return None;
         }
         if self.image_load.is_some() {
@@ -1287,7 +1287,7 @@ impl App {
     /// As attach_images, with the tags at `at` in the words (where they ended when the read
     /// began), or at the end when the words have since been cut shorter than that.
     fn attach_images_at(&mut self, got: images::Loading, at: Option<usize>) {
-        let busy = self.busy;
+        let busy = self.resolver.creating();
         let Mode::Compose { draft, .. } = &mut self.mode else {
             return;
         };
@@ -1533,20 +1533,165 @@ impl App {
         None
     }
 
+    /// Takes a change to a card into the action resolution tool (intent 0416): the board shows it
+    /// at once, and its command runs in the background.
+    pub fn queue_action(&mut self, machine: usize, request: Value) {
+        let from = self.action_from.take();
+        let id = request["id"].as_str().unwrap_or_default().to_string();
+        let key = from.as_ref().map(|f| f.key.clone()).or_else(|| {
+            let mine = |c: &&Card| c.detail.as_ref().is_some_and(|d| d.id == id);
+            let cards = &self.board.cards;
+            cards
+                .iter()
+                .filter(mine)
+                .find(|c| c.machine_index == machine)
+                .or_else(|| cards.iter().find(mine))
+                .map(|c| c.key.clone())
+        });
+        let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
+        let shows = effect.is_some();
+        self.resolver.add(machine, request, from, key, effect);
+        if shows {
+            self.rebuild();
+        }
+    }
+
+    /// What the board shows for a change while it's on its way: what the backend will make of the
+    /// record, as far as Kerdr can tell. A request that waits in a queue shows nothing.
+    fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
+        Some(match request["action"].as_str()? {
+            "dispatch" if request["queue"] != true => Effect::Starting,
+            "reopen" if request["queue"] != true => Effect::Reopening,
+            "close" => Effect::Close,
+            "dismiss" | "cancel" => Effect::SetAside,
+            "restore" => Effect::Restore,
+            "refresh" => Effect::Refresh(chrono::Local::now().date_naive().to_string()),
+            "move" => {
+                // As the backend orders it: the card's own group of open backlog work, by rank
+                // and then number, the card moved, everything numbered again from 0.
+                let card = self.card(key)?;
+                let source = key.rsplit_once(':').map(|(s, _)| s)?;
+                let mut peers: Vec<&Card> = self
+                    .board
+                    .cards
+                    .iter()
+                    .filter(|c| {
+                        c.stage == Stage::Backlog
+                            && !c.dismissed()
+                            && c.owner_key() == card.owner_key()
+                            && c.key.rsplit_once(':').map(|(s, _)| s) == Some(source)
+                    })
+                    .collect();
+                let number = |c: &Card| {
+                    c.detail
+                        .as_ref()
+                        .and_then(|d| d.id.parse::<i64>().ok())
+                        .unwrap_or(i64::MAX)
+                };
+                peers.sort_by_key(|c| (c.backlog_rank(), number(c)));
+                let at = peers.iter().position(|c| c.key == key)?;
+                let to = if request["top"] == true {
+                    0
+                } else if request["bottom"] == true {
+                    peers.len() - 1
+                } else {
+                    let delta = request["delta"].as_i64()?;
+                    (at as i64)
+                        .saturating_add(delta)
+                        .clamp(0, peers.len() as i64 - 1) as usize
+                };
+                let moved = peers.remove(at);
+                peers.insert(to, moved);
+                Effect::Order(
+                    peers
+                        .iter()
+                        .enumerate()
+                        .map(|(i, c)| (c.key.clone(), i as i64))
+                        .collect(),
+                )
+            }
+            _ => return None,
+        })
+    }
+
+    /// A change's answer, from the action resolution tool: one that went as shown keeps showing
+    /// until the feed has it; any other takes its effect with it, so the card is back as it really
+    /// is before anything is said or asked.
+    pub fn finish_job(&mut self, n: u64, request: Value, result: Result<Response, String>) {
+        let Some(job) = self.resolver.take(n) else {
+            return;
+        };
+        let machine = job.machine;
+        self.action_from = job.from.clone();
+        if result.as_ref().is_ok_and(|r| r.ok && !r.confirmation) {
+            // It stays as shown until the feed has it.
+            self.resolver.settle(job);
+        } else if job.effect.is_some() {
+            self.rebuild();
+        }
+        self.finish_action(machine, request, result);
+        // Not asked or taken anywhere: nothing else is owed to that card.
+        self.action_from = None;
+    }
+
+    /// Whether this card's record has a start or a reopen on its way, said when so: nothing else
+    /// may change it until that's answered, as the backend would refuse it.
+    pub(crate) fn still_changing(&mut self, card: &Card) -> bool {
+        let Some(id) = card.detail.as_ref().map(|d| d.id.clone()) else {
+            return false;
+        };
+        let Some(job) = self.resolver.starting(&id) else {
+            return false;
+        };
+        let (verb, secs) = (
+            if job.request["action"] == "reopen" {
+                "reopening"
+            } else {
+                "starting"
+            },
+            job.asked.elapsed().as_secs(),
+        );
+        self.say(
+            format!(
+                "{} is {verb} ({secs} s so far); ⏎ goes in once its workspace shows.",
+                card.reference
+            ),
+            Tone::Info,
+        );
+        true
+    }
+
+    /// How a failure names the change that didn't happen: "#41 wasn't marked done".
+    fn what_failed(&self, request: &Value) -> Option<String> {
+        let id = request["id"].as_str()?;
+        let reference = self.reference_for(id);
+        Some(match request["action"].as_str()? {
+            "dispatch" => format!("{reference} didn't start"),
+            "reopen" => format!("{reference} didn't reopen"),
+            "close" => format!("{reference} wasn't marked done"),
+            "dismiss" => format!("{reference} wasn't set aside"),
+            "cancel" => format!("{reference} wasn't cancelled"),
+            "restore" => format!("{reference} wasn't brought back"),
+            "refresh" => format!("{reference} wasn't refreshed"),
+            "move" => format!("{reference} didn't move"),
+            _ => format!("{reference} didn't change"),
+        })
+    }
+
     pub fn finish_action(
         &mut self,
         machine: usize,
         request: Value,
         result: Result<Response, String>,
     ) {
-        self.busy = false;
-        self.busy_id = None;
-        self.busy_since = None;
-        self.busy_label.clear();
         if request["action"]
             .as_str()
             .is_some_and(|a| a.starts_with("account-"))
         {
+            self.busy = false;
+            self.busy_id = None;
+            self.busy_since = None;
+            self.busy_label.clear();
             self.finish_account_action(machine, request, result);
             return;
         }
@@ -1576,18 +1721,16 @@ impl App {
                 .unwrap_or_default();
             match self.machine_index(host) {
                 None => {
-                    self.say(
-                        format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't open it there."),
-                        Tone::Warn,
+                    self.fail(
+                        format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't change it there."),
                     );
                     return;
                 }
                 Some(to) if to == machine => {}
                 Some(_) if was_resent => {
                     self.moved_home = None;
-                    self.say(
-                        format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then press ⏎ again."),
-                        Tone::Warn,
+                    self.fail(
+                        format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again."),
                     );
                     return;
                 }
@@ -1603,9 +1746,8 @@ impl App {
                     self.moved_home = Some((id.clone(), to));
                     let name = self.machines[to].name();
                     if !self.machines[to].conn.is_live() {
-                        self.say(
-                            format!("{reference} lives on {name} now, and {name} isn't answering; ⏎ opens it there once it's back."),
-                            Tone::Warn,
+                        self.fail(
+                            format!("{reference} lives on {name} now, and {name} isn't answering; nothing changed. Try again once it's back."),
                         );
                         return;
                     }
@@ -1613,10 +1755,7 @@ impl App {
                     if request["action"] == "reopen" && !session.is_empty() {
                         request["session"] = json!(session);
                     }
-                    self.say(
-                        format!("{reference} lives on {name} now; asking there."),
-                        Tone::Info,
-                    );
+                    // Sent on quietly: the card still shows the change while it goes there.
                     self.resent = Some((to, id));
                     self.resend = Some((to, request, from));
                     return;
@@ -1649,10 +1788,14 @@ impl App {
                     } else {
                         "d"
                     };
-                    self.say(
-                        format!("{reference} needs a yes first: {key} on it again asks."),
-                        Tone::Warn,
-                    );
+                    self.fail(format!(
+                        "{reference} didn't {}: it needs a yes first, and {key} on it again asks.",
+                        if request["action"] == "reopen" {
+                            "reopen"
+                        } else {
+                            "start"
+                        }
+                    ));
                     return;
                 }
                 let mut request = request;
@@ -1709,6 +1852,8 @@ impl App {
             }
             Ok(response) => {
                 let mut message = response.message.clone();
+                // What a change that went as shown still says: only what you'd need to find it.
+                let mut note = None;
                 if request["action"] == "dispatch" && response.ok {
                     self.started = request["id"]
                         .as_str()
@@ -1739,6 +1884,7 @@ impl App {
                         message.push_str(
                             " A filter may hide it until it's written up: F shows everything.",
                         );
+                        note = Some(message.clone());
                     }
                 }
                 // A reopen takes you in only while you're still on its card; otherwise it says so.
@@ -1762,7 +1908,10 @@ impl App {
                                 from,
                             })
                         }
-                        None => message.push_str(" ⏎ on its card goes in."),
+                        None => {
+                            message.push_str(" ⏎ on its card goes in.");
+                            note = Some(message.clone());
+                        }
                     }
                 }
                 if request["action"] == "create" && !response.ok && response.id.is_none() {
@@ -1770,10 +1919,17 @@ impl App {
                         "Your new intent wasn't saved: {message} c opens it again with your words."
                     );
                 }
-                self.say(
-                    short(message),
-                    if response.ok { Tone::Good } else { Tone::Warn },
-                );
+                if !response.ok {
+                    // The card is back as it really is; say what didn't happen, and why.
+                    let what = self.what_failed(&request);
+                    self.fail(short(match what {
+                        Some(what) if request["action"] != "create" => format!("{what}: {message}"),
+                        _ => message,
+                    }));
+                } else if let Some(note) = note {
+                    // Done as shown: only what you'd need to find it is said.
+                    self.say(short(note), Tone::Info);
+                }
             }
             Err(error) => {
                 if request["action"] == "create" {
@@ -1781,12 +1937,18 @@ impl App {
                     if let Some(s) = self.submission.as_mut() {
                         s.unknown = true;
                     }
-                    return self.say(
+                    return self.fail(
                         format!("Your new intent may not have been saved ({error}). c opens it again with your words; sending them again never makes a second one."),
-                        Tone::Warn,
                     );
                 }
-                self.say(short(error), Tone::Warn)
+                // Its result may be unknown (a timeout): the error says so in its own words.
+                match request["id"].as_str() {
+                    Some(id) => {
+                        let reference = self.reference_for(id);
+                        self.fail(short(format!("{reference}: {error}")))
+                    }
+                    None => self.fail(short(error)),
+                }
             }
         }
     }

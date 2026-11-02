@@ -41,9 +41,38 @@ fn draw_screen(f: &mut Frame, app: &App) {
         return;
     }
     draw_mode(f, area, app, &app.mode);
-    if !matches!(app.mode, Mode::Board) {
+    if app.failing() {
+        failure(f, area, app);
+    } else if !matches!(app.mode, Mode::Board) {
         action_status(f, area, app);
     }
+}
+
+/// A change that didn't happen (intent 0416): a red box over whatever is up, every failure that
+/// came together on a line of its own, until a key is pressed once it has been seen.
+fn failure(f: &mut Frame, area: Rect, app: &App) {
+    let Some((text, _)) = app.message() else {
+        return;
+    };
+    let w = area.width.saturating_sub(4).min(100);
+    let inner = w.saturating_sub(4) as usize;
+    let mut lines = vec![Line::from(Span::styled("Not done".to_string(), bold(RED)))];
+    for line in text.lines() {
+        lines.extend(wrapped(line, inner, fg(FG), Some(("✗ ", RED))));
+    }
+    lines.push(Line::from(Span::styled(
+        "The board shows it as it really is. Any key closes this.".to_string(),
+        fg(DIM),
+    )));
+    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rect = Rect {
+        x: area.x + (area.width - w) / 2,
+        y: area.bottom().saturating_sub(h + 2),
+        width: w,
+        height: h,
+    };
+    dialog(f, rect, RED);
+    f.render_widget(Paragraph::new(lines), pad(rect, 2, 1));
 }
 
 fn action_status(f: &mut Frame, area: Rect, app: &App) {
@@ -59,6 +88,7 @@ fn action_status(f: &mut Frame, area: Rect, app: &App) {
         Tone::Info => FG2,
         Tone::Good => GREEN,
         Tone::Warn => YELLOW,
+        Tone::Fail => RED,
     };
     // While an action runs, anything said since it started shows (a refusal, a ⏎ waiting its
     // turn, its own working line); otherwise what it's doing and for how long (intent 0411).
@@ -527,11 +557,11 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     }
     if let Some(line) = pending {
         put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
-    } else if let Some((text, tone)) = message {
+    } else if let Some((text, tone)) = message.filter(|(_, t)| *t != Tone::Fail) {
         let color = match tone {
             Tone::Info => FG2,
             Tone::Good => GREEN,
-            Tone::Warn => YELLOW,
+            Tone::Warn | Tone::Fail => YELLOW,
         };
         put(
             f.buffer_mut(),

@@ -17,6 +17,7 @@ pub mod palette;
 pub mod poll;
 pub mod providers;
 pub mod report;
+pub mod resolve;
 pub mod state;
 pub mod theme;
 pub mod transport;

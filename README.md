@@ -254,6 +254,15 @@ while one is on. Organization work stays distinct from tenant work.
 Controls are optional: [the action adapter contract](docs/feed.md#actions) lets your
 own record system validate and persist changes. Without an adapter, Kerdr remains a reader.
 
+Every change shows on the board the moment you make it: a start moves the card out of the
+backlog, `C` shows it done, `x` and `X` put it in Won't do, `J` and `K` reorder at once. The
+command behind it carries on in the background, so the board, and other cards' changes, never
+wait for it; changes to one card reach your adapter in the order you made them. When it succeeds
+nothing more is said. When it fails, the card goes back to how it really is and a red **Not done**
+box says what didn't happen and why, staying up until you press a key. A question your adapter
+asks first (a full session, reopening done work) is still asked while you're on that card. `q`
+waits until every change has been saved.
+
 ### Accounts and ordered models
 
 With an account-aware feed, each card shows its account at the bottom left and one status
