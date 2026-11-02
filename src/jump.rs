@@ -12,8 +12,9 @@ use std::time::Duration;
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
-    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self as crossterm_event, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture,
+    EnableBracketedPaste, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -256,6 +257,24 @@ pub struct TerminalFlags {
     pub keyboard: bool,
 }
 
+/// What the board says while it gets herdr ready on a card: herdr's own calls come first, and can
+/// take seconds over a slow connection (intent 0411).
+pub fn opening(label: &str, machine: &str, local: bool) -> String {
+    if local {
+        format!("Opening {label}…")
+    } else {
+        format!("Opening {label} on {machine}…")
+    }
+}
+
+/// Throws away keys pressed while the board was waiting on herdr, so they never reach an agent's
+/// prompt once herdr is attached, nor jump again once back on the board.
+fn drop_pending_keys() {
+    while crossterm_event::poll(Duration::ZERO).unwrap_or(false) {
+        let _ = crossterm_event::read();
+    }
+}
+
 pub fn leave(flags: &TerminalFlags) {
     let mut out = stdout();
     if flags.keyboard {
@@ -301,6 +320,7 @@ pub fn enter(terminal: &mut DefaultTerminal, flags: &TerminalFlags) {
         );
     }
     let _ = terminal.clear();
+    drop_pending_keys();
 }
 
 pub fn run(
@@ -377,6 +397,7 @@ pub fn run(
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let ctrl_c = CtrlCToHerdr::new();
+    drop_pending_keys();
     leave(flags);
     #[cfg(windows)]
     let console_modes = crate::windows::ConsoleModes::capture();
@@ -565,6 +586,15 @@ mod tests {
             feed: None,
             hidden: false,
         }
+    }
+
+    #[test]
+    fn opening_names_the_machine_only_when_its_not_this_one() {
+        assert_eq!(
+            opening("0411", "LAB-Server", false),
+            "Opening 0411 on LAB-Server…"
+        );
+        assert_eq!(opening("0411", "AMD-LZM4", true), "Opening 0411…");
     }
 
     #[test]

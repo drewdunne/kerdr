@@ -133,6 +133,13 @@ Kerdr takes you straight in. The backend asks first when that would go past the 
 workspace limit or the conversation may still be open somewhere else. See
 [docs/feed.md](docs/feed.md#reopening-work-whose-workspace-closed).
 
+Kerdr runs one reopen, start or other change at a time, but `Enter` is never dropped while one
+runs. On the card already being reopened it says how long that has taken; on any other card it
+waits its turn, says so ("#41 opens once #39's answer is in"), and opens it as soon as the
+running one answers. A newer `Enter` replaces the waiting one, and `Esc` drops it. While herdr
+gets ready on a card, the board says "Opening …", and keys pressed meanwhile are thrown away
+rather than reaching the agent's prompt.
+
 Done work isn't a dead end either. When an agent finishes and wraps itself before you're done
 talking about it, `Enter` on its card in Maintain asks to reopen it: the backend always asks
 first, saying it's done, and only your yes opens it again and resumes its conversation. See

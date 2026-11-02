@@ -387,6 +387,12 @@ pub struct App {
     pub background: Background,
     pub wont_do: bool,
     pub busy: bool,
+    /// The record the running action is for, when it names one: ⏎ on its card says how long it
+    /// has been running rather than sending it again (intent 0411).
+    pub busy_id: Option<String>,
+    /// When the running action started, and what the board says it's doing.
+    pub busy_since: Option<Instant>,
+    pub busy_label: String,
     pub count: String,
     /// Words typed into the new-intent box and not sent yet, kept for the next time it opens.
     pub draft: String,
@@ -424,8 +430,12 @@ pub struct App {
     /// The card the running action was asked from, as it was then: its answer asks or takes you
     /// in only while you're still on that work. Esc lets it go.
     pub action_from: Option<CardSnapshot>,
-    /// A card whose workspace turned out to have closed when you went in: reopen it next.
+    /// A card whose workspace turned out to have closed when you went in: reopen it next, once
+    /// nothing else is running.
     pub pending_reopen: Option<String>,
+    /// A card ⏎ was pressed on while another action ran: it opens, as ⏎ would, once that action
+    /// has answered. One deep; a newer ⏎ replaces it, and Esc drops it (intent 0411).
+    pub pending_enter: Option<String>,
     pub width: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
@@ -457,6 +467,9 @@ impl App {
             background: Background::All,
             wont_do: false,
             busy: false,
+            busy_id: None,
+            busy_since: None,
+            busy_label: String::new(),
             count: String::new(),
             draft: String::new(),
             draft_images: vec![],
@@ -476,6 +489,7 @@ impl App {
             started: None,
             action_from: None,
             pending_reopen: None,
+            pending_enter: None,
             width: 200,
             demo: false,
             fixed_now: None,
@@ -505,6 +519,34 @@ impl App {
 
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
         self.message = Some((text.into(), tone, Instant::now()));
+    }
+
+    /// Takes back a message, but only if it's still the one on screen: something said since
+    /// stays.
+    pub fn unsay(&mut self, text: &str) {
+        if self.message.as_ref().is_some_and(|(t, _, _)| t == text) {
+            self.message = None;
+        }
+    }
+
+    /// The message on screen, if it was said since the running action started: a refusal, a
+    /// queued ⏎, the working line itself. Older ones give way to the action's own line.
+    pub fn message_since_busy(&self) -> Option<(&str, Tone)> {
+        let since = self.busy_since?;
+        self.message
+            .as_ref()
+            .filter(|(_, _, at)| *at >= since && at.elapsed() < Duration::from_secs(8))
+            .map(|(t, tone, _)| (t.as_str(), *tone))
+    }
+
+    /// What the running action is doing and for how long, as in "Reopening #39… 12 s"; None
+    /// when it hasn't said.
+    pub fn busy_line(&self) -> Option<String> {
+        if !self.busy || self.busy_label.is_empty() {
+            return None;
+        }
+        let secs = self.busy_since.map(|t| t.elapsed().as_secs()).unwrap_or(0);
+        Some(format!("{} {secs} s", self.busy_label))
     }
 
     pub fn message(&self) -> Option<(&str, Tone)> {
@@ -828,9 +870,90 @@ impl App {
                     && (c.workspace_id.is_none() || c.workspace_id.as_deref() == tried)
             });
         if reopen {
-            self.pending_reopen = Some(key.to_string());
+            self.owe_reopen(key, "workspace");
         }
         reopen
+    }
+
+    /// Kerdr owes this card a reopen, its `what` (workspace or tab) found closed: it starts as
+    /// soon as nothing else is running, and says so when something is.
+    pub(crate) fn owe_reopen(&mut self, key: &str, what: &str) {
+        self.pending_enter = None;
+        self.pending_reopen = Some(key.to_string());
+        if self.busy {
+            let reference = self
+                .card(key)
+                .map(|c| c.reference.clone())
+                .unwrap_or_else(|| key.to_string());
+            self.say(
+                format!(
+                    "{reference}'s {what} has closed; it reopens as soon as the running action answers (Esc drops it)."
+                ),
+                Tone::Info,
+            );
+        }
+    }
+
+    /// ⏎ on a card that would send an action while another runs. On the card that action is for,
+    /// it says how long it has been running and sends nothing; on any other, it waits its turn
+    /// and opens once the running action has answered (intent 0411).
+    pub(crate) fn enter_while_busy(&mut self, card: &Card) -> Action {
+        let id = card.detail.as_ref().map(|d| d.id.as_str());
+        if id.is_some() && id == self.busy_id.as_deref() {
+            let line = self
+                .busy_line()
+                .unwrap_or_else(|| format!("{} is still being changed.", card.reference));
+            self.say(format!("{line}; Esc stops waiting."), Tone::Info);
+            return Action::None;
+        }
+        self.pending_reopen = None;
+        self.pending_enter = Some(card.key.clone());
+        let verb = if waiting_work(card) {
+            "starts"
+        } else {
+            "opens"
+        };
+        let after = match self.busy_id.clone() {
+            Some(id) => format!("{}'s answer is in", self.reference_for(&id)),
+            None => "the running action answers".to_string(),
+        };
+        self.say(
+            format!("{} {verb} once {after} (Esc drops it).", card.reference),
+            Tone::Info,
+        );
+        Action::None
+    }
+
+    /// What Kerdr owes once nothing is running and no question is up: a reopen of a card whose
+    /// workspace closed as you went in, else a ⏎ that waited its turn, taken as ⏎ is now (a card
+    /// whose workspace opened meanwhile is gone into, not reopened). It waits while you're typing
+    /// or anywhere but the board, a peek, a list or a card's own screen.
+    pub fn next_owed(&mut self) -> Action {
+        if self.busy
+            || self.open_after.is_some()
+            || (self.pending_reopen.is_none() && self.pending_enter.is_none())
+            || !matches!(
+                self.mode,
+                Mode::Board
+                    | Mode::Peek { .. }
+                    | Mode::Backlog { .. }
+                    | Mode::Misc { .. }
+                    | Mode::Card { .. }
+            )
+            || self.typing_view_search()
+        {
+            return Action::None;
+        }
+        if let Some(key) = self.pending_reopen.take() {
+            return match self.card(&key).cloned() {
+                Some(card) => self.reopen_action(&card),
+                None => Action::None,
+            };
+        }
+        match self.pending_enter.take() {
+            Some(key) => self.jump_action(key),
+            None => Action::None,
+        }
     }
 
     /// Waits for this card's machine to answer, then jumps in.
@@ -862,7 +985,7 @@ impl App {
             Some(true) => return Some(key),
             // Work still under way, or done, whose workspace closed meanwhile: reopen it instead.
             Some(false) if self.card(&key).is_some_and(|c| c.reopenable()) && self.actions_on() => {
-                self.pending_reopen = Some(key);
+                self.owe_reopen(&key, "workspace");
             }
             Some(false) => self.say(
                 format!("{workspace} closed while {machine} was away."),
@@ -946,6 +1069,9 @@ impl App {
         // Work under way whose workspace closed, or done work: reopen it rather than leave a dead
         // end. Done work is opened again only after a yes to the question its backend asks.
         if card.reopenable() {
+            if self.busy && self.actions_on() {
+                return self.enter_while_busy(&card);
+            }
             return self.reopen_action(&card);
         }
         if card.dismissed() {
@@ -979,6 +1105,9 @@ impl App {
                 );
                 return Action::None;
             }
+            if self.busy {
+                return self.enter_while_busy(&card);
+            }
             return self.intent_action_on(card, "dispatch", serde_json::json!({}));
         }
         let what = match card.stage {
@@ -1001,9 +1130,10 @@ impl App {
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
         self.closed_on_send = false;
         // Esc anywhere lets a running action's answer go: it still finishes, but neither asks nor
-        // takes you anywhere, and a reopen waiting its turn is dropped.
+        // takes you anywhere, and a reopen or ⏎ waiting its turn is dropped.
         let stopped = key.code == KeyCode::Esc
             && (self.pending_reopen.take().is_some()
+                | self.pending_enter.take().is_some()
                 | (self.busy && self.action_from.take().is_some()));
         let action = self.handle_key(key);
         // A list view's search belongs to it: gone once you leave the view.
@@ -1337,6 +1467,9 @@ impl App {
                     Action::Jump(card.key)
                 } else if card.can_reopen() || (card.can_reopen_done() && self.actions_on()) {
                     self.mode = Mode::Board;
+                    if self.busy && self.actions_on() {
+                        return self.enter_while_busy(&card);
+                    }
                     self.reopen_action(&card)
                 } else if waiting_work(&card) && self.actions_on() {
                     // From a peek on it, which keeps it selected wherever its card sits (inside
@@ -5079,5 +5212,268 @@ mod tests {
         app.on_paste(&title);
         assert_eq!(query(&app), Some((title, true)));
         assert!(!app.misc_cards().is_empty());
+    }
+
+    /// As start_action marks an action running: the board's busy, for this request.
+    fn mark_busy(app: &mut App, request: &serde_json::Value) {
+        app.busy = true;
+        app.busy_id = request["id"].as_str().map(str::to_string);
+        app.busy_since = Some(Instant::now() - Duration::from_secs(12));
+        app.busy_label = app.working_on(request);
+    }
+
+    /// A second card for work under way whose workspace has closed, beside `other`, on the first
+    /// machine and homed in `web`.
+    fn second_closed_card(app: &mut App, other: &str) -> (String, String) {
+        let machine = app.machines[0].name();
+        let card = app
+            .board
+            .cards
+            .iter_mut()
+            .find(|c| c.detail.is_some() && c.key != other)
+            .expect("a second card with a record in the demo");
+        card.stage = Stage::Test;
+        card.workspace_id = None;
+        card.session = None;
+        card.attention = Attention::Idle;
+        card.machine_index = 0;
+        let d = card.detail.as_mut().unwrap();
+        d.disposition = None;
+        d.intake = None;
+        d.state = None;
+        d.home = Some(crate::feed::Home {
+            machine: Some(machine),
+            session: Some("web".into()),
+        });
+        let (key, id) = (card.key.clone(), d.id.clone());
+        assert!(app.card(&key).unwrap().reopenable());
+        (key, id)
+    }
+
+    fn select_key(app: &mut App, key: &str) {
+        let col = app.card(key).unwrap().stage.index();
+        app.sel = Selection {
+            col,
+            key: Some(key.to_string()),
+        };
+    }
+
+    #[test]
+    fn enter_on_same_card_while_its_reopen_runs_says_still_working() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        assert_eq!(enter(&mut app), Action::None);
+        let (said, _) = app.message().unwrap();
+        assert!(
+            said.starts_with(&format!("Reopening {reference}… 12 s")),
+            "{said}"
+        );
+        assert!(said.contains("Esc stops waiting"), "{said}");
+        assert!(!said.contains("An action is still running"));
+        assert_eq!(app.pending_enter, None, "nothing is sent again");
+    }
+
+    #[test]
+    fn enter_on_other_card_while_busy_queues_it_and_opens_it_after() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate {
+            machine,
+            request: first,
+        } = enter(&mut app)
+        else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &first);
+        let (b, b_id) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
+        let (said, _) = app.message().unwrap();
+        let (a_ref, b_ref) = (
+            app.card(&a).unwrap().reference.clone(),
+            app.card(&b).unwrap().reference.clone(),
+        );
+        assert_eq!(
+            said,
+            format!("{b_ref} opens once {a_ref}'s answer is in (Esc drops it).")
+        );
+        // Nothing starts while the first still runs.
+        assert_eq!(app.next_owed(), Action::None);
+        assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
+        // The first answers: the waiting ⏎ goes out as ⏎ would.
+        app.finish_action(machine, first, reopen_reply("web", true, false, ""));
+        assert!(!app.busy && app.busy_id.is_none() && app.busy_label.is_empty());
+        let Action::Mutate { request, .. } = app.next_owed() else {
+            panic!("the waiting ⏎ sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(b_id.as_str()));
+        assert_eq!(app.pending_enter, None);
+    }
+
+    #[test]
+    fn a_waiting_enter_whose_workspace_opened_meanwhile_goes_in() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        let (b, _) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        enter(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == b).unwrap();
+        card.workspace_id = Some("w8".into());
+        card.session = Some("web".into());
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        assert_eq!(app.next_owed(), Action::Jump(b));
+    }
+
+    #[test]
+    fn a_waiting_enter_waits_out_a_question_and_typing() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        let (b, _) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        enter(&mut app);
+        app.busy = false;
+        for mode in [
+            Mode::Compose {
+                draft: Draft::default(),
+                back: Box::new(Mode::Board),
+            },
+            Mode::Keys {
+                filter: String::new(),
+                typing: true,
+                scroll: 0,
+            },
+        ] {
+            app.mode = mode;
+            assert_eq!(app.next_owed(), Action::None);
+            assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
+        }
+        app.mode = Mode::Board;
+        app.open_after = Some(OpenAfter {
+            machine: 0,
+            label: "w7".into(),
+            session: "web".into(),
+            workspace: "w7".into(),
+            from: a,
+        });
+        assert_eq!(app.next_owed(), Action::None);
+        app.open_after = None;
+        assert!(matches!(app.next_owed(), Action::Mutate { .. }));
+    }
+
+    #[test]
+    fn esc_drops_a_waiting_enter() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        let (b, _) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        enter(&mut app);
+        assert!(app.pending_enter.is_some());
+        esc(&mut app);
+        assert_eq!(app.pending_enter, None);
+        assert!(app.message().unwrap().0.starts_with("Stopped waiting"));
+        app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        assert_eq!(app.next_owed(), Action::None);
+    }
+
+    #[test]
+    fn a_newer_enter_replaces_the_waiting_one() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        let (b, _) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        enter(&mut app);
+        select_key(&mut app, &a);
+        enter(&mut app);
+        assert_eq!(
+            app.pending_enter.as_deref(),
+            Some(b.as_str()),
+            "⏎ on the running card itself queues nothing"
+        );
+        // A reopen owed since, herdr finding a workspace closed as you went in, is newer still.
+        let i = app.board.cards.iter().position(|c| c.key == a).unwrap();
+        app.board.cards[i].workspace_id = Some("w5".into());
+        app.board.cards[i].session = Some("web".into());
+        assert!(app.closed_under_you(&a, Some("w5")));
+        assert_eq!(app.pending_enter, None);
+        assert_eq!(app.pending_reopen.as_deref(), Some(a.as_str()));
+    }
+
+    #[test]
+    fn a_reopen_owed_while_another_action_runs_waits_its_turn() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].workspace_id = Some("w5".into());
+        app.board.cards[i].session = Some("web".into());
+        app.busy = true;
+        app.busy_since = Some(Instant::now());
+        assert!(app.closed_under_you(&key, Some("w5")));
+        assert_eq!(app.next_owed(), Action::None);
+        assert_eq!(app.pending_reopen.as_deref(), Some(key.as_str()));
+        assert!(
+            app.message().unwrap().0.contains("reopens as soon as"),
+            "{:?}",
+            app.message()
+        );
+        // The running action answers: the owed reopen goes out, even though the board still
+        // shows the workspace herdr said has closed.
+        app.busy = false;
+        let Action::Mutate { request, .. } = app.next_owed() else {
+            panic!("the owed reopen sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(app.pending_reopen, None);
+        // Esc before its turn drops it.
+        app.busy = true;
+        assert!(app.closed_under_you(&key, Some("w5")));
+        esc(&mut app);
+        app.busy = false;
+        assert_eq!(app.pending_reopen, None);
+        assert_eq!(app.next_owed(), Action::None);
+    }
+
+    #[test]
+    fn unsay_takes_back_only_its_own_message() {
+        let mut app = demo_app();
+        app.say("Opening 41-checkout on LAB-Server…", Tone::Info);
+        app.unsay("Opening 41-checkout on LAB-Server…");
+        assert!(app.message().is_none());
+        app.say("Couldn't reach LAB-Server: timed out", Tone::Warn);
+        app.unsay("Opening 41-checkout on LAB-Server…");
+        assert_eq!(
+            app.message().unwrap().0,
+            "Couldn't reach LAB-Server: timed out"
+        );
     }
 }

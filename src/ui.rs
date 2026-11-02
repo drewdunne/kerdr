@@ -50,17 +50,25 @@ fn action_status(f: &mut Frame, area: Rect, app: &App) {
     {
         return;
     }
+    let tone_color = |tone: Tone| match tone {
+        Tone::Info => FG2,
+        Tone::Good => GREEN,
+        Tone::Warn => YELLOW,
+    };
+    // While an action runs, anything said since it started shows (a refusal, a ⏎ waiting its
+    // turn, its own working line); otherwise what it's doing and for how long (intent 0411).
+    let working;
     let (text, color) = if app.busy {
-        ("Action in progress · navigation stays available", BLUE)
+        if let Some((text, tone)) = app.message_since_busy() {
+            (text, tone_color(tone))
+        } else if let Some(line) = app.busy_line() {
+            working = format!("{line} · navigation stays available");
+            (working.as_str(), BLUE)
+        } else {
+            ("Action in progress · navigation stays available", BLUE)
+        }
     } else if let Some((text, tone)) = app.message() {
-        (
-            text,
-            match tone {
-                Tone::Info => FG2,
-                Tone::Good => GREEN,
-                Tone::Warn => YELLOW,
-            },
-        )
+        (text, tone_color(tone))
     } else {
         return;
     };
@@ -826,7 +834,10 @@ fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
         left.push(Span::styled("   WON’T DO", bold(YELLOW)));
     }
     let right = if app.busy {
-        vec![Span::styled("◐ action in progress", fg(BLUE))]
+        let what = app
+            .busy_line()
+            .unwrap_or_else(|| "action in progress".to_string());
+        vec![Span::styled(format!("◐ {what}"), fg(BLUE))]
     } else if !app.count.is_empty() {
         vec![Span::styled(format!("count: {}", app.count), fg(CYAN))]
     } else {
@@ -4762,6 +4773,83 @@ mod tests {
         a.message = None;
         a.busy = true;
         assert!(rendered(&a, 176, 44).contains("Action in progress"));
+    }
+
+    /// Modes outside the board, where the action line is drawn over the screen.
+    fn screens_over_the_board(a: &App) -> Vec<Mode> {
+        let card = a.board.cards[0].key.clone();
+        vec![
+            Mode::Peek {
+                scroll: 0,
+                back: Box::new(Mode::Board),
+            },
+            Mode::Backlog { sel: 0 },
+            Mode::Misc { sel: 0 },
+            Mode::Card {
+                card: card.clone(),
+                focus: card,
+                opened: vec![],
+                back: Box::new(Mode::Board),
+            },
+        ]
+    }
+
+    #[test]
+    fn newer_message_shows_over_busy_line() {
+        let mut a = demo(false);
+        for mode in screens_over_the_board(&a) {
+            a.mode = mode;
+            a.busy = true;
+            a.busy_label = "Reopening #39…".into();
+            a.busy_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            a.say(
+                "#41 opens once #39's answer is in (Esc drops it).",
+                Tone::Info,
+            );
+            let text = rendered(&a, 176, 44);
+            assert!(text.contains("#41 opens once #39's answer is in"), "{text}");
+            // A message from before the action started gives way to the action's own line.
+            a.message = Some((
+                "Something said earlier".into(),
+                Tone::Info,
+                std::time::Instant::now() - std::time::Duration::from_secs(2),
+            ));
+            let text = rendered(&a, 176, 44);
+            assert!(
+                text.contains("Reopening #39… 1 s · navigation stays available"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn busy_line_names_the_work_and_how_long() {
+        let mut a = demo(false);
+        a.busy = true;
+        a.busy_label = "Reopening #39…".into();
+        a.busy_since = Some(std::time::Instant::now() - std::time::Duration::from_secs(20));
+        a.message = None;
+        for mode in screens_over_the_board(&a) {
+            a.mode = mode;
+            let text = rendered(&a, 176, 44);
+            assert!(
+                text.contains("Reopening #39… 20 s · navigation stays available"),
+                "{text}"
+            );
+        }
+        // On the board, its header says the same.
+        a.mode = Mode::Board;
+        assert!(rendered(&a, 176, 44).contains("◐ Reopening #39… 20 s"));
+    }
+
+    #[test]
+    fn the_board_says_it_is_opening_a_card_while_herdr_gets_ready() {
+        let mut a = demo(false);
+        a.say(
+            crate::jump::opening("41-checkout-expired-cards", "LAB-Server", false),
+            Tone::Info,
+        );
+        assert!(rendered(&a, 176, 44).contains("Opening 41-checkout-expired-cards on LAB-Server…"));
     }
 
     #[test]

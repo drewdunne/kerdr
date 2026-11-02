@@ -603,7 +603,7 @@ impl App {
         };
         if card.tab_id.is_some() {
             if self.actions_on() && (card.under_way() || card.done()) {
-                self.pending_reopen = Some(key.to_string());
+                self.owe_reopen(key, "tab");
             } else {
                 self.say(format!("{}'s tab has closed.", card.reference), Tone::Warn);
             }
@@ -1283,6 +1283,36 @@ mod tests {
             .filter(|id| *id == "0500" || *id == "0501")
             .count();
         assert_eq!(on_board, 1, "one heads the family, holding the other");
+    }
+
+    #[test]
+    fn a_childs_closed_tab_reopens_once_the_running_action_answers() {
+        let mut app = families(Some("w2K:t1"));
+        let k = key(&app, "0262");
+        let i = app.board.cards.iter().position(|c| c.key == k).unwrap();
+        app.board.cards[i].attention = crate::model::Attention::Idle;
+        assert!(app.card(&k).unwrap().tab_id.is_some());
+        assert!(app.card(&k).unwrap().under_way());
+        select(&mut app, "0262");
+        app.busy = true;
+        app.busy_since = Some(std::time::Instant::now());
+        app.tab_gone(&k);
+        assert_eq!(app.pending_reopen.as_deref(), Some(k.as_str()));
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("tab has closed; it reopens as soon as"),
+            "{:?}",
+            app.message()
+        );
+        app.busy = false;
+        let Action::Mutate { request, .. } = app.next_owed() else {
+            panic!("the owed reopen sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"], "0262");
     }
 
     #[test]

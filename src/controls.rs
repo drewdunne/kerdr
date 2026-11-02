@@ -634,7 +634,7 @@ impl App {
 
     /// Whether a list view's search is being typed: its letters are words, so no question may
     /// take them over as answers.
-    fn typing_view_search(&self) -> bool {
+    pub(super) fn typing_view_search(&self) -> bool {
         matches!(self.mode, Mode::Backlog { .. } | Mode::Misc { .. })
             && self.view_search.as_ref().is_some_and(|s| s.typing)
     }
@@ -666,6 +666,9 @@ impl App {
         } else if request["action"] == "close" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Marking {} done…", self.reference_for(id))
+        } else if request["action"] == "dispatch" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Starting {}…", self.reference_for(id))
         } else if request["action"] == "cancel" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Cancelling {}: stopping its agent…", self.reference_for(id))
@@ -675,7 +678,7 @@ impl App {
     }
 
     /// How a message names the record with this id: its card's reference, or the id.
-    fn reference_for(&self, id: &str) -> String {
+    pub(super) fn reference_for(&self, id: &str) -> String {
         self.board
             .cards
             .iter()
@@ -1491,6 +1494,9 @@ impl App {
         result: Result<Response, String>,
     ) {
         self.busy = false;
+        self.busy_id = None;
+        self.busy_since = None;
+        self.busy_label.clear();
         if request["action"]
             .as_str()
             .is_some_and(|a| a.starts_with("account-"))

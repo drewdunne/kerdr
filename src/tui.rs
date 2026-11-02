@@ -188,12 +188,25 @@ fn event_loop(
                 }
             }
         }
-        // A card whose workspace closed as you went in: work under way reopens instead.
-        if let Some(key) = app.pending_reopen.take()
-            && let Some(card) = app.card(&key).cloned()
-            && let Action::Mutate { machine, request } = app.reopen_action(&card)
-        {
-            start_action(app, &action_tx, machine, request);
+        // Once nothing runs: a card whose workspace closed as you went in reopens, or a ⏎ pressed
+        // while another action ran opens its card (intent 0411).
+        if !app.demo {
+            match app.next_owed() {
+                Action::Mutate { machine, request } => {
+                    start_action(app, &action_tx, machine, request)
+                }
+                Action::Jump(key) => jump_cards(
+                    terminal,
+                    flags,
+                    app,
+                    live.as_deref_mut(),
+                    inbox,
+                    client_config.as_ref(),
+                    key,
+                    true,
+                ),
+                _ => {}
+            }
         }
         for ev in inbox.take() {
             app.apply(ev);
@@ -461,8 +474,11 @@ fn start_action(
     };
     let tx = tx.clone();
     app.busy = true;
+    app.busy_id = request["id"].as_str().map(str::to_string);
+    app.busy_since = Some(Instant::now());
+    app.busy_label = app.working_on(&request);
     if request["action"] != "account-signin" {
-        app.say(app.working_on(&request), Tone::Info);
+        app.say(app.busy_label.clone(), Tone::Info);
     }
     std::thread::spawn(move || {
         let result = crate::actions::run(&target, &command, &request);
@@ -516,14 +532,7 @@ fn jump_workspace(
         prefix: app.prefix.clone(),
         keys: keys_on(app, mi),
     };
-    let outcome = jump::run(
-        terminal,
-        flags,
-        &j,
-        client_config
-            .map(|p| p.as_path())
-            .unwrap_or(std::path::Path::new("")),
-    );
+    let outcome = run_jump(terminal, flags, app, &j, client_config);
     if let Some(l) = live.as_deref() {
         l.wake(mi);
     }
@@ -533,6 +542,30 @@ fn jump_workspace(
         Outcome::Board | Outcome::Next | Outcome::TabGone => {}
     }
     Some(outcome)
+}
+
+/// Goes into herdr, saying first that it's opening the card, since herdr's own calls can take
+/// seconds on a slow connection and the board would look frozen meanwhile (intent 0411).
+fn run_jump(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    j: &Jump,
+    client_config: Option<&PathBuf>,
+) -> Outcome {
+    let opening = jump::opening(&j.label, &j.machine.name, j.machine.ssh.is_none());
+    app.say(opening.clone(), Tone::Info);
+    let _ = terminal.draw(|f| crate::ui::draw(f, app));
+    let outcome = jump::run(
+        terminal,
+        flags,
+        j,
+        client_config
+            .map(|p| p.as_path())
+            .unwrap_or(std::path::Path::new("")),
+    );
+    app.unsay(&opening);
+    outcome
 }
 
 /// Whether Kerdr's two keys are installed in that machine's herdr config.
@@ -614,14 +647,7 @@ fn jump_cards(
             prefix: app.prefix.clone(),
             keys: keys_on(app, mi),
         };
-        let outcome = jump::run(
-            terminal,
-            flags,
-            &j,
-            client_config
-                .map(|p| p.as_path())
-                .unwrap_or(std::path::Path::new("")),
-        );
+        let outcome = run_jump(terminal, flags, app, &j, client_config);
         let choosing_next = matches!(outcome, Outcome::Next | Outcome::Closed);
         read_again(app, live.as_deref(), inbox, mi, choosing_next);
         match outcome {
