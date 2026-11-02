@@ -213,9 +213,10 @@ before trying again. After success, the next feed read reflects the saved change
 `Enter` on a card for backlog work nobody has started (no workspace open, its state not
 `active`, `background` or `closed`, not in won't do) sends the `dispatch` request `d` sends, to
 the card's home machine, and a `confirmation` answer asks the same question before an
-`override: true`. On a search hit, a row inside a card or the misc list it starts that card,
-not the selected one. The backlog screen's `Enter` peeks, and in that peek `Enter` leaves starting
-to `d`.
+`override: true`. On a search hit or a row inside a card it starts that card, not the selected
+one; a search hit starts from a peek on it, and a start from a peek stays in the peek, so the
+question still finds its card. A second `Enter` before the feed shows the work under way sends
+nothing. The backlog screen's `Enter` peeks, and in that peek `Enter` leaves starting to `d`.
 
 ## Reopening work whose workspace closed
 

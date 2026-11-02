@@ -1532,6 +1532,11 @@ impl App {
             }
             Ok(response) => {
                 let mut message = response.message.clone();
+                if request["action"] == "dispatch" && response.ok {
+                    self.started = request["id"]
+                        .as_str()
+                        .map(|id| (id.to_string(), Instant::now()));
+                }
                 if request["action"] == "create"
                     && (response.id.is_some()
                         || !self.submission.as_ref().is_some_and(|s| s.unknown))

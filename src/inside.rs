@@ -1108,6 +1108,37 @@ mod tests {
             request,
             serde_json::json!({"action":"dispatch","id":"0332"})
         );
+        // Past the limit it asks, and a feed rebuild while the question is open keeps the row
+        // selected, so the yes and any newer question are still for it.
+        let over = crate::actions::Response {
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("KBZ".into()),
+            message: "3 of 3 slots used".into(),
+            ..Default::default()
+        };
+        app.finish_action(machine, request, Ok(over.clone()));
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        app.rebuild();
+        assert_eq!(app.sel.key.as_deref(), Some(want.as_str()));
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { machine, request } = press(&mut app, KeyCode::Enter) else {
+            panic!("{:?}", app.mode)
+        };
+        assert_eq!(request["id"], "0332");
+        assert_eq!(request["override"], true);
+        assert!(matches!(app.mode, Mode::Card { .. }));
+        assert_eq!(app.sel.key.as_deref(), Some(want.as_str()));
+        // A newer question after the yes still asks.
+        let newer = crate::actions::Response {
+            confirm: Some("0123456789ab0001".into()),
+            ..over
+        };
+        app.finish_action(machine, request, Ok(newer));
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
     }
 
     #[test]

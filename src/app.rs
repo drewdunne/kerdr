@@ -260,6 +260,18 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
     }
 }
 
+fn holds_card(mode: &Mode) -> bool {
+    match mode {
+        Mode::Card { .. } => true,
+        Mode::Palette { back, .. }
+        | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
+        | Mode::Confirm { back, .. } => holds_card(back),
+        _ => false,
+    }
+}
+
 fn holds_peek(mode: &Mode) -> bool {
     match mode {
         Mode::Peek { .. } => true,
@@ -375,6 +387,9 @@ pub struct App {
     pub pending_jump: Option<PendingJump>,
     /// The workspace a reopen just made, to go into now.
     pub open_after: Option<OpenAfter>,
+    /// The record a start just went out for, and when, so a second ⏎ before the feed shows it
+    /// under way doesn't start it again (intent 0404).
+    pub started: Option<(String, Instant)>,
     /// The card the running action was asked from, as it was then: its answer asks or takes you
     /// in only while you're still on that work. Esc lets it go.
     pub action_from: Option<CardSnapshot>,
@@ -425,6 +440,7 @@ impl App {
             message: None,
             pending_jump: None,
             open_after: None,
+            started: None,
             action_from: None,
             pending_reopen: None,
             width: 200,
@@ -626,6 +642,14 @@ impl App {
             return;
         }
         if self.fix_card_screen() {
+            return;
+        }
+        // A question over a card's screen keeps its row selected until it's answered, as a
+        // peek keeps its record.
+        if holds_card(&self.mode) {
+            if let Some(card) = self.selected() {
+                self.sel.col = card.stage.index();
+            }
             return;
         }
         if holds_peek(&self.mode) {
@@ -909,6 +933,19 @@ impl App {
                 );
                 return Action::None;
             }
+            let id = card.detail.as_ref().map(|d| d.id.as_str());
+            if self.started.as_ref().is_some_and(|(s, at)| {
+                Some(s.as_str()) == id && at.elapsed() < Duration::from_secs(120)
+            }) {
+                self.say(
+                    format!(
+                        "{} is starting; ⏎ goes in once its workspace shows.",
+                        card.reference
+                    ),
+                    Tone::Info,
+                );
+                return Action::None;
+            }
             return self.intent_action_on(card, "dispatch", serde_json::json!({}));
         }
         let what = match card.stage {
@@ -1113,7 +1150,10 @@ impl App {
             KeyCode::Enter => {
                 if let Some(k) = self.sel.key.clone() {
                     let action = self.jump_action(k);
-                    if action != Action::None {
+                    // A start stays in the peek, still on its card, so a question past the limit
+                    // asks there (a search behind it would let the question go).
+                    let starts = matches!(&action, Action::Mutate { request, .. } if request["action"] == "dispatch");
+                    if action != Action::None && !starts {
                         self.mode = *back;
                     }
                     return action;
@@ -1257,7 +1297,12 @@ impl App {
                     self.mode = Mode::Board;
                     self.reopen_action(&card)
                 } else if waiting_work(&card) && self.actions_on() {
-                    self.mode = Mode::Board;
+                    // From a peek on it, which keeps it selected wherever its card sits (inside
+                    // another card, a hidden column), so a question past the limit still asks.
+                    self.mode = Mode::Peek {
+                        scroll: 0,
+                        back: Box::new(Mode::Board),
+                    };
                     self.intent_action_on(card, "dispatch", serde_json::json!({}))
                 } else {
                     self.mode = Mode::Peek {
@@ -2032,6 +2077,18 @@ mod tests {
         assert_eq!(request["action"], "dispatch");
         assert_eq!(request["id"], id.as_str());
         assert_eq!(request["override"], true);
+        // Started, but the feed still shows it waiting: ⏎ again (a held key, say) sends nothing.
+        let started = crate::actions::Response {
+            ok: true,
+            message: "Started.".into(),
+            ..Default::default()
+        };
+        app.finish_action(home, request, Ok(started));
+        assert!(!app.busy);
+        assert!(crate::app::waiting_work(app.card(&key).unwrap()));
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("is starting"));
+        assert!(matches!(press(&mut app, 'd'), Action::Mutate { .. }));
     }
 
     /// Intent 0404: the backlog screen's ⏎ still peeks, and ⏎ again in that peek leaves starting
@@ -2058,7 +2115,8 @@ mod tests {
             back: Box::new(Mode::Board),
         };
         assert!(matches!(enter(&mut app), Action::Mutate { .. }));
-        assert!(matches!(app.mode, Mode::Board));
+        // A start stays in the peek, still on its card, so a question past the limit asks there.
+        assert!(matches!(app.mode, Mode::Peek { .. }));
     }
 
     /// Intent 0404: ⏎ on a search hit nobody started starts that card, not the one selected.
@@ -2090,12 +2148,44 @@ mod tests {
             .position(|(h, _)| matches!(h, Hit::Card(i) if app.board.cards[*i].key == key))
             .expect("the card among the hits");
         app.mode = Mode::Search(s);
-        let Action::Mutate { request, .. } = enter(&mut app) else {
+        let search = app.mode.clone();
+        let Action::Mutate { machine, request } = enter(&mut app) else {
             panic!("{:?}", app.message())
         };
         assert_eq!(request, serde_json::json!({"action":"dispatch","id":id}));
-        assert!(matches!(app.mode, Mode::Board));
+        // It starts from a peek on the card, which keeps it selected through a feed rebuild,
+        // wherever its card sits, so a question past the limit still asks.
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        app.rebuild();
         assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        app.finish_action(machine, request.clone(), Ok(over_limit(&id)));
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        // Search, Ctrl+O peeks at the hit, then ⏎ there: the peek stays, so the question asks.
+        app.mode = search;
+        app.on_key(KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL));
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("{:?}", app.message())
+        };
+        assert_eq!(request["id"], id.as_str());
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        app.finish_action(machine, request, Ok(over_limit(&id)));
+        settle(&mut app);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+    }
+
+    fn over_limit(id: &str) -> crate::actions::Response {
+        crate::actions::Response {
+            ok: false,
+            message: "3 of 3 slots used".into(),
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            id: Some(id.into()),
+            ..Default::default()
+        }
     }
 
     #[test]
