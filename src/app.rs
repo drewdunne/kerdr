@@ -6690,11 +6690,10 @@ mod tests {
         let last = app
             .backlog_order()
             .into_iter()
-            .filter(|&i| {
+            .rfind(|&i| {
                 let c = &app.board.cards[i];
                 c.owner_key() == app.card(&a).unwrap().owner_key() && c.machine_index == machine
             })
-            .last()
             .map(|i| app.board.cards[i].key.clone());
         assert_eq!(last.as_deref(), Some(a.as_str()));
     }
