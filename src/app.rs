@@ -131,6 +131,15 @@ impl SearchFilter {
     }
 }
 
+/// A search inside the Backlog, Won't do or Misc view (`/` there, intent 0402): it narrows that
+/// view's own list where it is, rather than opening the search of everything. While `typing`,
+/// letters go into the query; after Enter, they're the view's keys again, on the cards it left.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ViewSearch {
+    pub query: String,
+    pub typing: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Search {
     pub query: String,
@@ -272,6 +281,21 @@ fn holds_card(mode: &Mode) -> bool {
     }
 }
 
+/// The list view (Backlog, Won't do or Misc) under this screen, if it was opened from one.
+fn list_view(mode: &Mode) -> Option<&Mode> {
+    match mode {
+        Mode::Backlog { .. } | Mode::Misc { .. } => Some(mode),
+        Mode::Peek { back, .. }
+        | Mode::Palette { back, .. }
+        | Mode::Compose { back, .. }
+        | Mode::Filter { back, .. }
+        | Mode::Accounts { back, .. }
+        | Mode::Confirm { back, .. }
+        | Mode::Card { back, .. } => list_view(back),
+        _ => None,
+    }
+}
+
 fn holds_peek(mode: &Mode) -> bool {
     match mode {
         Mode::Peek { .. } => true,
@@ -380,6 +404,9 @@ pub struct App {
     /// The intent just created here, selected in the backlog as soon as its card arrives.
     pub new_intent_id: Option<(usize, String)>,
     backlog_focus: Option<String>,
+    /// `/` in a list view: what narrows it, kept while you peek or act from it, and dropped
+    /// once you leave the view.
+    pub view_search: Option<ViewSearch>,
     pub sel: Selection,
     pub mode: Mode,
     pub message: Option<(String, Tone, Instant)>,
@@ -435,6 +462,7 @@ impl App {
             new_intent_id: None,
             submission: None,
             backlog_focus: None,
+            view_search: None,
             sel: Selection::default(),
             mode: Mode::Board,
             message: None,
@@ -971,6 +999,10 @@ impl App {
             && (self.pending_reopen.take().is_some()
                 | (self.busy && self.action_from.take().is_some()));
         let action = self.handle_key(key);
+        // A list view's search belongs to it: gone once you leave the view.
+        if list_view(&self.mode).is_none() {
+            self.view_search = None;
+        }
         if stopped {
             self.say(
                 "Stopped waiting: it still finishes, and won't take you anywhere.",
@@ -994,6 +1026,9 @@ impl App {
                     .unwrap_or(Action::None);
             }
             return Action::Quit;
+        }
+        if let Some(action) = self.view_search_key(key) {
+            return action;
         }
         if let Some(action) = self.account_key(key) {
             return action;
@@ -1531,8 +1566,31 @@ impl App {
         Action::None
     }
 
-    /// The backlog in the order its view lists it.
+    /// The backlog in the order its view lists it, narrowed by the view's search.
     pub fn backlog_cards(&self) -> Vec<usize> {
+        self.backlog_order()
+            .into_iter()
+            .filter(|&i| self.matches_view_search(&self.board.cards[i]))
+            .collect()
+    }
+
+    /// Whether a card is in a list view's search: every card when there's none, or it's empty.
+    /// Only a list view's search narrows, so another screen never loses cards to one left over.
+    fn matches_view_search(&self, c: &Card) -> bool {
+        let Some(s) = self
+            .view_search
+            .as_ref()
+            .filter(|_| list_view(&self.mode).is_some())
+        else {
+            return true;
+        };
+        let q = s.query.trim().to_lowercase();
+        q.is_empty() || card_score(&q, c).is_some()
+    }
+
+    /// The whole backlog in its order, whatever the view's search: a card's place in it is the
+    /// number the view shows beside it.
+    pub fn backlog_order(&self) -> Vec<usize> {
         let scope = self.scope();
         self.board
             .cards
@@ -1546,6 +1604,129 @@ impl App {
             })
             .map(|(i, _)| i)
             .collect()
+    }
+
+    /// `/` in the Backlog, Won't do or Misc view searches only that view (intent 0402); on the
+    /// board it still searches everything. While typing, keys go into the query, except the
+    /// ones that move, Enter, which does what Enter does in the view on the card selected, and
+    /// Esc, which clears the search. With a search left in place, letters are the view's keys
+    /// again, on the cards it shows, `/` goes back to typing and Esc clears it.
+    fn view_search_key(&mut self, key: KeyEvent) -> Option<Action> {
+        let sel = match self.mode {
+            Mode::Backlog { sel } | Mode::Misc { sel } => sel,
+            _ => return None,
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let slash = key.code == KeyCode::Char('/') && !ctrl && !alt;
+        let Some(mut s) = self.view_search.clone() else {
+            if !slash {
+                return None;
+            }
+            self.count.clear();
+            self.view_search = Some(ViewSearch {
+                query: String::new(),
+                typing: true,
+            });
+            return Some(Action::None);
+        };
+        if !s.typing {
+            match key.code {
+                _ if slash => {
+                    self.count.clear();
+                    s.typing = true;
+                    self.view_search = Some(s);
+                }
+                KeyCode::Esc => {
+                    self.view_search = None;
+                    self.settle_view_selection(true);
+                }
+                _ => return None,
+            }
+            return Some(Action::None);
+        }
+        let plain = |code| KeyEvent::new(code, KeyModifiers::NONE);
+        match key.code {
+            KeyCode::Esc => {
+                self.view_search = None;
+                self.settle_view_selection(true);
+            }
+            KeyCode::Enter => {
+                s.typing = false;
+                self.view_search = (!s.query.trim().is_empty()).then_some(s);
+                return Some(self.list_view_key(key, sel));
+            }
+            KeyCode::Down => return Some(self.list_view_key(key, sel)),
+            KeyCode::Up => return Some(self.list_view_key(key, sel)),
+            KeyCode::Char('n' | 'j') if ctrl => {
+                return Some(self.list_view_key(plain(KeyCode::Down), sel));
+            }
+            KeyCode::Char('p' | 'k') if ctrl => {
+                return Some(self.list_view_key(plain(KeyCode::Up), sel));
+            }
+            KeyCode::Char('u') if ctrl => {
+                s.query.clear();
+                self.view_search = Some(s);
+                self.settle_view_selection(false);
+            }
+            KeyCode::Backspace if s.query.is_empty() => {
+                self.view_search = None;
+                self.settle_view_selection(true);
+            }
+            KeyCode::Backspace => {
+                s.query.pop();
+                self.view_search = Some(s);
+                self.settle_view_selection(false);
+            }
+            KeyCode::Char(c) if !ctrl && !alt => {
+                if s.query.chars().count() < 64 {
+                    s.query.push(c);
+                }
+                self.view_search = Some(s);
+                self.settle_view_selection(false);
+            }
+            _ => {}
+        }
+        Some(Action::None)
+    }
+
+    fn list_view_key(&mut self, key: KeyEvent, sel: usize) -> Action {
+        match self.mode {
+            Mode::Misc { .. } => self.misc_key(key, sel),
+            _ => self.backlog_key(key, sel),
+        }
+    }
+
+    /// After a list view's search changes: the card selected before when `keep` and it's still
+    /// listed, else the first card listed.
+    fn settle_view_selection(&mut self, keep: bool) {
+        match self.mode {
+            Mode::Backlog { .. } => {
+                let items = self.backlog_cards();
+                let sel = keep
+                    .then(|| {
+                        let key = self.backlog_focus.as_ref()?;
+                        items.iter().position(|&i| &self.board.cards[i].key == key)
+                    })
+                    .flatten()
+                    .unwrap_or(0);
+                self.backlog_focus = items.get(sel).map(|&i| self.board.cards[i].key.clone());
+                self.mode = Mode::Backlog { sel };
+            }
+            Mode::Misc { .. } => {
+                let items = self.misc_cards();
+                let sel = keep
+                    .then(|| {
+                        let key = self.sel.key.as_ref()?;
+                        items.iter().position(|&i| &self.board.cards[i].key == key)
+                    })
+                    .flatten()
+                    .unwrap_or(0);
+                self.sel.key = items.get(sel).map(|&i| self.board.cards[i].key.clone());
+                self.mode = Mode::Misc { sel };
+            }
+            _ => {}
+        }
     }
 
     fn backlog_key(&mut self, key: KeyEvent, sel: usize) -> Action {
@@ -1564,13 +1745,6 @@ impl App {
                 self.mode = Mode::Backlog {
                     sel: sel.saturating_sub(1),
                 }
-            }
-            KeyCode::Char('/') => {
-                self.mode = Mode::Search(Search {
-                    query: String::new(),
-                    filter: SearchFilter::Everything,
-                    sel: 0,
-                })
             }
             KeyCode::Char('o') => {
                 if let Some(&i) = items.get(sel) {
@@ -1607,12 +1781,17 @@ impl App {
             .cards
             .iter()
             .enumerate()
-            .filter(|(_, c)| c.stage == Stage::Misc && self.card_visible(c))
+            .filter(|(_, c)| {
+                c.stage == Stage::Misc && self.card_visible(c) && self.matches_view_search(c)
+            })
             .map(|(i, _)| i)
             .collect()
     }
 
     pub(super) fn enter_misc(&mut self) {
+        if !matches!(self.mode, Mode::Misc { .. }) {
+            self.view_search = None;
+        }
         self.mode = Mode::Misc { sel: 0 };
         self.sel.col = 0;
         self.sel.key = self
@@ -4505,5 +4684,249 @@ mod tests {
         });
         assert_eq!(press(&mut app, 'y'), Action::None);
         assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+    }
+
+    fn type_in(app: &mut App, words: &str) {
+        for c in words.chars() {
+            press(app, c);
+        }
+    }
+
+    fn query(app: &App) -> Option<(String, bool)> {
+        app.view_search
+            .as_ref()
+            .map(|s| (s.query.clone(), s.typing))
+    }
+
+    /// The card listed last in the backlog, and a word only it has: the search should leave it
+    /// alone, so its reference with nothing else.
+    fn last_backlog_card(app: &App) -> (String, String) {
+        let order = app.backlog_order();
+        let c = &app.board.cards[*order.last().unwrap()];
+        (c.key.clone(), c.reference.clone())
+    }
+
+    #[test]
+    fn slash_in_the_backlog_searches_only_the_backlog_and_stays_in_it() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'b');
+        let all = app.backlog_order();
+        assert!(all.len() > 2, "the demo has a backlog to narrow");
+        let (key, reference) = last_backlog_card(&app);
+        assert_eq!(press(&mut app, '/'), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Backlog { .. }),
+            "no search of everything"
+        );
+        assert_eq!(query(&app), Some((String::new(), true)));
+        // Letters, the card keys among them, go into the search while typing.
+        type_in(&mut app, &reference);
+        assert!(matches!(app.mode, Mode::Backlog { sel: 0 }));
+        assert_eq!(query(&app), Some((reference.clone(), true)));
+        let shown = app.backlog_cards();
+        assert_eq!(shown.len(), 1);
+        assert_eq!(app.board.cards[shown[0]].key, key);
+        assert!(shown.iter().all(|i| all.contains(i)));
+        assert_eq!(
+            press(&mut app, 'd'),
+            Action::None,
+            "d is typed, not started"
+        );
+        assert!(app.backlog_cards().is_empty());
+        app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.backlog_cards(), shown);
+        // Esc clears the search and stays in the backlog, on the card it showed; a second leaves.
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Backlog { sel } if sel == all.len() - 1));
+        assert_eq!(query(&app), None);
+        assert_eq!(app.backlog_cards(), all);
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn enter_on_a_backlog_search_peeks_and_coming_back_keeps_the_search() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'b');
+        let all = app.backlog_order();
+        let (key, reference) = last_backlog_card(&app);
+        press(&mut app, '/');
+        type_in(&mut app, &reference);
+        // Enter does what Enter does in the backlog: peek, on the card the search left.
+        enter(&mut app);
+        assert!(
+            matches!(&app.mode, Mode::Peek { back, .. } if matches!(**back, Mode::Backlog { .. }))
+        );
+        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        // Back in the backlog, the search is still there, and letters are its keys again.
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Backlog { sel: 0 }));
+        assert_eq!(query(&app), Some((reference.clone(), false)));
+        assert_eq!(app.backlog_cards().len(), 1);
+        assert_eq!(
+            app.backlog_card_for_keys().map(|c| c.key.clone()),
+            app.card(&key)
+                .filter(|c| c.dismissed() || waiting_work(c))
+                .map(|c| c.key.clone())
+        );
+        // / goes back to typing the same search; Esc clears it, and the next leaves.
+        press(&mut app, '/');
+        assert_eq!(query(&app), Some((reference, true)));
+        esc(&mut app);
+        assert_eq!(app.backlog_cards(), all);
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(query(&app), None);
+    }
+
+    #[test]
+    fn a_backlog_search_ends_when_you_leave_and_not_in_a_peek() {
+        let mut app = demo_app();
+        press(&mut app, 'b');
+        let all = app.backlog_order();
+        let (_, reference) = last_backlog_card(&app);
+        press(&mut app, '/');
+        type_in(&mut app, &reference);
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        assert!(
+            app.view_search.is_some(),
+            "kept while you peek from the view"
+        );
+        esc(&mut app);
+        // q leaves the backlog (it isn't typing now): the search goes with it.
+        press(&mut app, 'q');
+        assert!(matches!(app.mode, Mode::Board));
+        assert_eq!(query(&app), None);
+        press(&mut app, 'b');
+        assert_eq!(app.backlog_cards(), all);
+        // Into Won't do from a searched backlog: Won't do starts whole.
+        press(&mut app, '/');
+        type_in(&mut app, "zzz");
+        esc(&mut app);
+        press(&mut app, '/');
+        type_in(&mut app, "zzz");
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        press(&mut app, 'w');
+        assert!(app.wont_do);
+        assert_eq!(query(&app), None);
+    }
+
+    #[test]
+    fn slash_in_wont_do_searches_only_what_was_set_aside() {
+        let mut app = demo_app();
+        // Set two backlog cards aside; the rest stay in the backlog.
+        let backlog: Vec<usize> = app.backlog_order();
+        for &i in &backlog[..2] {
+            app.board.cards[i].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        }
+        let backlog_only = app.board.cards[backlog[2]].reference.clone();
+        press(&mut app, 'w');
+        assert!(matches!(app.mode, Mode::Backlog { .. }) && app.wont_do);
+        let all = app.backlog_order();
+        assert_eq!(all, backlog[..2]);
+        press(&mut app, '/');
+        type_in(&mut app, "zzzz-nothing");
+        assert!(matches!(app.mode, Mode::Backlog { .. }) && app.wont_do);
+        assert!(app.backlog_cards().is_empty());
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        assert_eq!(app.backlog_cards(), all);
+        let first = app.board.cards[all[0]].reference.clone();
+        type_in(&mut app, &first);
+        assert_eq!(app.backlog_cards(), vec![all[0]]);
+        // A card still in the backlog isn't found from Won't do.
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut app, &backlog_only);
+        assert!(app.backlog_cards().is_empty());
+    }
+
+    #[test]
+    fn slash_in_misc_searches_only_misc_and_enter_jumps_in() {
+        let mut app = demo_app();
+        press(&mut app, 'i');
+        let all = app.misc_cards();
+        assert!(!all.is_empty());
+        let card = app.board.cards[*all.last().unwrap()].clone();
+        assert_eq!(press(&mut app, '/'), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Misc { .. }),
+            "no search of everything"
+        );
+        type_in(&mut app, "zzzz-nothing");
+        assert!(app.misc_cards().is_empty());
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        type_in(&mut app, &card.title);
+        let shown = app.misc_cards();
+        assert!(shown.contains(all.last().unwrap()));
+        assert!(shown.iter().all(|i| all.contains(i)));
+        // q is typed while searching, not a way out.
+        assert!(matches!(app.mode, Mode::Misc { .. }));
+        // Enter does what Enter does in Misc: jump into the card selected.
+        let first = app.board.cards[shown[0]].key.clone();
+        assert_eq!(enter(&mut app), Action::Jump(first));
+        // Back in Misc with the search left in place, Esc clears it and the next leaves.
+        app.mode = Mode::Misc { sel: 0 };
+        assert_eq!(query(&app), Some((card.title.clone(), false)));
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Misc { .. }));
+        assert_eq!(app.misc_cards(), all);
+        esc(&mut app);
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn slash_on_the_board_still_searches_everything() {
+        let mut app = demo_app();
+        assert!(matches!(app.mode, Mode::Board));
+        press(&mut app, '/');
+        assert!(matches!(
+            &app.mode,
+            Mode::Search(s) if s.filter == SearchFilter::Everything && s.query.is_empty()
+        ));
+        assert_eq!(query(&app), None);
+    }
+
+    #[test]
+    fn a_searched_backlog_shows_the_search_and_each_card_keeps_its_place() {
+        let mut app = demo_app();
+        press(&mut app, 'b');
+        let n = app.backlog_order().len();
+        let (_, reference) = last_backlog_card(&app);
+        press(&mut app, '/');
+        type_in(&mut app, &reference);
+        let screen = crate::ui::tests_render(&app, 160, 40);
+        assert!(screen.contains(&format!("/ {reference}")), "{screen}");
+        assert!(screen.contains(&format!("1 of {n}")), "{screen}");
+        assert!(
+            screen.contains(&format!("{n:>3} ")),
+            "keeps its place {n}: {screen}"
+        );
+        assert!(screen.contains("clear the search"), "{screen}");
+        press(&mut app, 'q');
+        let screen = crate::ui::tests_render(&app, 160, 40);
+        assert!(
+            screen.contains("Nothing here matches this search."),
+            "{screen}"
+        );
+        esc(&mut app);
+        let screen = crate::ui::tests_render(&app, 300, 40);
+        assert!(screen.contains("/ search this list"), "{screen}");
+    }
+
+    #[test]
+    fn the_keys_say_what_slash_does_on_the_board_and_in_a_list() {
+        let mut app = demo_app();
+        press(&mut app, '?');
+        let screen = crate::ui::tests_render(&app, 200, 80);
+        assert!(
+            screen.contains("search cards, workspaces and sessions"),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("search only the list you're in"),
+            "{screen}"
+        );
     }
 }

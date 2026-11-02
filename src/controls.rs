@@ -147,6 +147,10 @@ impl App {
     }
 
     pub(super) fn enter_backlog(&mut self, wont_do: bool) {
+        // A search of the backlog stays across sessions and machines, but not into Won't do.
+        if wont_do != self.wont_do || !matches!(self.mode, Mode::Backlog { .. }) {
+            self.view_search = None;
+        }
         self.wont_do = wont_do;
         self.mode = Mode::Backlog { sel: 0 };
         self.backlog_focus = self

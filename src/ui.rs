@@ -554,7 +554,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             ("⏎", "jump in"),
             ("space", "peek"),
             ("n N", "next that needs you"),
-            ("/", "search"),
+            ("/", "search everything"),
             ("f", "filter"),
             ("b", "backlog"),
             ("ctrl+space", "menu"),
@@ -2870,7 +2870,12 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
                 "next / previous card that needs you",
                 "ctrl+alt+j/k too",
             ),
-            ("/", "search cards, workspaces and sessions", ""),
+            ("/", "search cards, workspaces and sessions", "on the board"),
+            (
+                "/",
+                "search only the list you're in: esc clears it, ⏎ does what ⏎ does there",
+                "backlog, won't do, misc",
+            ),
         ],
     ),
     (
@@ -3613,6 +3618,33 @@ fn machines_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
 
 // ─── Backlog ────────────────────────────────────────────────────────────────────────────────
 
+/// The search line of a list view (`/` there, intent 0402): what it's narrowed to and how many
+/// of the view's cards that leaves, or None with no search.
+fn view_search_line(app: &App, shown: usize, total: usize) -> Option<Vec<Span<'static>>> {
+    let s = app.view_search.as_ref()?;
+    let mut line = vec![
+        Span::styled("/ ", bold(CYAN)),
+        Span::styled(s.query.clone(), bold(FG)),
+    ];
+    if s.typing {
+        line.push(Span::styled("▏", fg(CYAN)));
+    }
+    line.push(Span::styled(
+        if s.query.trim().is_empty() {
+            "   type to search this list".to_string()
+        } else {
+            format!("   {shown} of {total}")
+        },
+        fg(DIM),
+    ));
+    Some(line)
+}
+
+/// The bottom line of a list view while its search is being typed.
+fn view_search_hints(enter: &'static str) -> Vec<Span<'static>> {
+    key_hints(&[("↑ ↓", "select"), ("⏎", enter), ("esc", "clear the search")])
+}
+
 fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     let inner = pad(area, 1, 0);
     let rows = Layout::vertical([
@@ -3628,16 +3660,31 @@ fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     filters(f.buffer_mut(), rows[1], app);
     strip(f, rows[2], app);
     let items = app.misc_cards();
+    let total = app
+        .board
+        .cards
+        .iter()
+        .filter(|c| c.stage == Stage::Misc && app.card_visible(c))
+        .count();
     put(
         f.buffer_mut(),
         rows[3].x,
         rows[3].y,
         rows[3].width,
         vec![
-            Span::styled(format!("MISC  {}", items.len()), bold(CYAN)),
+            Span::styled(format!("MISC  {total}"), bold(CYAN)),
             Span::styled("   Conversations without an intent", fg(FG2)),
         ],
     );
+    if let Some(line) = view_search_line(app, items.len(), total) {
+        put(
+            f.buffer_mut(),
+            rows[3].x,
+            rows[3].y + 1,
+            rows[3].width,
+            line,
+        );
+    }
     let selected = sel.min(items.len().saturating_sub(1));
     let h = rows[4].height as usize / 2;
     let start = selected.saturating_sub(h.saturating_sub(1));
@@ -3648,7 +3695,15 @@ fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             rows[4].y,
             rows[4].width,
             vec![Span::styled(
-                "No miscellaneous conversations match these filters.",
+                if app
+                    .view_search
+                    .as_ref()
+                    .is_some_and(|s| !s.query.trim().is_empty())
+                {
+                    "No miscellaneous conversations match this search."
+                } else {
+                    "No miscellaneous conversations match these filters."
+                },
                 fg(DIM),
             )],
         );
@@ -3699,16 +3754,27 @@ fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         rows[5].y,
         rows[5].width,
         fit(
-            key_hints(&[
-                ("⏎", "jump in"),
-                ("j k", "select"),
-                ("space", "peek"),
-                ("[ ]", "session"),
-                ("{ }", "machine"),
-                ("c", "new intent"),
-                ("f", "filter"),
-                ("esc", "board"),
-            ]),
+            match &app.view_search {
+                Some(s) if s.typing => view_search_hints("jump in"),
+                Some(_) => key_hints(&[
+                    ("⏎", "jump in"),
+                    ("j k", "select"),
+                    ("space", "peek"),
+                    ("/", "change the search"),
+                    ("esc", "clear the search"),
+                ]),
+                None => key_hints(&[
+                    ("⏎", "jump in"),
+                    ("j k", "select"),
+                    ("space", "peek"),
+                    ("/", "search this list"),
+                    ("[ ]", "session"),
+                    ("{ }", "machine"),
+                    ("c", "new intent"),
+                    ("f", "filter"),
+                    ("esc", "board"),
+                ]),
+            },
             rows[5].width as usize,
         ),
     );
@@ -3725,6 +3791,8 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     ])
     .split(inner);
     let items = app.backlog_cards();
+    // Each card keeps its place in the whole order while a search narrows the list.
+    let order = app.backlog_order();
     let s = app.summary();
     let now = app.now();
     {
@@ -3769,7 +3837,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                 ),
                 Span::styled(
                     if app.wont_do {
-                        format!("{} set aside · u restores to backlog", items.len())
+                        format!("{} set aside · u restores to backlog", order.len())
                     } else {
                         format!(
                             "{} waiting to start: {} queued, {} shelved",
@@ -3796,7 +3864,12 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     };
     let sel = sel.min(items.len().saturating_sub(1));
 
-    let mut lines: Vec<(Option<usize>, Vec<Span<'static>>, Vec<Span<'static>>)> = vec![(
+    let mut lines: Vec<(Option<usize>, Vec<Span<'static>>, Vec<Span<'static>>)> =
+        view_search_line(app, items.len(), order.len())
+            .map(|line| (None, line, vec![]))
+            .into_iter()
+            .collect();
+    lines.push((
         None,
         vec![Span::styled(
             if app.wont_do {
@@ -3807,9 +3880,10 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             bold(FG2),
         )],
         vec![Span::styled("LAST AFFIRMED", fg(DIM))],
-    )];
+    ));
     for (k, &i) in items.iter().enumerate() {
         let c = &app.board.cards[i];
+        let place = order.iter().position(|&j| j == i).unwrap_or(k) + 1;
         let (glyph, gc, meta, meta_color) = list_glyph(c, now);
         let age = c
             .stale_days
@@ -3829,7 +3903,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         lines.push((
             Some(k),
             vec![
-                Span::styled(format!("{:>3} {glyph} ", k + 1), fg(gc)),
+                Span::styled(format!("{place:>3} {glyph} "), fg(gc)),
                 Span::styled(format!("{:<6}", c.reference), bold(FG)),
                 Span::styled(c.title.clone(), fg(FG)),
             ],
@@ -3851,7 +3925,13 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         lines.push((
             None,
             vec![Span::styled(
-                if app.wont_do {
+                if app
+                    .view_search
+                    .as_ref()
+                    .is_some_and(|s| !s.query.trim().is_empty())
+                {
+                    "Nothing here matches this search."
+                } else if app.wont_do {
                     "No work set aside here."
                 } else {
                     "Nothing waiting to start here."
@@ -4052,31 +4132,57 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         rows[4].y,
         rows[4].width,
         fit(
-            key_hints(if app.wont_do {
-                &[
-                    ("j k", "move"),
-                    ("u", "bring it back"),
-                    ("⏎", "peek"),
-                    ("w", "the backlog"),
-                    ("f", "filter"),
-                    ("esc", "board"),
-                ]
-            } else {
-                &[
-                    ("j k", "move"),
-                    ("d", "start it"),
-                    ("y", "still want it"),
-                    ("x", "won’t do"),
-                    ("C", "done"),
-                    ("J K", "move down / up · 10J ten places"),
-                    ("t", "to the top"),
-                    ("c", "new intent"),
-                    ("⏎", "peek"),
-                    ("w", "won’t do list"),
-                    ("f", "filter"),
-                    ("esc", "board"),
-                ]
-            }),
+            match &app.view_search {
+                Some(s) if s.typing => view_search_hints("peek"),
+                Some(_) => key_hints(if app.wont_do {
+                    &[
+                        ("j k", "move"),
+                        ("u", "bring it back"),
+                        ("⏎", "peek"),
+                        ("/", "change the search"),
+                        ("esc", "clear the search"),
+                    ]
+                } else {
+                    &[
+                        ("j k", "move"),
+                        ("d", "start it"),
+                        ("y", "still want it"),
+                        ("x", "won’t do"),
+                        ("C", "done"),
+                        ("J K", "move down / up"),
+                        ("⏎", "peek"),
+                        ("/", "change the search"),
+                        ("esc", "clear the search"),
+                    ]
+                }),
+                None => key_hints(if app.wont_do {
+                    &[
+                        ("j k", "move"),
+                        ("u", "bring it back"),
+                        ("⏎", "peek"),
+                        ("/", "search this list"),
+                        ("w", "the backlog"),
+                        ("f", "filter"),
+                        ("esc", "board"),
+                    ]
+                } else {
+                    &[
+                        ("j k", "move"),
+                        ("d", "start it"),
+                        ("y", "still want it"),
+                        ("x", "won’t do"),
+                        ("C", "done"),
+                        ("J K", "move down / up · 10J ten places"),
+                        ("t", "to the top"),
+                        ("c", "new intent"),
+                        ("⏎", "peek"),
+                        ("/", "search this list"),
+                        ("w", "won’t do list"),
+                        ("f", "filter"),
+                        ("esc", "board"),
+                    ]
+                }),
+            },
             rows[4].width as usize,
         ),
     );
