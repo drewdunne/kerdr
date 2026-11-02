@@ -581,15 +581,51 @@ impl App {
         } else if let Some(tab) = &card.own_tab {
             // A recorded own tab is never guessed past: when it's gone, Enter offers a reopen.
             (Some(tab.clone()), true)
+        } else if let Some(tab) = self.live_own_tab(card) {
+            (Some(tab), true)
         } else {
             (None, false)
         }
     }
 
+    /// With no own tab on record (herdr doesn't know its agent's conversation), the one tab in the
+    /// card's workspace holding an agent that is neither a helper's nor a card's inside it. None
+    /// for no such tab or several, where Enter asks instead of guessing (intent 0411).
+    fn live_own_tab(&self, card: &Card) -> Option<String> {
+        let ws = card.workspace_id.as_deref()?;
+        let snap = self
+            .machines
+            .get(card.machine_index)?
+            .snapshot(card.session.as_deref()?)?;
+        let inside: Vec<String> = self
+            .tabs_inside(card)
+            .iter()
+            .filter_map(|c| c.tab_id.clone())
+            .collect();
+        let mut tabs: Vec<&str> = snap
+            .agents
+            .iter()
+            .filter(|a| a.workspace_id == ws && !a.helper)
+            .filter_map(|a| a.tab_id.as_deref())
+            .filter(|t| !inside.iter().any(|i| i == t))
+            .collect();
+        tabs.sort_unstable();
+        tabs.dedup();
+        match tabs.as_slice() {
+            [one] => Some((*one).to_string()),
+            _ => None,
+        }
+    }
+
     /// Enter on a card whose workspace holds other work's tabs while its records name no tab of
-    /// its own: it never guesses, and offers to reopen the card's own conversation instead.
+    /// its own, and herdr shows no single tab that can only be its own: it doesn't guess, and
+    /// offers to reopen the card's own conversation instead.
     pub(super) fn own_tab_unknown(&mut self, card: &Card) -> Option<Action> {
-        if card.tab_id.is_some() || card.own_tab.is_some() || self.tabs_inside(card).is_empty() {
+        if card.tab_id.is_some()
+            || card.own_tab.is_some()
+            || self.tabs_inside(card).is_empty()
+            || self.live_own_tab(card).is_some()
+        {
             return None;
         }
         Some(self.offer_own_reopen(card, false))
@@ -766,6 +802,23 @@ mod tests {
     /// The laptop holds 0256 (its own agent in tab 1, its child 0262 asking in tab 2, 0277 and
     /// 0332 not started) and 0139, done with three follow-ups open; arknet-one runs 0331, a
     /// follow-up of 0256's.
+    /// families with no own tab on record and two tabs herdr can't tell apart: the parent's and
+    /// another non-helper agent's, so Enter can't know which is the card's own.
+    fn two_unknown_tabs() -> App {
+        let mut app = families(None);
+        let data = app.machines[0].data.as_mut().unwrap();
+        let snap = data
+            .snapshots
+            .values_mut()
+            .next()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        snap.agents.push(agent("w2K:p3", "w2K:t3", "idle"));
+        app.rebuild();
+        app
+    }
+
     fn families(own_tab: Option<&str>) -> App {
         let laptop_snap = Snapshot {
             workspaces: vec![Workspace {
@@ -1023,7 +1076,7 @@ mod tests {
 
     #[test]
     fn with_no_tab_of_its_own_on_record_enter_offers_a_reopen_instead_of_guessing() {
-        let mut app = families(None);
+        let mut app = two_unknown_tabs();
         select(&mut app, "0256");
         assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
         let Mode::Confirm { title, message, .. } = &app.mode else {
@@ -1038,7 +1091,7 @@ mod tests {
 
     #[test]
     fn with_no_tab_of_its_own_on_record_enter_while_busy_asks_in_its_turn() {
-        let mut app = families(None);
+        let mut app = two_unknown_tabs();
         app.busy = true;
         app.busy_id = Some("0999".into());
         select(&mut app, "0256");
@@ -1060,8 +1113,36 @@ mod tests {
     }
 
     #[test]
-    fn search_enter_on_a_parent_with_no_own_tab_asks_as_the_board_does() {
+    fn with_no_own_tab_on_record_enter_lands_on_the_one_tab_only_it_can_be() {
+        // herdr's integration doesn't know the parent's conversation, but its workspace holds one
+        // agent's tab besides its child's: Enter goes there, never to the child's tab.
         let mut app = families(None);
+        select(&mut app, "0256");
+        let k = key(&app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k.clone()));
+        let card = app.card(&k).cloned().unwrap();
+        assert_eq!(app.jump_tab(&card), (Some("w2K:t1".to_string()), true));
+        // A helper's tab doesn't count as a second candidate.
+        let mut app = families(None);
+        let data = app.machines[0].data.as_mut().unwrap();
+        let snap = data
+            .snapshots
+            .values_mut()
+            .next()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        let mut reviewer = agent("w2K:p3", "w2K:t3", "working");
+        reviewer.helper = true;
+        snap.agents.push(reviewer);
+        app.rebuild();
+        select(&mut app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k));
+    }
+
+    #[test]
+    fn search_enter_on_a_parent_with_no_own_tab_asks_as_the_board_does() {
+        let mut app = two_unknown_tabs();
         let i = app
             .board
             .cards
