@@ -22,7 +22,7 @@ fn short(text: String) -> String {
     }
 }
 
-/// Work waiting to start: the only cards d, y, x, J, K and t change, so the bottom line, the
+/// Work waiting to start: the only cards d, y, x, J, K, t and B change, so the bottom line, the
 /// menu and the keys themselves agree.
 pub(crate) fn waiting_work(card: &Card) -> bool {
     card.detail.is_some()
@@ -780,11 +780,11 @@ impl App {
                 format!("{reference} is still being written up.")
             } else if card.closable() {
                 format!(
-                    "{reference} is already under way. d, y, J, K and t change backlog work; with no agent at it, C marks it done and x sets it aside."
+                    "{reference} is already under way. d, y, J, K, t and B change backlog work; with no agent at it, C marks it done and x sets it aside."
                 )
             } else {
                 format!(
-                    "{reference} is already under way or done. d, y, x, J, K and t change backlog work."
+                    "{reference} is already under way or done. d, y, x, J, K, t and B change backlog work."
                 )
             };
             self.say(said, Tone::Info);
@@ -998,7 +998,7 @@ impl App {
         self.mode = (*back).clone();
         let card_key = matches!(
             key.code,
-            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X' | 's')
+            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X' | 's')
         );
         // A refresh while the menu was open may have moved or removed the card it opened on;
         // its keys then act on nothing rather than on whatever took its place.
@@ -1009,7 +1009,7 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Char('c') => self.new_intent(),
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X')) => {
                 return self.card_action(c, 1);
             }
             // The menu's s is the board's: the selected card's agent to another account.
@@ -1047,6 +1047,7 @@ impl App {
             'X' => self.cancel_action(),
             'u' => self.intent_action("restore", json!({})),
             't' => self.intent_action("move", json!({"top":true})),
+            'B' => self.intent_action("move", json!({"bottom":true})),
             'J' => self.intent_action("move", json!({"delta":count})),
             'K' => self.intent_action("move", json!({"delta":-count})),
             _ => Action::None,
@@ -1492,7 +1493,7 @@ impl App {
         }
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'J' | 'K' | 'C' | 'X')) => {
+            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X')) => {
                 return Some(self.card_action(c, count));
             }
             KeyCode::Char('{') | KeyCode::Char('}')

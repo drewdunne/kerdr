@@ -236,7 +236,7 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
         ("x", "won’t do"),
         ("C", "done"),
         ("J K", "move down / up"),
-        ("t", "to the top"),
+        ("t B", "to the top / bottom"),
     ];
     spans.extend(key_hints(if card.dismissed() {
         &[("u", "bring it back")]
@@ -2031,7 +2031,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             ("x", "won’t do"),
             ("C", "done"),
             ("J K", "move down / up"),
-            ("t", "to the top"),
+            ("t B", "to the top / bottom"),
         ],
         None if c.reopenable() && app.actions_on() => vec![("⏎", reopen.as_str())],
         None => vec![("⏎", "jump in")],
@@ -2121,7 +2121,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
             ("x", "won’t do"),
             ("C", "done"),
             ("J K", "move down / up"),
-            ("t", "move to the top"),
+            ("t B", "move to the top / bottom"),
         ]
     };
     let groups: [MenuGroup; 3] = [
@@ -3026,6 +3026,7 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
             ("u", "bring it back from won’t do", ""),
             ("J  K", "move it down / up your order", "10J moves ten"),
             ("t", "move it to the top of your order", ""),
+            ("B", "move it to the bottom of your order", ""),
         ],
     ),
     (
@@ -4211,7 +4212,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                         ("x", "won’t do"),
                         ("C", "done"),
                         ("J K", "move down / up · 10J ten places"),
-                        ("t", "to the top"),
+                        ("t B", "to the top / bottom"),
                         ("c", "new intent"),
                         ("⏎", "peek"),
                         ("/", "search this list"),
@@ -5179,7 +5180,7 @@ mod tests {
             let text = rendered(&a, w, h);
             for expected in [
                 "start it",
-                "move to the top",
+                "move to the top / bottom",
                 "new intent",
                 "the backlog",
                 "filter by who, agents or bg",

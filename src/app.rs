@@ -2703,6 +2703,29 @@ mod tests {
     }
 
     #[test]
+    fn b_sends_the_selected_backlog_record_to_the_bottom_of_the_order() {
+        // Intent 0415: one key, the mirror of t, from the backlog screen and from the menu.
+        for leader in [false, true] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            app.mode = Mode::Backlog { sel: 0 };
+            let i = app.backlog_cards()[0];
+            let id = app.board.cards[i].detail.as_ref().unwrap().id.clone();
+            if leader {
+                app.on_key(KeyEvent::new(KeyCode::Char(' '), KeyModifiers::CONTROL));
+            }
+            let Action::Mutate { request, .. } = press(&mut app, 'B') else {
+                panic!("B did nothing (menu: {leader})")
+            };
+            assert_eq!(
+                request,
+                serde_json::json!({"action": "move", "id": id, "bottom": true}),
+                "menu: {leader}"
+            );
+        }
+    }
+
+    #[test]
     fn polling_preserves_peek_target_when_backlog_column_is_hidden() {
         let mut app = demo_app();
         app.width = 80;
@@ -3135,6 +3158,7 @@ mod tests {
             ('y', "refresh"),
             ('d', "dispatch"),
             ('t', "move"),
+            ('B', "move"),
             ('J', "move"),
         ] {
             let Action::Mutate { request, .. } = press(&mut app, c) else {
@@ -3842,7 +3866,7 @@ mod tests {
             key: Some(key),
         };
         assert!(app.backlog_card_for_keys().is_none());
-        for c in ['d', 'y', 'x', 't', 'J', 'u'] {
+        for c in ['d', 'y', 'x', 't', 'B', 'J', 'u'] {
             assert_eq!(
                 press(&mut app, c),
                 Action::None,
