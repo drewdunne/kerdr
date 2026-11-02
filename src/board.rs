@@ -24,9 +24,9 @@ pub struct MachineState {
     pub last_ok: Option<DateTime<Local>>,
     /// When the board took in the feed above, for a feed that doesn't say when it was made.
     pub feed_taken: Option<DateTime<Local>>,
-    /// By (session, pane): when Kerdr saw that pane's agent start working, from one read where it
-    /// wasn't to the next where it was. An agent already working when Kerdr first saw it has none.
-    pub started: HashMap<(String, String), DateTime<Local>>,
+    /// By (session, pane): the last read that saw that pane's agent not working (idle, done, asking).
+    /// An agent working again after one of these, made after it asked you, has had its answer.
+    pub stopped: HashMap<(String, String), DateTime<Local>>,
     /// By (session, workspace): the `kerdr_status` an agent reported, and when Kerdr first saw it.
     pub reported: HashMap<(String, String), (String, DateTime<Local>)>,
 }
@@ -46,14 +46,14 @@ impl MachineState {
             feed_error: None,
             last_ok: None,
             feed_taken: None,
-            started: HashMap::new(),
+            stopped: HashMap::new(),
             reported: HashMap::new(),
         }
     }
 
-    /// Takes in a read made at `at`: notes which agents started working since the last one, and
-    /// when each workspace's report changed, then keeps the read. A feed it brings stands until
-    /// the next; one it doesn't bring leaves the last in place.
+    /// Takes in a read made at `at`: notes which agents it saw not working, and when each
+    /// workspace's report changed, then keeps the read. A feed it brings stands until the next; one
+    /// it doesn't bring leaves the last in place. A session that didn't answer keeps what was known.
     pub fn take(&mut self, mut data: MachineData, at: DateTime<Local>) {
         match data.feed.take() {
             Some(Ok(feed)) => {
@@ -64,14 +64,12 @@ impl MachineState {
             Some(Err(e)) => self.feed_error = Some(e),
             None => {}
         }
-        let old = self.data.as_ref();
-        let mut started = HashMap::new();
+        let mut stopped = HashMap::new();
         let mut reported = HashMap::new();
         for (session, snap) in &data.snapshots {
             let Ok(snap) = snap else {
-                // A session that didn't answer this time keeps what was known about it.
-                started.extend(
-                    self.started
+                stopped.extend(
+                    self.stopped
                         .iter()
                         .filter(|((s, _), _)| s == session)
                         .map(|(k, v)| (k.clone(), *v)),
@@ -84,31 +82,12 @@ impl MachineState {
                 );
                 continue;
             };
-            let before = old
-                .and_then(|d| d.snapshots.get(session))
-                .and_then(|s| s.as_ref().ok());
             for a in &snap.agents {
-                if a.agent_status.as_deref() != Some("working") {
-                    continue;
-                }
                 let key = (session.clone(), a.pane_id.clone());
-                let was_working = before.map(|b| {
-                    b.agents.iter().any(|o| {
-                        o.pane_id == a.pane_id && o.agent_status.as_deref() == Some("working")
-                    })
-                });
-                match was_working {
-                    // Working before too: it started when it was first seen to, if ever.
-                    Some(true) => {
-                        if let Some(t) = self.started.get(&key) {
-                            started.insert(key, *t);
-                        }
-                    }
-                    Some(false) => {
-                        started.insert(key, at);
-                    }
-                    // Nothing read before: when it started isn't known.
-                    None => {}
+                if a.agent_status.as_deref() != Some("working") {
+                    stopped.insert(key, at);
+                } else if let Some(t) = self.stopped.get(&key) {
+                    stopped.insert(key, *t);
                 }
             }
             for w in &snap.workspaces {
@@ -122,7 +101,7 @@ impl MachineState {
                 }
             }
         }
-        self.started = started;
+        self.stopped = stopped;
         self.reported = reported;
         self.data = Some(data);
         self.last_ok = Some(at);
@@ -298,9 +277,10 @@ fn herdr_status(w: &WsRef) -> Option<String> {
     None
 }
 
-/// Whether the agent you talk to there started working after `asked`: any that isn't a helper's,
-/// or with `tab`, any in the card's own tab, whose agent may be a helper's (a child intent's). Only
-/// a start Kerdr saw counts: an agent kept working all along (a workflow or a background job
+/// Whether the agent you talk to there is back at work after `asked`: it's working now, and a read
+/// made after `asked` saw it not working, so this work began after the ask (your answer, as a rule).
+/// Any agent that isn't a helper's, or with `tab`, any in the card's own tab, whose agent may be a
+/// helper's (a child intent's). An agent kept working all along (a workflow or a background job
 /// running in its pane after its turn ended on a question) hasn't had its answer, and nor has one
 /// whose ask has no time.
 fn started_after(
@@ -314,7 +294,7 @@ fn started_after(
         a.agent_status.as_deref() == Some("working")
             && (tab || !a.helper)
             && machine
-                .started
+                .stopped
                 .get(&(w.session.clone(), a.pane_id.clone()))
                 .is_some_and(|t| *t > asked)
     })
@@ -1220,6 +1200,10 @@ mod tests {
         let t0 = Local::now() - chrono::Duration::seconds(10);
         let mut m = live(machine.clone(), vec![], None);
         let mut first = live(machine.clone(), before, None).data.unwrap();
+        // Made a moment before the read that brought it, as ark-sdlc's feed says.
+        let mut feed = feed;
+        feed.generated_at
+            .get_or_insert_with(|| (t0 - chrono::Duration::seconds(1)).to_rfc3339());
         first.feed = Some(Ok(feed));
         m.take(first, t0);
         let next = live(machine, after, None).data.unwrap();
@@ -1440,6 +1424,89 @@ mod tests {
         assert_eq!(attention(&signals).0, Attention::Running);
         signals.token_at_work = false;
         assert_eq!(attention(&signals).0, Attention::NeedsYou);
+    }
+
+    /// Reads of one machine's "default" session, each `(at, Some(agent status) or None for a read
+    /// that failed, feed made at)`, taken in turn; then the card's attention.
+    fn after_reads(reads: &[(i64, Option<&str>, Option<i64>)]) -> Attention {
+        let t0 = Local::now() - chrono::Duration::seconds(100);
+        let mut card = feed_card("0328", "build", "active");
+        card.attention = Some("needs_you".into());
+        card.status = Some("Waiting on Andrew".into());
+        card.workspace = Some(FeedWorkspace {
+            session: Some("default".into()),
+            id: Some("w2".into()),
+            ..Default::default()
+        });
+        let mut m = live(machine("build-box", true), vec![], None);
+        for &(at, status, feed_at) in reads {
+            let mut data = live(machine("build-box", true), vec![], None).data.unwrap();
+            data.snapshots = [(
+                "default".to_string(),
+                match status {
+                    Some(st) => Ok(Snapshot {
+                        workspaces: vec![ws("w2", "28-heimdall")],
+                        agents: vec![agent("w2", st)],
+                        ..Default::default()
+                    }),
+                    None => Err("herdr didn't answer".into()),
+                },
+            )]
+            .into_iter()
+            .collect();
+            data.feed = feed_at.map(|f| {
+                Ok(Feed {
+                    kerdr_feed: 1,
+                    generated_at: Some((t0 + chrono::Duration::seconds(f)).to_rfc3339()),
+                    cards: vec![card.clone()],
+                    ..Default::default()
+                })
+            });
+            m.take(data, t0 + chrono::Duration::seconds(at));
+        }
+        let b = build(&[m], &Config::default());
+        b.cards
+            .iter()
+            .find(|c| c.reference == "#328")
+            .unwrap()
+            .attention
+    }
+
+    #[test]
+    fn work_that_began_before_the_question_never_answers_it() {
+        // Seen idle, then it started a workflow and asked you, and the feed said so before the next
+        // read first saw it working: that work began before the question.
+        assert_eq!(
+            after_reads(&[(0, Some("idle"), None), (4, Some("working"), Some(2))]),
+            Attention::NeedsYou
+        );
+        // Working all along, a workflow keeping its pane busy after its turn ended on a question.
+        assert_eq!(
+            after_reads(&[(0, Some("working"), Some(1)), (4, Some("working"), None)]),
+            Attention::NeedsYou
+        );
+        // Seen stopped after the question, then at work: you answered.
+        assert_eq!(
+            after_reads(&[
+                (0, Some("working"), Some(1)),
+                (4, Some("idle"), None),
+                (8, Some("working"), None)
+            ]),
+            Attention::Running
+        );
+    }
+
+    #[test]
+    fn a_read_that_fails_forgets_nothing_about_an_answer() {
+        assert_eq!(
+            after_reads(&[
+                (0, Some("idle"), Some(-1)),
+                (4, Some("working"), None),
+                (8, None, None),
+                (12, Some("working"), None)
+            ]),
+            Attention::Running
+        );
     }
 
     #[test]
@@ -1740,12 +1807,21 @@ mod tests {
         assert_eq!(card(&b, "#237").attention, Attention::NeedsYou);
         assert_ne!(card(&b, "#246").attention, Attention::NeedsYou);
         // Once its agent goes to work again, a needs_you it reported has had its answer.
-        let m = read_twice(
+        // It reports needs_you mid-turn, stops, then goes to work again.
+        let mut m = read_twice(
             machine("build-box", true),
-            vec![("default", snap("idle", "idle", Some("needs_you")))],
             vec![("default", snap("working", "idle", Some("needs_you")))],
+            vec![("default", snap("idle", "idle", Some("needs_you")))],
             feed.clone(),
         );
+        let next = live(
+            machine("build-box", true),
+            vec![("default", snap("working", "idle", Some("needs_you")))],
+            None,
+        )
+        .data
+        .unwrap();
+        m.take(next, Local::now());
         let b = build(&[m], &Config::default());
         assert_eq!(card(&b, "#237").attention, Attention::Running);
         // But not while it was working all along: it reported needs_you mid-turn, then kept on.

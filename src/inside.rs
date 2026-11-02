@@ -188,7 +188,7 @@ impl App {
             }),
             // Your order, but what waits on you before it (a question asked before the work
             // starts): far down the list, nobody sees it (intent 0420).
-            Stage::Backlog => col.sort_by_key(|&i| !self.board.cards[i].needs_you()),
+            Stage::Backlog => col.sort_by_key(|&i| !self.backlog_needs_you(i)),
             Stage::Misc => {}
             // What's waiting on you first, then the rest as the board sorted it, cards as last
             // seen from a machine out of reach at the end (intent 0401).
@@ -198,6 +198,12 @@ impl App {
                 (on_you.is_none(), on_you, c.cached_at.is_some())
             }),
         }
+    }
+
+    /// A backlog card waits on you: itself (questions before it starts), or a piece it holds.
+    pub(super) fn backlog_needs_you(&self, i: usize) -> bool {
+        let c = &self.board.cards[i];
+        !c.dismissed() && (c.needs_you() || self.holds(i).needs > 0)
     }
 
     /// Opens card i's own screen on `focus` ("" for the card itself), going back to `back`.
@@ -1074,6 +1080,14 @@ mod tests {
             });
         });
         cards.push(world.clone());
+        // A queued card holding a piece already at work that asks you something.
+        cards.push(card("0450", "Queued, holding a question", "backlog", |c| {
+            c.backlog_rank = Some(450);
+        }));
+        cards.push(card("0451", "Its piece, asking", "build", |c| {
+            c.parent = Some("0450".into());
+            c.attention = Some("needs_you".into());
+        }));
         let laptop = machine("AMD-LZM4", false, "KBZ", empty.clone(), cards);
         let lab = machine("LAB-Server", true, "default", empty, vec![world]);
         let mut app = App::new(Config::default(), vec![laptop, lab]);
@@ -1085,21 +1099,39 @@ mod tests {
         assert_eq!(c.machine, "LAB-Server");
         // First in the backlog column; the backlog's own list keeps your order.
         let backlog = &column_ids(&app)[Stage::Backlog.index()];
-        assert_eq!(backlog[0], "0408");
-        assert_eq!(backlog[1], "0101");
+        assert_eq!(backlog[..3], ["0408", "0450", "0101"]);
         let order: Vec<String> = app
             .backlog_order()
             .iter()
             .map(|&i| app.board.cards[i].detail.as_ref().unwrap().id.clone())
             .collect();
-        assert_eq!(order.last().map(String::as_str), Some("0408"));
-        // Counted with what waits on you, and n reaches it.
+        assert_eq!(order.last().map(String::as_str), Some("0450"));
+        // Counted with what waits on you (the piece counts itself), and n reaches it.
         let s = crate::board::summarize(&app.board, &Scope::All, &app.machines);
-        assert_eq!(s.needs_you, 1);
-        assert_eq!(s.verdict, Some(crate::model::Verdict::FinishFirst(1)));
-        assert_eq!(app.step_needs_you(1), Some(k.clone()));
-        // A narrow screen keeps the Backlog column while something in it waits on you.
-        app.width = 80;
+        assert_eq!(s.needs_you, 2);
+        assert_eq!(s.verdict, Some(crate::model::Verdict::FinishFirst(2)));
+        assert_eq!(
+            app.needs_you_order(),
+            [k.clone(), key(&app, "0451")],
+            "n goes to the queued card, then the piece inside the other"
+        );
+        // A narrow screen keeps the Backlog column while something in it waits on you, and the
+        // row keeps its number, the note giving way first.
+        for w in [80, 60] {
+            app.width = w;
+            assert!(app.visible_columns()[Stage::Backlog.index()]);
+            let screen = crate::ui::tests_render(&app, w, 30);
+            assert!(screen.contains("● #408"), "at {w} columns:\n{screen}");
+        }
+        for m in &mut app.machines {
+            for c in &mut m.feed.as_mut().unwrap().cards {
+                if c.id == "0408" {
+                    c.attention = None;
+                }
+            }
+        }
+        app.rebuild();
+        // Only the piece held inside a queued card asks now: the column still stays.
         assert!(app.visible_columns()[Stage::Backlog.index()]);
         for m in &mut app.machines {
             for c in &mut m.feed.as_mut().unwrap().cards {

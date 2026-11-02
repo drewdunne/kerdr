@@ -1174,13 +1174,18 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     for (row, &i) in items.iter().enumerate().skip(start).take(visible) {
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
-        let (glyph, gcolor, mut meta, mut mcolor) = list_glyph(c, now);
+        let (mut glyph, mut gcolor, mut meta, mut mcolor) = list_glyph(c, now);
         // A card holding work says so with ▸; a done one with work still open says how much,
         // yellow only when some of it needs you. One whose card is out of view names that card.
         let holds = app.holds(i);
         if holds.open > 0 && c.stage == Stage::Maintain {
             meta = format!("{} open", holds.open);
             mcolor = if holds.needs > 0 { YELLOW } else { FG2 };
+        }
+        // Not started, but holding a piece that waits on you.
+        if c.stage == Stage::Backlog && holds.needs > 0 && !c.dismissed() {
+            (glyph, gcolor) = (Attention::NeedsYou.glyph(), YELLOW);
+            (meta, mcolor) = (Attention::NeedsYou.label().into(), YELLOW);
         }
         if let Some(r) = app.held_elsewhere(i) {
             meta = format!("in {r}");

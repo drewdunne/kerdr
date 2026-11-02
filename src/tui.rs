@@ -61,6 +61,15 @@ impl Live {
             let _ = p.wake.send(Wake::Now);
         }
     }
+
+    /// Reads the machine again now, its feed too: back from herdr, where you may have just
+    /// answered an agent whose pane never stopped working (a workflow running in it), only the
+    /// feed can say the question's answered (intent 0420).
+    fn wake_feed(&self, i: usize) {
+        if let Some(Some(p)) = self.pollers.get(i) {
+            let _ = p.wake.send(Wake::Feed);
+        }
+    }
 }
 
 pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
@@ -531,7 +540,7 @@ fn jump_workspace(
     let j = workspace_jump(app, mi, session, id, label, tab, via);
     let outcome = run_jump(terminal, flags, app, &j, client_config);
     if let Some(l) = live.as_deref() {
-        l.wake(mi);
+        l.wake_feed(mi);
     }
     match &outcome {
         Outcome::Failed(e) => app.say(e.clone(), Tone::Warn),
@@ -739,7 +748,11 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
         }
         let since = Instant::now();
         for &i in &machines {
-            l.wake(i);
+            if i == mi {
+                l.wake_feed(i);
+            } else {
+                l.wake(i);
+            }
         }
         if choosing_next {
             inbox.wait_since(&machines, since, FRESH_WAIT);

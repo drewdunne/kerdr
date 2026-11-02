@@ -694,14 +694,9 @@ impl App {
         let narrow = self.width < 100;
         let mut v = [true; 7];
         if narrow {
-            let scope = self.scope();
-            let backlog_needs_you = self.board.cards.iter().any(|c| {
-                c.stage == Stage::Backlog
-                    && c.needs_you()
-                    && !c.dismissed()
-                    && scope.contains(c)
-                    && self.card_visible(c)
-            });
+            let backlog_needs_you = self.columns()[Stage::Backlog.index()]
+                .iter()
+                .any(|&i| self.backlog_needs_you(i));
             v[Stage::Backlog.index()] = backlog_needs_you;
             v[Stage::Maintain.index()] = false;
         }
