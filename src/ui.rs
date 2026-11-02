@@ -1468,43 +1468,28 @@ fn cards(f: &mut Frame, body: Rect, app: &App, items: &[usize], selected: Option
         let c = &app.board.cards[*i];
         let is_sel = Some(c.key.as_str()) == selected;
         let cached = c.cached_at.is_some();
-        let border = if is_sel {
-            CYAN
-        } else if (c.attention == Attention::Waiting && c.why == "waiting for usage") && !cached {
-            RED
-        } else if (c.attention == Attention::NeedsYou || held.needs > 0) && !cached {
-            YELLOW
-        } else if c.attention == Attention::Running
-            && !cached
-            && app
-                .account_feed(c.machine_index)
-                .is_some_and(|f| !f.accounts.is_empty())
-        {
-            GREEN
-        } else if c.attention == Attention::Blocked && !cached {
-            RED
-        } else {
-            BORDER
-        };
-        let fill = if is_sel {
-            SEL
-        } else if cached {
-            BG
-        } else {
-            PANEL
-        };
+        // A box means it's selected or waiting on you, and nothing else does (intent 0401).
+        let on_you = crate::family::on_you(c, held.needs);
         let rect = Rect {
             x: body.x,
             y,
             width: body.width,
             height: h,
         };
-        let kind = if is_sel {
-            BorderType::Thick
-        } else {
-            BorderType::Rounded
-        };
-        panel(f, rect, border, fill, kind);
+        if is_sel || on_you.is_some() {
+            let border = match on_you {
+                _ if is_sel => CYAN,
+                Some(crate::family::OnYou::Asking) => YELLOW,
+                Some(crate::family::OnYou::Blocked) => RED,
+                _ => DIM,
+            };
+            let (fill, kind) = if is_sel {
+                (SEL, BorderType::Thick)
+            } else {
+                (PANEL, BorderType::Rounded)
+            };
+            panel(f, rect, border, fill, kind);
+        }
         let inner = pad(rect, 2, 1);
         let buf = f.buffer_mut();
         put_lr(buf, inner, inner.y, cl.head.clone(), cl.badge.clone());
@@ -4672,6 +4657,57 @@ mod tests {
         assert!(text.contains("u bring it back"));
     }
 
+    /// A box means selected or waiting on you: an agent at work or waiting on something else has
+    /// none, and what waits on you comes first in its column (intent 0401).
+    #[test]
+    fn only_the_selected_card_and_cards_waiting_on_you_have_boxes() {
+        let mut a = demo(false);
+        let build: Vec<usize> = a.columns()[Stage::Build.index()].clone();
+        assert!(build.len() >= 3, "the demo's Build column is too short");
+        for &i in &build {
+            a.board.cards[i].attention = Attention::Running;
+            a.board.cards[i].cached_at = None;
+            if let Some(d) = a.board.cards[i].detail.as_mut() {
+                d.no_agent = false;
+            }
+        }
+        let (asking, quiet) = (*build.last().unwrap(), build[build.len() - 2]);
+        a.board.cards[asking].attention = Attention::NeedsYou;
+        a.board.cards[quiet].attention = Attention::Idle;
+        a.board.holds.clear();
+        let order = a.columns()[Stage::Build.index()].clone();
+        assert_eq!(&order[..2], &[asking, quiet]);
+
+        // Away from the column, the two waiting on you are its only boxes.
+        a.sel = crate::app::Selection {
+            col: Stage::Plan.index(),
+            key: None,
+        };
+        let area = Rect::new(0, 0, 40, 60);
+        let boxes = |a: &App, items: &[usize], selected: Option<&str>| {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|f| cards(f, area, a, items, selected))
+                .unwrap();
+            let buf = terminal.backend().buffer().clone();
+            let corners = |want: &str| buf.content().iter().filter(|c| c.symbol() == want).count();
+            (corners("╭"), corners("┏"))
+        };
+        assert_eq!(boxes(&a, &order, None), (2, 0));
+
+        // A selected card at work has a box of its own while it's selected.
+        let running = order[2];
+        let key = a.board.cards[running].key.clone();
+        assert_eq!(boxes(&a, &order, Some(&key)), (2, 1));
+
+        // As last seen from a machine out of reach: no box, and after what's live.
+        a.board.cards[asking].cached_at = Some(chrono::Local::now());
+        let order = a.columns()[Stage::Build.index()].clone();
+        assert_eq!(order[0], quiet);
+        assert_eq!(*order.last().unwrap(), asking);
+        assert_eq!(boxes(&a, &order, None), (1, 0));
+    }
+
     /// Intent 0289: work its agent left open says "no agent" on its card, and the bottom line,
     /// a peek, the menu and the keys list name C and x for it.
     #[test]
@@ -5119,7 +5155,8 @@ mod tests {
         assert!(rendered(&a, 176, 44).contains("KBZ_X ⇄"));
         // Narrow, the whole code stays and the mark and the age give way.
         let narrow = rendered(&a, 80, 30);
-        assert!(narrow.contains("KBZ_X  │"), "{narrow}");
+        assert!(narrow.contains("KBZ_X"), "{narrow}");
+        assert!(!narrow.contains("KBZ_X ⇄"), "{narrow}");
         let c = a.board.cards.iter().find(|c| c.reference == "#47").unwrap();
         a.sel = Selection {
             col: c.stage.index(),

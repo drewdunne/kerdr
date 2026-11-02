@@ -187,13 +187,12 @@ impl App {
                 }
             }),
             Stage::Backlog | Stage::Misc => {}
+            // What's waiting on you first, then the rest as the board sorted it, cards as last
+            // seen from a machine out of reach at the end (intent 0401).
             _ => col.sort_by_key(|&i| {
-                let a = self.board.cards[i].attention;
-                if self.holds(i).needs > 0 {
-                    a.min(Attention::NeedsYou)
-                } else {
-                    a
-                }
+                let c = &self.board.cards[i];
+                let on_you = crate::family::on_you(c, self.holds(i).needs);
+                (on_you.is_none(), on_you, c.cached_at.is_some())
             }),
         }
     }
