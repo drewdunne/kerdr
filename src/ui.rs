@@ -211,17 +211,24 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
         return started_hints(app);
     };
     let mut spans = card_badge(card, YELLOW);
+    // On the board ⏎ starts it too (intent 0404); the backlog screen's ⏎ peeks.
+    let start = if matches!(app.mode, Mode::Board) && app.actions_on() {
+        "d ⏎"
+    } else {
+        "d"
+    };
+    let waiting = [
+        (start, "start it"),
+        ("y", "still want it"),
+        ("x", "won’t do"),
+        ("C", "done"),
+        ("J K", "move down / up"),
+        ("t", "to the top"),
+    ];
     spans.extend(key_hints(if card.dismissed() {
         &[("u", "bring it back")]
     } else {
-        &[
-            ("d", "start it"),
-            ("y", "still want it"),
-            ("x", "won’t do"),
-            ("C", "done"),
-            ("J K", "move down / up"),
-            ("t", "to the top"),
-        ]
+        &waiting
     }));
     spans.push(Span::styled("   │   ", fg(BORDER)));
     spans
@@ -1970,10 +1977,18 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         (true, Some(agent)) => format!("ask to reopen it, resuming its {agent} conversation"),
         (true, None) => "ask to reopen it".to_string(),
     };
+    // ⏎ starts waiting work too, as on the board, but not in a peek from the backlog screen,
+    // whose ⏎ peeks (intent 0404).
+    let start = match &app.mode {
+        Mode::Peek { back, .. } if !matches!(**back, Mode::Backlog { .. }) && app.actions_on() => {
+            "d ⏎"
+        }
+        _ => "d",
+    };
     let mut hints = match app.backlog_card_for_keys() {
         Some(c) if c.dismissed() => vec![("u", "bring it back")],
         Some(_) => vec![
-            ("d", "start it in its session"),
+            (start, "start it in its session"),
             ("y", "still want it"),
             ("x", "won’t do"),
             ("C", "done"),
@@ -2829,6 +2844,11 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
                 "⏎",
                 "jump in: herdr, full screen, on the card's workspace",
                 "",
+            ),
+            (
+                "⏎",
+                "on work nobody started: start it, as d does",
+                "with actions on",
             ),
             (
                 "⏎",
@@ -4973,6 +4993,25 @@ mod tests {
         let text = rendered(&a, 176, 44);
         assert!(text.contains("d start it in its session"), "{text}");
         assert!(!text.contains("⏎ jump in"));
+        // With intent actions ⏎ starts it too, so the peek and the board name it beside d; the
+        // backlog screen's ⏎ peeks, so neither its line nor its peek's does (intent 0404).
+        a.cfg.actions.command = Some("test-adapter".into());
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("d ⏎ start it in its session"), "{text}");
+        a.mode = Mode::Board;
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("d ⏎ start it"), "{text}");
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Backlog { sel: 0 }),
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("d start it in its session"), "{text}");
+        assert!(!text.contains("d ⏎"), "{text}");
+        a.mode = Mode::Backlog { sel: 0 };
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("⏎ peek"), "{text}");
+        assert!(!text.contains("d ⏎"), "{text}");
     }
 
     #[test]

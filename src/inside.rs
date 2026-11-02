@@ -1077,6 +1077,70 @@ mod tests {
         assert_eq!(app.sel.key, Some(key(&app, "0256")));
     }
 
+    /// Intent 0404: ⏎ on a row nobody started starts that row's work, as d does, never the
+    /// card the screen is for.
+    #[test]
+    fn enter_on_a_not_started_row_starts_that_work() {
+        let mut app = families(Some("w2K:t1"));
+        select(&mut app, "0256");
+        press(&mut app, KeyCode::Char('o'));
+        let want = key(&app, "0332");
+        for _ in 0..12 {
+            let Mode::Card { focus, .. } = &app.mode else {
+                panic!("{:?}", app.mode)
+            };
+            if *focus == want {
+                break;
+            }
+            let code = if focus.starts_with("group:") {
+                KeyCode::Enter
+            } else {
+                KeyCode::Char('j')
+            };
+            press(&mut app, code);
+        }
+        assert_eq!(app.sel.key.as_deref(), Some(want.as_str()));
+        let Action::Mutate { machine, request } = press(&mut app, KeyCode::Enter) else {
+            panic!("{:?}", app.message())
+        };
+        assert_eq!(app.machines[machine].name(), "AMD-LZM4");
+        assert_eq!(
+            request,
+            serde_json::json!({"action":"dispatch","id":"0332"})
+        );
+        // Past the limit it asks, and a feed rebuild while the question is open keeps the row
+        // selected, so the yes and any newer question are still for it.
+        let over = crate::actions::Response {
+            confirmation: true,
+            used: Some(3),
+            limit: Some(3),
+            session: Some("KBZ".into()),
+            message: "3 of 3 slots used".into(),
+            ..Default::default()
+        };
+        app.finish_action(machine, request, Ok(over.clone()));
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        app.rebuild();
+        assert_eq!(app.sel.key.as_deref(), Some(want.as_str()));
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { machine, request } = press(&mut app, KeyCode::Enter) else {
+            panic!("{:?}", app.mode)
+        };
+        assert_eq!(request["id"], "0332");
+        assert_eq!(request["override"], true);
+        assert!(matches!(app.mode, Mode::Card { .. }));
+        assert_eq!(app.sel.key.as_deref(), Some(want.as_str()));
+        // A newer question after the yes still asks.
+        let newer = crate::actions::Response {
+            confirm: Some("0123456789ab0001".into()),
+            ..over
+        };
+        app.finish_action(machine, request, Ok(newer));
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+    }
+
     #[test]
     fn a_done_cards_screen_lists_its_follow_ups_and_c_and_x_act_on_them() {
         let mut app = families(Some("w2K:t1"));
