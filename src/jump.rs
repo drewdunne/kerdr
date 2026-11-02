@@ -95,6 +95,41 @@ impl Drop for CtrlCToHerdr {
     }
 }
 
+/// The terminal's line settings as they were before herdr's window opened. herdr puts them back
+/// when it exits cleanly, but one stopped by a signal, or cut off, can leave the terminal raw:
+/// Enter then sends a bare carriage return, so the pause after it could never end, and the board
+/// would save that raw state as its own to restore on quit (intent 0411).
+struct TtyModes {
+    #[cfg(unix)]
+    saved: Option<libc::termios>,
+}
+
+impl TtyModes {
+    fn capture() -> TtyModes {
+        #[cfg(unix)]
+        {
+            // SAFETY: tcgetattr only fills the struct it's given; zeroed is a valid termios.
+            let mut t: libc::termios = unsafe { std::mem::zeroed() };
+            let ok = unsafe { libc::tcgetattr(libc::STDIN_FILENO, &mut t) } == 0;
+            TtyModes {
+                saved: ok.then_some(t),
+            }
+        }
+        #[cfg(not(unix))]
+        TtyModes {}
+    }
+
+    fn restore(&self) {
+        #[cfg(unix)]
+        if let Some(t) = &self.saved {
+            // SAFETY: sets back settings tcgetattr read from the same terminal.
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, t);
+            }
+        }
+    }
+}
+
 /// How herdr's window reaches a session on another machine.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Via {
@@ -462,6 +497,7 @@ pub fn run(
     let ctrl_c = CtrlCToHerdr::new();
     drop_pending_keys();
     leave(flags);
+    let tty = TtyModes::capture();
     let spawned = std::time::Instant::now();
     #[cfg(windows)]
     let console_modes = crate::windows::ConsoleModes::capture();
@@ -572,6 +608,7 @@ pub fn run(
     stop.store(true, Ordering::Relaxed);
     #[cfg(windows)]
     drop(console_modes);
+    tty.restore();
     let result = *request.lock().unwrap();
     // herdr's own words on why its window closed (SSH failing, an update under way, versions
     // that don't match) are on the plain screen: they stay there until you've read them, since
@@ -582,7 +619,9 @@ pub fn run(
         result,
         &jump.machine.name,
         |text| {
+            use std::io::Write;
             println!("\n{text}");
+            let _ = stdout().flush();
             let mut line = String::new();
             let _ = std::io::stdin().read_line(&mut line);
         },
@@ -630,7 +669,7 @@ fn outcome_of(
         (Some(Request::Next), _) => Outcome::Next,
         (Some(Request::Board), _) => Outcome::Board,
         (None, Some(Some(0))) if lasted < AT_ONCE => Outcome::Failed(format!(
-            "herdr's window on {machine} closed at once without saying why; ⏎ tries again."
+            "herdr's window on {machine} closed at once; anything it said was on the screen you just saw. ⏎ tries again."
         )),
         (None, Some(Some(0))) => Outcome::Board,
         (None, Some(Some(c))) => Outcome::Failed(format!(

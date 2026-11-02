@@ -20,6 +20,10 @@ pub mod inside;
 use account_controls::AccountScreen;
 pub(crate) use controls::waiting_work;
 
+/// How long an action's answer stays on screen before a ⏎ that waited its turn says something
+/// else over it (intent 0411).
+const ANSWER_HOLD: Duration = Duration::from_secs(3);
+
 /// A new intent in Andrew's own words. The agent that writes it up fills in everything else:
 /// its title, who it's for, its project and its triage.
 #[derive(Clone, Debug, Default)]
@@ -449,6 +453,15 @@ pub struct App {
     /// A card whose conversation runs outside herdr, and when ⏎ said so: a second ⏎ on it soon
     /// after goes on to the reopen question (intent 0411).
     pub outside_warned: Option<(String, Instant)>,
+    /// Whether the waiting ⏎ was pressed past the outside-herdr warning: it goes on to the
+    /// reopen when its turn comes, rather than warning again.
+    pub pending_past_outside: bool,
+    /// A record a refusal said lives on another machine, and that machine: its actions go there,
+    /// and a question that machine asks can be answered yes, even before the board catches up.
+    pub moved_home: Option<(String, usize)>,
+    /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
+    /// takes its turn and says something else.
+    pub answered_at: Option<Instant>,
     pub width: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
@@ -506,6 +519,9 @@ impl App {
             resend: None,
             resent: None,
             outside_warned: None,
+            pending_past_outside: false,
+            moved_home: None,
+            answered_at: None,
             width: 200,
             demo: false,
             fixed_now: None,
@@ -895,6 +911,7 @@ impl App {
     /// soon as nothing else is running, and says so when something is.
     pub(crate) fn owe_reopen(&mut self, key: &str, what: &str) {
         self.pending_enter = None;
+        self.pending_past_outside = false;
         self.pending_reopen = Some(key.to_string());
         if self.busy {
             let reference = self
@@ -903,7 +920,8 @@ impl App {
                 .unwrap_or_else(|| key.to_string());
             self.say(
                 format!(
-                    "{reference}'s {what} has closed; it reopens as soon as the running action answers (Esc drops it)."
+                    "{reference}'s {what} has closed; it reopens as soon as the running action answers ({} drops it).",
+                    self.esc_where()
                 ),
                 Tone::Info,
             );
@@ -919,11 +937,16 @@ impl App {
             let line = self
                 .busy_line()
                 .unwrap_or_else(|| format!("{} is still being changed.", card.reference));
-            self.say(format!("{line}; Esc stops waiting."), Tone::Info);
+            self.say(
+                format!("{line}; {} stops waiting.", self.esc_where()),
+                Tone::Info,
+            );
             return Action::None;
         }
         self.pending_reopen = None;
         self.pending_enter = Some(card.key.clone());
+        // Every way here has passed the outside-herdr warning already (outside_first).
+        self.pending_past_outside = card.outside_herdr().is_some();
         let verb = if waiting_work(card) {
             "starts"
         } else {
@@ -934,10 +957,42 @@ impl App {
             None => "the running action answers".to_string(),
         };
         self.say(
-            format!("{} {verb} once {after} (Esc drops it).", card.reference),
+            format!(
+                "{} {verb} once {after} ({} drops it).",
+                card.reference,
+                self.esc_where()
+            ),
             Tone::Info,
         );
         Action::None
+    }
+
+    /// Where Esc lets waiting work go: on the board; elsewhere Esc has its own job.
+    fn esc_where(&self) -> &'static str {
+        if matches!(self.mode, Mode::Board) {
+            "Esc"
+        } else {
+            "Esc on the board"
+        }
+    }
+
+    /// Whether a start just went out for this card's record and the board hasn't shown it under
+    /// way yet, said when so: a second ⏎ mustn't start it twice (intent 0404).
+    fn just_started(&mut self, card: &Card) -> bool {
+        let id = card.detail.as_ref().map(|d| d.id.as_str());
+        let starting = self.started.as_ref().is_some_and(|(s, at)| {
+            Some(s.as_str()) == id && at.elapsed() < Duration::from_secs(120)
+        });
+        if starting {
+            self.say(
+                format!(
+                    "{} is starting; ⏎ goes in once its workspace shows.",
+                    card.reference
+                ),
+                Tone::Info,
+            );
+        }
+        starting
     }
 
     /// What Kerdr owes once nothing is running and no question is up: a reopen of a card whose
@@ -967,6 +1022,14 @@ impl App {
         {
             return Action::None;
         }
+        // The last action's answer stays readable for a moment: what the waiting one says when it
+        // starts would replace it before it was ever drawn.
+        if let (Some(answered), Some((_, _, said))) = (self.answered_at, &self.message)
+            && *said >= answered
+            && said.elapsed() < ANSWER_HOLD
+        {
+            return Action::None;
+        }
         if let Some(key) = self.pending_reopen.take() {
             return match self.card(&key).cloned() {
                 Some(card) => self.reopen_action(&card),
@@ -974,7 +1037,12 @@ impl App {
             };
         }
         match self.pending_enter.take() {
-            Some(key) => self.jump_action(key),
+            Some(key) => {
+                if std::mem::take(&mut self.pending_past_outside) {
+                    self.outside_warned = Some((key.clone(), Instant::now()));
+                }
+                self.jump_action(key)
+            }
             None => Action::None,
         }
     }
@@ -1118,17 +1186,7 @@ impl App {
                 );
                 return Action::None;
             }
-            let id = card.detail.as_ref().map(|d| d.id.as_str());
-            if self.started.as_ref().is_some_and(|(s, at)| {
-                Some(s.as_str()) == id && at.elapsed() < Duration::from_secs(120)
-            }) {
-                self.say(
-                    format!(
-                        "{} is starting; ⏎ goes in once its workspace shows.",
-                        card.reference
-                    ),
-                    Tone::Info,
-                );
+            if self.just_started(&card) {
                 return Action::None;
             }
             if self.busy {
@@ -1173,7 +1231,7 @@ impl App {
         self.outside_warned = Some((card.key.clone(), Instant::now()));
         self.say(
             format!(
-                "{}'s conversation is running outside herdr, in {}{since}. Go to that window, or end it there and press ⏎ again. ⏎ again now asks to start a second copy here.",
+                "{}'s conversation is running outside herdr, in {}{since}. Go to that window, or end it there and then press ⏎. To start a second copy here instead, press ⏎ again within five seconds.",
                 card.reference,
                 outside.place()
             ),
@@ -1201,22 +1259,37 @@ impl App {
         }
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
         self.closed_on_send = false;
-        // Esc anywhere lets a running action's answer go: it still finishes, but neither asks nor
-        // takes you anywhere, and a reopen or ⏎ waiting its turn is dropped.
-        let stopped = key.code == KeyCode::Esc
-            && (self.pending_reopen.take().is_some()
-                | self.pending_enter.take().is_some()
-                | (self.busy && self.action_from.take().is_some()));
+        // Esc on the board lets a running action's answer go: it still finishes, but neither asks
+        // nor takes you anywhere, and a reopen or ⏎ waiting its turn is dropped. Anywhere else Esc
+        // has its own job (no to a question, back from a peek), so waiting work keeps waiting.
+        let mut stopped = vec![];
+        if key.code == KeyCode::Esc && matches!(self.mode, Mode::Board) {
+            if self.busy && self.action_from.take().is_some() {
+                stopped.push(
+                    "Stopped waiting: it still finishes, and won't take you anywhere.".to_string(),
+                );
+            }
+            let reopen = self.pending_reopen.take().map(|k| (k, "reopen"));
+            let enter = self.pending_enter.take().map(|k| {
+                let start = self.card(&k).is_some_and(waiting_work);
+                (k, if start { "start" } else { "open" })
+            });
+            self.pending_past_outside = false;
+            for (k, verb) in reopen.into_iter().chain(enter) {
+                let reference = self
+                    .card(&k)
+                    .map(|c| c.reference.clone())
+                    .unwrap_or_else(|| "The waiting card".to_string());
+                stopped.push(format!("{reference} won't {verb} after all."));
+            }
+        }
         let action = self.handle_key(key);
         // A list view's search belongs to it: gone once you leave the view.
         if list_view(&self.mode).is_none() {
             self.view_search = None;
         }
-        if stopped {
-            self.say(
-                "Stopped waiting: it still finishes, and won't take you anywhere.",
-                Tone::Info,
-            );
+        if !stopped.is_empty() {
+            self.say(stopped.join(" "), Tone::Info);
         }
         action
     }
@@ -1563,6 +1636,13 @@ impl App {
                         scroll: 0,
                         back: Box::new(Mode::Board),
                     };
+                    // As ⏎ on the board: once, and in its turn when another action runs.
+                    if self.just_started(&card) {
+                        return Action::None;
+                    }
+                    if self.busy {
+                        return self.enter_while_busy(&card);
+                    }
                     self.intent_action_on(card, "dispatch", serde_json::json!({}))
                 } else {
                     self.mode = Mode::Peek {
@@ -4828,7 +4908,8 @@ mod tests {
         settle(&mut app);
         assert_eq!(app.open_after, None);
         assert!(app.message().unwrap().0.contains("on its card goes in"));
-        // Esc while it runs, from its peek: it finishes, but takes you nowhere.
+        // Esc from its peek while it runs only goes back to the board, still waiting; Esc on the
+        // board lets it go: it finishes, but takes you nowhere.
         app.sel.key = Some(key.clone());
         let request = reopen_by_enter(&mut app);
         app.mode = Mode::Peek {
@@ -4837,6 +4918,9 @@ mod tests {
         };
         esc(&mut app);
         assert!(matches!(app.mode, Mode::Board));
+        assert!(app.action_from.is_some(), "leaving a peek isn't stopping");
+        esc(&mut app);
+        assert_eq!(app.action_from, None);
         app.finish_action(0, request, reopen_reply("web", true, false, ""));
         settle(&mut app);
         assert_eq!(app.open_after, None);
@@ -5301,6 +5385,14 @@ mod tests {
     }
 
     /// As start_action marks an action running: the board's busy, for this request.
+    /// Time passes after an action's answer, so a waiting ⏎ may say something over it.
+    fn answer_read(app: &mut App) {
+        if let Some(m) = app.message.as_mut() {
+            m.2 = m.2.checked_sub(ANSWER_HOLD).unwrap_or(m.2);
+        }
+        app.answered_at = None;
+    }
+
     fn mark_busy(app: &mut App, request: &serde_json::Value) {
         app.busy = true;
         app.busy_id = request["id"].as_str().map(str::to_string);
@@ -5394,9 +5486,18 @@ mod tests {
         // Nothing starts while the first still runs.
         assert_eq!(app.next_owed(), Action::None);
         assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
-        // The first answers: the waiting ⏎ goes out as ⏎ would.
+        // The first answers: what it said stays a moment, then the waiting ⏎ goes out as ⏎ would.
         app.finish_action(machine, first, reopen_reply("web", true, false, ""));
         assert!(!app.busy && app.busy_id.is_none() && app.busy_label.is_empty());
+        let answer = app.message().unwrap().0.to_string();
+        assert!(answer.contains("on its card goes in"), "{answer}");
+        assert_eq!(app.next_owed(), Action::None);
+        assert_eq!(
+            app.message().unwrap().0,
+            answer,
+            "the first answer stays readable"
+        );
+        answer_read(&mut app);
         let Action::Mutate { request, .. } = app.next_owed() else {
             panic!("the waiting ⏎ sent nothing: {:?}", app.message())
         };
@@ -5421,6 +5522,7 @@ mod tests {
         card.workspace_id = Some("w8".into());
         card.session = Some("web".into());
         app.finish_action(0, request, reopen_reply("web", true, false, ""));
+        answer_read(&mut app);
         assert_eq!(app.next_owed(), Action::Jump(b));
     }
 
@@ -5481,7 +5583,13 @@ mod tests {
         assert!(app.pending_enter.is_some());
         esc(&mut app);
         assert_eq!(app.pending_enter, None);
-        assert!(app.message().unwrap().0.starts_with("Stopped waiting"));
+        let said = app.message().unwrap().0.to_string();
+        let b_ref = app.card(&b).unwrap().reference.clone();
+        assert!(said.starts_with("Stopped waiting"), "{said}");
+        assert!(
+            said.ends_with(&format!("{b_ref} won't open after all.")),
+            "{said}"
+        );
         app.finish_action(0, request, reopen_reply("web", true, false, ""));
         assert_eq!(app.next_owed(), Action::None);
     }
@@ -5618,32 +5726,267 @@ mod tests {
             Some(key.as_str()),
             "its answer may still take you in"
         );
-        // That machine's answer is shown, whatever it says: never sent on again.
+        // Until the board catches up, its next actions go there too.
+        assert_eq!(app.moved_home, Some((id.clone(), 1)));
+        let card = app.card(&key).cloned().unwrap();
+        assert_eq!(app.home_machine(&card), Some(1));
+        // That machine's answer naming yet another home is never sent on again: Kerdr says the
+        // copies disagree, and stops guessing.
         app.busy = true;
         let back = || {
             Ok(crate::actions::Response {
                 ok: false,
-                message: "It lives on laptop now.".into(),
+                message: "It lives on laptop now; ⏎ again opens it there.".into(),
                 home: Some("laptop/web".into()),
                 ..Default::default()
             })
         };
         app.finish_action(1, again, back());
-        assert_eq!(app.message().unwrap().0, "It lives on laptop now.");
+        let said = app.message().unwrap().0.to_string();
+        assert_eq!(
+            said,
+            format!(
+                "{reference}'s copies on build-box and laptop disagree about where it lives; one is behind. Wait a minute for it to catch up, then press ⏎ again."
+            )
+        );
         assert_eq!(app.next_owed(), Action::None);
-        // A home that's the machine asked, or one Kerdr doesn't know, is only said.
-        for home in ["laptop/web", "elsewhere/ARK"] {
-            app.busy = true;
-            let reply = Ok(crate::actions::Response {
+        assert_eq!(app.moved_home, None);
+        // A home that's the machine asked is only said; one Kerdr doesn't know, or one that isn't
+        // answering, is said in Kerdr's words, never with a "⏎ again" that would ask the same copy.
+        app.busy = true;
+        let reply = Ok(crate::actions::Response {
+            ok: false,
+            message: "refused: laptop/web".into(),
+            home: Some("laptop/web".into()),
+            ..Default::default()
+        });
+        app.finish_action(0, request.clone(), reply);
+        assert_eq!(app.message().unwrap().0, "refused: laptop/web");
+        assert_eq!(app.resend, None);
+        let refused = |home: &str| {
+            Ok(crate::actions::Response {
                 ok: false,
-                message: format!("refused: {home}"),
+                message: format!("It lives on {home} now; ⏎ again opens it there."),
                 home: Some(home.into()),
                 ..Default::default()
-            });
-            app.finish_action(0, request.clone(), reply);
-            assert_eq!(app.message().unwrap().0, format!("refused: {home}"));
-            assert_eq!(app.resend, None);
+            })
+        };
+        app.finish_action(0, request.clone(), refused("elsewhere/ARK"));
+        assert_eq!(
+            app.message().unwrap().0,
+            format!(
+                "{reference} lives on elsewhere now, which isn't one of this board's machines, so Kerdr can't open it there."
+            )
+        );
+        assert_eq!(app.resend, None);
+        app.machines[1].conn = Conn::Unreachable {
+            since: Local::now(),
+            retry_at: Local::now(),
+            detail: "timed out".into(),
+        };
+        app.finish_action(0, request.clone(), refused("build-box/ARK"));
+        assert_eq!(
+            app.message().unwrap().0,
+            format!(
+                "{reference} lives on build-box now, and build-box isn't answering; ⏎ opens it there once it's back."
+            )
+        );
+        assert_eq!(app.resend, None);
+        assert_eq!(
+            app.moved_home,
+            Some((id.clone(), 1)),
+            "⏎ goes there once it's back"
+        );
+    }
+
+    #[test]
+    fn esc_elsewhere_keeps_a_waiting_enter() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        let (b, _) = second_closed_card(&mut app, &a);
+        select_key(&mut app, &b);
+        enter(&mut app);
+        let back = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        // No to an unrelated question, or back from a peek: both still wait.
+        for mode in [
+            Mode::Confirm {
+                machine: 0,
+                request: serde_json::json!({"action": "close", "id": "0001"}),
+                title: "Mark #1 done?".into(),
+                message: String::new(),
+                back: Box::new(back.clone()),
+                target: None,
+                queue: false,
+                ready_at: None,
+                plain: true,
+            },
+            back,
+        ] {
+            app.mode = mode;
+            esc(&mut app);
+            assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
+            assert!(app.action_from.is_some());
+            assert!(
+                !app.message().is_some_and(|(m, _)| m.contains("after all")),
+                "{:?}",
+                app.message()
+            );
         }
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn a_second_enter_on_work_outside_herdr_keeps_its_yes_while_it_waits() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, _) = closed_workspace_card(&mut app);
+        let Action::Mutate {
+            machine,
+            request: first,
+        } = enter(&mut app)
+        else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &first);
+        let (b, b_id) = second_closed_card(&mut app, &a);
+        let i = app.board.cards.iter().position(|c| c.key == b).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().outside_herdr =
+            Some(crate::feed::OutsideHerdr {
+                terminal: Some("foot".into()),
+                since: None,
+            });
+        select_key(&mut app, &b);
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("outside herdr"));
+        assert_eq!(app.pending_enter, None);
+        // The second ⏎ is the yes to a second copy: it waits its turn, and keeps that yes.
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.pending_enter.as_deref(), Some(b.as_str()));
+        app.finish_action(machine, first, reopen_reply("web", true, false, ""));
+        answer_read(&mut app);
+        let Action::Mutate { request, .. } = app.next_owed() else {
+            panic!("the waiting ⏎ warned again: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(b_id.as_str()));
+    }
+
+    #[test]
+    fn search_enter_on_waiting_work_while_busy_waits_its_turn() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter didn't ask to reopen")
+        };
+        mark_busy(&mut app, &request);
+        let (key, id) = waiting_backlog_card(&app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        let reference = app.board.cards[i].reference.clone();
+        let search = Search {
+            query: reference.clone(),
+            filter: SearchFilter::Everything,
+            sel: 0,
+        };
+        assert_eq!(app.open_hit(Hit::Card(i), search), Action::None);
+        assert_eq!(app.pending_enter.as_deref(), Some(key.as_str()));
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.starts_with(&format!("{reference} starts once")),
+            "{said}"
+        );
+        assert!(!said.contains("An action is still running"), "{said}");
+        // Its turn, from the peek search left it in: it starts.
+        app.busy = false;
+        let Action::Mutate { request, .. } = app.next_owed() else {
+            panic!("nothing started: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+    }
+
+    #[test]
+    fn a_long_answer_is_cut_to_what_the_board_shows() {
+        let mut app = demo_app();
+        let long = "x".repeat(3000);
+        app.finish_action(
+            0,
+            serde_json::json!({"action": "create"}),
+            Ok(crate::actions::Response {
+                ok: false,
+                message: long.clone(),
+                ..Default::default()
+            }),
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.chars().count() <= 301, "{}", said.chars().count());
+        assert!(said.ends_with('…'));
+        app.finish_action(
+            0,
+            serde_json::json!({"action": "close", "id": "1"}),
+            Err(long),
+        );
+        assert!(app.message().unwrap().0.chars().count() <= 301);
+        app.finish_action(
+            0,
+            serde_json::json!({"action": "close", "id": "1"}),
+            Err("Couldn't close it.".into()),
+        );
+        assert_eq!(app.message().unwrap().0, "Couldn't close it.");
+    }
+
+    #[test]
+    fn a_question_from_the_machine_a_refusal_named_can_be_answered_yes() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        app.finish_action(
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "It lives on build-box now; ⏎ again opens it there.".into(),
+                home: Some("build-box/ARK".into()),
+                ..Default::default()
+            }),
+        );
+        let Action::Mutate {
+            machine,
+            request: again,
+        } = app.next_owed()
+        else {
+            panic!("nothing was sent on")
+        };
+        assert_eq!(machine, 1);
+        app.busy = true;
+        // build-box asks first (done work, a full session): the board still shows the old home.
+        app.finish_action(1, again, reopen_reply("ARK", false, true, "tok-1"));
+        assert!(
+            matches!(app.mode, Mode::Confirm { machine: 1, .. }),
+            "{:?}",
+            app.message()
+        );
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let yes = app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let Action::Mutate { machine, request } = yes else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, 1);
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["confirm"], "tok-1");
+        assert_eq!(request["override"], true);
+        assert_eq!(app.card(&key).unwrap().machine_index, 0);
     }
 
     #[test]

@@ -639,6 +639,10 @@ impl App {
             self.say(format!("{said} o shows what's inside."), Tone::Info);
             return Action::None;
         }
+        // Another action runs: this ⏎ waits its turn, and asks then (intent 0411).
+        if self.busy {
+            return self.enter_while_busy(card);
+        }
         let back = self.mode.clone();
         match self.reopen_action(card) {
             Action::Mutate { machine, request } => {
@@ -1030,6 +1034,29 @@ mod tests {
         assert!(message.contains("can't tell which tab"), "{message}");
         press(&mut app, KeyCode::Esc);
         assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn with_no_tab_of_its_own_on_record_enter_while_busy_asks_in_its_turn() {
+        let mut app = families(None);
+        app.busy = true;
+        app.busy_id = Some("0999".into());
+        select(&mut app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        let key = app.sel.key.clone().unwrap();
+        assert_eq!(app.pending_enter.as_deref(), Some(key.as_str()));
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("#256 opens once"), "{said}");
+        assert!(!said.contains("still running"), "{said}");
+        // Its turn: the question it would have asked.
+        app.busy = false;
+        app.busy_id = None;
+        assert_eq!(app.next_owed(), Action::None);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("{:?}", app.mode)
+        };
+        assert_eq!(title, "Reopen #256's own agent?");
     }
 
     #[test]

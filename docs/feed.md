@@ -221,8 +221,12 @@ there that was behind named the wrong home), answer `ok: false` with `home`, the
 ```
 
 When that machine is one of Kerdr's, other than the one asked, and is answering, Kerdr sends the
-same request there once (a `reopen` with `session` set to that session), and shows whatever that
-machine answers, even another such refusal. Otherwise it shows the message.
+same request there once (a `reopen` with `session` set to that session), and sends that record's
+later actions there too until the feed catches up, so a question that machine asks can be answered
+yes. It never sends it on a second time: when that machine's answer names yet another home, Kerdr
+says the two copies disagree. When the home is a machine Kerdr doesn't list, or one that isn't
+answering, Kerdr says that in its own words instead of the message, since the message's "⏎ again"
+holds only when Kerdr sends it on. A home naming the machine asked is shown as the message.
 
 ## Starting work nobody started
 
