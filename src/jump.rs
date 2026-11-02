@@ -502,7 +502,6 @@ pub fn run(
     drop_pending_keys();
     leave(flags);
     let tty = TtyModes::capture();
-    let spawned = std::time::Instant::now();
     #[cfg(windows)]
     let console_modes = crate::windows::ConsoleModes::capture();
     let mut child = match cmd.spawn() {
@@ -619,7 +618,6 @@ pub fn run(
     // the board would cover them (intent 0411).
     let outcome = finish_client(
         status.map(|s| s.code()),
-        spawned.elapsed(),
         result,
         &jump.machine.name,
         |text| {
@@ -635,23 +633,19 @@ pub fn run(
     outcome
 }
 
-/// A herdr window that closes sooner than this, with no request of Kerdr's, failed to open.
-const AT_ONCE: Duration = Duration::from_secs(2);
-
 /// What a herdr window's end means. `exit` is None when its status couldn't be read, and
-/// Some(None) when a signal stopped it; `lasted` is how long it ran. When it failed, `pause` is
-/// given what to say on the plain screen, under herdr's own words, before the board comes back.
+/// Some(None) when a signal stopped it. A clean exit is herdr's own detach, however soon it
+/// came. When it failed, `pause` is given what to say on the plain screen, under herdr's own
+/// words, before the board comes back.
 fn finish_client(
     exit: Option<Option<i32>>,
-    lasted: Duration,
     request: Option<Request>,
     machine: &str,
     pause: impl FnOnce(&str),
 ) -> Outcome {
-    let outcome = outcome_of(exit, lasted, request, machine);
+    let outcome = outcome_of(exit, request, machine);
     if let Outcome::Failed(_) = outcome {
         let how = match exit {
-            Some(Some(0)) => "at once".to_string(),
             Some(Some(c)) => format!("with exit code {c}"),
             Some(None) => "when a signal stopped it".to_string(),
             None => "and Kerdr couldn't read why".to_string(),
@@ -663,18 +657,10 @@ fn finish_client(
     outcome
 }
 
-fn outcome_of(
-    exit: Option<Option<i32>>,
-    lasted: Duration,
-    request: Option<Request>,
-    machine: &str,
-) -> Outcome {
+fn outcome_of(exit: Option<Option<i32>>, request: Option<Request>, machine: &str) -> Outcome {
     match (request, exit) {
         (Some(Request::Next), _) => Outcome::Next,
         (Some(Request::Board), _) => Outcome::Board,
-        (None, Some(Some(0))) if lasted < AT_ONCE => Outcome::Failed(format!(
-            "herdr's window on {machine} closed at once; anything it said was on the screen you just saw. ⏎ tries again."
-        )),
         (None, Some(Some(0))) => Outcome::Board,
         (None, Some(Some(c))) => Outcome::Failed(format!(
             "herdr's window on {machine} closed with exit code {c}; its own message is on the screen you just saw. The board is as it was."
@@ -1081,49 +1067,37 @@ mod tests {
 
     #[test]
     fn a_herdr_window_that_fails_says_so_and_waits_on_the_plain_screen() {
-        let quick = Duration::from_millis(200);
-        let long = Duration::from_secs(30);
         let failed = |o: Outcome| match o {
             Outcome::Failed(m) => m,
             other => panic!("{other:?}"),
         };
-        let m = failed(outcome_of(Some(Some(1)), quick, None, "LAB-Server"));
+        let m = failed(outcome_of(Some(Some(1)), None, "LAB-Server"));
         assert!(
             m.contains("exit code 1") && m.contains("its own message"),
             "{m}"
         );
         assert!(m.contains("LAB-Server"), "{m}");
-        let m = failed(outcome_of(
-            Some(Some(0)),
-            Duration::from_millis(300),
-            None,
-            "m",
-        ));
-        assert!(m.contains("closed at once"), "{m}");
-        assert_eq!(outcome_of(Some(Some(0)), long, None, "m"), Outcome::Board);
+        // herdr's own detach is a clean exit, however soon it comes.
+        assert_eq!(outcome_of(Some(Some(0)), None, "m"), Outcome::Board);
         assert_eq!(
-            outcome_of(Some(Some(1)), long, Some(Request::Board), "m"),
+            outcome_of(Some(Some(1)), Some(Request::Board), "m"),
             Outcome::Board
         );
         assert_eq!(
-            outcome_of(Some(Some(0)), quick, Some(Request::Next), "m"),
+            outcome_of(Some(Some(0)), Some(Request::Next), "m"),
             Outcome::Next
         );
-        let m = failed(outcome_of(Some(None), long, None, "m"));
+        let m = failed(outcome_of(Some(None), None, "m"));
         assert!(m.contains("stopped by a signal"), "{m}");
         // A failure waits for Enter on the plain screen, where herdr's own words are.
         let mut paused = vec![];
-        finish_client(Some(Some(1)), quick, None, "m", |t| {
-            paused.push(t.to_string())
-        });
+        finish_client(Some(Some(1)), None, "m", |t| paused.push(t.to_string()));
         assert_eq!(paused.len(), 1);
         assert!(paused[0].contains("exit code 1"), "{}", paused[0]);
         assert!(paused[0].contains("Press Enter"), "{}", paused[0]);
         // Leaving herdr as usual doesn't.
         let mut paused = 0;
-        let outcome = finish_client(Some(Some(0)), Duration::from_secs(3), None, "m", |_| {
-            paused += 1
-        });
+        let outcome = finish_client(Some(Some(0)), None, "m", |_| paused += 1);
         assert_eq!((outcome, paused), (Outcome::Board, 0));
     }
 
