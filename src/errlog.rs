@@ -824,6 +824,8 @@ pub mod tests {
         assert!(last["message"].as_str().unwrap().starts_with("1499 "));
     }
 
+    // Windows has no flock, and only one Kerdr at a time writes there.
+    #[cfg(unix)]
     #[test]
     fn writers_at_once_keep_the_older_file_whole() {
         let (_dir, log, path) = log();
