@@ -5683,7 +5683,7 @@ mod tests {
         let mut form = kickoff_form();
         form.questions[0].pick =
             "A pick that is much too long to fit beside its label on this screen".into();
-        form.questions[0].why = format!("{}the very end", "A reason that goes on. ".repeat(12));
+        form.questions[0].why = format!("{}FINALE", "A reason that goes on. ".repeat(12));
         let mut a = demo(false);
         a.mode = Mode::Kickoff {
             form,
@@ -5696,10 +5696,10 @@ mod tests {
         rendered(&a, 60, 20);
         form.scroll.set(u16::MAX);
         let text = rendered(&a, 60, 20);
-        assert!(text.contains("the very end"), "{text}");
+        assert!(text.contains("FINALE"), "{text}");
         form.scroll.set(form.scroll.get().saturating_sub(4));
         let text = rendered(&a, 60, 20);
-        assert!(!text.contains("the very end"), "{text}");
+        assert!(!text.contains("FINALE"), "{text}");
     }
 
     #[test]
