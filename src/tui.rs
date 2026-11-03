@@ -153,6 +153,11 @@ fn event_loop(
         let _ = feeds.send(ToRunner::Feed { machine, intakes });
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
+    let bg = Bg {
+        images: &image_rx,
+        answers: &action_tx,
+        runner: &runner,
+    };
     // When q last said what still runs: a second q soon after quits (intent 0445).
     let mut quit_asked: Option<Instant> = None;
     // Colours from the desktop theme, read again when it changes (palette.rs).
@@ -160,19 +165,20 @@ fn event_loop(
     theme.check(true);
     loop {
         theme.check(false);
-        while let Ok((id, loading)) = image_rx.try_recv() {
-            // A new intent sent while its image was still being read goes now (intent 0445).
-            if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {
-                start_action(app, &action_tx, &runner, machine, request);
-            }
-        }
+        send_loaded_images(app, &bg, None);
         while let Ok(answer) = action_rx.try_recv() {
             let (job, machine, request, result) = match answer {
                 Answer::Started(n) => {
                     // A start that waited for its write-up shows from now.
-                    if app.resolver.started(n) {
-                        app.rebuild();
-                    }
+                    app.job_started(n);
+                    continue;
+                }
+                Answer::Handed(n) => {
+                    app.resolver.handed(n);
+                    continue;
+                }
+                Answer::Dropped(n, dropped) => {
+                    app.resolver.drop_answered(n, dropped);
                     continue;
                 }
                 Answer::Done(done) => *done,
@@ -223,6 +229,7 @@ fn event_loop(
                 app,
                 live.as_deref_mut(),
                 client_config.as_ref(),
+                &bg,
                 open.machine,
                 open.session,
                 open.workspace,
@@ -240,6 +247,7 @@ fn event_loop(
                         live.as_deref_mut(),
                         inbox,
                         client_config.as_ref(),
+                        &bg,
                         next,
                         false,
                     ),
@@ -265,6 +273,7 @@ fn event_loop(
                 live.as_deref_mut(),
                 inbox,
                 client_config.as_ref(),
+                &bg,
                 key,
                 true,
             );
@@ -309,9 +318,10 @@ fn event_loop(
             }
             Action::OpenLink(url) => open_signin(app, &url),
             Action::Quit => {
-                // Only what would be lost holds Kerdr open: a change not yet sent, or a new
-                // intent's words still on their way. A start or move already running finishes
-                // without Kerdr, so a second q quits (intent 0445).
+                // Only what would be lost holds Kerdr open: a change whose command doesn't have
+                // all of it yet, or a new intent until it's answered. A start or move whose
+                // command has the whole request carries on without Kerdr, so a second q quits
+                // (intent 0445).
                 if let Some(text) = app.quit_held() {
                     app.say(text, Tone::Warn);
                 } else if app.busy || !app.account_queue.is_empty() {
@@ -354,6 +364,7 @@ fn event_loop(
                         live.as_deref_mut(),
                         inbox,
                         client_config.as_ref(),
+                        &bg,
                         card,
                         true,
                     );
@@ -377,6 +388,7 @@ fn event_loop(
                     app,
                     live.as_deref_mut(),
                     client_config.as_ref(),
+                    &bg,
                     mi,
                     session,
                     id,
@@ -521,9 +533,13 @@ type ActionResult = (
     Result<crate::actions::Response, String>,
 );
 
-/// What comes back to the board's thread: a change's command has started, or an action answered.
+/// What comes back to the board's thread: a change's command has started, its command has the
+/// whole request, a drop was answered (whether it came before the change started), or an action
+/// answered.
 enum Answer {
     Started(u64),
+    Handed(u64),
+    Dropped(u64, bool),
     Done(Box<ActionResult>),
 }
 
@@ -595,10 +611,13 @@ impl Runner {
                         waiting.insert(n, (machine, target, command, request));
                     }
                     ToRunner::Done(n) => queue.done(n),
+                    // Said either way, so the board keeps a start Esc came too late for.
                     ToRunner::Drop(n) => {
-                        if queue.drop_unstarted(n) {
+                        let dropped = queue.drop_unstarted(n);
+                        if dropped {
                             waiting.remove(&n);
                         }
+                        let _ = answers.send(Answer::Dropped(n, dropped));
                     }
                     ToRunner::Feed { machine, intakes } => {
                         failed = queue.written(machine, &intakes);
@@ -624,7 +643,16 @@ impl Runner {
                     let _ = answers.send(Answer::Started(n));
                     let (answers, back) = (answers.clone(), back.clone());
                     std::thread::spawn(move || {
-                        let result = crate::actions::run(&target, &command, &request);
+                        // Its command having the whole request lets Kerdr quit (intent 0445).
+                        let handed = answers.clone();
+                        let result = crate::actions::run_handing(
+                            &target,
+                            &command,
+                            &request,
+                            Box::new(move || {
+                                let _ = handed.send(Answer::Handed(n));
+                            }),
+                        );
                         let metadata = crate::actions::request_metadata(&request);
                         drop(request);
                         // A refusal naming another home holds its record's place until the board
@@ -646,6 +674,38 @@ impl Runner {
             }
         });
         Runner { tx }
+    }
+}
+
+/// What the board's thread hands work on through, which a jump into herdr needs too.
+struct Bg<'a> {
+    images: &'a mpsc::Receiver<(u64, crate::images::Loading)>,
+    answers: &'a mpsc::Sender<Answer>,
+    runner: &'a Runner,
+}
+
+/// The longest a jump into herdr waits for the image a sent new intent waits for: a clipboard read
+/// may take two commands of five seconds each.
+const IMAGE_WAIT: Duration = Duration::from_secs(12);
+
+/// Puts images read for the box in, and sends a new intent that waited for its image (intent
+/// 0445). With `wait`, waits up to that long for that image first.
+fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
+    let until = wait.map(|w| Instant::now() + w);
+    loop {
+        let got = match until {
+            Some(until) if app.send_after_load.is_some() => {
+                let left = until.saturating_duration_since(Instant::now());
+                bg.images.recv_timeout(left).ok()
+            }
+            _ => bg.images.try_recv().ok(),
+        };
+        let Some((id, loading)) = got else {
+            return;
+        };
+        if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {
+            start_action(app, bg.answers, bg.runner, machine, request);
+        }
     }
 }
 
@@ -739,6 +799,7 @@ fn jump_workspace(
     app: &mut App,
     live: Option<&mut Live>,
     client_config: Option<&PathBuf>,
+    bg: &Bg,
     mi: usize,
     session: String,
     id: String,
@@ -766,7 +827,7 @@ fn jump_workspace(
     app.went_into_workspace(mi, &session, &id);
     let via = via_for(app, mi, &session);
     let j = workspace_jump(app, mi, session, id, label, tab, via);
-    let outcome = run_jump(terminal, flags, app, &j, client_config);
+    let outcome = run_jump(terminal, flags, app, &j, client_config, bg);
     if let Some(l) = live.as_deref() {
         l.wake_feed(mi);
     }
@@ -816,7 +877,18 @@ fn run_jump(
     app: &mut App,
     j: &Jump,
     client_config: Option<&PathBuf>,
+    bg: &Bg,
 ) -> Outcome {
+    // A new intent Enter sent while its image was read goes before herdr takes the screen, so
+    // it isn't left waiting until he's back on the board (review of intent 0445).
+    if app.send_after_load.is_some() {
+        const SENDING: &str =
+            "Sending your new intent before going in: its image is still being read…";
+        app.say(SENDING, Tone::Info);
+        let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        send_loaded_images(app, bg, Some(IMAGE_WAIT));
+        app.unsay(SENDING);
+    }
     let opening = jump::opening(&j.label, &j.machine.name, j.machine.ssh.is_none());
     app.say(opening.clone(), Tone::Info);
     let _ = terminal.draw(|f| crate::ui::draw(f, app));
@@ -859,6 +931,7 @@ fn jump_cards(
     live: Option<&mut Live>,
     inbox: &Inbox,
     client_config: Option<&PathBuf>,
+    bg: &Bg,
     first: String,
     mut yours: bool,
 ) {
@@ -921,7 +994,7 @@ fn jump_cards(
             prefix: app.prefix.clone(),
             keys: keys_on(app, mi),
         };
-        let outcome = run_jump(terminal, flags, app, &j, client_config);
+        let outcome = run_jump(terminal, flags, app, &j, client_config, bg);
         // The next card is chosen only on ctrl+space space, or when one Kerdr picked has gone.
         let choosing_next = matches!(outcome, Outcome::Next)
             || (!yours && matches!(outcome, Outcome::Closed | Outcome::Stopped));
@@ -1081,6 +1154,37 @@ mod tests {
         assert_eq!((j.tab, j.strict), (None, false));
     }
 
+    /// What the runner says, in words: "started 1", "handed 1", "dropped 1 yes", "done 1 ok".
+    fn heard(answer: Answer) -> String {
+        match answer {
+            Answer::Started(n) => format!("started {n}"),
+            Answer::Handed(n) => format!("handed {n}"),
+            Answer::Dropped(n, d) => format!("dropped {n} {}", if d { "yes" } else { "no" }),
+            Answer::Done(done) => format!(
+                "done {} {}",
+                done.0.unwrap(),
+                match &done.3 {
+                    Ok(r) if r.ok => "ok",
+                    Ok(_) => "refused",
+                    Err(_) => "failed",
+                }
+            ),
+        }
+    }
+
+    /// The next thing the runner says within `wait` ms, leaving out that a command has its
+    /// request, which comes between its start and its answer.
+    fn next_heard(rx: &mpsc::Receiver<Answer>, wait: u64) -> Option<String> {
+        let until = Instant::now() + Duration::from_millis(wait);
+        loop {
+            let left = until.saturating_duration_since(Instant::now());
+            let said = heard(rx.recv_timeout(left).ok()?);
+            if !said.starts_with("handed") {
+                return Some(said);
+            }
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn the_runner_starts_a_record_s_next_change_without_the_board() {
@@ -1113,15 +1217,11 @@ mod tests {
         }
         let mut seen = vec![];
         while seen.len() < 4 {
-            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-                Answer::Started(n) => seen.push(format!("started {n}")),
-                Answer::Done(done) => {
-                    assert!(done.3.as_ref().is_ok_and(|r| r.ok), "{:?}", done.3);
-                    seen.push(format!("done {}", done.0.unwrap()));
-                }
+            if let Some(said) = next_heard(&rx, 10_000) {
+                seen.push(said);
             }
         }
-        assert_eq!(seen, ["started 1", "done 1", "started 2", "done 2"]);
+        assert_eq!(seen, ["started 1", "done 1 ok", "started 2", "done 2 ok"]);
     }
 
     #[cfg(unix)]
@@ -1152,17 +1252,115 @@ mod tests {
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
-        let next = |wait: u64| match rx.recv_timeout(Duration::from_millis(wait)) {
-            Ok(Answer::Started(n)) => Some(format!("started {n}")),
-            Ok(Answer::Done(done)) => Some(format!("done {}", done.0.unwrap())),
-            Err(_) => None,
-        };
+        let next = |wait: u64| next_heard(&rx, wait);
         assert_eq!(next(10_000).as_deref(), Some("started 1"));
-        assert_eq!(next(10_000).as_deref(), Some("done 1"));
+        assert_eq!(next(10_000).as_deref(), Some("done 1 refused"));
         assert_eq!(next(500), None, "K waits while J is sent on");
         runner.tx.send(run(1, 1, &ok)).unwrap();
         let seen: Vec<String> = (0..4).filter_map(|_| next(10_000)).collect();
-        assert_eq!(seen, ["started 1", "done 1", "started 2", "done 2"]);
+        assert_eq!(seen, ["started 1", "done 1 ok", "started 2", "done 2 ok"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runner_says_when_a_command_has_its_request_and_answers_every_drop() {
+        // Review of intent 0445: q waits until a command has the whole request, and Esc on a
+        // start whose write-up was read a moment before learns that it began.
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let command = "cat >/dev/null\nprintf '%s' '{\"ok\":true,\"message\":\"started\"}'\n";
+        let run = |n: u64, gated: bool| ToRunner::Run {
+            n,
+            machine: 0,
+            key: Some(format!("here:{n}")),
+            target: machine.clone(),
+            command: command.into(),
+            request: serde_json::json!({"action":"dispatch","id":n.to_string()}),
+            gated,
+        };
+        let next = || heard(rx.recv_timeout(Duration::from_secs(10)).unwrap());
+        // Not yet written up: taken out before it started.
+        runner.tx.send(run(1, true)).unwrap();
+        runner.tx.send(ToRunner::Drop(1)).unwrap();
+        assert_eq!(next(), "dropped 1 yes");
+        // Its command has the request before it answers.
+        runner.tx.send(run(2, false)).unwrap();
+        let said: Vec<String> = (0..3).map(|_| next()).collect();
+        assert_eq!(said, ["started 2", "handed 2", "done 2 ok"]);
+        // Written up and started before the drop reached it: it goes on, and the board is told.
+        runner.tx.send(run(3, true)).unwrap();
+        runner
+            .tx
+            .send(ToRunner::Feed {
+                machine: 0,
+                intakes: std::collections::HashMap::from([("3".to_string(), None)]),
+            })
+            .unwrap();
+        assert_eq!(next(), "started 3");
+        runner.tx.send(ToRunner::Drop(3)).unwrap();
+        let mut said: Vec<String> = (0..3).map(|_| next()).collect();
+        said.sort();
+        assert_eq!(said, ["done 3 ok", "dropped 3 no", "handed 3"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn going_into_herdr_sends_a_new_intent_whose_image_is_still_being_read() {
+        // Review of intent 0445: Enter sent the words while their image was read, then Andrew
+        // went straight into a workspace. They go before herdr takes the screen, not once he's
+        // back on the board.
+        let mut app = App::new(
+            crate::config::Config::default(),
+            crate::demo::machines(false),
+        );
+        app.cfg.actions.command = Some(
+            "cat >/dev/null\nprintf '%s' '{\"ok\":true,\"message\":\"Saved.\",\"id\":\"9001\"}'\n"
+                .into(),
+        );
+        let (answers, rx) = mpsc::channel();
+        let runner = Runner::spawn(answers.clone());
+        let (image_tx, image_rx) = mpsc::channel();
+        let bg = Bg {
+            images: &image_rx,
+            answers: &answers,
+            runner: &runner,
+        };
+        app.image_load = Some(7);
+        app.send_after_load = Some((
+            7,
+            crate::app::Draft {
+                words: "The dock:".into(),
+                session: "web".into(),
+                ..Default::default()
+            },
+        ));
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            let loading = crate::images::Loading {
+                images: vec![crate::images::Loaded {
+                    media_type: "image/png",
+                    bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+                }],
+                why: None,
+            };
+            let _ = image_tx.send((7, loading));
+        });
+        send_loaded_images(&mut app, &bg, Some(Duration::from_secs(5)));
+        assert!(app.send_after_load.is_none());
+        assert!(
+            app.resolver
+                .unanswered_where(|r| r["action"] == "create")
+                .is_some()
+        );
+        // The runner has it already: it starts while herdr has the screen.
+        assert_eq!(next_heard(&rx, 10_000).as_deref(), Some("started 1"));
     }
 
     #[cfg(unix)]
@@ -1208,14 +1406,7 @@ mod tests {
                 })
                 .unwrap();
         }
-        let next = || match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
-            Answer::Started(n) => format!("started {n}"),
-            Answer::Done(done) => format!(
-                "done {} {}",
-                done.0.unwrap(),
-                if done.3.is_ok() { "ok" } else { "failed" }
-            ),
-        };
+        let next = || next_heard(&rx, 10_000).unwrap();
         assert_eq!(next(), "started 2");
         assert_eq!(next(), "done 2 ok");
         runner

@@ -136,8 +136,9 @@ workspace limit or the conversation may still be open somewhere else. See
 [docs/feed.md](docs/feed.md#reopening-work-whose-workspace-closed).
 
 `Enter` never waits for another card's change, or for an account action. On a card that is still
-starting or reopening, it goes into the workspace that opened for it as soon as one shows (the
-workspace opens before its agent has taken its brief), and until then it says the card is starting
+starting or reopening, it goes into the workspace that opened for it as soon as a feed names that
+workspace for its record (the workspace opens before its agent has taken its brief; a name alone
+isn't enough, since 0045 and 0145 both make `45-…`), and until then it says the card is starting
 up and for how long; the card, its peek and its own screen say the same. While herdr
 gets ready on a card, the board says "Opening …", and keys pressed meanwhile are thrown away
 rather than reaching the agent's prompt.
@@ -222,10 +223,15 @@ peek alike:
 
 `c` opens the new-intent box: one field for what you want, in your own words. Enter sends it and
 closes the box at once onto the backlog, where a card for it shows straight away, selected, saying
-it's being saved; once it's saved, the record's card takes its place. `c` opens the box again at
+it's being saved; once it's saved, the record's card takes its place, and a card the board still
+hasn't read a minute after it was saved says so rather than going. `c` opens the box again at
 once, empty, however many earlier ones are still saving. If a save fails, Kerdr says so and keeps
-your words for the next `c` (or for the one after, when the box holds other words meanwhile).
-Enter while an image is still being read closes the box too, and sends once the image is in.
+your words for the next `c` (or for the one after, when the box holds other words meanwhile);
+sent again unchanged, they go as the send they came back from, so the adapter never makes a second
+intent of them, and the same words sent while they're still saving go only once.
+Enter while an image is still being read closes the box too, and sends once the image is in, even
+if you go into a workspace meanwhile; an image that doesn't go in (the box full, or one that
+couldn't be read) sends nothing, and your words come back with why.
 Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its
 line breaks. Escape keeps your words for the next time you open it. The adapter files it in the backlog of the
 session you're looking at and writes it up (see [docs/feed.md](docs/feed.md#actions)); Kerdr
@@ -267,8 +273,9 @@ else, and no key answers a question hidden under the box. Several failures show 
 and anything said meanwhile shows once they're read. A question your adapter
 asks first (a full session, reopening done work) is still asked while you're on that card. A change
 whose turn comes while you're inside a workspace starts then, not once you're back. `q` waits only
-for what would be lost (a change not yet sent, or a new intent still saving); when a start or
-another change is still running, which finishes without Kerdr, it says so, and a second `q` quits.
+for what would be lost (a change whose command doesn't have all of it yet, or a new intent still
+saving); when a start or another change is still running, its command already has the whole
+request and carries on after Kerdr quits: `q` says so, and a second `q` quits.
 
 ### Accounts and ordered models
 

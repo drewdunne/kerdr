@@ -111,7 +111,15 @@ impl Placeholder {
         })
     }
 
-    fn card(&self) -> FeedCard {
+    /// Its card. Saved a while ago and still not read (`late`), it says so rather than going.
+    fn card(&self, late: bool) -> FeedCard {
+        let status = match (&self.made, late) {
+            (Some(id), true) => format!(
+                "Saved as #{}; not on the board yet",
+                id.trim_start_matches('0')
+            ),
+            _ => "Saving…".into(),
+        };
         FeedCard {
             id: self.id.clone(),
             reference: Some("new".into()),
@@ -119,7 +127,7 @@ impl Placeholder {
             stage: Some("backlog".into()),
             state: Some("queued".into()),
             intake: Some(SAVING.into()),
-            status: Some("Saving…".into()),
+            status: Some(status),
             home: Some(Home {
                 machine: Some(self.machine.clone()),
                 session: Some(self.session.clone()),
@@ -244,6 +252,15 @@ impl Effect {
     }
 }
 
+/// What the runner starting a change means for the board (Resolver::started).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// A start that waited for its write-up: it shows from now.
+    pub shows_now: bool,
+    /// Esc dropped it a moment after its write-up was read and it began: it goes on.
+    pub too_late: bool,
+}
+
 /// One change on its way to the backend.
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -271,6 +288,12 @@ pub struct Job {
     pub gated: bool,
     /// Andrew has gone into the workspace it opened himself, so its answer takes him nowhere.
     pub entered: bool,
+    /// Its whole request is in its command's hands (written to the adapter's input), so it
+    /// carries on if Kerdr quits (review of intent 0445).
+    pub handed: bool,
+    /// A start waiting for its write-up that Esc dropped: gone once the runner says it never
+    /// started, or shown again if it already had (review of intent 0445).
+    pub dropping: bool,
 }
 
 impl Job {
@@ -289,12 +312,20 @@ impl Job {
         self.request["action"] == "move"
     }
 
-    /// How long its effect may stay, settled, without the feed showing it.
+    /// How long its effect may stay, settled, without the feed showing it. A new intent's card
+    /// stays until its record is read, however long that takes: its card says so once it's late
+    /// (review of intent 0445).
     fn life(&self) -> Duration {
         match self.effect {
             Some(Effect::StartingOn(_)) => ELSEWHERE_MOST,
+            Some(Effect::Saving(_)) => Duration::MAX,
             _ => SETTLED_MOST,
         }
+    }
+
+    /// Whether only the feed showing it retires it, not a count of reads.
+    fn waits_for_feed(&self) -> bool {
+        matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
     }
 
     /// The record it changes, by id.
@@ -406,7 +437,9 @@ impl Queue {
 
     /// The changes that can start now, marked started: each record's oldest one, once nothing
     /// ahead of it for that record (or, for a move, that machine's backlog) is still running or
-    /// held. A request with no record (a new intent) starts straight away.
+    /// held, and nothing behind it that it would clash with is running: a change refused and sent
+    /// on goes back in its place, but a later move may already be running where it now goes.
+    /// A request with no record (a new intent) starts straight away.
     pub fn startable(&mut self) -> Vec<u64> {
         let mut out = vec![];
         for i in 0..self.items.len() {
@@ -414,10 +447,11 @@ impl Queue {
             if job.started || job.gated {
                 continue;
             }
-            let ahead = self.items[..i]
-                .iter()
-                .any(|j| job.same(j) || (job.moves && j.moves && j.machine == job.machine));
-            if ahead {
+            let clashes =
+                |j: &Queued| job.same(j) || (job.moves && j.moves && j.machine == job.machine);
+            let ahead = self.items[..i].iter().any(clashes);
+            let running_behind = self.items[i + 1..].iter().any(|j| j.started && clashes(j));
+            if ahead || running_behind {
                 continue;
             }
             self.items[i].started = true;
@@ -470,6 +504,8 @@ impl Resolver {
             settled: None,
             gated: false,
             entered: false,
+            handed: false,
+            dropping: false,
         });
         self.next
     }
@@ -523,15 +559,32 @@ impl Resolver {
     }
 
     /// The runner has started this change's command. Whether it's a start that waited for its
-    /// write-up, which shows only from now.
-    pub fn started(&mut self, n: u64) -> bool {
+    /// write-up, which shows only from now, and whether Esc had dropped it a moment too late.
+    pub fn started(&mut self, n: u64) -> Started {
         match self.jobs.iter_mut().find(|j| j.n == n) {
             Some(j) => {
                 let shows_now = j.waits_for_write_up() && j.effect.is_some();
+                let too_late = j.dropping;
+                j.dropping = false;
                 j.running.get_or_insert_with(Instant::now);
-                shows_now
+                Started {
+                    shows_now,
+                    too_late,
+                }
             }
-            None => false,
+            None => Started::default(),
+        }
+    }
+
+    /// A change by its number.
+    pub fn job(&self, n: u64) -> Option<&Job> {
+        self.jobs.iter().find(|j| j.n == n)
+    }
+
+    /// Its whole request has been written to its command, which carries on without Kerdr.
+    pub fn handed(&mut self, n: u64) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.handed = true;
         }
     }
 
@@ -539,32 +592,43 @@ impl Resolver {
     pub fn waiting_for_write_up(&self, key: &str) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.waits_for_write_up() && j.key.as_deref() == Some(key))
+            .find(|j| j.waits_for_write_up() && !j.dropping && j.key.as_deref() == Some(key))
     }
 
     /// Every start waiting for a write-up.
     pub fn write_ups_awaited(&self) -> Vec<&Job> {
         self.jobs
             .iter()
-            .filter(|j| j.waits_for_write_up())
+            .filter(|j| j.waits_for_write_up() && !j.dropping)
             .collect()
     }
 
     /// Esc on the board: starts waiting for their write-up won't start after all. The cards they
-    /// were for, by key.
+    /// were for, by key. Each stays, out of sight, until the runner says whether it took it out
+    /// before it started (Resolver::drop_answered): the write-up may have been read, and the start
+    /// begun, a moment before Esc.
     pub fn drop_awaited(&mut self) -> Vec<String> {
         let mut keys = vec![];
-        let mut dropped = vec![];
-        self.jobs.retain(|j| {
-            if !j.waits_for_write_up() {
-                return true;
-            }
-            dropped.push(j.n);
+        for j in self
+            .jobs
+            .iter_mut()
+            .filter(|j| j.waits_for_write_up() && !j.dropping)
+        {
+            j.dropping = true;
+            self.dropped.push(j.n);
             keys.extend(j.key.clone());
-            false
-        });
-        self.dropped.extend(dropped);
+        }
         keys
+    }
+
+    /// The runner's answer to a drop: taken out before it started, it goes; otherwise it had
+    /// started already (Resolver::started showed it again) and its answer still comes.
+    pub fn drop_answered(&mut self, n: u64, dropped: bool) {
+        if dropped {
+            self.jobs.retain(|j| j.n != n);
+        } else if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.dropping = false;
+        }
     }
 
     /// The changes dropped since the runner was last told.
@@ -598,25 +662,26 @@ impl Resolver {
         })
     }
 
-    /// Changes Kerdr mustn't quit before: ones not yet started (they'd never be sent) and new
-    /// intents (his words may still be on their way to the command). A start or another change
-    /// already running finishes without Kerdr.
+    /// Changes Kerdr mustn't quit before: ones whose whole request isn't yet in their command's
+    /// hands (quitting would stop them unsent, or half sent), and new intents until they're
+    /// answered (a failed save gives their words back, which only Kerdr keeps). A start or another
+    /// change its command has whole carries on without Kerdr.
     pub fn holding_quit(&self) -> Vec<&Job> {
         self.jobs
             .iter()
             .filter(|j| {
                 j.settled.is_none()
                     && !j.waits_for_write_up()
-                    && (j.running.is_none() || j.request["action"] == "create")
+                    && (!j.handed || j.request["action"] == "create")
             })
             .collect()
     }
 
-    /// Unanswered changes whose commands are running and finish without Kerdr.
+    /// Unanswered changes whose commands have their whole request and carry on without Kerdr.
     pub fn running(&self) -> Vec<&Job> {
         self.jobs
             .iter()
-            .filter(|j| j.settled.is_none() && j.running.is_some())
+            .filter(|j| j.settled.is_none() && j.handed)
             .collect()
     }
 
@@ -657,6 +722,7 @@ impl Resolver {
         job.sent = false;
         job.gated = false;
         job.running = None;
+        job.handed = false;
         job.settled = None;
         let at = self.jobs.partition_point(|j| j.n < job.n);
         self.jobs.insert(at, job);
@@ -725,7 +791,7 @@ impl Resolver {
             .collect();
         self.jobs.retain_mut(|j| {
             let life = j.life();
-            let elsewhere = matches!(j.effect, Some(Effect::StartingOn(_)));
+            let elsewhere = j.waits_for_feed();
             let reordered = match &j.effect {
                 Some(Effect::Order(o)) => orders
                     .iter()
@@ -791,8 +857,11 @@ impl Resolver {
                 {
                     continue;
                 }
+                let late = job
+                    .settled
+                    .is_some_and(|(at, _)| at.elapsed() >= SETTLED_MOST);
                 if let Some(feed) = out.get_mut(job.machine).and_then(|m| m.feed.as_mut()) {
-                    feed.cards.push(p.card());
+                    feed.cards.push(p.card(late));
                 }
                 continue;
             }
@@ -931,6 +1000,12 @@ mod tests {
         assert_eq!(r.holding_quit().len(), 3);
         r.started(a);
         r.started(c);
+        // Started, but its command may not have all of the request yet: quitting could cut it
+        // off (review of intent 0445).
+        assert_eq!(r.holding_quit().len(), 3);
+        assert!(r.running().is_empty());
+        r.handed(a);
+        r.handed(c);
         let held: Vec<u64> = r.holding_quit().iter().map(|j| j.n).collect();
         assert_eq!(held, vec![b, c], "not yet started, and a new intent");
         assert_eq!(r.running().len(), 2);
@@ -1530,7 +1605,7 @@ mod tests {
         assert!(!r.holds_you());
         assert!(r.waiting_for_write_up("s:7").is_some());
         assert!(r.ready()[0].3);
-        assert!(r.started(n), "it shows from now");
+        assert!(r.started(n).shows_now, "it shows from now");
         assert_eq!(status(&r).as_deref(), Some("Starting…"));
         assert!(r.starting("7").is_some());
         assert!(
@@ -1649,6 +1724,114 @@ mod tests {
             serde_json::from_value(json!({"id":"7","title":"t","stale_days":20})).unwrap();
         Effect::Refresh("2026-11-02".into()).apply(&mut fc, "s:7");
         assert_eq!(fc.stale_days, Some(0), "today, not unknown");
+    }
+
+    #[test]
+    fn a_change_sent_on_never_runs_beside_a_later_move_already_running_there() {
+        // Review of intent 0445: J on machine 0 and K on machine 1 both run; J is refused and sent
+        // on to machine 1, where K is still running: J waits for K.
+        let mut q = Queue::default();
+        q.push(1, 0, None, &json!({"action":"move","id":"1","delta":1}));
+        q.push(2, 1, None, &json!({"action":"move","id":"2","delta":1}));
+        assert_eq!(q.startable(), vec![1, 2]);
+        q.push(1, 1, None, &json!({"action":"move","id":"1","delta":1}));
+        assert!(
+            q.startable().is_empty(),
+            "K is still reordering that backlog"
+        );
+        q.done(2);
+        assert_eq!(q.startable(), vec![1]);
+    }
+
+    #[test]
+    fn esc_racing_a_start_that_already_began_keeps_it_until_the_runner_answers() {
+        // Review of intent 0445: the write-up is read and the start begins a moment before Esc.
+        let mut r = Resolver::default();
+        let start = |r: &mut Resolver| {
+            r.add_gated(
+                0,
+                json!({"action":"dispatch","id":"7"}),
+                None,
+                Some("s:7".into()),
+                Some(Effect::Starting),
+            )
+        };
+        let n = start(&mut r);
+        r.ready();
+        assert_eq!(r.drop_awaited(), vec!["s:7".to_string()]);
+        assert_eq!(r.take_dropped(), vec![n]);
+        assert!(r.write_ups_awaited().is_empty(), "no longer said to wait");
+        assert!(r.drop_awaited().is_empty(), "dropped once");
+        // The runner had already started it: it shows, and its answer still finds it.
+        assert_eq!(
+            r.started(n),
+            Started {
+                shows_now: true,
+                too_late: true
+            }
+        );
+        r.drop_answered(n, false);
+        assert!(r.starting("7").is_some());
+        assert!(r.take(n).is_some());
+        // Taken out before it started: it goes.
+        let n = start(&mut r);
+        r.ready();
+        r.drop_awaited();
+        r.drop_answered(n, true);
+        assert!(r.job(n).is_none());
+    }
+
+    #[test]
+    fn a_saved_new_intent_s_card_stays_until_its_record_is_read_and_says_when_it_s_late() {
+        // Review of intent 0445: the answer names the record, but the feed is slow to show it.
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(placeholder())),
+        );
+        let mut job = r.take(n).unwrap();
+        if let Some(Effect::Saving(p)) = job.effect.as_mut() {
+            p.made = Some("9001".into());
+        }
+        r.settle(job);
+        let without = feed(json!([{"id":"1","title":"a"}]));
+        for _ in 0..4 {
+            r.read(0, Some(&without));
+        }
+        assert!(!r.expire());
+        let mut m = MachineState::new(here());
+        m.feed = Some(without.clone());
+        let status = |r: &Resolver| {
+            r.overlay(std::slice::from_ref(&m))[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .cards
+                .iter()
+                .find(|c| c.id == "saving-kerdr-1")
+                .and_then(|c| c.status.clone())
+        };
+        assert_eq!(status(&r).as_deref(), Some("Saving…"));
+        // A minute on, still not read: it says so rather than going.
+        for j in &mut r.jobs {
+            j.settled = Some((Instant::now() - Duration::from_secs(61), 2));
+        }
+        assert!(!r.expire());
+        r.read(0, Some(&without));
+        assert_eq!(
+            status(&r).as_deref(),
+            Some("Saved as #9001; not on the board yet")
+        );
+        r.read(
+            0,
+            Some(&feed(
+                json!([{"id":"1","title":"a"},{"id":"9001","title":"t"}]),
+            )),
+        );
+        assert!(!r.shows());
     }
 
     #[test]

@@ -33,6 +33,18 @@ pub struct Draft {
     pub session: String,
     /// Images pasted into it, each standing in the words as its `[Image #N]` tag.
     pub images: Vec<crate::images::Image>,
+    /// The send these words came back from, when a save failed or went unheard: sent again
+    /// unchanged, they go as that send, so the adapter finds what it may have made (intent 0445).
+    pub came_back: Option<Submission>,
+}
+
+/// Words (and their images) a save gave back while the box held other words, with the send they
+/// came back from (intent 0445).
+#[derive(Clone, Debug)]
+pub struct Returned {
+    pub words: String,
+    pub images: Vec<crate::images::Image>,
+    pub from: Option<Submission>,
 }
 
 /// One new intent as sent: its id lets the adapter tell a resend of the same words from new
@@ -428,6 +440,8 @@ pub struct App {
     pub draft: String,
     /// The images pasted with those words.
     pub draft_images: Vec<crate::images::Image>,
+    /// The send those words came back from, if they did (Draft::came_back).
+    pub draft_came_back: Option<Submission>,
     /// The images being read for the new-intent box, by the number of that read; a read whose
     /// box closed meanwhile is dropped when it ends.
     pub image_load: Option<u64>,
@@ -439,7 +453,7 @@ pub struct App {
     pub submissions: Vec<Submission>,
     /// Words (and their images) whose save failed while the box held other words: c offers them,
     /// oldest first, once the box is empty (intent 0445).
-    pub returned: std::collections::VecDeque<(String, Vec<crate::images::Image>)>,
+    pub returned: std::collections::VecDeque<Returned>,
     /// A new intent Enter sent while its image was still being read: the read's number and its
     /// words, sent once the image is in (intent 0445).
     pub send_after_load: Option<(u64, Draft)>,
@@ -531,6 +545,7 @@ impl App {
             count: String::new(),
             draft: String::new(),
             draft_images: vec![],
+            draft_came_back: None,
             image_load: None,
             image_loads: 0,
             image_at: 0,
@@ -3785,6 +3800,135 @@ mod tests {
         assert_eq!(app.draft, "Again");
     }
 
+    fn a_png() -> crate::images::Loaded {
+        crate::images::Loaded {
+            media_type: "image/png",
+            bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+        }
+    }
+
+    #[test]
+    fn words_sent_while_their_image_is_read_never_clear_words_typed_since() {
+        // Review of intent 0445: words Esc kept, sent with an image still being read; the box
+        // opens empty meanwhile, and what's typed and kept there stays when the first go.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.draft = "Back up the NAS".into();
+        press(&mut app, 'c');
+        use crate::images::Source;
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        press(&mut app, 'c');
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words.is_empty()),
+            "the words on their way came back into the box"
+        );
+        for c in "Fix the dock".chars() {
+            press(&mut app, c);
+        }
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        let loading = crate::images::Loading {
+            images: vec![a_png()],
+            why: None,
+        };
+        let Action::Mutate { request, .. } = app.images_loaded(id, loading) else {
+            panic!("the words weren't sent once the image was in")
+        };
+        assert_eq!(request["words"], "Back up the NAS [Image #1]");
+        assert_eq!(app.draft, "Fix the dock");
+    }
+
+    #[test]
+    fn the_same_words_twice_go_once_and_words_given_back_keep_their_submission() {
+        // Review of intent 0445: two sends of the same words would share one submission as two
+        // jobs; one failing gives its words back while the other saves them, and a resend of
+        // those words mustn't make a second intent.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let first = send_words(&mut app, "Back up the NAS");
+        let submission = first["submission"].clone();
+        app.queue_action(0, first.clone());
+        // The same words again while the first is on its way: nothing more is sent.
+        app.draft = "Back up the NAS".into();
+        press(&mut app, 'c');
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert!(app.message().unwrap().0.contains("already being saved"));
+        assert_eq!(
+            app.resolver
+                .unanswered_where(|r| r["action"] == "create")
+                .into_iter()
+                .count(),
+            1
+        );
+        // Unheard: the words come back with the send they came from...
+        reply_to(&mut app, 0, first, Err("timed out".into()));
+        assert_eq!(app.draft, "Back up the NAS");
+        assert_eq!(
+            app.draft_came_back.as_ref().map(|s| s.id.as_str()),
+            submission.as_str()
+        );
+        // ...and keep it even once nothing else remembers that send.
+        app.submissions.clear();
+        app.mode = Mode::Board;
+        press(&mut app, 'c');
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        assert_eq!(request["submission"], submission);
+        // Words given back by a send that's since been saved are never offered again.
+        app.queue_action(0, request.clone());
+        let from = app.submissions[0].clone();
+        app.returned.push_back(Returned {
+            words: from.words.clone(),
+            images: vec![],
+            from: Some(from),
+        });
+        reply_to(&mut app, 0, request, answer(true, Some("9003")));
+        assert!(app.returned.is_empty());
+    }
+
+    #[test]
+    fn an_image_that_doesn_t_go_in_keeps_its_words_unsent() {
+        // Review of intent 0445: the image read while Enter waited didn't fit, or only some of
+        // what was read went in: nothing is sent, and the words are kept with why.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        use crate::images::Source;
+        let full = "x".repeat(47_995);
+        app.draft = full.clone();
+        press(&mut app, 'c');
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let loading = crate::images::Loading {
+            images: vec![a_png()],
+            why: None,
+        };
+        assert_eq!(app.images_loaded(id, loading), Action::None);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Fail);
+        assert!(said.contains("The box is full"), "{said}");
+        assert_eq!(app.draft, full);
+        // One image in and one that couldn't be read: not sent either.
+        app.draft = "The dock".into();
+        app.mode = Mode::Board;
+        press(&mut app, 'c');
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let loading = crate::images::Loading {
+            images: vec![a_png()],
+            why: Some("photo.heic isn't an image Kerdr can send.".into()),
+        };
+        assert_eq!(app.images_loaded(id, loading), Action::None);
+        assert!(app.message().unwrap().0.contains("photo.heic"));
+        assert_eq!(app.draft, "The dock [Image #1] ");
+        assert_eq!(app.draft_images.len(), 1);
+    }
+
     #[test]
     fn several_new_intents_save_at_once_and_a_failed_one_waits_its_turn_for_the_box() {
         let mut app = demo_app();
@@ -6794,7 +6938,31 @@ mod tests {
             .note_workspaces(i, vec![("web".into(), "w-old".into())]);
         app.board.workspaces.push(row("w-old"));
         assert_eq!(enter(&mut app), Action::None);
+        // One whose name carries its last two digits, as 0045's and 0145's both do, isn't
+        // enough: Kerdr waits for a feed to name it for this record (review of intent 0445).
         app.board.workspaces.push(row("w-new"));
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("is starting up"));
+        let named = |app: &mut App, ws: &str| {
+            for c in app.machines[machine]
+                .feed
+                .as_mut()
+                .unwrap()
+                .cards
+                .iter_mut()
+                .filter(|c| c.id == id)
+            {
+                c.workspace = Some(crate::feed::FeedWorkspace {
+                    session: Some("web".into()),
+                    id: Some(ws.into()),
+                    ..Default::default()
+                });
+            }
+        };
+        // Named for it, but already there when it was asked: an old one.
+        named(&mut app, "w-old");
+        assert_eq!(enter(&mut app), Action::None);
+        named(&mut app, "w-new");
         assert_eq!(
             enter(&mut app),
             Action::JumpWorkspace {
@@ -6949,7 +7117,7 @@ mod tests {
         assert!(queue.written(m, &intake(None)).is_empty());
         assert_eq!(queue.startable(), vec![n]);
         // Started: it shows as starting from now.
-        assert!(app.resolver.started(n));
+        assert!(app.resolver.started(n).shows_now);
         app.rebuild();
         assert!(!app.starts_when_written(&key));
         assert!(app.resolver.starting(&id).is_some());
@@ -7010,11 +7178,16 @@ mod tests {
         // Handed to the runner but not yet started: it would never be sent.
         assert!(app.quit_held().is_some());
         app.resolver.started(n);
-        // Running: it finishes without Kerdr, and q says so before it quits.
+        // Started, but its command doesn't have the whole request yet: quitting now would cut it
+        // off (review of intent 0445).
+        let held = app.quit_held().unwrap();
+        assert!(held.contains("still being handed to its command"), "{held}");
+        app.resolver.handed(n);
+        // Its command has it all: it carries on without Kerdr, and q says so before it quits.
         assert_eq!(app.quit_held(), None);
         let said = app.still_running().unwrap();
         assert!(
-            said.contains("is still starting; it finishes without Kerdr"),
+            said.contains("is still starting; its command has the whole request and carries on after Kerdr quits"),
             "{said}"
         );
         // A new intent holds it until it's answered: its words may still be on their way.
@@ -7040,8 +7213,11 @@ mod tests {
         assert!(app.quit_loses().unwrap().contains("once its image is in"));
         app.send_after_load = None;
         // Words a failed save gave back, kept for c.
-        app.returned
-            .push_back(("Back up the NAS".into(), Vec::new()));
+        app.returned.push_back(Returned {
+            words: "Back up the NAS".into(),
+            images: Vec::new(),
+            from: None,
+        });
         assert!(app.quit_loses().unwrap().contains("c brings them back"));
         app.returned.clear();
         app.draft = "half a thought".into();

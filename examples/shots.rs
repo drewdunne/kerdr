@@ -364,6 +364,7 @@ fn main() {
                 media_type: "image/png",
                 bytes: std::sync::Arc::new(vec![]),
             }],
+            came_back: None,
         },
         back: Box::new(Mode::Board),
     };

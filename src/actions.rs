@@ -118,7 +118,24 @@ fn most_bytes(request: &Value) -> usize {
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
-    run_with_deadline(machine, command, request, deadline_for(request))
+    run_with_deadline(machine, command, request, deadline_for(request), None)
+}
+
+/// As run, calling `handed` once the adapter has the whole request: from then on it carries on
+/// if Kerdr quits (review of intent 0445).
+pub fn run_handing(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    handed: transport::Handed,
+) -> Result<Response, String> {
+    run_with_deadline(
+        machine,
+        command,
+        request,
+        deadline_for(request),
+        Some(handed),
+    )
 }
 
 /// How long an action may take before Kerdr stops waiting. Starting or reopening work can take
@@ -155,6 +172,7 @@ fn run_with_deadline(
     command: &str,
     request: &Value,
     deadline: Duration,
+    handed: Option<transport::Handed>,
 ) -> Result<Response, String> {
     if command.trim().is_empty() {
         return Err("actions are disabled; configure [actions] command".into());
@@ -175,7 +193,7 @@ fn run_with_deadline(
         None => Target::Local,
     };
     // The configured command is source; user data is JSON on stdin, never source.
-    let output = transport::run_adapter(&target, command, Some(&json), deadline);
+    let output = transport::run_adapter_handing(&target, command, Some(&json), deadline, handed);
     let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
         if starts_work(request) {
@@ -516,6 +534,7 @@ mod tests {
             &command,
             &json!({"action":"refresh","id":"4"}),
             Duration::from_millis(60),
+            None,
         )
         .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
@@ -552,6 +571,7 @@ mod tests {
                 &command,
                 &json!({"action":action,"id":"0391"}),
                 Duration::from_millis(60),
+                None,
             )
             .unwrap_err();
             assert!(error.starts_with(verb), "{error}");

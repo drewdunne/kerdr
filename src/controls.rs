@@ -1056,10 +1056,11 @@ impl App {
         // The box opens while earlier ones are still saving (intent 0445). Words a failed save
         // gave back come first, once nothing else waits in it.
         if self.draft.trim().is_empty()
-            && let Some((words, images)) = self.returned.pop_front()
+            && let Some(back) = self.returned.pop_front()
         {
-            self.draft = words;
-            self.draft_images = images;
+            self.draft = back.words;
+            self.draft_images = back.images;
+            self.draft_came_back = back.from;
         }
         let machine = match self.scope() {
             Scope::Session(m, _) => self.machine_index(m),
@@ -1081,6 +1082,7 @@ impl App {
                 machine,
                 session,
                 images: self.draft_images.clone(),
+                came_back: self.draft_came_back.clone(),
             },
             back: Box::new(self.mode.clone()),
         };
@@ -1156,6 +1158,7 @@ impl App {
         if key.code == KeyCode::Esc {
             self.draft = draft.words;
             self.draft_images = draft.images;
+            self.draft_came_back = draft.came_back;
             // A read for words already sent carries on for them.
             if self.box_loading().is_some() {
                 self.image_load = None;
@@ -1186,7 +1189,10 @@ impl App {
                     // Said why; the box stays open with the words.
                 } else if let Some(load) = self.box_loading() {
                     // The image still being read goes with them: the box closes now, and they're
-                    // sent once it's in (intent 0445).
+                    // sent once it's in (intent 0445). What the box kept for next time is these
+                    // words, now on their way: it opens empty, and nothing else typed meanwhile
+                    // is cleared when they go.
+                    self.clear_kept_draft();
                     self.send_after_load = Some((load, draft));
                     self.closed_on_send = true;
                     self.enter_backlog(false);
@@ -1198,6 +1204,7 @@ impl App {
                 } else {
                     // The box closes at once onto the backlog, where the new intent's card shows
                     // while it's saved (intent 0445).
+                    self.clear_kept_draft();
                     self.closed_on_send = true;
                     self.enter_backlog(false);
                     return self.send_draft(draft);
@@ -1243,7 +1250,7 @@ impl App {
     fn send_draft(&mut self, mut draft: Draft) -> Action {
         // Its machine stopped answering meanwhile (a read that took a while): nothing is lost.
         if !self.can_write(draft.machine) {
-            self.give_back(draft.words, draft.images);
+            self.give_back(draft.words, draft.images, draft.came_back);
             return Action::None;
         }
         let words = draft.words.trim().to_string();
@@ -1254,7 +1261,19 @@ impl App {
             .filter(|i| words.contains(&images::tag(i.tag)))
             .cloned()
             .collect();
-        if let Some(s) = self
+        // Words a save gave back, unchanged: they go again as the send they came back from, even
+        // when another send of the same words has since been answered (intent 0445).
+        if let Some(s) = draft
+            .came_back
+            .take()
+            .filter(|s| s.words == words && s.images == images)
+        {
+            draft.machine = s.machine;
+            draft.session = s.session.clone();
+            if !self.submissions.iter().any(|k| k.id == s.id) {
+                self.submissions.push(s);
+            }
+        } else if let Some(s) = self
             .submissions
             .iter()
             .find(|s| s.unknown && s.words == words && s.images == images)
@@ -1282,14 +1301,28 @@ impl App {
                 id
             }
         };
+        // The same words already on their way: one send, not two, so a failure of one can't
+        // give back words the other has saved (intent 0445).
+        if self.resolver.saving(&id).is_some() {
+            self.say(
+                "Those words are already being saved; their card shows in the backlog.",
+                Tone::Info,
+            );
+            return Action::None;
+        }
         let mut request =
             json!({"action":"create","words":words,"session":draft.session,"submission":id});
         if !images.is_empty() {
             request["images"] = Value::Array(images::request_images(&words, &images));
         }
+        self.emit_mutation(draft.machine, request)
+    }
+
+    /// Empties what the box keeps for next time: Enter has taken those words.
+    fn clear_kept_draft(&mut self) {
         self.draft.clear();
         self.draft_images.clear();
-        self.emit_mutation(draft.machine, request)
+        self.draft_came_back = None;
     }
 
     /// The image read for the box that's open, not one for words already sent.
@@ -1300,14 +1333,24 @@ impl App {
 
     /// Words a failed save gives back: into the box for the next c when it's free, else kept
     /// for a later c. Whether they went into the box.
-    fn give_back(&mut self, words: String, images: Vec<images::Image>) -> bool {
+    fn give_back(
+        &mut self,
+        words: String,
+        images: Vec<images::Image>,
+        from: Option<crate::app::Submission>,
+    ) -> bool {
         let open = matches!(self.mode, Mode::Compose { .. }) || self.send_after_load.is_some();
         if !open && self.draft.trim().is_empty() {
             self.draft = words;
             self.draft_images = images;
+            self.draft_came_back = from;
             true
         } else {
-            self.returned.push_back((words, images));
+            self.returned.push_back(crate::app::Returned {
+                words,
+                images,
+                from,
+            });
             false
         }
     }
@@ -1421,13 +1464,18 @@ impl App {
         self.image_load = None;
         if let Some((load, mut draft)) = self.send_after_load.take() {
             if load == id {
-                let read = loading.images.len();
                 let said = attach_into(&mut draft, loading, Some(self.image_at));
-                if read == 0 && !said.is_empty() {
-                    // Nothing came in: not sent, words kept.
-                    self.give_back(draft.words, draft.images);
+                if said.iter().any(|s| !s.starts_with("Attached")) {
+                    // Not everything read went in (none found, the box full, too many or too
+                    // big): not sent, words and what did go in kept, and why said.
+                    let into_box = self.give_back(draft.words, draft.images, draft.came_back);
+                    let back = if into_box {
+                        "c opens it again with your words."
+                    } else {
+                        "Its words are kept, and c brings them back once the box is empty."
+                    };
                     self.fail(format!(
-                        "Your new intent wasn't sent: {} c opens it again with your words.",
+                        "Your new intent wasn't sent: {} {back}",
                         said.join(" ")
                     ));
                     return Action::None;
@@ -1936,8 +1984,9 @@ impl App {
     }
 
     /// ⏎ on a card whose start or reopen is on its way and no workspace shows on it yet: into the
-    /// workspace that has opened for it meanwhile (ark-dispatch opens it before its agent takes its
-    /// brief, and answers only then), else says it's starting up and for how long. None when no
+    /// workspace a feed names for its record that has opened meanwhile (ark-dispatch opens it
+    /// before its agent takes its brief, and answers only then), else says it's starting up and
+    /// for how long. None when no
     /// start is on its way (intent 0445).
     pub(crate) fn enter_starting(&mut self, card: &Card) -> Option<Action> {
         let id = card.detail.as_ref()?.id.clone();
@@ -1952,20 +2001,32 @@ impl App {
         {
             machines.push(self.machines[i].name());
         }
-        let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
-        let named = (digits.len() >= 2).then(|| format!("{}-", &digits[digits.len() - 2..]));
-        let opened = named.and_then(|named| {
-            self.board.workspaces.iter().find(|w| {
-                machines.contains(&w.machine)
-                    && w.label.starts_with(&named)
-                    && !job
-                        .before
-                        .iter()
-                        .any(|(s, i)| *s == w.session && *i == w.id)
-                    && w.card
-                        .as_ref()
-                        .is_none_or(|k| *k == card.key || k.starts_with("ws:"))
+        // Only a workspace a feed names for this very record: herdr's names carry two digits of
+        // its number, which 0045 and 0145 share, so a name alone never says it's this one's.
+        let named: Vec<(String, String, String)> = self
+            .machines
+            .iter()
+            .filter(|m| machines.contains(&m.name()))
+            .filter_map(|m| m.feed.as_ref().map(|f| (m.name(), f)))
+            .flat_map(|(name, f)| {
+                let source = f.source.clone().unwrap_or_else(|| "feed".into());
+                f.cards
+                    .iter()
+                    .filter(move |c| format!("{source}:{}", c.id) == card.key)
+                    .filter_map(move |c| {
+                        let w = c.workspace.as_ref()?;
+                        Some((name.clone(), w.session.clone()?, w.id.clone()?))
+                    })
             })
+            .collect();
+        let opened = self.board.workspaces.iter().find(|w| {
+            named
+                .iter()
+                .any(|(m, s, i)| *m == w.machine && *s == w.session && *i == w.id)
+                && !job
+                    .before
+                    .iter()
+                    .any(|(s, i)| *s == w.session && *i == w.id)
         });
         if let Some(w) = opened {
             let action = Action::JumpWorkspace {
@@ -2018,6 +2079,27 @@ impl App {
             .collect();
         for key in keys {
             self.went_into(&key);
+        }
+    }
+
+    /// The runner has started a change's command: a start that waited for its write-up shows
+    /// from now, and one Esc dropped a moment too late says it carries on (review of intent 0445).
+    pub fn job_started(&mut self, n: u64) {
+        let started = self.resolver.started(n);
+        if started.too_late {
+            let reference = self
+                .resolver
+                .job(n)
+                .and_then(|j| j.id())
+                .map(|id| self.reference_for(id))
+                .unwrap_or_else(|| "The waiting card".into());
+            self.say(
+                format!("{reference} had already begun starting when Esc came, so it carries on."),
+                Tone::Info,
+            );
+        }
+        if started.shows_now || started.too_late {
+            self.rebuild();
         }
     }
 
@@ -2080,14 +2162,19 @@ impl App {
                 "Your new intent is still being saved. Wait a moment before quitting.".into(),
             );
         }
-        let names: Vec<String> = held
-            .iter()
-            .filter_map(|j| j.id())
+        let first = held[0];
+        let reference = first
+            .id()
             .map(|id| self.reference_for(id))
-            .collect();
+            .unwrap_or_else(|| "A card".into());
+        // Started, but its command doesn't have all of it yet: quitting now would cut it off.
+        if first.running.is_some() {
+            return Some(format!(
+                "{reference}'s change is still being handed to its command. Wait a moment before quitting."
+            ));
+        }
         Some(format!(
-            "{}'s change hasn't been sent yet; it goes once the one before it answers. Wait a moment before quitting.",
-            names.first().cloned().unwrap_or_else(|| "A card".into())
+            "{reference}'s change hasn't been sent yet; it goes once the one before it answers. Wait a moment before quitting."
         ))
     }
 
@@ -2124,8 +2211,9 @@ impl App {
         None
     }
 
-    /// What's still running and finishes without Kerdr, for q to say before it quits: "#41 is
-    /// still starting; it finishes without Kerdr." None when nothing is.
+    /// What's still running and carries on without Kerdr, for q to say before it quits: "#41 is
+    /// still starting; its command has the whole request and carries on after Kerdr quits." None
+    /// when nothing is.
     pub fn still_running(&self) -> Option<String> {
         let running = self.resolver.running();
         let first = running.first()?;
@@ -2143,7 +2231,7 @@ impl App {
             n => format!(" ({} more running)", n - 1),
         };
         Some(format!(
-            "{reference} {what}{more}; it finishes without Kerdr."
+            "{reference} {what}{more}; its command has the whole request and carries on after Kerdr quits."
         ))
     }
 
@@ -2478,6 +2566,16 @@ impl App {
                 if let Some(i) = at {
                     self.submissions.remove(i);
                 }
+                // Words an earlier send of it gave back are saved now: never offered again.
+                self.returned
+                    .retain(|r| r.from.as_ref().is_none_or(|s| s.id != submission));
+                if self
+                    .draft_came_back
+                    .as_ref()
+                    .is_some_and(|s| s.id == submission && s.words == self.draft.trim())
+                {
+                    self.clear_kept_draft();
+                }
                 if on_it {
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
                 }
@@ -2499,10 +2597,13 @@ impl App {
             }
             Ok(response) => {
                 // Nothing made. Settled, unless an earlier send of these words went unheard.
-                if let Some(i) = at.filter(|&i| !self.submissions[i].unknown) {
+                let unheard = at
+                    .map(|i| self.submissions[i].clone())
+                    .filter(|s| s.unknown);
+                if let Some(i) = at.filter(|_| unheard.is_none()) {
                     self.submissions.remove(i);
                 }
-                let into_box = self.give_back(words.0, words.1);
+                let into_box = self.give_back(words.0, words.1, unheard);
                 self.fail(short(format!(
                     "Your new intent wasn't saved: {} {}.",
                     response.message,
@@ -2510,10 +2611,11 @@ impl App {
                 )));
             }
             Err(error) => {
-                if let Some(i) = at {
+                let unheard = at.map(|i| {
                     self.submissions[i].unknown = true;
-                }
-                let into_box = self.give_back(words.0, words.1);
+                    self.submissions[i].clone()
+                });
+                let into_box = self.give_back(words.0, words.1, unheard);
                 self.fail(format!(
                     "Your new intent may not have been saved ({error}). {}; sending them again never makes a second one.",
                     back(into_box)
