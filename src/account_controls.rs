@@ -863,6 +863,22 @@ impl App {
         None
     }
 
+    /// Whether the machine's backend has a current account to show and set; an older one says
+    /// so when c or C is pressed, and nothing is sent.
+    fn knows_current(&mut self, machine: usize) -> bool {
+        if self
+            .account_feed(machine)
+            .is_some_and(|f| f.knows_current())
+        {
+            return true;
+        }
+        self.say(
+            "This machine's backend has no current account yet: update it to set one here.",
+            Tone::Info,
+        );
+        false
+    }
+
     fn target_current(&self, target: &MoveTarget) -> bool {
         self.card(&target.key)
             .filter(|c| c.machine_index == target.machine)
@@ -1247,6 +1263,14 @@ impl App {
                             *model = 0;
                         }
                     }
+                    // C takes the current account off, from any line (intent 0455). It always asks: the
+                    // backend's answer, not this machine's feed, says whether one was set.
+                    KeyCode::Char('C') => {
+                        if self.knows_current(*machine) {
+                            request =
+                                Some((*machine, json!({"action":"account-current","clear":true})))
+                        }
+                    }
                     KeyCode::Char('+') => {
                         let machine = *machine;
                         let mut choices = self.offered(machine).list();
@@ -1307,6 +1331,16 @@ impl App {
                                             let machines =
                                                 self.signin_order(&code, copy.is_some(), *machine);
                                             return self.begin_needed_signin(code, copy, machines);
+                                        }
+                                        // c makes it the current account, for every
+                                        // machine (intent 0455); the backend says if it already was.
+                                        KeyCode::Char('c') => {
+                                            if self.knows_current(*machine) {
+                                                request = Some((
+                                                    *machine,
+                                                    json!({"action":"account-current","to":code}),
+                                                ));
+                                            }
                                         }
                                         KeyCode::Char('t') => {
                                             request = Some((
@@ -1992,6 +2026,19 @@ impl App {
         let action = request["action"].as_str().unwrap_or("");
         if action == "account-models" && response.ok {
             self.saved_models(machine, &request);
+        }
+        if action == "account-current" && response.ok {
+            // Shown at once on the machine asked; the others' feeds follow as their machines do.
+            let current = if request["clear"] == true {
+                None
+            } else {
+                response.current.clone()
+            };
+            if let Some(feed) = self.machines.get_mut(machine).and_then(|m| m.feed.as_mut())
+                && (current.is_some() || request["clear"] == true)
+            {
+                feed.current = Some(current);
+            }
         }
         if action == "account-move-waiting" {
             self.account_batch_messages.push(format!(
@@ -4317,5 +4364,122 @@ mod tests {
         assert!(!code_ok("KBZ_C", "X") && !code_ok("KBZX", "X") && !code_ok("K_X", "X"));
         assert!(!code_ok("4BZ_X", "X") && !code_ok("ANETS_X", "X") && !code_ok("kbz_x", "X"));
         assert!(code_ok("KBZ", "") && !code_ok("KBZ_C", ""));
+    }
+
+    /// Intent 0455: c makes the selected account current, C clears it, each saying what it did,
+    /// and the answer shows at once on the machine asked.
+    #[test]
+    fn c_sets_the_current_account_and_shift_c_clears_it() {
+        let mut a = app();
+        knows_current(&mut a);
+        a.open_accounts();
+        let action = press(&mut a, 'c');
+        let (mi, request) = sent(action.clone());
+        assert_eq!(mi, 0);
+        assert_eq!(request, json!({"action":"account-current","to":"KBZ_C"}));
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"KBZ_C (Personal) is the current account","current":{"account":"KBZ_C","name":"Personal","since":"2026-11-02T10:00:00-06:00","status":"out","until":"2026-11-03T09:00:00-06:00","machine":"laptop"}}),
+        );
+        let current = a.machines[0]
+            .feed
+            .as_ref()
+            .unwrap()
+            .current_account()
+            .cloned()
+            .unwrap();
+        assert_eq!(current.account, "KBZ_C");
+        assert!(!current.starts_sessions());
+        assert!(current.held_back("here").unwrap().starts_with("out until"));
+        assert!(
+            a.message().unwrap().0.contains("is the current account"),
+            "{:?}",
+            a.message()
+        );
+        let action = press(&mut a, 'C');
+        assert_eq!(
+            sent(action.clone()).1,
+            json!({"action":"account-current","clear":true})
+        );
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"No current account now","current":null}),
+        );
+        assert!(
+            a.machines[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .current_account()
+                .is_none()
+        );
+    }
+
+    /// A refused set changes nothing shown.
+    #[test]
+    fn a_refused_current_account_leaves_the_feed_as_it_was() {
+        let mut a = app();
+        knows_current(&mut a);
+        a.open_accounts();
+        let action = press(&mut a, 'c');
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"no account KBZ_C"}),
+        );
+        assert!(
+            a.machines[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .current_account()
+                .is_none()
+        );
+    }
+
+    /// Every feed says null: a backend that has a current account, none set.
+    fn knows_current(a: &mut App) {
+        for m in a.machines.iter_mut() {
+            if let Some(f) = m.feed.as_mut() {
+                f.current = Some(None);
+            }
+        }
+    }
+
+    /// Codex's review: a feed not yet caught up never stops c or C. Set on the laptop, the build
+    /// box's feed still says none, and C there still asks its backend, which knows better; c on
+    /// the account a feed already calls current asks too.
+    #[test]
+    fn c_and_shift_c_ask_the_backend_whatever_a_feed_still_says() {
+        let mut a = app();
+        knows_current(&mut a);
+        a.open_accounts();
+        let action = press(&mut a, 'c');
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"set","current":{"account":"KBZ_C","status":"ready"}}),
+        );
+        key(&mut a, KeyCode::Tab);
+        let (mi, request) = sent(press(&mut a, 'C'));
+        assert_eq!(mi, 1);
+        assert_eq!(request, json!({"action":"account-current","clear":true}));
+        a.account_pending = None;
+        key(&mut a, KeyCode::Tab);
+        let (mi, request) = sent(press(&mut a, 'c'));
+        assert_eq!(mi, 0);
+        assert_eq!(request, json!({"action":"account-current","to":"KBZ_C"}));
+    }
+
+    /// An older backend, whose feed has no `current` at all: c and C send nothing and say why.
+    #[test]
+    fn an_older_backend_is_never_sent_a_current_account() {
+        let mut a = app();
+        a.open_accounts();
+        assert!(matches!(press(&mut a, 'c'), Action::None));
+        assert!(matches!(press(&mut a, 'C'), Action::None));
+        assert!(a.message().unwrap().0.contains("no current account yet"));
     }
 }

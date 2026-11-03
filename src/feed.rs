@@ -42,6 +42,36 @@ pub struct Feed {
     #[serde(default)]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub providers: Vec<crate::accounts::Provider>,
+    /// The one account new sessions start on ahead of every owner's list, as this machine sees
+    /// it: `Some(None)` for the feed's `null` (none set), `None` when the field is absent, an
+    /// older backend that has no current account to show or set (intent 0455).
+    #[serde(
+        default,
+        deserialize_with = "present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub current: Option<Option<crate::accounts::Current>>,
+}
+
+/// A field that's there, even as `null`, is `Some`; only a missing one is `None`.
+fn present<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Ok(Some(Option::<T>::deserialize(d)?))
+}
+
+impl Feed {
+    /// The current account, when one is set.
+    pub fn current_account(&self) -> Option<&crate::accounts::Current> {
+        self.current.as_ref().and_then(Option::as_ref)
+    }
+
+    /// Whether this feed's backend knows the current account, so Kerdr shows and sets it.
+    pub fn knows_current(&self) -> bool {
+        self.current.is_some()
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

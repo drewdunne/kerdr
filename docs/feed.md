@@ -457,9 +457,19 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
     "account":"KBZ_C","how":"list","problem":null,"waiting":{"why":"usage","until":"2026-10-22T09:00:00-05:00"}},
     {"pane":"w2:p1","session":"web","conversation":"another-id","program":"codex","account":"KBZ_X",
     "how":"next","handed_from":{"account":"KBZ_C","program":"claude","conversation":"conversation-id",
-    "why":"usage_limit","at":"2026-10-21T17:44:00-05:00"}}]
+    "why":"usage_limit","at":"2026-10-21T17:44:00-05:00"}}],
+  "current": {"account":"KBZ_X","name":"Personal Codex","since":"2026-10-21T16:00:00-05:00",
+    "status":"ready","until":null,"machine":"build-box"}
 }
 ```
+
+`current` is the **current account**: the one new sessions start on ahead of every owner's
+list, set for every machine at once. It's `null` when none is set. A backend that has no current
+account leaves the field out: Kerdr then shows nothing about it and never sends `account-current`
+there, so a backend that has one always sends the field, `null` included. `status` and `until` are the account's as this feed's machine
+sees it (`ready`, `out`, `sign_in`, `missing`), so each machine's feed says its own: where it
+isn't `ready`, new sessions on that machine start on their lists, and Kerdr shows that machine
+in a warning colour with why. A session started on it has `how: "current"` in `agents`.
 
 ### Providers
 
@@ -534,7 +544,7 @@ Sessions are explicitly assigned to owners, with `default` falling back to `mach
 Unowned sessions are marked on the accounts screen. `owners_source: "mock"` is shown as such.
 
 Cards join their herdr agents to the feed’s agents by **machine, session, and pane**, including
-child cards that name a tab. `how` is `list`, `manual`, `next`, or `handed_over`. An agent's
+child cards that name a tab. `how` is `list`, `manual`, `next`, `found`, `current` (started on the current account), or `handed_over`. An agent's
 `program` is what it runs (one of a provider's `programs`). `handed_from` marks an agent that
 took over from another program: the account and program before, the conversation left there,
 `why` (`usage_limit`, `sign_in`, `manual`, or anything else, shown as words) and `at`. Its card
@@ -559,6 +569,12 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
 | `account-test` | `code`, optional `copy` | status and message |
 | `account-remove` | `code` | removes after Kerdr’s local confirmation |
+| `account-current` | `to` (a code), or `clear: true` | makes it the current account for every machine, or clears it; answers `message` and `current` (the field above, as this machine sees it now, or null) |
+
+`c` on the accounts screen sends `account-current` with `to`, and `C` sends it with `clear`, to
+the machine being viewed, whatever its feed last said (the backend answers if it was already
+so); Kerdr shows the answer's `message`, and its `current` at once on that
+machine, while the other machines' feeds follow as their backends do.
 
 The `S` tick runs `account-move-waiting` on configured feed machines only after the list was
 saved successfully. Unreachable machines are reported rather than silently claimed as moved.
