@@ -2742,13 +2742,12 @@ fn confirm(
 }
 
 /// The Kickoff Questions box (intent 0409): what it is, then one question, whole. On a screen too
-/// small for all of it, the recommendation stays in sight above the answer box, since ⏎ takes it, and
-/// the question's text above it scrolls.
+/// small for all of it, its text scrolls, and ⏎ shows the rest before it can take the recommendation.
 fn kickoff(f: &mut Frame, area: Rect, form: &Kickoff) {
     let question = form.question();
     let many = form.questions.len() > 1;
-    let width = 100.min(area.width.saturating_sub(2));
-    let w = width.saturating_sub(8).max(1) as usize;
+    let box_width = 100.min(area.width.saturating_sub(2));
+    let w = box_width.saturating_sub(8).max(1) as usize;
     let mut above = wrapped(
         if many {
             "Answer these and it runs on its own from start to finish. It starts after the last one."
@@ -2772,28 +2771,31 @@ fn kickoff(f: &mut Frame, area: Rect, form: &Kickoff) {
     if !question.background.is_empty() {
         above.extend(wrapped(&question.background, w, fg(DIM), None));
     }
-    let mut pinned: Vec<Line> = Vec::new();
     if form.recommends() {
-        pinned.push(Line::from(vec![
-            Span::styled("Recommended", bold(CYAN)),
-            Span::raw("  "),
-            Span::styled(question.pick.clone(), bold(FG)),
-        ]));
+        above.push(Line::raw(""));
+        let label = "Recommended";
+        if width(label) + 2 + width(&question.pick) <= w {
+            above.push(Line::from(vec![
+                Span::styled(label, bold(CYAN)),
+                Span::raw("  "),
+                Span::styled(question.pick.clone(), bold(FG)),
+            ]));
+        } else {
+            above.push(Line::styled(label, bold(CYAN)));
+            above.extend(wrapped(&question.pick, w, bold(FG), None));
+        }
         if !question.why.is_empty() {
-            pinned.extend(wrapped(&question.why, w, fg(DIM), None));
+            above.extend(wrapped(&question.why, w, fg(DIM), None));
         }
     }
     if let Some(note) = &form.note {
-        if !pinned.is_empty() {
-            pinned.push(Line::raw(""));
-        }
-        pinned.extend(wrapped(note, w, fg(YELLOW), None));
+        above.push(Line::raw(""));
+        above.extend(wrapped(note, w, fg(YELLOW), None));
     }
-    let gap = u16::from(!pinned.is_empty());
     // Its border 2, its title row and a blank 2, the answer box and a blank each side 6, and two
     // rows of keys.
-    let height = (above.len() + pinned.len()) as u16 + gap + 12;
-    let rect = centered(area, width, height, None);
+    let height = above.len() as u16 + 12;
+    let rect = centered(area, box_width, height, None);
     dialog(f, rect, PURPLE);
     let inner = pad(rect, 3, 1);
     let of = if many {
@@ -2825,25 +2827,14 @@ fn kickoff(f: &mut Frame, area: Rect, form: &Kickoff) {
     let answer_y = inner.bottom().saturating_sub(keys + 1 + answer_rows);
     let top = inner.y + 2;
     let room = answer_y.saturating_sub(top + 1);
-    // What's pinned gets its rows first, leaving at least two for the question.
-    let pinned_rows = (pinned.len() as u16).min(room.saturating_sub(2 + gap));
-    let above_rows = room.saturating_sub(pinned_rows + gap);
-    let most = (above.len() as u16).saturating_sub(above_rows);
+    let most = (above.len() as u16).saturating_sub(room);
     form.scroll_most.set(most);
     form.scroll.set(form.scroll.get().min(most));
     f.render_widget(
         Paragraph::new(above).scroll((form.scroll.get(), 0)),
         Rect {
             y: top,
-            height: above_rows,
-            ..inner
-        },
-    );
-    f.render_widget(
-        Paragraph::new(pinned),
-        Rect {
-            y: top + above_rows + gap,
-            height: pinned_rows,
+            height: room,
             ..inner
         },
     );
@@ -2886,6 +2877,8 @@ fn kickoff(f: &mut Frame, area: Rect, form: &Kickoff) {
     };
     f.render_widget(Paragraph::new(shown), field);
     let enter = match (form.is_last(), typed.trim().is_empty()) {
+        // ⏎ never takes what you couldn't see.
+        (_, true) if form.recommends() && form.scroll.get() < most => "show the rest of it",
         (false, true) => "take the recommendation",
         (false, false) => "keep your answer",
         (true, true) => "take the recommendation and start it",
@@ -5649,26 +5642,64 @@ mod tests {
             back: Box::new(Mode::Board),
             target: None,
         };
-        for (w, h) in [(80, 24), (60, 20)] {
-            let text = rendered(&a, w, h);
-            assert!(text.contains("BACKGROUND TASK"), "{w}x{h}: {text}");
-            assert!(text.contains("Type your own answer"), "{w}x{h}: {text}");
-            assert!(text.contains("esc"), "{w}x{h}: {text}");
-            // ⏎ takes the recommendation, so it's always in sight, and the rest can be reached.
-            assert!(text.contains("Recommended  Kibbelz"), "{w}x{h}: {text}");
-            assert!(text.contains("it sounds like your"), "{w}x{h}: {text}");
+        let text = rendered(&a, 80, 24);
+        for want in [
+            "BACKGROUND TASK",
+            "Type your own answer",
+            "esc",
+            "Recommended  Kibbelz",
+            "take the recommendation",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
         }
-        // Too small for all of it: the rest is a key away.
+        // Too small for all of it: the rest is a key away, and ⏎ shows it before it can take it.
         let text = rendered(&a, 60, 20);
-        assert!(text.contains("pgdn"), "{text}");
-        assert!(!text.contains("words."), "{text}");
+        for want in [
+            "BACKGROUND TASK",
+            "Type your own answer",
+            "esc",
+            "pgdn",
+            "show the rest of it",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        assert!(!text.contains("Recommended"), "{text}");
         let Mode::Kickoff { form, .. } = &a.mode else {
             panic!()
         };
         form.scroll.set(u16::MAX);
         let text = rendered(&a, 60, 20);
-        assert!(text.contains("words."), "{text}");
-        assert!(text.contains("Recommended  Kibbelz"), "{text}");
+        for want in [
+            "Recommended  Kibbelz",
+            "it sounds like your",
+            "take the recommendation",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_long_recommendation_can_be_read_whole_on_a_small_screen() {
+        let mut form = kickoff_form();
+        form.questions[0].pick =
+            "A pick that is much too long to fit beside its label on this screen".into();
+        form.questions[0].why = format!("{}the very end", "A reason that goes on. ".repeat(12));
+        let mut a = demo(false);
+        a.mode = Mode::Kickoff {
+            form,
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        let Mode::Kickoff { form, .. } = &a.mode else {
+            panic!()
+        };
+        rendered(&a, 60, 20);
+        form.scroll.set(u16::MAX);
+        let text = rendered(&a, 60, 20);
+        assert!(text.contains("the very end"), "{text}");
+        form.scroll.set(form.scroll.get().saturating_sub(4));
+        let text = rendered(&a, 60, 20);
+        assert!(!text.contains("the very end"), "{text}");
     }
 
     #[test]

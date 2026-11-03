@@ -216,6 +216,12 @@ impl App {
                         "This one has no recommendation, so it needs your own answer.",
                         Tone::Info,
                     );
+                } else if form.typed().trim().is_empty()
+                    && form.scroll.get() < form.scroll_most.get()
+                {
+                    // Its recommendation isn't all on screen, and ⏎ never takes what you can't see.
+                    form.scroll.set(form.scroll_most.get());
+                    form.ready_at = Instant::now() + READY_AFTER;
                 } else if form.is_last() {
                     self.mode = *back;
                     return self.leave_kickoff(form, target, Leaving::Start);
@@ -223,6 +229,7 @@ impl App {
                     form.at += 1;
                     form.reached = form.reached.max(form.at);
                     form.scroll.set(0);
+                    form.scroll_most.set(0);
                     form.ready_at = Instant::now() + READY_AFTER;
                 }
             }
@@ -737,6 +744,41 @@ mod tests {
         assert_eq!(form.question().question, "Whose[2J is it?");
         assert_eq!(form.question().pick, "Kibbelz");
         assert!(!form.note.unwrap().contains(char::is_control));
+    }
+
+    #[test]
+    fn enter_shows_the_rest_before_it_can_take_a_recommendation_off_the_screen() {
+        let mut app = open(&answer());
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!()
+        };
+        form.scroll_most.set(5);
+        assert!(matches!(key(&mut app, KeyCode::Enter), Action::None));
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!()
+        };
+        assert_eq!(
+            (form.at, form.scroll.get()),
+            (0, 5),
+            "it scrolled, and took nothing"
+        );
+        key(&mut app, KeyCode::Enter);
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!()
+        };
+        assert_eq!(form.at, 1, "seen, it takes it");
+        // Your own words need nothing scrolled.
+        let mut app = open(&answer());
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!()
+        };
+        form.scroll_most.set(5);
+        typed(&mut app, "mine");
+        key(&mut app, KeyCode::Enter);
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!()
+        };
+        assert_eq!(form.at, 1);
     }
 
     #[test]
