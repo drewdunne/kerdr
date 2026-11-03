@@ -667,6 +667,14 @@ impl Resolver {
             .find(|j| j.starts() && j.record() == Some(id))
     }
 
+    /// The newest unanswered change shown on this card, by its key.
+    pub fn unanswered_on(&self, key: &str) -> Option<&Job> {
+        self.jobs
+            .iter()
+            .rev()
+            .find(|j| j.settled.is_none() && j.effect.is_some() && j.key.as_deref() == Some(key))
+    }
+
     /// The unanswered change sending this action for this record, oldest first.
     pub fn unanswered_for(&self, action: &str, id: Option<&str>) -> Option<u64> {
         self.jobs
@@ -681,13 +689,6 @@ impl Resolver {
         self.jobs
             .iter()
             .any(|j| j.settled.is_none() && j.starts() && j.from.is_some())
-    }
-
-    /// Whether a new intent is on its way.
-    pub fn creating(&self) -> bool {
-        self.jobs
-            .iter()
-            .any(|j| j.settled.is_none() && j.request["action"] == "create")
     }
 
     /// The oldest unanswered change whose request `matches`.

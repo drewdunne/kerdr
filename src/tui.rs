@@ -1012,4 +1012,86 @@ mod tests {
         );
         assert_eq!((j.tab, j.strict), (None, false));
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runner_starts_a_record_s_next_change_without_the_board() {
+        // Nothing reads the answers while it runs, as while Andrew is inside a workspace: the
+        // second change to the record still starts once the first has answered (intent 0445).
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let command =
+            "cat >/dev/null\nsleep 0.2\nprintf '%s' '{\"ok\":true,\"message\":\"done\"}'\n";
+        for n in [1, 2] {
+            runner
+                .tx
+                .send(ToRunner::Run {
+                    n,
+                    machine: 0,
+                    key: Some("here:7".into()),
+                    target: machine.clone(),
+                    command: command.into(),
+                    request: serde_json::json!({"action":"move","id":"7","delta":1}),
+                })
+                .unwrap();
+        }
+        let mut seen = vec![];
+        while seen.len() < 4 {
+            match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+                Answer::Started(n) => seen.push(format!("started {n}")),
+                Answer::Done(done) => {
+                    assert!(done.3.as_ref().is_ok_and(|r| r.ok), "{:?}", done.3);
+                    seen.push(format!("done {}", done.0.unwrap()));
+                }
+            }
+        }
+        assert_eq!(seen, ["started 1", "done 1", "started 2", "done 2"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_refused_for_another_home_holds_its_card_s_place_until_sent_on() {
+        // J is refused, naming another home: K waits while the board sends J on, and J, sent
+        // again to the other machine, goes before K (intent 0416).
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let answer = |json: &str| format!("cat >/dev/null\nprintf '%s' '{json}'\n");
+        let refused = answer(r#"{"ok":false,"message":"lives elsewhere","home":"there/ARK"}"#);
+        let ok = answer(r#"{"ok":true,"message":"done"}"#);
+        let run = |n: u64, machine_index: usize, command: &str| ToRunner::Run {
+            n,
+            machine: machine_index,
+            key: Some("here:7".into()),
+            target: machine.clone(),
+            command: command.into(),
+            request: serde_json::json!({"action":"move","id":"7","delta":1}),
+        };
+        runner.tx.send(run(1, 0, &refused)).unwrap();
+        runner.tx.send(run(2, 0, &ok)).unwrap();
+        let next = |wait: u64| match rx.recv_timeout(Duration::from_millis(wait)) {
+            Ok(Answer::Started(n)) => Some(format!("started {n}")),
+            Ok(Answer::Done(done)) => Some(format!("done {}", done.0.unwrap())),
+            Err(_) => None,
+        };
+        assert_eq!(next(10_000).as_deref(), Some("started 1"));
+        assert_eq!(next(10_000).as_deref(), Some("done 1"));
+        assert_eq!(next(500), None, "K waits while J is sent on");
+        runner.tx.send(run(1, 1, &ok)).unwrap();
+        let seen: Vec<String> = (0..4).filter_map(|_| next(10_000)).collect();
+        assert_eq!(seen, ["started 1", "done 1", "started 2", "done 2"]);
+    }
 }

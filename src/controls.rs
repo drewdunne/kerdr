@@ -1691,9 +1691,18 @@ impl App {
         self.resolver
             .add(machine, request, None, Some(key.clone()), effect);
         if self.closed_on_send && matches!(self.mode, Mode::Backlog { .. }) {
-            self.backlog_focus = Some(key);
+            self.backlog_focus = Some(key.clone());
         }
         self.rebuild();
+        // Its card can't show where you are (a filter hides it, or its machine has no feed yet):
+        // say so instead.
+        if !self
+            .backlog_cards()
+            .iter()
+            .any(|&i| self.board.cards[i].key == key)
+        {
+            self.say("Saving your new intent…", Tone::Info);
+        }
     }
 
     /// What the board shows for a change while it's on its way: what the backend will make of the
@@ -1793,8 +1802,12 @@ impl App {
                 }
                 _ => {}
             }
-            // It stays as shown until the feed has it.
+            // It stays as shown until the feed has it; a start answered yes moves on now.
+            let changes = matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
             self.resolver.settle(job);
+            if changes {
+                self.rebuild();
+            }
         } else {
             refused = Some(job);
         }
@@ -1912,8 +1925,9 @@ impl App {
         Some(Action::None)
     }
 
-    /// What a card's own screen and its peek say while its start or reopen is on its way: "Starting
-    /// up · 12 s · ⏎ goes in once its workspace opens" (intent 0445).
+    /// What a card's own screen and its peek say while a change to it is on its way: "◐ Starting
+    /// up · 12 s so far · ⏎ goes in as soon as its workspace opens", "◐ Marking it done… 2 s"
+    /// (intent 0445).
     pub fn starting_line(&self, card: &Card) -> Option<String> {
         let id = card.detail.as_ref()?.id.as_str();
         if card.intake() == Some(crate::resolve::SAVING) {
@@ -1924,7 +1938,21 @@ impl App {
                 "Being written up from your words; it starts as soon as that's done.".into(),
             );
         }
-        let job = self.resolver.starting(id)?;
+        let Some(job) = self.resolver.starting(id) else {
+            // Any other change still on its way: shown as done, but not yet saved.
+            let job = self.resolver.unanswered_on(&card.key)?;
+            let secs = job.asked.elapsed().as_secs();
+            let what = match job.request["action"].as_str() {
+                Some("close") => "Marking it done",
+                Some("dismiss") => "Setting it aside",
+                Some("cancel") => "Setting it aside: stopping its agent",
+                Some("restore") => "Bringing it back",
+                Some("refresh") => "Saving that you still want it",
+                Some("move") => "Moving it",
+                _ => "Saving the change",
+            };
+            return Some(format!("◐ {what}… {secs} s"));
+        };
         if card.is_open_workspace() {
             return None;
         }

@@ -632,6 +632,12 @@ fn details(
         facts.push(format!("{} of {r}", l.label()));
     }
     let (p, _) = place(app, c, holder, itself);
+    // A change on its way that its place doesn't already say (intent 0445).
+    if !p.starts_with('◐')
+        && let Some(line) = app.starting_line(c)
+    {
+        facts.push(line);
+    }
     facts.push(p);
     if c.machine_index != holder.machine_index || itself {
         facts.push(format!("on {}", c.machine));

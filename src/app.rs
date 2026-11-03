@@ -6699,4 +6699,258 @@ mod tests {
             ))
         );
     }
+
+    #[test]
+    fn enter_on_a_starting_card_goes_into_the_workspace_it_opened() {
+        // Intent 0445: ark-dispatch opens the workspace before its agent takes its brief, and
+        // answers only then. ⏎ goes in as soon as one shows, and says it's starting up till then.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        select_key(&mut app, &key);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        select_key(&mut app, &key);
+        assert_eq!(enter(&mut app), Action::None);
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("is starting up"), "{said}");
+        assert!(said.contains("as soon as its workspace opens"), "{said}");
+        // Its card says so too, wherever it's looked at.
+        let card = app.card(&key).cloned().unwrap();
+        assert!(app.starting_line(&card).unwrap().contains("Starting up"));
+        // x (or C, X) on it says what will work, and when.
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert!(app.message().unwrap().0.contains("X stops it"));
+        // A workspace that was already there isn't its; one named for it that opened since is.
+        let name = app.machines[machine].name();
+        let two = &id[id.len() - 2..];
+        let row = |id: &str| crate::board::WorkspaceRow {
+            machine: name.clone(),
+            session: "web".into(),
+            id: id.into(),
+            label: format!("{two}-the-work"),
+            status: "working".into(),
+            card: None,
+            note: None,
+            cached: false,
+        };
+        let i = app
+            .resolver
+            .unanswered_where(|r| r["action"] == "dispatch")
+            .unwrap();
+        app.resolver
+            .note_workspaces(i, vec![("web".into(), "w-old".into())]);
+        app.board.workspaces.push(row("w-old"));
+        assert_eq!(enter(&mut app), Action::None);
+        app.board.workspaces.push(row("w-new"));
+        assert_eq!(
+            enter(&mut app),
+            Action::JumpWorkspace {
+                machine: name,
+                session: "web".into(),
+                id: "w-new".into()
+            }
+        );
+    }
+
+    #[test]
+    fn d_on_work_being_written_up_starts_it_once_that_s_done() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        let set_intake = |app: &mut App, intake: Option<&str>| {
+            for c in app.machines[machine]
+                .feed
+                .as_mut()
+                .unwrap()
+                .cards
+                .iter_mut()
+            {
+                if c.id == id {
+                    c.intake = intake.map(str::to_string);
+                }
+            }
+            app.rebuild();
+        };
+        set_intake(&mut app, Some("pending"));
+        select_key(&mut app, &key);
+        // Remembered, not refused, and not sent to a backend that would refuse it.
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("starts as soon as that's done"), "{said}");
+        assert_eq!(
+            app.start_written_up(),
+            Action::None,
+            "still being written up"
+        );
+        let card = app.card(&key).cloned().unwrap();
+        assert!(
+            app.starting_line(&card)
+                .unwrap()
+                .contains("Being written up")
+        );
+        // Written up: it starts, wherever he is now.
+        set_intake(&mut app, None);
+        app.mode = Mode::Keys {
+            filter: String::new(),
+            typing: false,
+            scroll: 0,
+        };
+        let Action::Mutate { request, .. } = app.start_written_up() else {
+            panic!("the start wasn't sent: {:?}", app.message())
+        };
+        assert_eq!(
+            (request["action"].as_str(), request["id"].as_str()),
+            (Some("dispatch"), Some(id.as_str()))
+        );
+        assert!(app.start_when_written.is_empty());
+        // Esc on the board drops one still waiting.
+        set_intake(&mut app, Some("pending"));
+        app.mode = Mode::Board;
+        select_key(&mut app, &key);
+        press(&mut app, 'd');
+        esc(&mut app);
+        assert!(app.start_when_written.is_empty());
+        assert!(app.message().unwrap().0.contains("won't start after all"));
+    }
+
+    #[test]
+    fn q_waits_only_for_what_would_be_lost() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        app.queue_action(machine, serde_json::json!({"action": "dispatch", "id": id}));
+        let n = app.resolver.ready()[0].0;
+        // Handed to the runner but not yet started: it would never be sent.
+        assert!(app.quit_held().is_some());
+        app.resolver.started(n);
+        // Running: it finishes without Kerdr, and q says so before it quits.
+        assert_eq!(app.quit_held(), None);
+        let said = app.still_running().unwrap();
+        assert!(
+            said.contains("is still starting; it finishes without Kerdr"),
+            "{said}"
+        );
+        // A new intent holds it until it's answered: its words may still be on their way.
+        let request = send_words(&mut app, "Back up the NAS");
+        app.queue_action(0, request);
+        let n = app.resolver.ready()[0].0;
+        app.resolver.started(n);
+        assert!(app.quit_held().unwrap().contains("new intent"));
+    }
+
+    #[test]
+    fn a_start_asked_for_on_another_machine_shows_as_starting_there() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        let request = serde_json::json!({"action": "dispatch", "id": id});
+        app.queue_action(machine, request.clone());
+        let n = app.resolver.ready()[0].0;
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: "Asked for on far-box: it's starting in web there.".into(),
+                machine: Some("far-box".into()),
+                ..Default::default()
+            }),
+        );
+        let card = app.card(&key).cloned().unwrap();
+        assert_eq!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("Starting on far-box…")
+        );
+        assert_eq!(card.stage, Stage::Backlog, "it hasn't started here");
+        assert!(app.message().unwrap().0.contains("Asked for on far-box"));
+        // Reads go by without the start reaching this copy: it still shows.
+        for _ in 0..3 {
+            let feed = app.machines[machine].feed.clone();
+            app.resolver.read(machine, feed.as_ref());
+        }
+        app.rebuild();
+        assert!(
+            app.card(&key)
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref()
+                == Some("Starting on far-box…")
+        );
+    }
+
+    #[test]
+    fn a_reopen_of_done_work_reads_as_reopening_where_it_is() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.can_reopen_done())
+            .cloned()
+            .expect("done work in the demo");
+        let id = card.detail.as_ref().unwrap().id.clone();
+        app.queue_action(
+            card.machine_index,
+            serde_json::json!({"action": "reopen", "id": id, "override": true}),
+        );
+        let now = app.card(&card.key).unwrap();
+        assert_eq!(now.stage, Stage::Maintain, "it stays where it is");
+        assert_eq!(now.why, "Reopening…");
+        assert_ne!(now.attention, Attention::Done);
+    }
+
+    #[test]
+    fn d_in_the_backlog_view_keeps_the_starting_card_selected_and_takes_no_second_start() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _, _) = waiting_card(&app);
+        app.enter_backlog(false);
+        let at = app
+            .backlog_cards()
+            .iter()
+            .position(|&i| app.board.cards[i].key == key)
+            .unwrap();
+        app.mode = Mode::Backlog { sel: at };
+        app.backlog_focus = Some(key.clone());
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        assert_eq!(
+            app.backlog_card_for_keys().map(|c| c.key.clone()),
+            Some(key.clone()),
+            "the starting card stays, selected"
+        );
+        // d again, or held: the same card, which refuses; never its neighbour.
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert!(app.message().unwrap().0.contains("is starting up"));
+        // Its peek says what's under way, not that it's stalled.
+        let card = app.card(&key).cloned().unwrap();
+        assert!(
+            app.starting_line(&card)
+                .unwrap()
+                .starts_with("◐ Starting up")
+        );
+    }
+
+    #[test]
+    fn a_change_on_its_way_says_so_in_its_peek() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let card = app.card(&key).cloned().unwrap();
+        assert!(
+            app.starting_line(&card)
+                .unwrap()
+                .contains("Marking it done")
+        );
+    }
 }

@@ -3068,7 +3068,11 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
         "WHEN A MACHINE IS IN TROUBLE",
         &[
             ("r", "retry its machine now", "skips the wait"),
-            ("R", "retry every machine now", ""),
+            (
+                "R",
+                "read every machine now, retrying any not answering",
+                "",
+            ),
             (
                 "M ⏎",
                 "answer SSH's prompt for a machine that needs you",
