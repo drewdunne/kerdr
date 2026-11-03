@@ -47,6 +47,17 @@ pub struct Response {
     /// With `account-current`: the current account as the machine asked sees it now, null once
     /// cleared.
     pub current: Option<crate::accounts::Current>,
+    /// With a start: the machine it was asked for on, when that isn't the one asked (intent
+    /// 0445): it starts there within minutes.
+    pub machine: Option<String>,
+}
+
+impl Response {
+    /// A refusal naming another home: Kerdr may send the change on there, in its place (intents
+    /// 0411 and 0416).
+    pub fn sends_on(&self) -> bool {
+        !self.ok && !self.confirmation && self.home.is_some()
+    }
 }
 
 fn confirmation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -107,7 +118,24 @@ fn most_bytes(request: &Value) -> usize {
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
-    run_with_deadline(machine, command, request, deadline_for(request))
+    run_with_deadline(machine, command, request, deadline_for(request), None)
+}
+
+/// As run, calling `handed` once the adapter has the whole request: from then on it carries on
+/// if Kerdr quits (review of intent 0445).
+pub fn run_handing(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    handed: transport::Handed,
+) -> Result<Response, String> {
+    run_with_deadline(
+        machine,
+        command,
+        request,
+        deadline_for(request),
+        Some(handed),
+    )
 }
 
 /// How long an action may take before Kerdr stops waiting. Starting or reopening work can take
@@ -144,6 +172,7 @@ fn run_with_deadline(
     command: &str,
     request: &Value,
     deadline: Duration,
+    handed: Option<transport::Handed>,
 ) -> Result<Response, String> {
     if command.trim().is_empty() {
         return Err("actions are disabled; configure [actions] command".into());
@@ -164,7 +193,7 @@ fn run_with_deadline(
         None => Target::Local,
     };
     // The configured command is source; user data is JSON on stdin, never source.
-    let output = transport::run_adapter(&target, command, Some(&json), deadline);
+    let output = transport::run_adapter_handing(&target, command, Some(&json), deadline, handed);
     let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
         if starts_work(request) {
@@ -194,7 +223,7 @@ fn run_with_deadline(
     // so parse it before interpreting process status.
     parse_response(&output.stdout).map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.user_code, &mut response.expires].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires].into_iter().flatten() {
             *text = redact(text);
         }
         // A status the protocol knows stays as it is, even when it matches what was sent (a code
@@ -505,6 +534,7 @@ mod tests {
             &command,
             &json!({"action":"refresh","id":"4"}),
             Duration::from_millis(60),
+            None,
         )
         .unwrap_err();
         assert!(error.contains("timed out"), "{error}");
@@ -541,6 +571,7 @@ mod tests {
                 &command,
                 &json!({"action":action,"id":"0391"}),
                 Duration::from_millis(60),
+                None,
             )
             .unwrap_err();
             assert!(error.starts_with(verb), "{error}");

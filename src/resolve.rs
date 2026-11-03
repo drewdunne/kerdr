@@ -9,16 +9,28 @@
 //! then the feed alone speaks. When it fails, or the backend asks a question first, the effect goes
 //! at once, so the card is back as it really is, and the app says so where it can't be missed.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::board::MachineState;
-use crate::feed::{Feed, FeedCard};
+use crate::feed::{Feed, FeedCard, Home};
 use crate::model::CardSnapshot;
+
+/// The intake a new intent's card has while its words are still being saved (intent 0445): no
+/// record exists yet, so nothing may be done to it.
+pub const SAVING: &str = "saving";
+
+/// What a start that waited for its intent's write-up says when the write-up failed (intent 0445).
+pub const NOT_WRITTEN_UP: &str =
+    "couldn't be written up from your words, so it didn't start; d starts it as it is.";
 
 /// How long a settled effect may stay without the feed showing it.
 const SETTLED_MOST: Duration = Duration::from_secs(60);
+/// How long a start asked for on another machine shows as starting there: a start over SSH may
+/// take four minutes, and the requests pass there two (intent 0445).
+const ELSEWHERE_MOST: Duration = Duration::from_secs(300);
 /// How many of its machine's reads a settled effect waits for: the first may have started before
 /// the change was saved.
 const SETTLED_READS: u8 = 2;
@@ -31,6 +43,9 @@ pub enum Effect {
     Starting,
     /// `dispatch`, answered yes: out of the backlog, under way.
     Started,
+    /// `dispatch`, answered yes by a start asked for on another machine (named), which takes
+    /// minutes there: where it is, saying it's starting there, until it reaches this copy.
+    StartingOn(String),
     /// `reopen`: where it is, saying so.
     Reopening,
     /// `close`: done.
@@ -44,6 +59,84 @@ pub enum Effect {
     /// `move`: the backlog's new order for the records it reorders, by card key, as the backend
     /// writes it (0, 1, 2… within the moved card's group).
     Order(Vec<(String, i64)>),
+    /// `create`: a card for the new intent in its machine's backlog, saying it's being saved, until
+    /// the feed has the record the answer names (intent 0445).
+    Saving(Placeholder),
+}
+
+/// The card a new intent shows as while it's saved: Andrew's first words, in the backlog of the
+/// machine and session they went to.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Placeholder {
+    /// Its id in that machine's feed, `saving-<submission>`: never a record's, which are numbers.
+    pub id: String,
+    pub title: String,
+    pub machine: String,
+    pub session: String,
+    /// The source of the store it's saved in (its machine's feed's), where `made` is a record.
+    pub source: String,
+    /// The record the save made, once its answer names it: the card goes once the feed has it.
+    pub made: Option<String>,
+}
+
+impl Placeholder {
+    /// The id its card has for a submission.
+    pub fn id_for(submission: &str) -> String {
+        format!("saving-{submission}")
+    }
+
+    /// Its title: the start of his words, on one line.
+    pub fn title_for(words: &str) -> String {
+        let line = words.split_whitespace().collect::<Vec<_>>().join(" ");
+        match line.char_indices().nth(72) {
+            Some((at, _)) => format!("{}…", line[..at].trim_end()),
+            None => line,
+        }
+    }
+
+    /// The submission it was sent with.
+    pub fn submission(&self) -> &str {
+        self.id.strip_prefix("saving-").unwrap_or(&self.id)
+    }
+
+    /// Whether this feed, any machine's, has the record the save made: one that carries its
+    /// submission, which the record's header has from the moment it's written, before the answer
+    /// comes; or the record the answer named, in a copy of the store it went to (intent 0445).
+    pub fn made_in(&self, feed: &Feed) -> bool {
+        let source = feed.source.as_deref().unwrap_or("feed");
+        let submission = self.submission();
+        feed.cards.iter().any(|c| {
+            c.submission.as_deref() == Some(submission)
+                || (source == self.source && self.made.as_ref().is_some_and(|id| &c.id == id))
+        })
+    }
+
+    /// Its card. Saved a while ago and still not read (`late`), it says so rather than going.
+    fn card(&self, late: bool) -> FeedCard {
+        let status = match (&self.made, late) {
+            (Some(id), true) => format!(
+                "Saved as #{}; not on the board yet",
+                id.trim_start_matches('0')
+            ),
+            _ => "Saving…".into(),
+        };
+        FeedCard {
+            id: self.id.clone(),
+            reference: Some("new".into()),
+            title: self.title.clone(),
+            stage: Some("backlog".into()),
+            state: Some("queued".into()),
+            intake: Some(SAVING.into()),
+            status: Some(status),
+            home: Some(Home {
+                machine: Some(self.machine.clone()),
+                session: Some(self.session.clone()),
+            }),
+            created: Some(chrono::Local::now().date_naive().to_string()),
+            stale_days: Some(0),
+            ..Default::default()
+        }
+    }
 }
 
 impl Effect {
@@ -53,6 +146,15 @@ impl Effect {
             Effect::Starting => {
                 fc.status = Some("Starting…".into());
                 fc.no_agent = false;
+            }
+            Effect::StartingOn(machine) => {
+                // A copy that already shows it under way speaks for itself (intent 0445).
+                let state = fc.state.as_deref().unwrap_or("active");
+                let open = fc.workspace.as_ref().is_some_and(|w| w.id.is_some());
+                if matches!(state, "queued" | "shelved" | "none") && !open {
+                    fc.status = Some(format!("Starting on {machine}…"));
+                    fc.no_agent = false;
+                }
             }
             Effect::Started => {
                 fc.state = Some("active".into());
@@ -78,7 +180,15 @@ impl Effect {
                 fc.status = Some("Starting…".into());
                 fc.no_agent = false;
             }
+            // Where it is, saying so: done work stays in Maintain, but no longer reads done, and
+            // work under way no longer reads what it waited on before (intent 0445).
             Effect::Reopening => {
+                if fc.state.as_deref() == Some("closed") {
+                    fc.state = Some("active".into());
+                }
+                fc.attention = Some("running".into());
+                fc.needs = None;
+                fc.blockers.clear();
                 fc.status = Some("Reopening…".into());
                 fc.no_agent = false;
             }
@@ -96,13 +206,15 @@ impl Effect {
             Effect::Restore => fc.disposition = None,
             Effect::Refresh(date) => {
                 fc.refreshed_at = Some(date.clone());
-                fc.stale_days = None;
+                fc.stale_days = Some(0);
             }
             Effect::Order(order) => {
                 if let Some((_, rank)) = order.iter().find(|(k, _)| k == key) {
                     fc.backlog_rank = Some(*rank);
                 }
             }
+            // Its card is added, not changed: Resolver::overlay.
+            Effect::Saving(_) => {}
         }
     }
 
@@ -112,7 +224,7 @@ impl Effect {
         match self {
             // Only a record that says so: a feed with no state, or a read begun before the start,
             // mustn't let a second start through.
-            Effect::Starting | Effect::Started => {
+            Effect::Starting | Effect::Started | Effect::StartingOn(_) => {
                 fc.state
                     .as_deref()
                     .is_some_and(|s| !matches!(s, "queued" | "shelved" | "none"))
@@ -135,8 +247,18 @@ impl Effect {
                     .iter()
                     .all(|(k, r)| rank(k).is_none_or(|got| got == Some(*r)))
             }
+            Effect::Saving(p) => p.made_in(feed),
         }
     }
+}
+
+/// What the runner starting a change means for the board (Resolver::started).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Started {
+    /// A start that waited for its write-up: it shows from now.
+    pub shows_now: bool,
+    /// Esc dropped it a moment after its write-up was read and it began: it goes on.
+    pub too_late: bool,
 }
 
 /// One change on its way to the backend.
@@ -152,10 +274,26 @@ pub struct Job {
     pub key: Option<String>,
     pub effect: Option<Effect>,
     pub asked: Instant,
+    /// Handed to the runner, which starts it in its turn (intent 0445).
+    pub sent: bool,
     /// When its command started; None while it waits behind another change to the same record.
     pub running: Option<Instant>,
+    /// For a start or reopen: the workspaces its machine had when it was asked, so one that opens
+    /// for it meanwhile can be told apart (intent 0445).
+    pub before: Vec<(String, String)>,
     /// Succeeded: when, and how many of its machine's reads have come since.
     pub settled: Option<(Instant, u8)>,
+    /// A start d asked for while its intent was still being written up: the runner holds it until
+    /// its machine's feed shows the write-up done, wherever Andrew is meanwhile (intent 0445).
+    pub gated: bool,
+    /// Andrew has gone into the workspace it opened himself, so its answer takes him nowhere.
+    pub entered: bool,
+    /// Its whole request is in its command's hands (written to the adapter's input), so it
+    /// carries on if Kerdr quits (review of intent 0445).
+    pub handed: bool,
+    /// A start waiting for its write-up that Esc dropped: gone once the runner says it never
+    /// started, or shown again if it already had (review of intent 0445).
+    pub dropping: bool,
 }
 
 impl Job {
@@ -173,12 +311,172 @@ impl Job {
     fn moves(&self) -> bool {
         self.request["action"] == "move"
     }
+
+    /// How long its effect may stay, settled, without the feed showing it. A new intent's card
+    /// stays until its record is read, however long that takes: its card says so once it's late
+    /// (review of intent 0445).
+    fn life(&self) -> Duration {
+        match self.effect {
+            Some(Effect::StartingOn(_)) => ELSEWHERE_MOST,
+            Some(Effect::Saving(_)) => Duration::MAX,
+            _ => SETTLED_MOST,
+        }
+    }
+
+    /// Whether only the feed showing it retires it, not a count of reads.
+    fn waits_for_feed(&self) -> bool {
+        matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
+    }
+
+    /// The record it changes, by id.
+    pub fn id(&self) -> Option<&str> {
+        self.record()
+    }
+
+    /// Whether it's a start still waiting for its intent's write-up: not started, nor shown.
+    pub fn waits_for_write_up(&self) -> bool {
+        self.gated && self.running.is_none() && self.settled.is_none()
+    }
+
+    /// Whether any machine's read may show it: a start that ran on another machine reaches
+    /// copies there first, and a new intent may reach any copy of its store first.
+    fn shows_anywhere(&self) -> bool {
+        matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
+    }
+}
+
+/// The order changes run in, kept by the runner away from the board's thread, so a change whose
+/// turn comes while Andrew is inside a workspace starts then (intent 0445): each record's changes
+/// one at a time, a machine's moves one at a time, everything else side by side. A record is its
+/// card, wherever a refusal sent its change, else its id on one machine (intent 0416).
+#[derive(Debug, Default)]
+pub struct Queue {
+    items: Vec<Queued>,
+}
+
+#[derive(Debug)]
+struct Queued {
+    n: u64,
+    machine: usize,
+    record: Option<String>,
+    key: Option<String>,
+    moves: bool,
+    started: bool,
+    /// Waiting for its record's write-up (a start d asked for while it was written up).
+    gated: bool,
+}
+
+impl Queued {
+    /// Whether `other` changes the same record.
+    fn same(&self, other: &Queued) -> bool {
+        (self.key.is_some() && other.key == self.key)
+            || (self.record.is_some()
+                && other.record == self.record
+                && other.machine == self.machine)
+    }
+}
+
+impl Queue {
+    /// Takes a change in its turn. One already here, refused and sent on to another machine, goes
+    /// back where it was, to start again there before anything behind it for its record.
+    pub fn push(&mut self, n: u64, machine: usize, key: Option<String>, request: &Value) {
+        let item = Queued {
+            n,
+            machine,
+            record: request["id"].as_str().map(str::to_string),
+            key,
+            moves: request["action"] == "move",
+            started: false,
+            gated: false,
+        };
+        match self.items.iter_mut().find(|j| j.n == n) {
+            Some(held) => *held = item,
+            None => self.items.push(item),
+        }
+    }
+
+    /// A start that waits for its record's write-up before it may start, as `written` finds it.
+    pub fn push_gated(&mut self, n: u64, machine: usize, key: Option<String>, request: &Value) {
+        self.push(n, machine, key, request);
+        if let Some(item) = self.items.iter_mut().find(|j| j.n == n) {
+            item.gated = item.record.is_some();
+        }
+    }
+
+    /// A read of `machine`'s feed: each record there by id, with its intake. Starts waiting for a
+    /// record it shows written up may start; ones whose write-up failed are taken out, and
+    /// returned, since starting an intent nobody wrote up isn't what d was pressed for.
+    pub fn written(
+        &mut self,
+        machine: usize,
+        intakes: &HashMap<String, Option<String>>,
+    ) -> Vec<u64> {
+        let mut failed = vec![];
+        for q in self
+            .items
+            .iter_mut()
+            .filter(|q| q.gated && q.machine == machine)
+        {
+            match q.record.as_ref().and_then(|r| intakes.get(r)) {
+                Some(None) => q.gated = false,
+                Some(Some(intake)) if intake == "failed" => failed.push(q.n),
+                _ => {}
+            }
+        }
+        self.items.retain(|q| !failed.contains(&q.n));
+        failed
+    }
+
+    /// Takes out a change that hasn't started (a start Esc dropped). Whether it was still there
+    /// unstarted.
+    pub fn drop_unstarted(&mut self, n: u64) -> bool {
+        let before = self.items.len();
+        self.items.retain(|q| q.n != n || q.started);
+        self.items.len() != before
+    }
+
+    /// The changes that can start now, marked started: each record's oldest one, once nothing
+    /// ahead of it for that record (or, for a move, that machine's backlog) is still running or
+    /// held, and nothing behind it that it would clash with is running: a change refused and sent
+    /// on goes back in its place, but a later move may already be running where it now goes.
+    /// A request with no record (a new intent) starts straight away.
+    pub fn startable(&mut self) -> Vec<u64> {
+        let mut out = vec![];
+        for i in 0..self.items.len() {
+            let job = &self.items[i];
+            if job.started || job.gated {
+                continue;
+            }
+            let clashes =
+                |j: &Queued| job.same(j) || (job.moves && j.moves && j.machine == job.machine);
+            let ahead = self.items[..i].iter().any(clashes);
+            let running_behind = self.items[i + 1..].iter().any(|j| j.started && clashes(j));
+            if ahead || running_behind {
+                continue;
+            }
+            self.items[i].started = true;
+            out.push(self.items[i].n);
+        }
+        out
+    }
+
+    /// A change's command has answered and it's finished with: the next for its record may start.
+    /// One whose refusal may send it on stays held until the board says (Resolver::sent_on).
+    pub fn done(&mut self, n: u64) {
+        self.items.retain(|j| j.n != n);
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, Default)]
 pub struct Resolver {
     jobs: Vec<Job>,
     next: u64,
+    /// Changes the runner holds that were dropped before they started: it's told on its next pass.
+    dropped: Vec<u64>,
 }
 
 impl Resolver {
@@ -200,42 +498,191 @@ impl Resolver {
             key,
             effect,
             asked: Instant::now(),
+            sent: false,
             running: None,
+            before: vec![],
             settled: None,
+            gated: false,
+            entered: false,
+            handed: false,
+            dropping: false,
         });
         self.next
     }
 
-    /// The changes that can start now, marked running: each record's oldest unanswered one, once
-    /// nothing ahead of it for that record is still running. A request with no record (a new
-    /// intent) runs straight away.
-    pub fn ready(&mut self) -> Vec<(u64, usize, Value)> {
-        let mut out = vec![];
-        for i in 0..self.jobs.len() {
-            let job = &self.jobs[i];
-            if job.running.is_some() || job.settled.is_some() {
-                continue;
-            }
-            // The same record: the same card, wherever a refusal sent its change, else the same
-            // id on the same machine.
-            let same = |j: &Job| {
-                (job.key.is_some() && j.key == job.key)
-                    || (job.record().is_some()
-                        && j.record() == job.record()
-                        && j.machine == job.machine)
-            };
-            let ahead = self.jobs[..i].iter().any(|j| {
-                j.settled.is_none()
-                    && (same(j) || (job.moves() && j.moves() && j.machine == job.machine))
-            });
-            if ahead {
-                continue;
-            }
-            let job = &mut self.jobs[i];
-            job.running = Some(Instant::now());
-            out.push((job.n, job.machine, job.request.clone()));
+    /// Takes a start d asked for while its intent is still being written up: it shows nothing,
+    /// and the runner starts it once its machine's feed shows the write-up done (intent 0445).
+    pub fn add_gated(
+        &mut self,
+        machine: usize,
+        request: Value,
+        from: Option<CardSnapshot>,
+        key: Option<String>,
+        effect: Option<Effect>,
+    ) -> u64 {
+        let n = self.add(machine, request, from, key, effect);
+        if let Some(j) = self.jobs.last_mut() {
+            j.gated = true;
         }
-        out
+        n
+    }
+
+    /// The changes not yet handed to the runner, marked handed, each with whether it waits for a
+    /// write-up: it starts each in its turn (Queue), so this needs nothing from the board's thread
+    /// later (intent 0445).
+    pub fn ready(&mut self) -> Vec<(u64, usize, Value, bool)> {
+        self.jobs
+            .iter_mut()
+            .filter(|j| !j.sent && j.settled.is_none())
+            .map(|j| {
+                j.sent = true;
+                (j.n, j.machine, j.request.clone(), j.gated)
+            })
+            .collect()
+    }
+
+    /// The card a change is to, by key: the runner keeps a record's changes in order by it, wherever
+    /// a refusal sends one (intent 0416).
+    pub fn key_of(&self, n: u64) -> Option<String> {
+        self.jobs
+            .iter()
+            .find(|j| j.n == n)
+            .and_then(|j| j.key.clone())
+    }
+
+    /// Whether this change, answered, was sent on to another machine and waits to be handed to the
+    /// runner again: its place in the runner's queue stays held until then.
+    pub fn sent_on(&self, n: u64) -> bool {
+        self.jobs
+            .iter()
+            .any(|j| j.n == n && !j.sent && j.settled.is_none())
+    }
+
+    /// The runner has started this change's command. Whether it's a start that waited for its
+    /// write-up, which shows only from now, and whether Esc had dropped it a moment too late.
+    pub fn started(&mut self, n: u64) -> Started {
+        match self.jobs.iter_mut().find(|j| j.n == n) {
+            Some(j) => {
+                let shows_now = j.waits_for_write_up() && j.effect.is_some();
+                let too_late = j.dropping;
+                j.dropping = false;
+                j.running.get_or_insert_with(Instant::now);
+                Started {
+                    shows_now,
+                    too_late,
+                }
+            }
+            None => Started::default(),
+        }
+    }
+
+    /// A change by its number.
+    pub fn job(&self, n: u64) -> Option<&Job> {
+        self.jobs.iter().find(|j| j.n == n)
+    }
+
+    /// Its whole request has been written to its command, which carries on without Kerdr.
+    pub fn handed(&mut self, n: u64) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.handed = true;
+        }
+    }
+
+    /// The start waiting for this card's write-up, if one is.
+    pub fn waiting_for_write_up(&self, key: &str) -> Option<&Job> {
+        self.jobs
+            .iter()
+            .find(|j| j.waits_for_write_up() && !j.dropping && j.key.as_deref() == Some(key))
+    }
+
+    /// Every start waiting for a write-up.
+    pub fn write_ups_awaited(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| j.waits_for_write_up() && !j.dropping)
+            .collect()
+    }
+
+    /// Esc on the board: starts waiting for their write-up won't start after all. The cards they
+    /// were for, by key. Each stays, out of sight, until the runner says whether it took it out
+    /// before it started (Resolver::drop_answered): the write-up may have been read, and the start
+    /// begun, a moment before Esc.
+    pub fn drop_awaited(&mut self) -> Vec<String> {
+        let mut keys = vec![];
+        for j in self
+            .jobs
+            .iter_mut()
+            .filter(|j| j.waits_for_write_up() && !j.dropping)
+        {
+            j.dropping = true;
+            self.dropped.push(j.n);
+            keys.extend(j.key.clone());
+        }
+        keys
+    }
+
+    /// The runner's answer to a drop: taken out before it started, it goes; otherwise it had
+    /// started already (Resolver::started showed it again) and its answer still comes.
+    pub fn drop_answered(&mut self, n: u64, dropped: bool) {
+        if dropped {
+            self.jobs.retain(|j| j.n != n);
+        } else if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.dropping = false;
+        }
+    }
+
+    /// The changes dropped since the runner was last told.
+    pub fn take_dropped(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Andrew has gone into this record's workspace himself while its start or reopen is on its
+    /// way: its answer neither asks him anything nor takes him in again (intent 0445).
+    pub fn went_in(&mut self, id: &str) {
+        for j in self.jobs.iter_mut().filter(|j| {
+            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.record() == Some(id)
+        }) {
+            j.from = None;
+            j.entered = true;
+        }
+    }
+
+    /// Notes the workspaces a start's machine had when it was asked.
+    pub fn note_workspaces(&mut self, n: u64, before: Vec<(String, String)>) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.before = before;
+        }
+    }
+
+    /// The unanswered new intent with this submission, so its answer finds its card.
+    pub fn saving(&self, submission: &str) -> Option<&Job> {
+        let id = Placeholder::id_for(submission);
+        self.jobs.iter().find(|j| {
+            j.settled.is_none() && matches!(&j.effect, Some(Effect::Saving(p)) if p.id == id)
+        })
+    }
+
+    /// Changes Kerdr mustn't quit before: ones whose whole request isn't yet in their command's
+    /// hands (quitting would stop them unsent, or half sent), and new intents until they're
+    /// answered (a failed save gives their words back, which only Kerdr keeps). A start or another
+    /// change its command has whole carries on without Kerdr.
+    pub fn holding_quit(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| {
+                j.settled.is_none()
+                    && !j.waits_for_write_up()
+                    && (!j.handed || j.request["action"] == "create")
+            })
+            .collect()
+    }
+
+    /// Unanswered changes whose commands have their whole request and carry on without Kerdr.
+    pub fn running(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| j.settled.is_none() && j.handed)
+            .collect()
     }
 
     /// Takes a change out as its answer arrives: a failure's effect goes with it.
@@ -270,7 +717,12 @@ impl Resolver {
         job.machine = machine;
         job.request = request;
         job.from = from;
+        // Handed to the runner again, which still holds its place (intent 0445); a start that
+        // waited for its write-up has had it.
+        job.sent = false;
+        job.gated = false;
         job.running = None;
+        job.handed = false;
         job.settled = None;
         let at = self.jobs.partition_point(|j| j.n < job.n);
         self.jobs.insert(at, job);
@@ -299,6 +751,9 @@ impl Resolver {
                 let (Some(key), Some(effect)) = (&j.key, &j.effect) else {
                     return true;
                 };
+                if matches!(effect, Effect::Saving(_)) {
+                    return effect.shown(&FeedCard::default(), feed);
+                }
                 let source = feed.source.as_deref().unwrap_or("feed");
                 feed.cards
                     .iter()
@@ -322,10 +777,31 @@ impl Resolver {
             .filter(|j| j.settled.is_some() && j.machine == machine && shown(j))
             .filter_map(|j| j.key.clone().map(|k| (k, j.n)))
             .collect();
+        // A move the feed shows carries its whole group's order, so it speaks for every earlier
+        // move that reordered any of the same cards: J on one card then J on its neighbour,
+        // both read, mustn't put the first order back (intent 0445).
+        let orders: Vec<(u64, Vec<String>)> = self
+            .jobs
+            .iter()
+            .filter(|j| j.settled.is_some() && j.machine == machine && shown(j))
+            .filter_map(|j| match &j.effect {
+                Some(Effect::Order(o)) => Some((j.n, o.iter().map(|(k, _)| k.clone()).collect())),
+                _ => None,
+            })
+            .collect();
         self.jobs.retain_mut(|j| {
-            let superseded = latest
-                .iter()
-                .any(|(k, n)| Some(k) == j.key.as_ref() && *n > j.n)
+            let life = j.life();
+            let elsewhere = j.waits_for_feed();
+            let reordered = match &j.effect {
+                Some(Effect::Order(o)) => orders
+                    .iter()
+                    .any(|(n, keys)| *n > j.n && o.iter().any(|(k, _)| keys.contains(k))),
+                _ => false,
+            };
+            let superseded = reordered
+                || latest
+                    .iter()
+                    .any(|(k, n)| Some(k) == j.key.as_ref() && *n > j.n)
                 || (j.moves() && latest_order.is_some_and(|n| n > j.n));
             let here = j.machine == machine;
             let Some((at, reads)) = j.settled.as_mut() else {
@@ -333,15 +809,17 @@ impl Resolver {
             };
             if here {
                 *reads = reads.saturating_add(1);
-                if superseded || *reads >= SETTLED_READS {
+                if superseded || (*reads >= SETTLED_READS && !elsewhere) {
                     return false;
                 }
             }
-            at.elapsed() < SETTLED_MOST
+            at.elapsed() < life
         });
-        // What the feed shows now speaks for itself.
-        self.jobs
-            .retain(|j| !(j.settled.is_some() && j.machine == machine && shown(j)));
+        // What the feed shows now speaks for itself: for a start that ran elsewhere, or a new
+        // intent, any machine's copy may show it first (intent 0445).
+        self.jobs.retain(|j| {
+            !(j.settled.is_some() && (j.machine == machine || j.shows_anywhere()) && shown(j))
+        });
         self.jobs.len() != before
     }
 
@@ -349,7 +827,7 @@ impl Resolver {
     pub fn expire(&mut self) -> bool {
         let before = self.jobs.len();
         self.jobs
-            .retain(|j| j.settled.is_none_or(|(at, _)| at.elapsed() < SETTLED_MOST));
+            .retain(|j| j.settled.is_none_or(|(at, _)| at.elapsed() < j.life()));
         self.jobs.len() != before
     }
 
@@ -366,6 +844,27 @@ impl Resolver {
             let (Some(key), Some(effect)) = (&job.key, &job.effect) else {
                 continue;
             };
+            if job.waits_for_write_up() {
+                continue;
+            }
+            if let Effect::Saving(p) = effect {
+                // A new card in the backlog it went to, until any machine's feed has the record it
+                // made: never two cards for one intent (intent 0445).
+                if machines
+                    .iter()
+                    .filter_map(|m| m.feed.as_ref())
+                    .any(|f| p.made_in(f))
+                {
+                    continue;
+                }
+                let late = job
+                    .settled
+                    .is_some_and(|(at, _)| at.elapsed() >= SETTLED_MOST);
+                if let Some(feed) = out.get_mut(job.machine).and_then(|m| m.feed.as_mut()) {
+                    feed.cards.push(p.card(late));
+                }
+                continue;
+            }
             for m in &mut out {
                 let Some(feed) = m.feed.as_mut() else {
                     continue;
@@ -390,7 +889,13 @@ impl Resolver {
     /// answer. Whether any would have.
     pub fn let_go(&mut self) -> bool {
         let mut any = false;
-        for j in self.jobs.iter_mut().filter(|j| j.settled.is_none()) {
+        // Only a start or a reopen ever asks or takes you in; other changes keep where they were
+        // asked, for a resend to the record's real home (intent 0445).
+        for j in self
+            .jobs
+            .iter_mut()
+            .filter(|j| j.settled.is_none() && j.starts() && !j.waits_for_write_up())
+        {
             any |= j.from.take().is_some();
         }
         any
@@ -401,7 +906,17 @@ impl Resolver {
     pub fn starting(&self, id: &str) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.starts() && j.record() == Some(id))
+            .find(|j| j.starts() && !j.waits_for_write_up() && j.record() == Some(id))
+    }
+
+    /// The newest unanswered change shown on this card, by its key.
+    pub fn unanswered_on(&self, key: &str) -> Option<&Job> {
+        self.jobs.iter().rev().find(|j| {
+            j.settled.is_none()
+                && !j.waits_for_write_up()
+                && j.effect.is_some()
+                && j.key.as_deref() == Some(key)
+        })
     }
 
     /// The unanswered change sending this action for this record, oldest first.
@@ -415,16 +930,17 @@ impl Resolver {
     /// Whether an unanswered change may still ask you something or take you somewhere: Esc on the
     /// board lets that go.
     pub fn holds_you(&self) -> bool {
-        self.jobs
-            .iter()
-            .any(|j| j.settled.is_none() && j.from.is_some())
+        self.jobs.iter().any(|j| {
+            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.from.is_some()
+        })
     }
 
-    /// Whether a new intent is on its way.
-    pub fn creating(&self) -> bool {
+    /// The oldest unanswered change whose request `matches`.
+    pub fn unanswered_where(&self, matches: impl Fn(&Value) -> bool) -> Option<u64> {
         self.jobs
             .iter()
-            .any(|j| j.settled.is_none() && j.request["action"] == "create")
+            .find(|j| j.settled.is_none() && matches(&j.request))
+            .map(|j| j.n)
     }
 
     /// How many changes haven't been answered yet.
@@ -454,44 +970,45 @@ mod tests {
 
     #[test]
     fn a_record_s_changes_run_in_order_and_others_alongside() {
-        let mut r = Resolver::default();
-        let a = r.add(
-            0,
-            json!({"action":"move","id":"1","delta":1}),
-            None,
-            None,
-            None,
-        );
-        let b = r.add(
-            0,
-            json!({"action":"move","id":"1","delta":1}),
-            None,
-            None,
-            None,
-        );
-        let c = r.add(0, json!({"action":"close","id":"2"}), None, None, None);
-        let d = r.add(0, json!({"action":"create","words":"x"}), None, None, None);
-        let first: Vec<u64> = r.ready().into_iter().map(|(n, ..)| n).collect();
-        assert_eq!(first, vec![a, c, d]);
-        assert!(r.ready().is_empty(), "nothing starts twice");
-        r.take(a);
-        assert_eq!(
-            r.ready().into_iter().map(|(n, ..)| n).collect::<Vec<_>>(),
-            vec![b]
-        );
+        let mut q = Queue::default();
+        q.push(1, 0, None, &json!({"action":"move","id":"1","delta":1}));
+        q.push(2, 0, None, &json!({"action":"move","id":"1","delta":1}));
+        q.push(3, 0, None, &json!({"action":"close","id":"2"}));
+        q.push(4, 0, None, &json!({"action":"create","words":"x"}));
+        assert_eq!(q.startable(), vec![1, 3, 4]);
+        assert!(q.startable().is_empty(), "nothing starts twice");
+        q.done(1);
+        assert_eq!(q.startable(), vec![2]);
         // The same id on another machine is another record.
-        let e = r.add(
-            1,
-            json!({"action":"move","id":"2","delta":1}),
-            None,
-            None,
-            None,
-        );
-        assert_eq!(
-            r.ready().into_iter().map(|(n, ..)| n).collect::<Vec<_>>(),
-            vec![e]
-        );
-        assert_eq!(r.unanswered(), 4, "b, c, d and e");
+        q.push(5, 1, None, &json!({"action":"move","id":"2","delta":1}));
+        assert_eq!(q.startable(), vec![5]);
+        for n in [2, 3, 4, 5] {
+            q.done(n);
+        }
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn every_change_goes_to_the_runner_once_and_is_held_for_quitting_until_it_runs() {
+        let mut r = Resolver::default();
+        let a = r.add(0, json!({"action":"move","id":"1"}), None, None, None);
+        let b = r.add(0, json!({"action":"move","id":"1"}), None, None, None);
+        let c = r.add(0, json!({"action":"create","words":"x"}), None, None, None);
+        let sent: Vec<u64> = r.ready().into_iter().map(|(n, ..)| n).collect();
+        assert_eq!(sent, vec![a, b, c], "the runner orders them, not the board");
+        assert!(r.ready().is_empty());
+        assert_eq!(r.holding_quit().len(), 3);
+        r.started(a);
+        r.started(c);
+        // Started, but its command may not have all of the request yet: quitting could cut it
+        // off (review of intent 0445).
+        assert_eq!(r.holding_quit().len(), 3);
+        assert!(r.running().is_empty());
+        r.handed(a);
+        r.handed(c);
+        let held: Vec<u64> = r.holding_quit().iter().map(|j| j.n).collect();
+        assert_eq!(held, vec![b, c], "not yet started, and a new intent");
+        assert_eq!(r.running().len(), 2);
     }
 
     #[test]
@@ -661,34 +1178,17 @@ mod tests {
 
     #[test]
     fn moves_on_one_machine_go_one_at_a_time_whatever_the_card() {
-        let mut r = Resolver::default();
-        let a = r.add(
-            0,
-            json!({"action":"move","id":"1","delta":1}),
-            None,
-            None,
-            None,
-        );
-        r.add(
-            0,
-            json!({"action":"move","id":"2","delta":1}),
-            None,
-            None,
-            None,
-        );
-        let other = r.add(
-            1,
-            json!({"action":"move","id":"3","delta":1}),
-            None,
-            None,
-            None,
-        );
-        let first: Vec<u64> = r.ready().into_iter().map(|(n, ..)| n).collect();
+        let mut q = Queue::default();
+        q.push(1, 0, None, &json!({"action":"move","id":"1","delta":1}));
+        q.push(2, 0, None, &json!({"action":"move","id":"2","delta":1}));
+        q.push(3, 1, None, &json!({"action":"move","id":"3","delta":1}));
         assert_eq!(
-            first,
-            vec![a, other],
+            q.startable(),
+            vec![1, 3],
             "another machine's backlog is its own"
         );
+        q.done(1);
+        assert_eq!(q.startable(), vec![2]);
     }
 
     #[test]
@@ -817,6 +1317,7 @@ mod tests {
     #[test]
     fn a_change_sent_on_to_another_machine_keeps_its_place() {
         let mut r = Resolver::default();
+        let mut q = Queue::default();
         let card = || Some("s:1".to_string());
         let j = r.add(
             0,
@@ -832,14 +1333,39 @@ mod tests {
             card(),
             None,
         );
-        r.ready();
+        // The runner takes both, by card.
+        let hand = |r: &mut Resolver, q: &mut Queue| {
+            for (n, machine, request, _) in r.ready() {
+                q.push(n, machine, r.key_of(n), &request);
+            }
+            q.startable()
+        };
+        assert_eq!(hand(&mut r, &mut q), vec![j]);
+        // J is refused, naming another machine: its place stays held while the board sends it on.
         let job = r.take(j).unwrap();
         r.retarget(job, 1, json!({"action":"move","id":"1","delta":1}), None);
-        let ready: Vec<u64> = r.ready().into_iter().map(|(n, ..)| n).collect();
-        assert_eq!(ready, vec![j], "K waits for J, now on its new machine");
+        assert!(r.sent_on(j));
+        assert!(q.startable().is_empty(), "K waits while J is sent on");
+        assert_eq!(
+            hand(&mut r, &mut q),
+            vec![j],
+            "K waits for J, now on its new machine"
+        );
+        assert!(!r.sent_on(j));
         r.take(j);
-        let ready: Vec<u64> = r.ready().into_iter().map(|(n, ..)| n).collect();
-        assert_eq!(ready, vec![k], "then K, after it");
+        q.done(j);
+        assert_eq!(hand(&mut r, &mut q), vec![k], "then K, after it");
+    }
+
+    #[test]
+    fn a_record_s_changes_keep_their_order_by_card_across_machines() {
+        let mut q = Queue::default();
+        let card = || Some("s:1".to_string());
+        q.push(1, 1, card(), &json!({"action":"move","id":"1","delta":1}));
+        q.push(2, 0, card(), &json!({"action":"close","id":"1"}));
+        assert_eq!(q.startable(), vec![1], "the same card, on another machine");
+        q.done(1);
+        assert_eq!(q.startable(), vec![2]);
     }
 
     #[test]
@@ -877,5 +1403,447 @@ mod tests {
             ]))),
         );
         assert!(!r.shows(), "A's older order mustn't come back");
+    }
+
+    #[test]
+    fn a_new_intent_shows_as_a_card_until_the_feed_has_the_record_it_made() {
+        let mut r = Resolver::default();
+        let p = Placeholder {
+            id: Placeholder::id_for("kerdr-1"),
+            title: Placeholder::title_for("Back up\nthe NAS"),
+            machine: "here".into(),
+            session: "web".into(),
+            source: "s".into(),
+            made: None,
+        };
+        assert_eq!(p.title, "Back up the NAS");
+        let n = r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(p)),
+        );
+        assert!(r.saving("kerdr-1").is_some());
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(json!([{"id":"1","title":"a","state":"queued"}])));
+        let shown = r.overlay(std::slice::from_ref(&m));
+        let cards = &shown[0].feed.as_ref().unwrap().cards;
+        assert_eq!(cards.len(), 2);
+        assert_eq!(cards[1].intake.as_deref(), Some(SAVING));
+        assert_eq!(cards[1].title, "Back up the NAS");
+        // Unanswered, reads leave it.
+        r.read(0, m.feed.as_ref());
+        r.read(0, m.feed.as_ref());
+        assert!(r.shows());
+        // Answered with the record it made: it stays until the feed has that record.
+        let mut job = r.take(n).unwrap();
+        if let Some(Effect::Saving(p)) = job.effect.as_mut() {
+            p.made = Some("9001".into());
+        }
+        r.settle(job);
+        let with = feed(json!([{"id":"1","title":"a"},{"id":"9001","title":"Back up the NAS"}]));
+        m.feed = Some(with.clone());
+        assert_eq!(
+            r.overlay(std::slice::from_ref(&m))[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .cards
+                .len(),
+            2,
+            "never two cards for one intent"
+        );
+        r.read(0, Some(&with));
+        assert!(!r.shows());
+    }
+
+    fn placeholder() -> Placeholder {
+        Placeholder {
+            id: Placeholder::id_for("kerdr-1"),
+            title: "Back up the NAS".into(),
+            machine: "here".into(),
+            session: "web".into(),
+            source: "s".into(),
+            made: None,
+        }
+    }
+
+    fn cards_in(shown: &[MachineState], i: usize) -> Vec<String> {
+        shown[i]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_new_intent_s_record_read_before_its_answer_takes_the_card_s_place() {
+        // create writes the record, submission and all, seconds before it answers: a read
+        // meanwhile shows it, and the card shown while it saved gives way (intent 0445).
+        let mut r = Resolver::default();
+        r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(placeholder())),
+        );
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(json!([{"id":"1","title":"a"}])));
+        assert_eq!(
+            cards_in(&r.overlay(std::slice::from_ref(&m)), 0),
+            ["1", "saving-kerdr-1"]
+        );
+        m.feed = Some(feed(
+            json!([{"id":"1","title":"a"},{"id":"9001","title":"back up nas","intake":"pending","submission":"kerdr-1"}]),
+        ));
+        assert_eq!(
+            cards_in(&r.overlay(std::slice::from_ref(&m)), 0),
+            ["1", "9001"],
+            "never two cards for one intent"
+        );
+        r.read(0, m.feed.as_ref());
+        assert!(r.shows(), "unanswered, its answer still finds it");
+    }
+
+    #[test]
+    fn a_new_intent_s_record_on_another_machine_first_takes_the_card_s_place() {
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(placeholder())),
+        );
+        let mut here_m = MachineState::new(here());
+        here_m.feed = Some(feed(json!([{"id":"1","title":"a"}])));
+        let mut there = MachineState::new(here());
+        there.feed = Some(feed(
+            json!([{"id":"1","title":"a"},{"id":"9001","title":"t"}]),
+        ));
+        let both = [here_m.clone(), there.clone()];
+        // Answered: the record it made, by id, on another machine's copy of the same store.
+        let mut job = r.take(n).unwrap();
+        if let Some(Effect::Saving(p)) = job.effect.as_mut() {
+            p.made = Some("9001".into());
+        }
+        r.settle(job);
+        let shown = r.overlay(&both);
+        assert_eq!(cards_in(&shown, 0), ["1"], "no card shown while it saved");
+        assert_eq!(cards_in(&shown, 1), ["1", "9001"]);
+        // Another store's record with that number isn't it.
+        let mut other = there.clone();
+        other.feed.as_mut().unwrap().source = Some("elsewhere".into());
+        let shown = r.overlay(&[here_m.clone(), other]);
+        assert_eq!(cards_in(&shown, 0), ["1", "saving-kerdr-1"]);
+        // The other machine's read retires it.
+        assert!(r.read(1, there.feed.as_ref()));
+        assert!(!r.shows());
+    }
+
+    #[test]
+    fn a_start_that_ran_elsewhere_goes_once_any_copy_shows_it_under_way() {
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"dispatch","id":"7"}),
+            None,
+            Some("s:7".into()),
+            Some(Effect::Starting),
+        );
+        let mut job = r.take(n).unwrap();
+        job.effect = Some(Effect::StartingOn("far-box".into()));
+        r.settle(job);
+        let mut here_m = MachineState::new(here());
+        here_m.feed = Some(feed(json!([{"id":"7","title":"t","state":"queued"}])));
+        let mut there = MachineState::new(here());
+        there.feed = Some(feed(
+            json!([{"id":"7","title":"t","state":"active","status":"Working"}]),
+        ));
+        let shown = r.overlay(&[here_m, there.clone()]);
+        let status = |i: usize| shown[i].feed.as_ref().unwrap().cards[0].status.clone();
+        assert_eq!(status(0).as_deref(), Some("Starting on far-box…"));
+        assert_eq!(
+            status(1).as_deref(),
+            Some("Working"),
+            "a copy under way speaks for itself"
+        );
+        assert!(r.starting("7").is_some());
+        assert!(r.read(1, there.feed.as_ref()));
+        assert!(r.starting("7").is_none(), "the far machine's read shows it");
+    }
+
+    #[test]
+    fn a_start_waiting_for_its_write_up_shows_nothing_and_counts_for_nothing_yet() {
+        let mut r = Resolver::default();
+        let n = r.add_gated(
+            0,
+            json!({"action":"dispatch","id":"7"}),
+            Some(CardSnapshot::default()),
+            Some("s:7".into()),
+            Some(Effect::Starting),
+        );
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(json!([{"id":"7","title":"t","state":"queued"}])));
+        let status = |r: &Resolver| {
+            r.overlay(std::slice::from_ref(&m))[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .cards[0]
+                .status
+                .clone()
+        };
+        assert_eq!(status(&r), None);
+        assert!(r.starting("7").is_none());
+        assert!(r.holding_quit().is_empty());
+        assert!(!r.holds_you());
+        assert!(r.waiting_for_write_up("s:7").is_some());
+        assert!(r.ready()[0].3);
+        assert!(r.started(n).shows_now, "it shows from now");
+        assert_eq!(status(&r).as_deref(), Some("Starting…"));
+        assert!(r.starting("7").is_some());
+        assert!(
+            r.drop_awaited().is_empty(),
+            "started: Esc no longer drops it"
+        );
+    }
+
+    #[test]
+    fn the_runner_holds_a_start_until_its_write_up_and_drops_one_that_failed() {
+        let mut q = Queue::default();
+        let start = json!({"action":"dispatch","id":"7"});
+        q.push_gated(1, 0, None, &start);
+        q.push(2, 0, None, &json!({"action":"move","id":"7","delta":1}));
+        q.push(3, 0, None, &json!({"action":"close","id":"8"}));
+        assert_eq!(
+            q.startable(),
+            vec![3],
+            "the record's later change waits behind it"
+        );
+        let feed =
+            |intake: Option<&str>| HashMap::from([("7".to_string(), intake.map(str::to_string))]);
+        assert!(
+            q.written(1, &feed(None)).is_empty(),
+            "another machine's feed isn't its home's"
+        );
+        assert!(q.startable().is_empty());
+        assert!(q.written(0, &feed(Some("pending"))).is_empty());
+        assert!(q.written(0, &feed(None)).is_empty());
+        assert_eq!(q.startable(), vec![1]);
+        let mut q = Queue::default();
+        q.push_gated(1, 0, None, &start);
+        assert_eq!(q.written(0, &feed(Some("failed"))), vec![1]);
+        assert!(q.is_empty());
+        let mut q = Queue::default();
+        q.push_gated(1, 0, None, &start);
+        assert!(q.drop_unstarted(1));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn going_in_yourself_lets_a_start_s_answer_go() {
+        let mut r = Resolver::default();
+        r.add(
+            0,
+            json!({"action":"reopen","id":"7"}),
+            Some(CardSnapshot::default()),
+            Some("s:7".into()),
+            Some(Effect::Reopening),
+        );
+        assert!(r.holds_you());
+        r.went_in("8");
+        assert!(r.holds_you(), "another record's");
+        r.went_in("7");
+        assert!(!r.holds_you());
+        assert!(r.starting("7").unwrap().entered);
+    }
+
+    #[test]
+    fn a_later_move_of_a_neighbour_speaks_for_the_earlier_one() {
+        // J on card 1, then J on card 2 of the same group: both saved, and the read shows the
+        // second's order. The first's mustn't come back over it.
+        let mut r = Resolver::default();
+        let first = Effect::Order(vec![
+            ("s:2".into(), 0),
+            ("s:1".into(), 1),
+            ("s:3".into(), 2),
+        ]);
+        let second = Effect::Order(vec![
+            ("s:2".into(), 0),
+            ("s:3".into(), 1),
+            ("s:1".into(), 2),
+        ]);
+        for (id, e) in [("1", first), ("2", second)] {
+            let n = r.add(
+                0,
+                json!({"action":"move","id":id,"delta":1}),
+                None,
+                Some(format!("s:{id}")),
+                Some(e),
+            );
+            r.ready();
+            let job = r.take(n).unwrap();
+            r.settle(job);
+        }
+        r.read(
+            0,
+            Some(&feed(
+                json!([{"id":"1","title":"a","backlog_rank":2},{"id":"2","title":"b","backlog_rank":0},{"id":"3","title":"c","backlog_rank":1}]),
+            )),
+        );
+        assert!(!r.shows(), "nothing laid over a board already right");
+    }
+
+    #[test]
+    fn a_reopen_reads_as_reopening_and_a_refresh_as_today() {
+        let mut fc: FeedCard = serde_json::from_value(
+            json!({"id":"7","title":"t","state":"closed","stage":"maintain","attention":"done"}),
+        )
+        .unwrap();
+        Effect::Reopening.apply(&mut fc, "s:7");
+        assert_eq!(fc.state.as_deref(), Some("active"));
+        assert_eq!(
+            fc.stage.as_deref(),
+            Some("maintain"),
+            "it stays where it is"
+        );
+        assert_eq!(fc.status.as_deref(), Some("Reopening…"));
+        let mut fc: FeedCard = serde_json::from_value(
+            json!({"id":"7","title":"t","attention":"needs_you","needs":"a question","blockers":["x"]}),
+        )
+        .unwrap();
+        Effect::Reopening.apply(&mut fc, "s:7");
+        assert!(fc.needs.is_none() && fc.blockers.is_empty());
+        let mut fc: FeedCard =
+            serde_json::from_value(json!({"id":"7","title":"t","stale_days":20})).unwrap();
+        Effect::Refresh("2026-11-02".into()).apply(&mut fc, "s:7");
+        assert_eq!(fc.stale_days, Some(0), "today, not unknown");
+    }
+
+    #[test]
+    fn a_change_sent_on_never_runs_beside_a_later_move_already_running_there() {
+        // Review of intent 0445: J on machine 0 and K on machine 1 both run; J is refused and sent
+        // on to machine 1, where K is still running: J waits for K.
+        let mut q = Queue::default();
+        q.push(1, 0, None, &json!({"action":"move","id":"1","delta":1}));
+        q.push(2, 1, None, &json!({"action":"move","id":"2","delta":1}));
+        assert_eq!(q.startable(), vec![1, 2]);
+        q.push(1, 1, None, &json!({"action":"move","id":"1","delta":1}));
+        assert!(
+            q.startable().is_empty(),
+            "K is still reordering that backlog"
+        );
+        q.done(2);
+        assert_eq!(q.startable(), vec![1]);
+    }
+
+    #[test]
+    fn esc_racing_a_start_that_already_began_keeps_it_until_the_runner_answers() {
+        // Review of intent 0445: the write-up is read and the start begins a moment before Esc.
+        let mut r = Resolver::default();
+        let start = |r: &mut Resolver| {
+            r.add_gated(
+                0,
+                json!({"action":"dispatch","id":"7"}),
+                None,
+                Some("s:7".into()),
+                Some(Effect::Starting),
+            )
+        };
+        let n = start(&mut r);
+        r.ready();
+        assert_eq!(r.drop_awaited(), vec!["s:7".to_string()]);
+        assert_eq!(r.take_dropped(), vec![n]);
+        assert!(r.write_ups_awaited().is_empty(), "no longer said to wait");
+        assert!(r.drop_awaited().is_empty(), "dropped once");
+        // The runner had already started it: it shows, and its answer still finds it.
+        assert_eq!(
+            r.started(n),
+            Started {
+                shows_now: true,
+                too_late: true
+            }
+        );
+        r.drop_answered(n, false);
+        assert!(r.starting("7").is_some());
+        assert!(r.take(n).is_some());
+        // Taken out before it started: it goes.
+        let n = start(&mut r);
+        r.ready();
+        r.drop_awaited();
+        r.drop_answered(n, true);
+        assert!(r.job(n).is_none());
+    }
+
+    #[test]
+    fn a_saved_new_intent_s_card_stays_until_its_record_is_read_and_says_when_it_s_late() {
+        // Review of intent 0445: the answer names the record, but the feed is slow to show it.
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(placeholder())),
+        );
+        let mut job = r.take(n).unwrap();
+        if let Some(Effect::Saving(p)) = job.effect.as_mut() {
+            p.made = Some("9001".into());
+        }
+        r.settle(job);
+        let without = feed(json!([{"id":"1","title":"a"}]));
+        for _ in 0..4 {
+            r.read(0, Some(&without));
+        }
+        assert!(!r.expire());
+        let mut m = MachineState::new(here());
+        m.feed = Some(without.clone());
+        let status = |r: &Resolver| {
+            r.overlay(std::slice::from_ref(&m))[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .cards
+                .iter()
+                .find(|c| c.id == "saving-kerdr-1")
+                .and_then(|c| c.status.clone())
+        };
+        assert_eq!(status(&r).as_deref(), Some("Saving…"));
+        // A minute on, still not read: it says so rather than going.
+        for j in &mut r.jobs {
+            j.settled = Some((Instant::now() - Duration::from_secs(61), 2));
+        }
+        assert!(!r.expire());
+        r.read(0, Some(&without));
+        assert_eq!(
+            status(&r).as_deref(),
+            Some("Saved as #9001; not on the board yet")
+        );
+        r.read(
+            0,
+            Some(&feed(
+                json!([{"id":"1","title":"a"},{"id":"9001","title":"t"}]),
+            )),
+        );
+        assert!(!r.shows());
+    }
+
+    #[test]
+    fn only_a_start_or_reopen_is_let_go_by_esc() {
+        let mut r = Resolver::default();
+        let snap = || Some(CardSnapshot::default());
+        r.add(0, json!({"action":"move","id":"1"}), snap(), None, None);
+        assert!(!r.holds_you());
+        assert!(!r.let_go(), "a move never takes you anywhere");
+        r.add(0, json!({"action":"dispatch","id":"2"}), snap(), None, None);
+        assert!(r.holds_you());
+        assert!(r.let_go());
+        assert!(!r.holds_you());
     }
 }

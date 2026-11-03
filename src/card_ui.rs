@@ -42,6 +42,25 @@ fn place(app: &App, c: &Card, holder: &Card, itself: bool) -> (String, Color) {
     if c.dismissed() {
         return ("won’t do".into(), DIM);
     }
+    // A start or reopen on its way, before its workspace or tab shows: what it is, not what
+    // broken work would say (intent 0445).
+    if !c.is_open_workspace()
+        && let Some(job) = c.detail.as_ref().and_then(|d| app.resolver.starting(&d.id))
+    {
+        let secs = job.asked.elapsed().as_secs();
+        let what = if job.request["action"] == "reopen" {
+            "reopening".to_string()
+        } else if !itself
+            && c.link
+                .as_ref()
+                .is_some_and(|(_, l)| *l == crate::model::Link::Part)
+        {
+            format!("starting in a tab of {}", holder.reference)
+        } else {
+            "starting up".to_string()
+        };
+        return (format!("◐ {what}… {secs} s"), CYAN);
+    }
     if family::finished(c) {
         return match closed_on(c) {
             Some(d) => (format!("closed {d}"), DIM),
@@ -613,6 +632,12 @@ fn details(
         facts.push(format!("{} of {r}", l.label()));
     }
     let (p, _) = place(app, c, holder, itself);
+    // A change on its way that its place doesn't already say (intent 0445).
+    if !p.starts_with('◐')
+        && let Some(line) = app.starting_line(c)
+    {
+        facts.push(line);
+    }
     facts.push(p);
     if c.machine_index != holder.machine_index || itself {
         facts.push(format!("on {}", c.machine));

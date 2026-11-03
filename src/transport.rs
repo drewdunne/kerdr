@@ -161,7 +161,7 @@ pub fn run_script(target: &Target, script: &str, deadline: Duration) -> Output {
             c
         }
     };
-    run(&mut cmd, Some(script.as_bytes()), deadline, true)
+    run(&mut cmd, Some(script.as_bytes()), deadline, true, None)
 }
 
 /// Runs herdr with these arguments on the target.
@@ -172,7 +172,7 @@ pub fn run_herdr(target: &Target, herdr: &str, args: &[&str], deadline: Duration
         cmd.args(args);
         clean_herdr_env(&mut cmd);
         // Never put Herdr clients in a kill-on-close job: they may start a persistent server.
-        return run(&mut cmd, None, deadline, false);
+        return run(&mut cmd, None, deadline, false, None);
     }
     let quoted: Vec<String> = args.iter().map(|a| quote(a)).collect();
     let script = format!(
@@ -191,6 +191,21 @@ pub fn run_adapter(
     input: Option<&str>,
     deadline: Duration,
 ) -> Output {
+    run_adapter_handing(target, command, input, deadline, None)
+}
+
+/// Called once the whole of an adapter's input is written to it: from then on it has the request
+/// whatever becomes of Kerdr, since it runs in a process group of its own.
+pub type Handed = Box<dyn FnOnce() + Send>;
+
+/// As run_adapter, calling `handed` once the adapter has the whole of its input.
+pub fn run_adapter_handing(
+    target: &Target,
+    command: &str,
+    input: Option<&str>,
+    deadline: Duration,
+    handed: Option<Handed>,
+) -> Output {
     #[cfg(windows)]
     if *target == Target::Local {
         let mut cmd = powershell_command(&format!(
@@ -205,6 +220,7 @@ pub fn run_adapter(
             input.map(str::as_bytes),
             deadline,
             input.is_none(),
+            handed,
         );
     }
     // JSON stays on stdin, separate from shell source and process arguments, including tokens.
@@ -233,6 +249,7 @@ pub fn run_adapter(
         input.map(str::as_bytes),
         deadline,
         input.is_none(),
+        handed,
     )
 }
 
@@ -246,7 +263,13 @@ fn remote_adapter_command(script: &str) -> String {
     )
 }
 
-fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: bool) -> Output {
+fn run(
+    cmd: &mut Command,
+    input: Option<&[u8]>,
+    deadline: Duration,
+    _kill_tree: bool,
+    handed: Option<Handed>,
+) -> Output {
     let started = Instant::now();
     // Input stays in memory, including credentials. The writer below is cancellable even
     // when a persistent descendant retains stdin without reading it.
@@ -353,6 +376,13 @@ fn run(cmd: &mut Command, input: Option<&[u8]>, deadline: Duration, _kill_tree: 
                         Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
                     }
+                }
+                // All of it is in the pipe, which the adapter reads to its end even if Kerdr has
+                // gone by then.
+                if left.is_empty()
+                    && let Some(handed) = handed
+                {
+                    handed();
                 }
             })
         })
@@ -544,6 +574,42 @@ mod tests {
 
     #[test]
     #[cfg(unix)]
+    fn an_adapter_is_said_to_have_its_request_only_once_all_of_it_is_written() {
+        // Review of intent 0445: quitting is safe only once the adapter, in a process group of its
+        // own, holds the whole request. More than a pipe holds waits for it to read.
+        use std::sync::Mutex;
+        let input = "x".repeat(512 * 1024);
+        let handed_at: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let at = handed_at.clone();
+        let started = Instant::now();
+        let out = run_adapter_handing(
+            &Target::Local,
+            "sleep 0.5\ncat >/dev/null\nprintf ok",
+            Some(&input),
+            Duration::from_secs(10),
+            Some(Box::new(move || *at.lock().unwrap() = Some(Instant::now()))),
+        );
+        assert!(out.ok(), "{}", out.stderr);
+        let handed = handed_at.lock().unwrap().expect("never said to have it");
+        assert!(
+            handed.duration_since(started) >= Duration::from_millis(400),
+            "said to have it before it read it"
+        );
+        // One that goes without reading it never has it.
+        let handed_at: Arc<Mutex<Option<Instant>>> = Arc::default();
+        let at = handed_at.clone();
+        run_adapter_handing(
+            &Target::Local,
+            "exit 0",
+            Some(&input),
+            Duration::from_secs(10),
+            Some(Box::new(move || *at.lock().unwrap() = Some(Instant::now()))),
+        );
+        assert!(handed_at.lock().unwrap().is_none());
+    }
+
+    #[test]
+    #[cfg(unix)]
     fn remote_adapter_source_is_one_line_and_request_remains_separate() {
         let command = remote_adapter_command(
             "# a multiline adapter\nread -r value\nprintf '%s' \"$value\"\n",
@@ -552,7 +618,13 @@ mod tests {
         let mut child = Command::new("sh");
         child.arg("-c").arg(command);
         let request = br#"{"value":"literal $(touch should-never-exist) and 'quotes'"}"#;
-        let out = run(&mut child, Some(request), Duration::from_secs(5), true);
+        let out = run(
+            &mut child,
+            Some(request),
+            Duration::from_secs(5),
+            true,
+            None,
+        );
         assert!(out.ok(), "{}", out.stderr);
         assert_eq!(out.stdout.as_bytes(), request);
     }

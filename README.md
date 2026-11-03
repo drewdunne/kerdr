@@ -135,12 +135,11 @@ Kerdr takes you straight in. The backend asks first when that would go past the 
 workspace limit or the conversation may still be open somewhere else. See
 [docs/feed.md](docs/feed.md#reopening-work-whose-workspace-closed).
 
-Kerdr runs one reopen, start or other change at a time, but `Enter` is never dropped while one
-runs. On the card already being reopened it says how long that has taken; on any other card it
-waits its turn, says so ("#41 opens once #39's answer is in"), and opens it as soon as the
-running one answers, after its answer has been on screen a moment. A newer `Enter` replaces the
-waiting one, and `Esc` on the board drops it (elsewhere `Esc` keeps its own job, such as saying no
-to a question, and the waiting one keeps waiting). While herdr
+`Enter` never waits for another card's change, or for an account action. On a card that is still
+starting or reopening, it goes into the workspace that opened for it as soon as a feed names that
+workspace for its record (the workspace opens before its agent has taken its brief; a name alone
+isn't enough, since 0045 and 0145 both make `45-…`), and until then it says the card is starting
+up and for how long; the card, its peek and its own screen say the same. While herdr
 gets ready on a card, the board says "Opening …", and keys pressed meanwhile are thrown away
 rather than reaching the agent's prompt.
 
@@ -149,7 +148,7 @@ it opens (SSH failing, herdr updating itself, versions that don't match), herdr'
 on the screen until you press Enter. A herdr session that has stopped counts as a closed workspace,
 so work under way reopens. A reopen that opened a new tab lands on that tab. When a card's
 conversation runs in a terminal outside herdr, `Enter` says which and sends nothing; a second
-`Enter` within five seconds goes on to ask about a second copy, even when it has to wait its turn.
+`Enter` within five seconds goes on to ask about a second copy.
 When the machine asked turns out not to be the work's home any more, Kerdr asks its home instead,
 once, and sends that work's actions there until the board catches up; when it can't (a machine it
 doesn't list, or one not answering), it says so in its own words. Answers longer than 300
@@ -223,12 +222,22 @@ peek alike:
   selected intent back. Its record and original creation date are retained.
 
 `c` opens the new-intent box: one field for what you want, in your own words. Enter sends it and
-closes the box at once, while the save carries on behind it: once it's saved, the backlog opens on
-its card if you're still where the box closed, and if the save fails, Kerdr says so and keeps your
-words for the next `c`. Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its
+closes the box at once onto the backlog, where a card for it shows straight away, selected, saying
+it's being saved; once it's saved, the record's card takes its place, and a card the board still
+hasn't read a minute after it was saved says so rather than going. `c` opens the box again at
+once, empty, however many earlier ones are still saving. If a save fails, Kerdr says so and keeps
+your words for the next `c` (or for the one after, when the box holds other words meanwhile);
+sent again unchanged, they go as the send they came back from, so the adapter never makes a second
+intent of them, and the same words sent while they're still saving go only once.
+Enter while an image is still being read closes the box too, and sends once the image is in, even
+if you go into a workspace meanwhile; an image that doesn't go in (the box full, or one that
+couldn't be read) sends nothing, and your words come back with why.
+Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its
 line breaks. Escape keeps your words for the next time you open it. The adapter files it in the backlog of the
 session you're looking at and writes it up (see [docs/feed.md](docs/feed.md#actions)); Kerdr
-shows it as being written up until that's done, and creating it never starts an agent by itself.
+shows it as being written up until that's done, and creating it never starts an agent by itself:
+`d` on it meanwhile starts it as soon as it's written up, even while you're inside a workspace (`Esc` on
+the board drops that); if it can't be written up, it doesn't start, and Kerdr says so.
 
 Ctrl+V in the box attaches the image on your clipboard, as Claude Code does: it goes in at the end
 of your words as an `[Image #1]` tag, numbered within that intent, and travels with them to the
@@ -262,8 +271,11 @@ nothing more is said. When it fails, the card goes back to how it really is and 
 box says what didn't happen and why, staying up until you press a key; that key does nothing
 else, and no key answers a question hidden under the box. Several failures show three at a time,
 and anything said meanwhile shows once they're read. A question your adapter
-asks first (a full session, reopening done work) is still asked while you're on that card. `q`
-waits until every change has been saved.
+asks first (a full session, reopening done work) is still asked while you're on that card. A change
+whose turn comes while you're inside a workspace starts then, not once you're back. `q` waits only
+for what would be lost (a change whose command doesn't have all of it yet, or a new intent still
+saving); when a start or another change is still running, its command already has the whole
+request and carries on after Kerdr quits: `q` says so, and a second `q` quits.
 
 ### Accounts and ordered models
 
@@ -398,9 +410,9 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `i` | Misc: workspaces with no record |
 | `Ctrl+Space` | a menu of the work and view keys, with the same letters |
 | `M` | machines |
-| `r` / `R` | retry a machine that isn't answering / all of them |
+| `r` / `R` | retry a machine that isn't answering / read every machine now, trying again any that aren't |
 | `?` | keys |
-| `q` | quit (every session keeps running) |
+| `q` | quit (every session keeps running; with a start still running, a start waiting for its write-up, or words for a new intent only Kerdr holds, it says so and a second `q` quits) |
 
 | Inside herdr | |
 |---|---|

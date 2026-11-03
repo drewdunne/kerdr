@@ -157,7 +157,13 @@ pub struct Inbox {
     /// landing.
     slots: Mutex<Vec<Slot>>,
     arrived: Condvar,
+    /// Told of every feed a machine's reader brings, as it lands, whether or not the board is
+    /// there to apply it: the runner starts work waiting on a write-up from it while Andrew is
+    /// inside a workspace (intent 0445).
+    watch: Mutex<Option<FeedWatch>>,
 }
+
+type FeedWatch = Box<dyn Fn(usize, &crate::feed::Feed) + Send>;
 
 #[derive(Default)]
 struct Slot {
@@ -195,12 +201,26 @@ impl Inbox {
         if slots[i].reader != reader {
             return;
         }
+        if let Some(Some(Ok(feed))) = ev.data.as_ref().map(|d| d.feed.as_ref())
+            && let Some(watch) = self
+                .watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+        {
+            watch(i, feed);
+        }
         let ev = match slots[i].read.take() {
             Some((old, _)) => replace(old, ev),
             None => ev,
         };
         slots[i].read = Some((ev, started));
         self.arrived.notify_all();
+    }
+
+    /// Has `watch` told of each machine's feed as its reader brings it, from the reader's thread.
+    pub fn watch_feeds(&self, watch: impl Fn(usize, &crate::feed::Feed) + Send + 'static) {
+        *self.watch.lock().unwrap_or_else(|e| e.into_inner()) = Some(Box::new(watch));
     }
 
     /// Every read waiting, in machine order.
@@ -583,6 +603,24 @@ mod tests {
         );
         assert_eq!((reads[1].machine, host(&reads[1])), (1, Some("now")));
         assert!(inbox.take().is_empty());
+    }
+
+    #[test]
+    fn every_feed_a_current_reader_brings_is_watched_as_it_lands() {
+        // Whether or not the board takes it: the runner hears of it while Andrew is inside a
+        // workspace (intent 0445).
+        let inbox = Inbox::default();
+        let (tx, rx) = mpsc::channel();
+        inbox.watch_feeds(move |machine, _| {
+            let _ = tx.send(machine);
+        });
+        let t = Instant::now();
+        inbox.put(read_of(1, live(), Some("with a feed"), true), t, 0);
+        inbox.put(read_of(1, live(), Some("without"), false), t, 0);
+        // A retired reader's read never lands, nor is watched.
+        inbox.next_reader(0);
+        inbox.put(read_of(0, live(), Some("retired"), true), t, 0);
+        assert_eq!(rx.try_iter().collect::<Vec<_>>(), vec![1]);
     }
 
     #[test]
