@@ -19,6 +19,9 @@ pub struct SessionInfo {
     pub running: bool,
     #[serde(default)]
     pub default: bool,
+    /// The session's API socket on its own machine.
+    #[serde(default)]
+    pub socket_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

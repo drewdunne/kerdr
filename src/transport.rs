@@ -67,6 +67,21 @@ fn control_dir() -> std::path::PathBuf {
     dir
 }
 
+/// The folder for SSH's sockets, made and closed to everyone else. None when it can't be.
+#[cfg(unix)]
+pub fn private_control_dir() -> Option<std::path::PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = control_dir();
+    std::fs::create_dir_all(&dir).ok()?;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+    Some(dir)
+}
+
+/// Runs a command here with no input and a deadline.
+pub fn run_plain(cmd: &mut Command, deadline: Duration) -> Output {
+    run(cmd, None, deadline, true, None)
+}
+
 pub fn ssh_args() -> Vec<String> {
     let args = [
         "-T",

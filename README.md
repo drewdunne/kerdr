@@ -122,6 +122,18 @@ theirs. If that session was started by an older herdr than yours, `herdr --remot
 ask whether to restart it, which stops its agents, so Kerdr runs herdr there over plain SSH
 instead until the versions match.
 
+Going into a card on another machine has no wait when its session is held. `herdr --remote` takes
+seconds, since it starts from a new SSH connection and checks the other machine first. So Kerdr
+keeps one SSH connection per machine and forwards the session's socket through it, ready for
+herdr's client to connect to: about half a second from Enter to the screen. A session is held while
+a workspace in it has something waiting on you (the card itself, or a piece inside it) that you
+haven't been into yet, while you're in it, and for 60 seconds after you leave. A wait you've been
+into counts again only once it has ended and another has begun. Anything else is released, and a
+machine with nothing held has no connection for this. Going in with nothing held works the usual
+way, and so does anything a held connection can't do: different herdr versions at each end, a
+connection that has just dropped, or a client that fails to open. Nothing to set up, and nothing
+on the other machine changes. On Windows, whose OpenSSH has no shared connections, nothing is held.
+
 When a connection drops (a laptop on a train, a server rebooting), its cards stay on the board,
 dimmed, with the time they were last seen. Kerdr retries with longer and longer waits, up to
 15 seconds, so a laptop back from sleep has them again within seconds. `Enter` on one of those

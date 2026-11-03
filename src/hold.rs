@@ -1,0 +1,1030 @@
+//! Holding connections ready, so going into a card on another machine has no wait (intent 0481).
+//!
+//! `herdr --remote` takes seconds because it starts from nothing: a new SSH connection, a few
+//! commands to check the other machine's herdr, then a bridge. All of that is only a way to reach
+//! one socket, the session's client socket. So Kerdr keeps one SSH connection per machine and
+//! forwards that socket through it to a socket here, and `herdr client` connects to it directly.
+//! herdr closes a client that hasn't said hello within seconds, so a connection can't be left open
+//! ahead of time: a held session is the forward, ready to connect on the first key.
+//!
+//! What's held follows you. A session is held while a workspace in it has something waiting on you
+//! that you haven't been into yet, while you're in it, and for a minute after you leave it. A wait
+//! you've been into counts again only once it has ended and another begins. Anything else is
+//! released, and going into a session with nothing held works the slow way, as it always has.
+
+use std::collections::{BTreeMap, BTreeSet};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
+use std::time::{Duration, Instant};
+
+use crate::app::App;
+use crate::family;
+use crate::jump;
+
+/// How long a session stays held after you leave it.
+pub const AFTER_LEAVING: Duration = Duration::from_secs(60);
+
+/// A herdr session on a machine.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Place {
+    pub machine: usize,
+    pub session: String,
+}
+
+/// A workspace in a session.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Spot {
+    pub place: Place,
+    pub workspace: String,
+}
+
+/// Which sessions to hold: only the rule, with no connections, so it can be read and tested alone.
+#[derive(Debug, Default)]
+pub struct Policy {
+    /// Workspaces with something waiting on you now.
+    waiting: BTreeSet<Spot>,
+    /// Those you've been into during this wait. Each wait counts until you've been into it.
+    been_into: BTreeSet<Spot>,
+    inside: Option<Spot>,
+    /// Sessions you've left, and when.
+    left: BTreeMap<Place, Instant>,
+}
+
+impl Policy {
+    /// What waits on you now, from the board.
+    pub fn saw(&mut self, waiting: BTreeSet<Spot>) {
+        let inside = self.inside.clone();
+        self.been_into
+            .retain(|s| waiting.contains(s) || inside.as_ref() == Some(s));
+        self.waiting = waiting;
+    }
+
+    pub fn enter(&mut self, spot: Spot) {
+        self.been_into.insert(spot.clone());
+        self.inside = Some(spot);
+    }
+
+    /// The minute starts here, when you leave, however long you were in there.
+    pub fn leave(&mut self, now: Instant) {
+        if let Some(spot) = self.inside.take() {
+            self.left.insert(spot.place, now);
+        }
+    }
+
+    /// The sessions to hold now.
+    pub fn wanted(&mut self, now: Instant) -> BTreeSet<Place> {
+        self.left
+            .retain(|_, at| now.saturating_duration_since(*at) < AFTER_LEAVING);
+        let mut places: BTreeSet<Place> = self.left.keys().cloned().collect();
+        places.extend(self.inside.iter().map(|s| s.place.clone()));
+        places.extend(
+            self.waiting
+                .iter()
+                .filter(|s| !self.been_into.contains(s))
+                .map(|s| s.place.clone()),
+        );
+        places
+    }
+}
+
+/// Every open workspace on a machine over SSH where the card or a piece inside it waits on you.
+pub fn waiting_spots(app: &App) -> BTreeSet<Spot> {
+    app.board
+        .cards
+        .iter()
+        .filter(|c| family::needs(c))
+        .filter_map(|c| {
+            let machine = app.machines.get(c.machine_index)?;
+            machine.machine.ssh.as_ref()?;
+            Some(Spot {
+                place: Place {
+                    machine: c.machine_index,
+                    session: c.session.clone()?,
+                },
+                workspace: c.workspace_id.clone()?,
+            })
+        })
+        .collect()
+}
+
+/// The session's client socket from its API socket, as herdr names it: `herdr.sock` beside
+/// `herdr-client.sock`. None for a path SSH's forward can't take, since `:` separates its parts.
+pub fn client_socket(api_socket: &str) -> Option<String> {
+    let path = api_socket.strip_suffix(".sock")?;
+    if !path.starts_with('/') || path.contains(':') {
+        return None;
+    }
+    Some(format!("{path}-client.sock"))
+}
+
+/// Where to hold a session: the SSH host and the client socket there. None when it can't be held:
+/// this machine's session, a machine not answering, or a different herdr at each end, which
+/// `herdr --remote` is the one to handle (it may need to ask you).
+pub fn target(app: &App, place: &Place) -> Option<(String, String)> {
+    let m = app.machines.get(place.machine)?;
+    if !m.conn.is_live() {
+        return None;
+    }
+    let host = m.machine.ssh.clone()?;
+    let server = m.snapshot(&place.session)?.version.as_deref();
+    let here = app.machines.first()?.data.as_ref()?.version.as_deref();
+    if !jump::same_herdr(&m.machine, server, here) {
+        return None;
+    }
+    let info = m
+        .data
+        .as_ref()?
+        .sessions
+        .iter()
+        .find(|s| s.running && s.name == place.session)?;
+    Some((host, client_socket(info.socket_path.as_deref()?)?))
+}
+
+/// The rule and the connections together: what the board talks to.
+pub struct Holds {
+    policy: Policy,
+    holder: Option<Holder>,
+}
+
+impl Holds {
+    /// Holds nothing: the demo, and Windows, whose OpenSSH has no shared connections.
+    pub fn off() -> Holds {
+        Holds {
+            policy: Policy::default(),
+            holder: None,
+        }
+    }
+
+    pub fn on() -> Holds {
+        Holds {
+            policy: Policy::default(),
+            holder: Holder::start("ssh", Duration::from_secs(2)),
+        }
+    }
+
+    /// Brings what's held in line with the board. Cheap: it only sends a change.
+    pub fn sync(&mut self, app: &App) {
+        let Some(holder) = self.holder.as_mut() else {
+            return;
+        };
+        self.policy.saw(waiting_spots(app));
+        let mut wanted: Wanted = BTreeMap::new();
+        for place in self.policy.wanted(Instant::now()) {
+            if let Some((host, socket)) = target(app, &place) {
+                wanted
+                    .entry(host)
+                    .or_default()
+                    .insert(place.session, socket);
+            }
+        }
+        holder.want(wanted);
+    }
+
+    /// You're going in: the socket to connect to, when this session can be reached that way now.
+    /// A connection already up to its machine takes a moment to forward one more session.
+    pub fn entering(&mut self, app: &App, spot: Spot) -> Option<PathBuf> {
+        let place = spot.place.clone();
+        self.policy.enter(spot);
+        self.sync(app);
+        let (host, _) = target(app, &place)?;
+        self.holder
+            .as_ref()?
+            .ready_soon(&host, &place.session, Duration::from_millis(250))
+    }
+
+    pub fn left(&mut self, app: &App) {
+        self.policy.leave(Instant::now());
+        self.sync(app);
+    }
+}
+
+/// By SSH host, each session to hold and its client socket there.
+type Wanted = BTreeMap<String, BTreeMap<String, String>>;
+
+/// One SSH connection per machine with something to hold, each kept by a thread of its own so a
+/// machine that's slow to answer never holds up the board or another machine.
+#[cfg(unix)]
+pub struct Holder {
+    program: String,
+    dir: PathBuf,
+    tick: Duration,
+    shared: std::sync::Arc<std::sync::Mutex<Shared>>,
+    hosts: BTreeMap<String, Worker>,
+    sent: Wanted,
+}
+
+#[cfg(not(unix))]
+pub struct Holder;
+
+#[cfg(not(unix))]
+impl Holder {
+    fn start(_program: &str, _tick: Duration) -> Option<Holder> {
+        None
+    }
+    fn want(&mut self, _wanted: Wanted) {}
+    fn ready_soon(&self, _host: &str, _session: &str, _within: Duration) -> Option<PathBuf> {
+        None
+    }
+}
+
+#[cfg(unix)]
+#[derive(Default)]
+struct Shared {
+    /// Machines whose connection is up.
+    up: BTreeSet<String>,
+    /// By (host, session), the socket here that reaches that session.
+    ready: BTreeMap<(String, String), PathBuf>,
+}
+
+#[cfg(unix)]
+struct Worker {
+    tx: std::sync::mpsc::Sender<Message>,
+    /// Closes when the thread has cleaned up.
+    done: std::sync::mpsc::Receiver<()>,
+}
+
+#[cfg(unix)]
+enum Message {
+    Want(BTreeMap<String, String>),
+    Stop,
+}
+
+/// A connection that keeps failing is tried less often, up to this.
+#[cfg(unix)]
+const LONGEST_RETRY: Duration = Duration::from_secs(60);
+
+#[cfg(unix)]
+impl Holder {
+    fn start(program: &str, tick: Duration) -> Option<Holder> {
+        let dir = crate::transport::private_control_dir()?;
+        sweep(&dir);
+        Some(Holder::in_dir(program, tick, dir))
+    }
+
+    fn in_dir(program: &str, tick: Duration, dir: PathBuf) -> Holder {
+        Holder {
+            program: program.to_string(),
+            dir,
+            tick,
+            shared: Default::default(),
+            hosts: BTreeMap::new(),
+            sent: BTreeMap::new(),
+        }
+    }
+
+    fn want(&mut self, wanted: Wanted) {
+        if wanted == self.sent {
+            return;
+        }
+        for host in self.sent.keys() {
+            if !wanted.contains_key(host)
+                && let Some(worker) = self.hosts.get(host)
+            {
+                let _ = worker.tx.send(Message::Want(BTreeMap::new()));
+            }
+        }
+        for (host, sessions) in &wanted {
+            if self.sent.get(host) == Some(sessions) {
+                continue;
+            }
+            let worker = self.hosts.entry(host.clone()).or_insert_with(|| {
+                spawn_worker(
+                    self.program.clone(),
+                    host.clone(),
+                    self.dir.clone(),
+                    self.tick,
+                    self.shared.clone(),
+                )
+            });
+            let _ = worker.tx.send(Message::Want(sessions.clone()));
+        }
+        self.sent = wanted;
+    }
+
+    /// The socket for a session once it's ready to connect to, waiting only while its machine's
+    /// connection is already up, and never longer than `within`.
+    fn ready_soon(&self, host: &str, session: &str, within: Duration) -> Option<PathBuf> {
+        let key = (host.to_string(), session.to_string());
+        let deadline = Instant::now() + within;
+        loop {
+            let (socket, up) = {
+                let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                (shared.ready.get(&key).cloned(), shared.up.contains(host))
+            };
+            if let Some(socket) = socket {
+                // Refused when the connection behind it has just gone.
+                return std::os::unix::net::UnixStream::connect(&socket)
+                    .ok()
+                    .map(|_| socket);
+            }
+            if !up || Instant::now() >= deadline {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Holder {
+    fn drop(&mut self) {
+        for worker in self.hosts.values() {
+            let _ = worker.tx.send(Message::Stop);
+        }
+        // Quitting isn't held up by a machine slow to answer: what's left closes with Kerdr, and
+        // the next Kerdr sweeps any socket left behind.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        for worker in self.hosts.values() {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let _ = worker.done.recv_timeout(left);
+        }
+    }
+}
+
+/// The file names Kerdr uses here start with its process id, kept short because a socket's path
+/// can't be longer than about 100 bytes.
+#[cfg(unix)]
+fn socket_name(pid: u32, n: u64, kind: &str) -> String {
+    format!("h{pid}-{n}.{kind}")
+}
+
+#[cfg(unix)]
+fn name_pid(name: &str) -> Option<i32> {
+    name.strip_prefix('h')?.split('-').next()?.parse().ok()
+}
+
+/// Removes the sockets a Kerdr that was killed left behind.
+#[cfg(unix)]
+fn sweep(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(name_pid) else {
+            continue;
+        };
+        // SAFETY: signal 0 only asks whether the process exists.
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone {
+            let _ = std::fs::remove_file(entry.path());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn spawn_worker(
+    program: String,
+    host: String,
+    dir: PathBuf,
+    tick: Duration,
+    shared: std::sync::Arc<std::sync::Mutex<Shared>>,
+) -> Worker {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let (done_tx, done) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut held = Connection {
+            program,
+            host,
+            dir,
+            shared,
+            master: None,
+            forwards: BTreeMap::new(),
+            failures: 0,
+            retry_at: None,
+        };
+        let mut wanted = BTreeMap::new();
+        loop {
+            match rx.recv_timeout(tick) {
+                Ok(Message::Want(w)) => wanted = w,
+                Ok(Message::Stop) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            held.reconcile(&wanted);
+        }
+        held.reconcile(&BTreeMap::new());
+        let _ = done_tx.send(());
+    });
+    Worker { tx, done }
+}
+
+#[cfg(unix)]
+struct Master {
+    child: std::process::Child,
+    control: PathBuf,
+}
+
+#[cfg(unix)]
+struct Forward {
+    local: PathBuf,
+    remote: String,
+}
+
+/// One machine's connection and the sessions forwarded through it.
+#[cfg(unix)]
+struct Connection {
+    program: String,
+    host: String,
+    dir: PathBuf,
+    shared: std::sync::Arc<std::sync::Mutex<Shared>>,
+    master: Option<Master>,
+    forwards: BTreeMap<String, Forward>,
+    failures: u32,
+    retry_at: Option<Instant>,
+}
+
+#[cfg(unix)]
+impl Connection {
+    fn reconcile(&mut self, wanted: &BTreeMap<String, String>) {
+        self.notice_lost();
+        if wanted.is_empty() {
+            self.close();
+            self.failures = 0;
+            self.retry_at = None;
+            return;
+        }
+        // A session gone from the list, or whose socket has moved.
+        let stale: Vec<String> = self
+            .forwards
+            .iter()
+            .filter(|(session, f)| wanted.get(*session) != Some(&f.remote))
+            .map(|(session, _)| session.clone())
+            .collect();
+        for session in stale {
+            self.cancel(&session);
+        }
+        if self.master.is_none() && !self.open() {
+            return;
+        }
+        for (session, remote) in wanted {
+            if !self.forwards.contains_key(session) {
+                self.forward(session, remote);
+            }
+        }
+    }
+
+    /// A connection that dropped takes its forwards with it. Trying again starts straight away.
+    fn notice_lost(&mut self) {
+        let lost = self
+            .master
+            .as_mut()
+            .is_some_and(|m| !matches!(m.child.try_wait(), Ok(None)));
+        if lost {
+            self.close();
+        }
+    }
+
+    fn open(&mut self) -> bool {
+        if self.retry_at.is_some_and(|at| Instant::now() < at) {
+            return false;
+        }
+        match self.start_master() {
+            Some(master) => {
+                self.master = Some(master);
+                self.failures = 0;
+                self.retry_at = None;
+                self.lock().up.insert(self.host.clone());
+                true
+            }
+            None => {
+                self.failures = self.failures.saturating_add(1);
+                let wait = Duration::from_secs(5u64 << self.failures.min(4));
+                self.retry_at = Some(Instant::now() + wait.min(LONGEST_RETRY));
+                false
+            }
+        }
+    }
+
+    /// The remote command does nothing but end when Kerdr does, however Kerdr ends: its input
+    /// closes, and the connection goes with it. Keepalives are gentler than the ones Kerdr reads
+    /// the board with: your window into a session runs through this one, so a short drop on the
+    /// network mustn't close it.
+    fn start_master(&self) -> Option<Master> {
+        use std::os::unix::process::CommandExt;
+        use std::process::{Command, Stdio};
+        let control = self.path("ctl");
+        let mut cmd = Command::new(&self.program);
+        cmd.args(["-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8"])
+            .args([
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=4",
+            ])
+            .args(["-o", "ControlMaster=yes", "-o", "ControlPersist=no", "-o"])
+            .arg(format!("ControlPath={}", control.display()))
+            .args(["--", &self.host, "cat >/dev/null"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            // Never in the terminal's way, nor stopped by a Ctrl+C meant for something else.
+            .process_group(0);
+        let mut child = cmd.spawn().ok()?;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if !matches!(child.try_wait(), Ok(None)) {
+                break;
+            }
+            if self.control(&control, &["check"], &[]) {
+                return Some(Master { child, control });
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&control);
+        None
+    }
+
+    fn forward(&mut self, session: &str, remote: &str) {
+        let Some(master) = &self.master else {
+            return;
+        };
+        let local = self.path("sock");
+        let spec = format!("{}:{remote}", local.display());
+        if self.control(&master.control, &["forward"], &["-L", &spec]) {
+            self.lock()
+                .ready
+                .insert((self.host.clone(), session.to_string()), local.clone());
+            self.forwards.insert(
+                session.to_string(),
+                Forward {
+                    local,
+                    remote: remote.to_string(),
+                },
+            );
+        } else {
+            let _ = std::fs::remove_file(&local);
+        }
+    }
+
+    fn cancel(&mut self, session: &str) {
+        let Some(f) = self.forwards.remove(session) else {
+            return;
+        };
+        self.lock()
+            .ready
+            .remove(&(self.host.clone(), session.to_string()));
+        if let Some(master) = &self.master {
+            let spec = format!("{}:{}", f.local.display(), f.remote);
+            self.control(&master.control, &["cancel"], &["-L", &spec]);
+        }
+        let _ = std::fs::remove_file(&f.local);
+    }
+
+    /// Lets go of the machine: its connection and everything forwarded through it.
+    fn close(&mut self) {
+        let sessions: Vec<String> = self.forwards.keys().cloned().collect();
+        for session in sessions {
+            self.cancel(&session);
+        }
+        if let Some(mut master) = self.master.take() {
+            let _ = master.child.kill();
+            let _ = master.child.wait();
+            let _ = std::fs::remove_file(&master.control);
+        }
+        self.lock().up.remove(&self.host);
+    }
+
+    /// Asks the connection to do something: `ssh -S <its socket> -O <what> ...`.
+    fn control(&self, control: &Path, what: &[&str], rest: &[&str]) -> bool {
+        let mut cmd = std::process::Command::new(&self.program);
+        cmd.arg("-S").arg(control).arg("-O").args(what).args(rest);
+        cmd.args(["-o", "BatchMode=yes", "--", &self.host]);
+        crate::transport::run_plain(&mut cmd, Duration::from_secs(3)).ok()
+    }
+
+    fn path(&self, kind: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.dir.join(socket_name(std::process::id(), n, kind))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Shared> {
+        self.shared.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spot(session: &str, workspace: &str) -> Spot {
+        Spot {
+            place: Place {
+                machine: 1,
+                session: session.into(),
+            },
+            workspace: workspace.into(),
+        }
+    }
+
+    fn places(names: &[&str]) -> BTreeSet<Place> {
+        names
+            .iter()
+            .map(|session| Place {
+                machine: 1,
+                session: (*session).into(),
+            })
+            .collect()
+    }
+
+    fn set(spots: &[Spot]) -> BTreeSet<Spot> {
+        spots.iter().cloned().collect()
+    }
+
+    #[test]
+    fn a_session_is_held_while_something_in_it_waits_on_you_and_no_longer() {
+        let mut p = Policy::default();
+        let now = Instant::now();
+        assert!(p.wanted(now).is_empty());
+        p.saw(set(&[spot("ARK", "w1")]));
+        assert_eq!(p.wanted(now), places(&["ARK"]));
+        // It stopped waiting without your going in: nothing needs it now.
+        p.saw(set(&[]));
+        assert!(p.wanted(now).is_empty());
+    }
+
+    #[test]
+    fn the_minute_starts_when_you_leave_however_long_you_stayed() {
+        let mut p = Policy::default();
+        let t0 = Instant::now();
+        p.saw(set(&[spot("ARK", "w1")]));
+        p.enter(spot("ARK", "w1"));
+        // Half an hour in the card: still held, and the wait you're in doesn't end it.
+        p.saw(set(&[]));
+        assert_eq!(p.wanted(t0 + Duration::from_secs(1800)), places(&["ARK"]));
+        let left = t0 + Duration::from_secs(1800);
+        p.leave(left);
+        assert_eq!(p.wanted(left + Duration::from_secs(59)), places(&["ARK"]));
+        assert!(p.wanted(left + Duration::from_secs(60)).is_empty());
+    }
+
+    #[test]
+    fn a_wait_you_have_been_into_is_released_after_the_minute_even_if_it_still_shows() {
+        let mut p = Policy::default();
+        let t0 = Instant::now();
+        p.saw(set(&[spot("ARK", "w1")]));
+        p.enter(spot("ARK", "w1"));
+        p.leave(t0);
+        p.saw(set(&[spot("ARK", "w1")]));
+        assert_eq!(p.wanted(t0 + Duration::from_secs(30)), places(&["ARK"]));
+        assert!(p.wanted(t0 + Duration::from_secs(60)).is_empty());
+        // It ended, and another began: that one counts.
+        p.saw(set(&[]));
+        p.saw(set(&[spot("ARK", "w1")]));
+        assert_eq!(p.wanted(t0 + Duration::from_secs(61)), places(&["ARK"]));
+    }
+
+    #[test]
+    fn another_workspace_waiting_keeps_the_session_held() {
+        let mut p = Policy::default();
+        let t0 = Instant::now();
+        p.saw(set(&[spot("ARK", "w1"), spot("ARK", "w2")]));
+        p.enter(spot("ARK", "w1"));
+        p.leave(t0);
+        assert_eq!(p.wanted(t0 + Duration::from_secs(600)), places(&["ARK"]));
+    }
+
+    #[test]
+    fn hopping_holds_where_you_were_and_where_you_are() {
+        let mut p = Policy::default();
+        let t0 = Instant::now();
+        p.enter(spot("ARK", "w1"));
+        p.leave(t0);
+        p.enter(spot("P4M", "w1"));
+        assert_eq!(
+            p.wanted(t0 + Duration::from_secs(5)),
+            places(&["ARK", "P4M"])
+        );
+        assert_eq!(p.wanted(t0 + Duration::from_secs(61)), places(&["P4M"]));
+    }
+
+    #[test]
+    fn going_back_in_starts_the_minute_again_from_the_new_leaving() {
+        let mut p = Policy::default();
+        let t0 = Instant::now();
+        p.enter(spot("ARK", "w1"));
+        p.leave(t0);
+        p.enter(spot("ARK", "w1"));
+        let later = t0 + Duration::from_secs(50);
+        p.leave(later);
+        assert_eq!(p.wanted(later + Duration::from_secs(59)), places(&["ARK"]));
+    }
+
+    #[test]
+    fn the_client_socket_is_named_as_herdr_names_it() {
+        assert_eq!(
+            client_socket("/home/d/.config/herdr/sessions/ARK/herdr.sock").as_deref(),
+            Some("/home/d/.config/herdr/sessions/ARK/herdr-client.sock")
+        );
+        assert_eq!(client_socket("relative/herdr.sock"), None);
+        assert_eq!(client_socket("/a:b/herdr.sock"), None);
+        assert_eq!(client_socket("/a/herdr"), None);
+    }
+
+    mod board {
+        use super::*;
+        use crate::board::MachineState;
+        use crate::config::{Config, Machine};
+        use crate::herdr::{Agent, SessionInfo, Snapshot, Workspace};
+        use crate::poll::{Conn, MachineData};
+
+        fn machine(name: &str, ssh: bool, server: &str, status: &str) -> MachineState {
+            let mut m = MachineState::new(Machine {
+                name: name.into(),
+                ssh: ssh.then(|| name.to_lowercase()),
+                herdr: "herdr".into(),
+                feed: None,
+                hidden: false,
+            });
+            m.conn = Conn::Live {
+                latency: Default::default(),
+            };
+            let snap = Snapshot {
+                version: Some(server.into()),
+                workspaces: vec![Workspace {
+                    workspace_id: "w1".into(),
+                    label: "01-a".into(),
+                    ..Default::default()
+                }],
+                agents: vec![Agent {
+                    agent: Some("claude".into()),
+                    agent_status: Some(status.into()),
+                    pane_id: "w1:p1".into(),
+                    tab_id: Some("w1:t1".into()),
+                    workspace_id: "w1".into(),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            };
+            m.data = Some(MachineData {
+                host: Some(name.into()),
+                version: Some(server.into()),
+                sessions: vec![SessionInfo {
+                    name: "ARK".into(),
+                    running: true,
+                    default: false,
+                    socket_path: Some("/h/.config/herdr/sessions/ARK/herdr.sock".into()),
+                }],
+                snapshots: [("ARK".to_string(), Ok(snap))].into_iter().collect(),
+                keys: true,
+                feed: None,
+                feed_failed_after: None,
+            });
+            m
+        }
+
+        fn app(machines: Vec<MachineState>) -> App {
+            let mut app = App::new(Config::default(), machines);
+            app.rebuild();
+            app
+        }
+
+        fn ark() -> Place {
+            Place {
+                machine: 1,
+                session: "ARK".into(),
+            }
+        }
+
+        #[test]
+        fn only_another_machines_waiting_workspaces_count() {
+            let a = app(vec![
+                machine("here", false, "0.9.1", "blocked"),
+                machine("server", true, "0.9.1", "blocked"),
+            ]);
+            let spots = waiting_spots(&a);
+            assert_eq!(spots.len(), 1, "{spots:?}");
+            assert_eq!(spots.iter().next().unwrap().place, ark());
+            assert_eq!(spots.iter().next().unwrap().workspace, "w1");
+        }
+
+        #[test]
+        fn nothing_counts_while_the_agent_works() {
+            let a = app(vec![
+                machine("here", false, "0.9.1", "working"),
+                machine("server", true, "0.9.1", "working"),
+            ]);
+            assert!(waiting_spots(&a).is_empty());
+        }
+
+        #[test]
+        fn a_session_is_held_only_with_the_same_herdr_at_both_ends() {
+            let same = app(vec![
+                machine("here", false, "0.9.1", "blocked"),
+                machine("server", true, "0.9.1", "blocked"),
+            ]);
+            assert_eq!(
+                target(&same, &ark()),
+                Some((
+                    "server".to_string(),
+                    "/h/.config/herdr/sessions/ARK/herdr-client.sock".to_string()
+                ))
+            );
+            let older = app(vec![
+                machine("here", false, "0.9.5", "blocked"),
+                machine("server", true, "0.9.1", "blocked"),
+            ]);
+            assert_eq!(target(&older, &ark()), None);
+            let newer = app(vec![
+                machine("here", false, "0.9.1", "blocked"),
+                machine("server", true, "0.9.5", "blocked"),
+            ]);
+            assert_eq!(target(&newer, &ark()), None);
+        }
+
+        #[test]
+        fn a_machine_not_answering_is_not_held() {
+            let mut away = machine("server", true, "0.9.1", "blocked");
+            away.conn = Conn::Connecting;
+            let a = app(vec![machine("here", false, "0.9.1", "blocked"), away]);
+            assert_eq!(target(&a, &ark()), None);
+        }
+    }
+
+    #[cfg(unix)]
+    mod connections {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        /// Stands in for ssh: logs what it's asked, and counts as a connection while it runs.
+        fn fake_ssh(dir: &Path, master_works: bool) -> String {
+            let path = dir.join("fake-ssh");
+            let script = format!(
+                r#"#!/bin/sh
+D='{d}'
+case " $* " in
+  *" -O check "*) test -f "$D/up" ;;
+  *" -O forward "*) echo "forward $*" >>"$D/log" ;;
+  *" -O cancel "*) echo "cancel $*" >>"$D/log" ;;
+  *)
+    echo "master $*" >>"$D/log"
+    {fail}
+    touch "$D/up"
+    trap 'rm -f "$D/up"; exit 0' TERM
+    while :; do sleep 0.02; done
+    ;;
+esac
+"#,
+                d = dir.display(),
+                fail = if master_works { "" } else { "exit 255" }
+            );
+            std::fs::write(&path, script).unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            path.display().to_string()
+        }
+
+        fn wanted(host: &str, sessions: &[(&str, &str)]) -> Wanted {
+            [(
+                host.to_string(),
+                sessions
+                    .iter()
+                    .map(|(s, r)| (s.to_string(), r.to_string()))
+                    .collect(),
+            )]
+            .into_iter()
+            .collect()
+        }
+
+        fn wait_for(what: &str, mut ok: impl FnMut() -> bool) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while !ok() {
+                assert!(Instant::now() < deadline, "never happened: {what}");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        fn log(dir: &Path) -> String {
+            std::fs::read_to_string(dir.join("log")).unwrap_or_default()
+        }
+
+        fn ready(h: &Holder, host: &str, session: &str) -> Option<PathBuf> {
+            let shared = h.shared.lock().unwrap();
+            shared
+                .ready
+                .get(&(host.to_string(), session.to_string()))
+                .cloned()
+        }
+
+        #[test]
+        fn holding_forwards_through_one_connection_and_releasing_lets_it_go() {
+            let dir = tempfile::tempdir().unwrap();
+            let ssh = fake_ssh(dir.path(), true);
+            let mut h = Holder::in_dir(&ssh, Duration::from_millis(20), dir.path().to_path_buf());
+            h.want(wanted("server", &[("ARK", "/r/ark-client.sock")]));
+            wait_for("ARK ready", || ready(&h, "server", "ARK").is_some());
+            let local = ready(&h, "server", "ARK").unwrap();
+            let name = local.file_name().unwrap().to_str().unwrap().to_string();
+            assert!(
+                name.starts_with(&format!("h{}-", std::process::id())),
+                "{name}"
+            );
+
+            h.want(wanted(
+                "server",
+                &[("ARK", "/r/ark-client.sock"), ("P4M", "/r/p4m-client.sock")],
+            ));
+            wait_for("P4M ready", || ready(&h, "server", "P4M").is_some());
+            let text = log(dir.path());
+            assert_eq!(text.matches("master ").count(), 1, "one connection: {text}");
+            assert!(text.contains("ControlPersist=no"), "{text}");
+            assert!(text.contains("ServerAliveInterval=15"), "{text}");
+            assert!(
+                text.contains(&format!("{}:/r/ark-client.sock", local.display())),
+                "{text}"
+            );
+
+            // One session released: the other stays, on the same connection.
+            h.want(wanted("server", &[("P4M", "/r/p4m-client.sock")]));
+            wait_for("ARK released", || ready(&h, "server", "ARK").is_none());
+            assert!(dir.path().join("up").exists());
+            assert!(log(dir.path()).contains("cancel "));
+
+            // The last one: the connection goes too.
+            h.want(BTreeMap::new());
+            wait_for("all released", || ready(&h, "server", "P4M").is_none());
+            wait_for("connection closed", || {
+                !h.shared.lock().unwrap().up.contains("server")
+            });
+        }
+
+        #[test]
+        fn a_connection_that_drops_comes_back_with_its_sessions() {
+            let dir = tempfile::tempdir().unwrap();
+            let ssh = fake_ssh(dir.path(), true);
+            let mut h = Holder::in_dir(&ssh, Duration::from_millis(20), dir.path().to_path_buf());
+            h.want(wanted("server", &[("ARK", "/r/ark-client.sock")]));
+            wait_for("ready", || ready(&h, "server", "ARK").is_some());
+            let first = ready(&h, "server", "ARK").unwrap();
+            let pids = std::process::Command::new("pkill")
+                .args(["-TERM", "-f", &ssh])
+                .status()
+                .unwrap();
+            assert!(pids.success());
+            wait_for("a new forward", || {
+                ready(&h, "server", "ARK").is_some_and(|p| p != first)
+            });
+            assert_eq!(log(dir.path()).matches("master ").count(), 2);
+        }
+
+        #[test]
+        fn a_machine_that_refuses_is_tried_again_only_after_a_wait() {
+            let dir = tempfile::tempdir().unwrap();
+            let ssh = fake_ssh(dir.path(), false);
+            let mut h = Holder::in_dir(&ssh, Duration::from_millis(10), dir.path().to_path_buf());
+            h.want(wanted("server", &[("ARK", "/r/ark-client.sock")]));
+            wait_for("the first try", || log(dir.path()).contains("master "));
+            std::thread::sleep(Duration::from_millis(300));
+            assert_eq!(log(dir.path()).matches("master ").count(), 1);
+            assert!(ready(&h, "server", "ARK").is_none());
+            assert_eq!(h.ready_soon("server", "ARK", Duration::from_secs(5)), None);
+        }
+
+        #[test]
+        fn nothing_held_answers_at_once_when_no_connection_is_up() {
+            let dir = tempfile::tempdir().unwrap();
+            let h = Holder::in_dir("true", Duration::from_millis(10), dir.path().to_path_buf());
+            let t = Instant::now();
+            assert_eq!(h.ready_soon("server", "ARK", Duration::from_secs(5)), None);
+            assert!(t.elapsed() < Duration::from_secs(1));
+        }
+
+        #[test]
+        fn a_socket_nothing_listens_on_any_more_is_not_ready() {
+            let dir = tempfile::tempdir().unwrap();
+            let h = Holder::in_dir("true", Duration::from_millis(10), dir.path().to_path_buf());
+            let path = dir.path().join("gone.sock");
+            drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
+            h.shared
+                .lock()
+                .unwrap()
+                .ready
+                .insert(("server".into(), "ARK".into()), path);
+            assert_eq!(h.ready_soon("server", "ARK", Duration::from_secs(1)), None);
+        }
+
+        #[test]
+        fn a_killed_kerdrs_sockets_are_swept_and_a_running_ones_kept() {
+            let dir = tempfile::tempdir().unwrap();
+            let mine = dir.path().join(socket_name(std::process::id(), 1, "sock"));
+            // A process that has finished: its id is free.
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let dead = child.id();
+            child.wait().unwrap();
+            let theirs = dir.path().join(socket_name(dead, 1, "sock"));
+            let other = dir.path().join("ssh-abc");
+            for p in [&mine, &theirs, &other] {
+                std::fs::write(p, "").unwrap();
+            }
+            sweep(dir.path());
+            assert!(mine.exists() && other.exists());
+            assert!(!theirs.exists());
+        }
+    }
+}

@@ -85,6 +85,7 @@ fn session(name: &str) -> SessionInfo {
         name: name.into(),
         running: true,
         default: name == "default",
+        socket_path: None,
     }
 }
 

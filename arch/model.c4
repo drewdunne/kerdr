@@ -33,6 +33,7 @@ model {
   kerdr -> readfeed "poll JSON locally or over SSH"
   readfeed -> records "read work and affirmation dates"
   kerdr -> herdr "read snapshots; focus workspace"
+  kerdr -> herdr "hold a forwarded client socket for sessions waiting on Drew"
   kerdr -> action "explicit user action as JSON"
   action -> dispatch "validate request; invoke domain operation"
   dispatch -> records "write work, rank and affirmation state"
