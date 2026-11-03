@@ -3,7 +3,8 @@
 //! owner, the older half in `errors.log.1`. What you typed never goes in, nor a token it can
 //! recognise, and a log that can't be written changes nothing else: Kerdr carries on without it.
 
-use std::fs::{self, OpenOptions};
+use std::collections::HashSet;
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -14,14 +15,18 @@ use crate::config::state_dir;
 /// A file this big starts again, its lines kept in `errors.log.1` until the next time.
 const MOST_BYTES: u64 = 1024 * 1024;
 const MOST_MESSAGE: usize = 8 * 1024;
-const MOST_STDERR: usize = 16 * 1024;
+pub const MOST_STDERR: usize = 16 * 1024;
 /// A run of this many characters that's also in something you typed is taken for a quote of it.
 const QUOTE_RUN: usize = 12;
-/// Shorter words than this are too common to take for a quote of what you typed.
+/// Shorter text than this is too common to take for a quote of what you typed, and a shorter word
+/// than this is left in an answer to the request it was typed into.
 const SHORTEST_TYPED: usize = 4;
+/// How few characters in a row from a credential count as quoting it.
+const CREDENTIAL_RUN: usize = 8;
 /// A run of letters and digits this long, with both in it, is taken for a token.
 const TOKEN_RUN: usize = 32;
-const TYPED: &str = "[what you typed]";
+const TYPED: &str = "[typed]";
+const LOCK_TRIES: u32 = 5;
 const SECRET: &str = "[redacted]";
 
 /// What one line says. Anything it doesn't know is left out.
@@ -66,11 +71,14 @@ impl ErrorLog {
         ErrorLog { path: None }
     }
 
-    /// Adds a line, taking out what `typed` holds and anything that looks like a token. A failure
-    /// to write it is dropped: the log never stops Kerdr or changes what it shows.
-    pub fn write(&self, entry: &Entry, typed: &[&str]) {
+    /// Adds a line, taking out what was typed and anything that looks like a token. `typed` is
+    /// everything Kerdr holds that was typed, out wherever it's quoted; `sent` is what was typed
+    /// into the request this answers, whose every word goes, as a backend may build a message or
+    /// a path from them. A failure to write it is dropped: the log never stops Kerdr or changes
+    /// what it shows.
+    pub fn write(&self, entry: &Entry, typed: &[&str], sent: &[&str]) {
         if let Some(path) = &self.path {
-            let _ = append(path, &line(entry, typed));
+            let _ = append(path, &line(entry, typed, sent));
         }
     }
 }
@@ -81,15 +89,7 @@ pub fn path() -> PathBuf {
 }
 
 /// One line of the log, ending in its newline.
-fn line(entry: &Entry, typed: &[&str]) -> String {
-    let clean = |text: &str, most: usize, keep_end: bool| -> String {
-        let cut = if keep_end {
-            last_part(text, most)
-        } else {
-            first_part(text, most)
-        };
-        scrub(cut, typed)
-    };
+fn line(entry: &Entry, typed: &[&str], sent: &[&str]) -> String {
     let mut fields = Map::new();
     fields.insert(
         "time".into(),
@@ -98,28 +98,27 @@ fn line(entry: &Entry, typed: &[&str]) -> String {
     fields.insert("kerdr".into(), json!(env!("CARGO_PKG_VERSION")));
     fields.insert("source".into(), json!(entry.source));
     fields.insert("shown".into(), json!(entry.shown));
+    // Kerdr's own names for things: a word you also typed stays in these.
     for (name, value) in [
         ("machine", &entry.machine),
         ("card", &entry.card),
         ("action", &entry.action),
     ] {
         if let Some(value) = value.as_deref().filter(|v| !v.is_empty()) {
-            fields.insert(name.into(), json!(clean(value, 256, false)));
+            fields.insert(name.into(), json!(tokens_out(first_part(value, 256))));
         }
     }
-    fields.insert(
-        "message".into(),
-        json!(clean(&entry.message, MOST_MESSAGE, false)),
-    );
+    let clean = |text: &str| scrub(first_part(text, MOST_MESSAGE), typed, sent);
+    fields.insert("message".into(), json!(clean(&entry.message)));
     if let Some(answer) = entry.answer.as_deref().filter(|a| !a.trim().is_empty())
         && answer != entry.message
     {
-        fields.insert("answer".into(), json!(clean(answer, MOST_MESSAGE, false)));
+        fields.insert("answer".into(), json!(clean(answer)));
     }
     if let Some(stderr) = entry.stderr.as_deref().filter(|s| !s.trim().is_empty()) {
         fields.insert(
             "stderr".into(),
-            json!(clean(stderr.trim(), MOST_STDERR, true)),
+            json!(scrub(last_part(stderr.trim(), MOST_STDERR), typed, sent)),
         );
     }
     let mut text = Value::Object(fields).to_string();
@@ -141,7 +140,7 @@ fn first_part(text: &str, most: usize) -> &str {
 }
 
 /// The last `most` bytes, which is where a command says what finally went wrong, cut likewise.
-fn last_part(text: &str, most: usize) -> &str {
+pub fn last_part(text: &str, most: usize) -> &str {
     if text.len() <= most {
         return text;
     }
@@ -153,22 +152,20 @@ fn last_part(text: &str, most: usize) -> &str {
     cut.find(char::is_whitespace).map_or("", |at| &cut[at..])
 }
 
-/// Takes out what was typed and what looks like a token.
-pub fn scrub(text: &str, typed: &[&str]) -> String {
-    tokens_out(&typed_out(text, typed))
+/// Takes out what was typed and what looks like a token: `typed` wherever it's quoted, every word
+/// of `sent`.
+pub fn scrub(text: &str, typed: &[&str], sent: &[&str]) -> String {
+    tokens_out(&words_out(&typed_out(text, typed), sent))
 }
 
-/// Takes out whatever is typed in `typed`, whole or quoted in part: a backend may give back only
-/// a line or the start of it.
+/// Takes out whatever is in `typed`, whole or quoted in part: a backend may give back only a line
+/// or the start of it.
 fn typed_out(text: &str, typed: &[&str]) -> String {
     let typed: Vec<&str> = typed
         .iter()
         .map(|t| t.trim())
         .filter(|t| t.chars().count() >= SHORTEST_TYPED)
         .collect();
-    if typed.is_empty() {
-        return text.to_string();
-    }
     let mut out = text.to_string();
     // Short ones can only be matched whole.
     for t in typed.iter().filter(|t| t.chars().count() < QUOTE_RUN) {
@@ -179,23 +176,28 @@ fn typed_out(text: &str, typed: &[&str]) -> String {
         .copied()
         .filter(|t| t.chars().count() >= QUOTE_RUN)
         .collect();
-    if long.is_empty() {
-        return out;
+    quotes_out(&out, &long, QUOTE_RUN, TYPED)
+}
+
+/// Replaces every run of at least `run` characters that's also in one of `from`.
+fn quotes_out(text: &str, from: &[&str], run: usize, instead: &str) -> String {
+    if from.is_empty() {
+        return text.to_string();
     }
-    let chars: Vec<(usize, char)> = out.char_indices().collect();
-    let at = |i: usize| chars.get(i).map_or(out.len(), |(byte, _)| *byte);
-    let mut kept = String::with_capacity(out.len());
+    let chars: Vec<(usize, char)> = text.char_indices().collect();
+    let at = |i: usize| chars.get(i).map_or(text.len(), |(byte, _)| *byte);
+    let mut kept = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
-        // How far from here matches something typed.
-        let mut end = i + QUOTE_RUN;
-        let run = |end: usize| long.iter().any(|t| t.contains(&out[at(i)..at(end)]));
-        if end <= chars.len() && run(end) {
-            while end < chars.len() && run(end + 1) {
+        // How far from here matches.
+        let mut end = i + run;
+        let matches = |end: usize| from.iter().any(|t| t.contains(&text[at(i)..at(end)]));
+        if end <= chars.len() && matches(end) {
+            while end < chars.len() && matches(end + 1) {
                 end += 1;
             }
-            if !kept.ends_with(TYPED) {
-                kept.push_str(TYPED);
+            if !kept.ends_with(instead) {
+                kept.push_str(instead);
             }
             i = end;
         } else {
@@ -204,6 +206,48 @@ fn typed_out(text: &str, typed: &[&str]) -> String {
         }
     }
     kept
+}
+
+/// Takes a credential out however much of it is quoted, for a message that's also shown.
+pub fn credential_out(text: &str, credential: &str) -> String {
+    quotes_out(text, &[credential.trim()], CREDENTIAL_RUN, SECRET)
+}
+
+/// Takes out every word of `sent`, in any case, however it was joined up: a backend may make a
+/// path of them, as `intents/0099-make-boards-new-intent-box`. No match on the characters of a
+/// quote could find a name said once on its own. Words too short to say much stay.
+fn words_out(text: &str, sent: &[&str]) -> String {
+    let words: HashSet<String> = sent
+        .iter()
+        .flat_map(|s| s.split(|c: char| !c.is_alphanumeric()))
+        .filter(|w| w.chars().count() >= SHORTEST_TYPED)
+        .map(str::to_lowercase)
+        .collect();
+    if words.is_empty() {
+        return text.to_string();
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut word = String::new();
+    let end_word = |word: &mut String, out: &mut String| {
+        if !word.is_empty() {
+            if words.contains(&word.to_lowercase()) {
+                out.push_str(TYPED);
+            } else {
+                out.push_str(word);
+            }
+            word.clear();
+        }
+    };
+    for c in text.chars() {
+        if c.is_alphanumeric() {
+            word.push(c);
+        } else {
+            end_word(&mut word, &mut out);
+            out.push(c);
+        }
+    }
+    end_word(&mut word, &mut out);
+    out
 }
 
 /// Whether a character can be part of a token's long run.
@@ -245,10 +289,13 @@ const SECRET_NAMES: &[&str] = &[
 ];
 
 /// Takes out what looks like a token: a word that starts as one does, the value of a name like
-/// `token=`, what follows `Bearer`, and any very long run of letters and digits.
+/// `token=` or `"password": `, what follows `Bearer`, and any very long run of letters and digits.
 fn tokens_out(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut after_bearer = false;
+    let mut secret_next = false;
+    let mut last_named = false;
+    // Inside a quoted value given a secret's name, which may run over several words.
+    let mut in_value: Option<char> = None;
     for piece in text.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end();
         let gap = &piece[word.len()..];
@@ -256,25 +303,56 @@ fn tokens_out(text: &str) -> String {
             out.push_str(piece);
             continue;
         }
-        if after_bearer {
-            after_bearer = false;
-            out.push_str(SECRET);
+        if let Some(quote) = in_value {
+            if word.contains(quote) {
+                in_value = None;
+            }
             out.push_str(gap);
             continue;
         }
-        after_bearer = word.eq_ignore_ascii_case("bearer") || word.eq_ignore_ascii_case("token:");
+        if secret_next {
+            // `Authorization: Bearer abc`: the word after Bearer is the one.
+            secret_next = word.eq_ignore_ascii_case("bearer");
+            let opening = word.chars().next().filter(|c| matches!(c, '"' | '\''));
+            if let Some(quote) = opening
+                && !word[quote.len_utf8()..].contains(quote)
+            {
+                in_value = Some(quote);
+            }
+            out.push_str(SECRET);
+            if in_value.is_none() {
+                out.push_str(gap);
+            }
+            continue;
+        }
+        // `api_key = abc` too: a separator on its own, after a secret's name.
+        secret_next = word.eq_ignore_ascii_case("bearer")
+            || names_a_secret_next(word)
+            || (matches!(word, "=" | ":") && last_named);
+        last_named = secret_name(word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'));
         out.push_str(&word_out(word));
         out.push_str(gap);
     }
     out
 }
 
+/// Whether a word is a secret's name with nothing after its separator: `token:`, `"password":`.
+fn names_a_secret_next(word: &str) -> bool {
+    let name = word.trim_end_matches(|c: char| !c.is_alphanumeric());
+    let tail = &word[name.len()..];
+    tail.contains([':', '=']) && secret_name(name)
+}
+
+fn secret_name(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    SECRET_NAMES.iter().any(|s| name.contains(s))
+}
+
 fn word_out(word: &str) -> String {
     // A value given a secret's name: everything after the first = or : goes.
     if let Some(at) = word.find(['=', ':']) {
-        let name = word[..at].to_ascii_lowercase();
         let value = word[at + 1..].trim_matches(|c: char| !c.is_alphanumeric());
-        if !value.is_empty() && SECRET_NAMES.iter().any(|s| name.contains(s)) {
+        if !value.is_empty() && secret_name(&word[..at]) {
             return format!("{}{SECRET}", &word[..=at]);
         }
     }
@@ -324,27 +402,70 @@ fn append(path: &Path, line: &str) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         private_folder(dir)?;
     }
-    if fs::symlink_metadata(path).is_ok_and(|m| m.len() + line.len() as u64 > MOST_BYTES) {
+    // Held until the line is written, so two writers can't both move the log and lose its history.
+    // Taken only for a moment: without it the line goes in and the moving waits for another.
+    let lock = rotation_lock(path);
+    if lock.is_some()
+        && fs::symlink_metadata(path).is_ok_and(|m| m.len() + line.len() as u64 > MOST_BYTES)
+    {
         let mut old = path.as_os_str().to_owned();
         old.push(".1");
         fs::rename(path, &old)?;
     }
-    let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    let mut file = open_private(OpenOptions::new().create(true).append(true), path)?;
+    file.write_all(line.as_bytes())
+}
+
+/// Opens a file for its owner alone: never through a link, and never anything but a plain file,
+/// since opening a named pipe nobody reads would otherwise wait for ever.
+fn open_private(options: &mut OpenOptions, path: &Path) -> std::io::Result<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    let mut file = options.open(path)?;
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other("not a plain file"));
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if file.metadata()?.permissions().mode() & 0o077 != 0 {
+        if meta.permissions().mode() & 0o077 != 0 {
             file.set_permissions(fs::Permissions::from_mode(0o600))?;
         }
     }
-    file.write_all(line.as_bytes())
+    Ok(file)
+}
+
+#[cfg(unix)]
+fn rotation_lock(path: &Path) -> Option<File> {
+    use std::os::fd::AsRawFd;
+    let mut name = path.as_os_str().to_owned();
+    name.push(".lock");
+    let file = open_private(
+        OpenOptions::new().create(true).write(true),
+        Path::new(&name),
+    )
+    .ok()?;
+    for _ in 0..LOCK_TRIES {
+        // SAFETY: flock only reads the descriptor `file` holds open, and is released with it.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    None
+}
+
+/// Windows has no flock: its one writer at a time is whichever Kerdr is open.
+#[cfg(not(unix))]
+fn rotation_lock(path: &Path) -> Option<()> {
+    let _ = path;
+    Some(())
 }
 
 /// Makes the log's folder, closed to everyone but its owner.
@@ -406,6 +527,7 @@ pub fn keep_panics() {
                 ..Default::default()
             },
             &[],
+            &[],
         );
         before(info);
     }));
@@ -452,6 +574,7 @@ pub mod tests {
                 ..entry("#500 didn't start: the who…")
             },
             &[],
+            &[],
         );
         let got = lines(&path);
         assert_eq!(got.len(), 1);
@@ -481,28 +604,63 @@ pub mod tests {
             ),
             ("saved 'please rebuild the mark…'".to_string(), "rebuild"),
         ] {
-            let got = scrub(&text, &[words]);
+            let got = scrub(&text, &[words], &[]);
             assert!(!got.contains(gone), "{got}");
             assert!(got.contains(TYPED), "{got}");
         }
-        // A short answer goes when whole, and a word too small to be a quote stays.
+        // A short answer goes when whole, and text too small to be a quote stays.
         assert_eq!(
-            scrub("the laptop said no", &["laptop"]),
+            scrub("the laptop said no", &["laptop"], &[]),
             format!("the {TYPED} said no")
         );
-        assert_eq!(scrub("no such card", &["no"]), "no such card");
+        assert_eq!(scrub("no such card", &["no"], &[]), "no such card");
         // What wasn't typed stays.
         assert_eq!(
-            scrub("the push failed: rejected", &[words]),
+            scrub("the push failed: rejected", &[words], &[words]),
             "the push failed: rejected"
         );
         // Letters beyond ASCII don't trip the cutting.
         assert_eq!(
             scrub(
                 "é café: déjà vu ünïcödé tèxt here",
-                &["déjà vu ünïcödé tèxt"]
+                &["déjà vu ünïcödé tèxt"],
+                &[]
             ),
             format!("é café: {TYPED} here")
+        );
+    }
+
+    #[test]
+    fn every_word_sent_stays_out_however_it_came_back() {
+        let words = "Ask Zephyr's team to move the Board's new-intent box, don't \"wait\"";
+        for (text, gone) in [
+            // A short quote, a name said once.
+            ("no such person: Zephyr", "Zephyr"),
+            // A path made of them.
+            (
+                "intents/0099-move-boards-new-intent-box is already there",
+                "intent-box",
+            ),
+            // Another case, or escaped as JSON.
+            ("said ZEPHYR", "ZEPHYR"),
+            ("refused \\\"wait\\\"", "wait"),
+        ] {
+            let got = scrub(text, &[], &[words]);
+            assert!(!got.contains(gone), "{got}");
+            assert!(got.contains(TYPED), "{got}");
+        }
+        assert_eq!(
+            scrub(
+                "intents/0099-move-boards-new-intent-box is already there",
+                &[],
+                &[words]
+            ),
+            format!("intents/0099-{TYPED}-boards-new-{TYPED}-box is already there")
+        );
+        // What isn't theirs stays readable beside it.
+        assert_eq!(
+            scrub("the push failed: Zephyr", &[], &[words]),
+            format!("the push failed: {TYPED}")
         );
     }
 
@@ -517,13 +675,23 @@ pub mod tests {
             ("url?token=hunter2hunter2", "hunter2"),
             ("PASSWORD=swordfish", "swordfish"),
             ("token: notsecretlooking", "notsecretlooking"),
+            ("password: dummy-private-value", "dummy-private"),
+            ("{\"token\": \"dummy-private-value\"}", "dummy-private"),
+            ("{\"token\":\"dummy-private-value\"}", "dummy-private"),
+            ("{\"password\": \"two private words\"}", "private"),
+            ("api_key = dummy-private-value", "dummy-private"),
         ] {
-            let got = scrub(text, &[]);
+            let got = scrub(text, &[], &[]);
             assert!(!got.contains(secret), "{text} -> {got}");
             assert!(got.contains(SECRET), "{text} -> {got}");
         }
-        let got = scrub(&format!("key was {long}."), &[]);
+        let got = scrub(&format!("key was {long}."), &[], &[]);
         assert!(!got.contains(long), "{got}");
+        // What follows a quoted secret carries on as usual.
+        assert_eq!(
+            scrub("{\"password\": \"two words\", \"who\": \"me\"}", &[], &[]),
+            "{\"password\": [redacted] \"who\": \"me\"}"
+        );
         // Ordinary words and paths come through.
         for text in [
             "/home/someone/repos/ark-sdlc/intents/0500-kerdr-error-log/intent.md is there",
@@ -531,8 +699,23 @@ pub mod tests {
             "ssh: connect to host lab port 22: Connection timed out",
             "error: tokens are fine",
         ] {
-            assert_eq!(scrub(text, &[]), text);
+            assert_eq!(scrub(text, &[], &[]), text);
         }
+    }
+
+    #[test]
+    fn a_credential_quoted_in_part_goes_too() {
+        assert_eq!(
+            credential_out(
+                "bad: private-credential-value!",
+                "abc-private-credential-value"
+            ),
+            "bad: [redacted]!"
+        );
+        assert_eq!(
+            credential_out("no match here", "abc-private"),
+            "no match here"
+        );
     }
 
     #[cfg(unix)]
@@ -540,14 +723,14 @@ pub mod tests {
     fn only_its_owner_can_read_it() {
         use std::os::unix::fs::PermissionsExt;
         let (_dir, log, path) = log();
-        log.write(&entry("one"), &[]);
+        log.write(&entry("one"), &[], &[]);
         let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         // One made open before is closed by the next line.
         fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
         fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o755)).unwrap();
-        log.write(&entry("two"), &[]);
+        log.write(&entry("two"), &[], &[]);
         assert_eq!(mode(&path), 0o600);
         assert_eq!(mode(path.parent().unwrap()), 0o700);
         assert_eq!(lines(&path).len(), 2);
@@ -561,7 +744,7 @@ pub mod tests {
         let elsewhere = dir.path().join("elsewhere");
         fs::write(&elsewhere, "").unwrap();
         std::os::unix::fs::symlink(&elsewhere, &path).unwrap();
-        log.write(&entry("one"), &[]);
+        log.write(&entry("one"), &[], &[]);
         assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "");
     }
 
@@ -570,7 +753,7 @@ pub mod tests {
         let (_dir, log, path) = log();
         let long = "word ".repeat(1500);
         for i in 0..1500 {
-            log.write(&entry(&format!("{i} {long}")), &[]);
+            log.write(&entry(&format!("{i} {long}")), &[], &[]);
         }
         let old = path.with_extension("log.1");
         let size = |p: &Path| fs::metadata(p).unwrap().len();
@@ -582,6 +765,47 @@ pub mod tests {
     }
 
     #[test]
+    fn writers_at_once_keep_the_older_file_whole() {
+        let (_dir, log, path) = log();
+        let long = "word ".repeat(400);
+        std::thread::scope(|scope| {
+            for writer in 0..8 {
+                let (log, long) = (&log, &long);
+                scope.spawn(move || {
+                    for i in 0..500 {
+                        log.write(&entry(&format!("{writer} {i} {long}")), &[], &[]);
+                    }
+                });
+            }
+        });
+        let old = path.with_extension("log.1");
+        let size = |p: &Path| fs::metadata(p).unwrap().len();
+        // Never moved over itself: the older file is a full one, and each line is whole.
+        assert!(size(&old) > MOST_BYTES / 2, "{}", size(&old));
+        assert!(size(&old) <= MOST_BYTES, "{}", size(&old));
+        assert!(size(&path) <= MOST_BYTES, "{}", size(&path));
+        lines(&path);
+        lines(&old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_named_pipe_in_its_place_never_holds_kerdr_up() {
+        let (_dir, log, path) = log();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let name = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a valid path for the length of the call.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            log.write(&entry("one"), &[], &[]);
+            let _ = tx.send(());
+        });
+        rx.recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the write should have given up at once");
+    }
+
+    #[test]
     fn a_long_message_or_stderr_is_cut_where_a_word_ends() {
         let (_dir, log, path) = log();
         log.write(
@@ -589,6 +813,7 @@ pub mod tests {
                 stderr: Some(format!("{}the real cause", "noise ".repeat(5000))),
                 ..entry(&format!("the first thing {}", "more ".repeat(5000)))
             },
+            &[],
             &[],
         );
         let l = &lines(&path)[0];
@@ -608,9 +833,9 @@ pub mod tests {
         let dir = tempfile::tempdir().unwrap();
         let in_the_way = dir.path().join("a file");
         fs::write(&in_the_way, "").unwrap();
-        ErrorLog::at(in_the_way.join("errors.log")).write(&entry("one"), &[]);
-        ErrorLog::at(PathBuf::from("/proc/no/such/errors.log")).write(&entry("two"), &[]);
-        ErrorLog::off().write(&entry("three"), &[]);
+        ErrorLog::at(in_the_way.join("errors.log")).write(&entry("one"), &[], &[]);
+        ErrorLog::at(PathBuf::from("/proc/no/such/errors.log")).write(&entry("two"), &[], &[]);
+        ErrorLog::off().write(&entry("three"), &[], &[]);
     }
 
     #[test]

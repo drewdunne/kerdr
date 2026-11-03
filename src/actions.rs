@@ -237,13 +237,10 @@ fn answer_with_stderr(
     handed: Option<transport::Handed>,
 ) -> Answered {
     let (result, stderr) = run_with_deadline(machine, command, request, deadline, handed);
-    // An edit's error output may quote the text it was sent, a piece too small to recognise
-    // included, so a save's is left out here as it is from the message.
-    let stderr = if request["action"] == "edit" && request.get("text").is_some() {
-        String::new()
-    } else {
-        crate::errlog::scrub(&redact_credentials(&stderr, request), &typed_in(request))
-    };
+    // Its end says what finally went wrong; the board never sees this.
+    let stderr = crate::errlog::last_part(&stderr, crate::errlog::MOST_STDERR);
+    let typed = typed_in(request);
+    let stderr = crate::errlog::scrub(&redact_credentials(stderr, request), &typed, &typed);
     Answered { result, stderr }
 }
 
@@ -371,6 +368,7 @@ fn redact_credentials(text: &str, request: &Value) -> String {
                 if secret != secret.trim() && !secret.trim().is_empty() {
                     text = text.replace(secret.trim(), "[redacted]");
                 }
+                text = crate::errlog::credential_out(&text, secret);
             }
         }
     }
@@ -597,17 +595,18 @@ mod tests {
         assert!(!answered.result.unwrap().ok);
         assert!(answered.stderr.contains("the push failed: rejected"));
         assert!(!answered.stderr.contains("private"), "{}", answered.stderr);
-        // A save's is left out whole: it may quote its text in pieces too small to recognise.
+        // A save's is kept too, for its cause, without its text.
         let answered = run_keeping_stderr(
             &machine(),
             &command,
-            &json!({"action":"edit","id":"1","text":"my text","was":"x"}),
+            &json!({"action":"edit","id":"1","text":"my private secret words","was":"x"}),
         );
-        assert_eq!(answered.stderr, "");
+        assert!(answered.stderr.contains("the push failed: rejected"));
+        assert!(!answered.stderr.contains("private"), "{}", answered.stderr);
         // A sign-in's token doesn't come back either.
         let command = fixture(
             dir.path(),
-            "cat >/dev/null\necho 'bad token fixture-private-value' >&2\nprintf 'not json'\n",
+            "cat >/dev/null\necho 'bad code private-value' >&2\nprintf '{\"ok\":false,\"message\":\"bad code private-value\"}'\n",
             "",
         );
         let answered = run_keeping_stderr(
@@ -615,12 +614,10 @@ mod tests {
             &command,
             &json!({"action":"account-signin","token":"fixture-private-value"}),
         );
-        assert!(answered.result.is_err());
-        assert!(
-            !answered.stderr.contains("fixture-private"),
-            "{}",
-            answered.stderr
-        );
+        // Quoted in part: not in its standard error, nor in the message, which is shown too.
+        assert!(!answered.stderr.contains("private"), "{}", answered.stderr);
+        let message = answered.result.unwrap().message;
+        assert!(!message.contains("private"), "{message}");
     }
 
     #[test]

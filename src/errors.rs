@@ -24,6 +24,12 @@ pub struct Answering {
     kept: bool,
 }
 
+impl Answering {
+    fn sent(&self) -> impl Iterator<Item = &str> {
+        self.typed.iter().map(String::as_str)
+    }
+}
+
 impl App {
     /// An answer is here: what's said until `answer_done` is about it.
     pub(super) fn answer_arrives(
@@ -46,6 +52,17 @@ impl App {
                 .into_iter()
                 .map(str::to_string),
         );
+        // A save's text comes only counted, and is held here.
+        if request["action"] == "edit" {
+            let id = request["id"].as_str().unwrap_or_default();
+            typed.extend(
+                self.edits
+                    .values()
+                    .filter(|h| h.id == id)
+                    .filter_map(|h| h.mine.as_ref())
+                    .map(|m| m.text.clone()),
+            );
+        }
         self.answering = Some(Answering {
             machine: self
                 .machines
@@ -141,7 +158,8 @@ impl App {
                 }
             }
         };
-        self.error_log.write(&entry, &self.typed_now());
+        let sent: Vec<&str> = self.answering.iter().flat_map(Answering::sent).collect();
+        self.error_log.write(&entry, &self.typed_now(), &sent);
         if let Some(a) = &mut self.answering {
             a.kept = true;
         }
@@ -226,7 +244,7 @@ impl App {
                 message: text,
                 ..Default::default()
             };
-            self.error_log.write(&entry, &self.typed_now());
+            self.error_log.write(&entry, &self.typed_now(), &[]);
         }
     }
 }
@@ -379,19 +397,52 @@ mod tests {
     #[test]
     fn a_new_intents_words_never_reach_the_log() {
         let (_dir, mut app, path) = board();
-        let words = "buy the domain for the secret launch before anyone sees it";
+        let words = "buy the domain for the Zephyr launch before anyone sees it";
         app.answer_stderr = format!("create failed for: {words}");
         app.finish_action(
             0,
             json!({"action":"create","words":words,"submission":"k-1"}),
-            refused(&format!("couldn't save: {words}")),
+            refused(&format!(
+                "couldn't save: {words}, nor intents/0099-buy-domain-zephyr-launch"
+            )),
         );
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("wasn't saved"), "{text}");
-        assert!(!text.contains("secret launch"), "{text}");
+        assert!(!text.to_lowercase().contains("zephyr"), "{text}");
         assert!(!text.contains("buy the domain"), "{text}");
         // The screen still says what it said, words included: only the log leaves them out.
-        assert!(app.message().unwrap().0.contains("secret launch"));
+        assert!(app.message().unwrap().0.contains("Zephyr"));
+    }
+
+    #[test]
+    fn a_refused_edit_keeps_its_cause_and_not_its_text() {
+        let (_dir, mut app, path) = board();
+        app.edits.insert(
+            "k".into(),
+            crate::app::edit_controls::Held {
+                id: "0143".into(),
+                machine: 0,
+                current: "what it said before".into(),
+                was: "sha256:x".into(),
+                read_at: Instant::now(),
+                mine: Some(crate::app::edit_controls::Mine {
+                    text: "Zephyr's private plan".into(),
+                    from: "what it said before".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        app.answer_stderr = "index.lock exists; couldn't save Zephyr".into();
+        app.finish_action(
+            0,
+            json!({"action":"edit","id":"0143","text":21,"was":"sha256:x"}),
+            refused("couldn't save Zephyr"),
+        );
+        let l = one(&path);
+        assert_eq!(l["action"], "edit");
+        assert_eq!(l["stderr"], "index.lock exists; couldn't save [typed]");
+        assert!(!l.to_string().contains("Zephyr"), "{l}");
     }
 
     #[test]

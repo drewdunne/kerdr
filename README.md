@@ -499,10 +499,12 @@ Each line is a JSON object:
 
 `source` is `action`, `machine` or `kerdr`; `shown` is `fail`, `warn`, `board`, or `quiet` for a
 failure nothing on screen said; `answer` is the backend's whole answer when the message shortened it.
-Only its owner can read it. What you type (a new intent's words, an edit, an answer) never goes in,
-whole or quoted in part, and a save's standard error is left out for fear of quoting its text; anything
-that looks like a token is written `[redacted]`. Past 1 MiB it moves to `errors.log.1`, replacing the
-one before, so it never takes more than 2 MiB. A log that can't be written changes nothing else.
+Only its owner can read it. What you type (a new intent's words, an edit, an answer) doesn't go in:
+a quote of it, whole or in part, is written `[typed]`, and so is every word of four letters or more of
+what you sent in the request a failure answers, even in a path made from them, which can leave `[typed]`
+in place of an ordinary word you happened to use. Anything that looks like a token is written
+`[redacted]`. Past 1 MiB it moves to `errors.log.1`, replacing the one before, so it stays near 2 MiB
+at most. A log that can't be written changes nothing else.
 
 ## Install
 

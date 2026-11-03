@@ -106,6 +106,7 @@ fn main() -> ExitCode {
                     ..Default::default()
                 },
                 &[],
+                &[],
             );
             eprintln!("kerdr: {e}");
             ExitCode::FAILURE
