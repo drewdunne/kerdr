@@ -19,8 +19,11 @@ mod controls;
 pub mod edit_controls;
 #[path = "inside.rs"]
 pub mod inside;
+#[path = "kickoff_controls.rs"]
+pub mod kickoff_controls;
 use account_controls::AccountScreen;
 pub(crate) use controls::waiting_work;
+pub use kickoff_controls::Kickoff;
 
 /// How long an action's answer stays on screen before a ⏎ that waited its turn says something
 /// else over it (intent 0411).
@@ -199,6 +202,12 @@ pub enum Mode {
         typing: bool,
         back: Box<Mode>,
     },
+    /// Background work's open questions, one at a time, taking your answers (intent 0409).
+    Kickoff {
+        form: Kickoff,
+        back: Box<Mode>,
+        target: Option<Box<CardSnapshot>>,
+    },
     Confirm {
         machine: usize,
         request: serde_json::Value,
@@ -261,6 +270,7 @@ fn misc_selection(mode: &Mode) -> Option<usize> {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. } => misc_selection(back),
         _ => None,
     }
@@ -274,6 +284,7 @@ fn set_misc_selection(mode: &mut Mode, selected: usize) {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. } => set_misc_selection(back, selected),
         _ => {}
     }
@@ -287,6 +298,7 @@ fn backlog_selection(mode: &Mode) -> Option<usize> {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. } => backlog_selection(back),
         _ => None,
     }
@@ -300,6 +312,7 @@ fn set_backlog_selection(mode: &mut Mode, selected: usize) {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. } => set_backlog_selection(back, selected),
         _ => {}
     }
@@ -312,6 +325,7 @@ fn holds_card(mode: &Mode) -> bool {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. } => holds_card(back),
         _ => false,
     }
@@ -326,6 +340,7 @@ fn list_view(mode: &Mode) -> Option<&Mode> {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. }
         | Mode::Card { back, .. } => list_view(back),
         _ => None,
@@ -339,6 +354,7 @@ fn holds_peek(mode: &Mode) -> bool {
         | Mode::Compose { back, .. }
         | Mode::Filter { back, .. }
         | Mode::Accounts { back, .. }
+        | Mode::Kickoff { back, .. }
         | Mode::Confirm { back, .. } => holds_peek(back),
         _ => false,
     }
@@ -506,6 +522,8 @@ pub struct App {
     /// holds only while the feed still shows that old home; fresh news of its home ends it. One
     /// for each record, since several can be refused at once (intent 0416).
     pub moved_home: Vec<(String, usize, Option<String>)>,
+    /// What's typed in a Kickoff Questions box and not saved yet, by its record's number.
+    pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
     /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
@@ -585,6 +603,7 @@ impl App {
             resent: vec![],
             outside_warned: None,
             moved_home: vec![],
+            kickoff_kept: Default::default(),
             answered_at: None,
             width: 200,
             demo: false,
@@ -1505,6 +1524,7 @@ impl App {
             | Mode::Palette { .. }
             | Mode::Compose { .. }
             | Mode::Filter { .. }
+            | Mode::Kickoff { .. }
             | Mode::Confirm { .. } => Action::None,
         }
     }
@@ -2810,6 +2830,70 @@ mod tests {
         assert_eq!(machine, home);
         assert_eq!(request["id"], id.as_str());
         assert_eq!(request["override"], true);
+    }
+
+    /// Intent 0409: a start refused for your open questions opens the box, not a yes-or-no, and
+    /// the answers go back with the start. A question that comes while you've moved on waits for d.
+    #[test]
+    fn a_start_refused_for_questions_opens_the_box_and_the_answers_go_with_the_next_start() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        let home = app.card(&key).unwrap().machine_index;
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        let request = serde_json::json!({"action":"dispatch","id":id});
+        let response = crate::actions::Response {
+            ok: false,
+            message: "for an older Kerdr".into(),
+            confirmation: true,
+            confirm: Some("0123456789abcdef".into()),
+            asked: Some("fedcba9876543210".into()),
+            questions: vec![crate::actions::Question {
+                num: "1".into(),
+                question: "Whose is it?".into(),
+                pick: "Kibbelz".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+        reply_to(&mut app, home, request.clone(), Ok(response.clone()));
+        let Mode::Kickoff { form, .. } = &mut app.mode else {
+            panic!("expected the box: {:?}", app.mode)
+        };
+        assert_eq!(form.question().question, "Whose is it?");
+        form.ready_at = Instant::now();
+        let Action::Mutate {
+            machine,
+            request: sent,
+        } = app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("expected the start")
+        };
+        assert_eq!(machine, home);
+        assert_eq!(sent["action"], "dispatch");
+        assert_eq!(sent["asked"], "fedcba9876543210");
+        assert_eq!(
+            sent["answers"],
+            serde_json::json!([{"num":"1","take":true}])
+        );
+        assert_eq!(sent.get("override"), None);
+
+        // Moved on while it was asked: nothing pops up over what you're doing, and d asks again.
+        app.mode = Mode::Board;
+        let from = CardSnapshot::of(app.card(&key).unwrap());
+        app.sel.key = None;
+        app.action_from = Some(from);
+        reply_to(&mut app, home, request, Ok(response));
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        assert!(
+            last_said(&app).unwrap().0.contains("kickoff questions"),
+            "{:?}",
+            last_said(&app)
+        );
     }
 
     /// Intent 0404: ⏎ on work nobody started starts it, sending what d sends, and past the usual

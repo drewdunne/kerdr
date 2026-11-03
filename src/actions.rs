@@ -10,6 +10,21 @@ use crate::transport::{self, Target};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 
+/// One of your open questions on background work, for the Kickoff Questions box (intent 0409).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Question {
+    pub num: String,
+    pub question: String,
+    /// What you need to know to answer it.
+    #[serde(default)]
+    pub background: String,
+    /// The recommended answer, and why.
+    #[serde(default)]
+    pub pick: String,
+    #[serde(default)]
+    pub why: String,
+}
+
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Response {
     pub ok: bool,
@@ -54,6 +69,13 @@ pub struct Response {
     /// and its fingerprint, sent back with a save of it (intent 0414).
     pub text: Option<String>,
     pub was: Option<String>,
+    /// With a start refused for your open questions: those questions, whole, and a token of what
+    /// was asked, sent back with your answers (intent 0409).
+    #[serde(default)]
+    pub questions: Vec<Question>,
+    pub asked: Option<String>,
+    /// Something for the Kickoff Questions box to say.
+    pub note: Option<String>,
 }
 
 impl Response {
@@ -251,8 +273,13 @@ fn run_with_deadline(
     // so parse it before interpreting process status.
     parse_response(&output.stdout).map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires, &mut response.text, &mut response.was].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires, &mut response.text, &mut response.was, &mut response.asked, &mut response.note].into_iter().flatten() {
             *text = redact(text);
+        }
+        for question in &mut response.questions {
+            for text in [&mut question.num, &mut question.question, &mut question.background, &mut question.pick, &mut question.why] {
+                *text = redact(text);
+            }
         }
         // A status the protocol knows stays as it is, even when it matches what was sent (a code
         // "done"); anything else is scrubbed like the rest.

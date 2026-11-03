@@ -8,7 +8,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 
-use crate::app::{App, Background, Draft, Hit, Mode, Search, SearchFilter, Tone, match_range};
+use crate::app::{
+    App, Background, Draft, Hit, Kickoff, Mode, Search, SearchFilter, Tone, match_range,
+};
 use crate::board::{Scope, SessionRow};
 use crate::herdr;
 use crate::model::{Attention, Card, Priority, Stage, Verdict};
@@ -175,6 +177,11 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             draw_mode(f, area, app, back);
             dim_behind(f);
             confirm(f, area, title, message, request["action"].as_str(), *queue);
+        }
+        Mode::Kickoff { form, back, .. } => {
+            draw_mode(f, area, app, back);
+            dim_behind(f);
+            kickoff(f, area, form);
         }
         Mode::Machines { sel } => machines_view(f, area, app, *sel),
         Mode::Backlog { sel } => backlog_view(f, area, app, *sel),
@@ -2731,6 +2738,186 @@ fn confirm(
             ),
             w,
         ),
+    );
+}
+
+/// The Kickoff Questions box (intent 0409): what it is, then one question, whole. On a screen too
+/// small for all of it, its text scrolls, and ⏎ shows the rest before it can take the recommendation.
+fn kickoff(f: &mut Frame, area: Rect, form: &Kickoff) {
+    let question = form.question();
+    let many = form.questions.len() > 1;
+    let box_width = 100.min(area.width.saturating_sub(2));
+    let w = box_width.saturating_sub(8).max(1) as usize;
+    let mut above = wrapped(
+        if many {
+            "Answer these and it runs on its own from start to finish. It starts after the last one."
+        } else {
+            "Answer this and it runs on its own from start to finish. It starts right after."
+        },
+        w,
+        fg(FG2),
+        None,
+    );
+    above.push(Line::raw(""));
+    above.push(Line::styled(
+        if many {
+            "Kickoff Questions"
+        } else {
+            "Kickoff Question"
+        },
+        bold(YELLOW),
+    ));
+    above.extend(wrapped(&question.question, w, bold(FG), None));
+    if !question.background.is_empty() {
+        above.extend(wrapped(&question.background, w, fg(DIM), None));
+    }
+    if form.recommends() {
+        above.push(Line::raw(""));
+        let label = "Recommended";
+        if width(label) + 2 + width(&question.pick) <= w {
+            above.push(Line::from(vec![
+                Span::styled(label, bold(CYAN)),
+                Span::raw("  "),
+                Span::styled(question.pick.clone(), bold(FG)),
+            ]));
+        } else {
+            above.push(Line::styled(label, bold(CYAN)));
+            above.extend(wrapped(&question.pick, w, bold(FG), None));
+        }
+        if !question.why.is_empty() {
+            above.extend(wrapped(&question.why, w, fg(DIM), None));
+        }
+    }
+    if let Some(note) = &form.note {
+        above.push(Line::raw(""));
+        above.extend(wrapped(note, w, fg(YELLOW), None));
+    }
+    // Its border 2, its title row and a blank 2, the answer box and a blank each side 6, and two
+    // rows of keys.
+    let height = above.len() as u16 + 12;
+    let rect = centered(area, box_width, height, None);
+    dialog(f, rect, PURPLE);
+    let inner = pad(rect, 3, 1);
+    let of = if many {
+        format!("{} of {}", form.at + 1, form.questions.len())
+    } else {
+        String::new()
+    };
+    put_lr(
+        f.buffer_mut(),
+        inner,
+        inner.y,
+        vec![
+            Span::styled(
+                " BACKGROUND TASK ",
+                Style::default()
+                    .bg(PURPLE)
+                    .fg(BG)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(form.reference.clone(), bold(FG)),
+            Span::raw(" "),
+            Span::styled(form.title.clone(), fg(FG2)),
+        ],
+        vec![Span::styled(of, fg(DIM))],
+    );
+    let keys = 2;
+    let answer_rows = 4;
+    let answer_y = inner.bottom().saturating_sub(keys + 1 + answer_rows);
+    let top = inner.y + 2;
+    let room = answer_y.saturating_sub(top + 1);
+    let most = (above.len() as u16).saturating_sub(room);
+    form.scroll_most.set(most);
+    form.scroll.set(form.scroll.get().min(most));
+    f.render_widget(
+        Paragraph::new(above).scroll((form.scroll.get(), 0)),
+        Rect {
+            y: top,
+            height: room,
+            ..inner
+        },
+    );
+    let typed = form.typed();
+    let boxed = Rect {
+        y: answer_y,
+        height: answer_rows,
+        ..inner
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(fg(if typed.is_empty() { BORDER } else { CYAN }))
+            .style(Style::default().bg(BG)),
+        boxed,
+    );
+    let field = pad(boxed, 2, 1);
+    let shown: Vec<Line> = if typed.is_empty() {
+        vec![Line::from(vec![
+            Span::styled("▏", fg(CYAN)),
+            Span::styled(
+                if form.recommends() {
+                    "Type your own answer, or press ⏎ to take the recommendation."
+                } else {
+                    "Type your answer."
+                },
+                fg(FAINT),
+            ),
+        ])]
+    } else {
+        field_lines(
+            typed,
+            field.width.max(1) as usize,
+            field.height.max(1) as usize,
+            true,
+        )
+        .into_iter()
+        .map(Line::raw)
+        .collect()
+    };
+    f.render_widget(Paragraph::new(shown), field);
+    let enter = match (form.is_last(), typed.trim().is_empty()) {
+        // ⏎ never takes what you couldn't see.
+        (_, true) if form.recommends() && form.scroll.get() < most => "show the rest of it",
+        (false, true) => "take the recommendation",
+        (false, false) => "keep your answer",
+        (true, true) => "take the recommendation and start it",
+        (true, false) => "send your answers and start it",
+    };
+    let back = format!("back to question {}", form.at);
+    let mut first = vec![("⏎", enter)];
+    if form.at > 0 {
+        first.push(("↑", back.as_str()));
+    }
+    if most > 0 {
+        first.push(("pgdn pgup", "the rest of it"));
+    }
+    let mut second = Vec::new();
+    if form.along.is_some() {
+        second.push(("tab", "start it with me along instead"));
+    }
+    second.push((
+        "esc",
+        if form.reached > 0 {
+            "keep these answers and leave it for later"
+        } else {
+            "leave it for later"
+        },
+    ));
+    let buf = f.buffer_mut();
+    put(
+        buf,
+        inner.x,
+        inner.bottom().saturating_sub(2),
+        inner.width,
+        fit(key_hints(&first), w),
+    );
+    put(
+        buf,
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        fit(key_hints(&second), w),
     );
 }
 
@@ -5351,6 +5538,168 @@ mod tests {
             !board.contains("no agent") && !board.contains("C done"),
             "{board}"
         );
+    }
+
+    fn kickoff_form() -> crate::app::Kickoff {
+        let response = crate::actions::Response {
+            confirmation: true,
+            confirm: Some("0123456789abcdef".into()),
+            asked: Some("fedcba9876543210".into()),
+            questions: vec![
+                crate::actions::Question {
+                    num: "1".into(),
+                    question: "Whose work is this, Arkship's or Kibbelz's?".into(),
+                    background: format!(
+                        "It decides which machine runs it. {}And the last words.",
+                        "It matters. ".repeat(12)
+                    ),
+                    pick: "Kibbelz".into(),
+                    why: "it sounds like your personal site (a guess)".into(),
+                },
+                crate::actions::Question {
+                    num: "2".into(),
+                    question: "Where should it be served?".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        let request = serde_json::json!({"action":"dispatch","id":"0449"});
+        crate::app::Kickoff::from_answer(
+            0,
+            &request,
+            &response,
+            "#449".into(),
+            "Robb Morgan site".into(),
+            &[],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn kickoff_questions_say_it_is_background_work_and_show_each_question_whole() {
+        let mut a = demo(false);
+        let form = kickoff_form();
+        a.mode = Mode::Kickoff {
+            form: form.clone(),
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        let text = rendered(&a, 176, 44);
+        for want in [
+            "BACKGROUND TASK",
+            "#449",
+            "Robb Morgan site",
+            "1 of 2",
+            "runs on its own",
+            "Kickoff Questions",
+            "Whose work is this, Arkship's or Kibbelz's?",
+            "And the last words.",
+            "Recommended",
+            "Kibbelz",
+            "it sounds like your personal site (a guess)",
+            "take the recommendation",
+            "start it with me along",
+            "leave it for later",
+        ] {
+            assert!(text.contains(want), "{want} missing: {text}");
+        }
+        assert!(!text.contains("I'd say"), "{text}");
+
+        // The second question: where you are, a way back, and no recommendation to take.
+        let mut second = form.clone();
+        second.at = 1;
+        a.mode = Mode::Kickoff {
+            form: second.clone(),
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("2 of 2") && text.contains("back to question 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Type your answer.") && !text.contains("Recommended"),
+            "{text}"
+        );
+        second.drafts[1] = "On the laptop this one time".into();
+        a.mode = Mode::Kickoff {
+            form: second,
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("On the laptop this one time"), "{text}");
+        assert!(text.contains("send your answers and start it"), "{text}");
+    }
+
+    #[test]
+    fn kickoff_questions_keep_their_answer_box_and_keys_on_a_small_screen() {
+        let mut a = demo(false);
+        a.mode = Mode::Kickoff {
+            form: kickoff_form(),
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        let text = rendered(&a, 80, 24);
+        for want in [
+            "BACKGROUND TASK",
+            "Type your own answer",
+            "esc",
+            "Recommended  Kibbelz",
+            "take the recommendation",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        // Too small for all of it: the rest is a key away, and ⏎ shows it before it can take it.
+        let text = rendered(&a, 60, 20);
+        for want in [
+            "BACKGROUND TASK",
+            "Type your own answer",
+            "esc",
+            "pgdn",
+            "show the rest of it",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+        assert!(!text.contains("Recommended"), "{text}");
+        let Mode::Kickoff { form, .. } = &a.mode else {
+            panic!()
+        };
+        form.scroll.set(u16::MAX);
+        let text = rendered(&a, 60, 20);
+        for want in [
+            "Recommended  Kibbelz",
+            "it sounds like your",
+            "take the recommendation",
+        ] {
+            assert!(text.contains(want), "{want}: {text}");
+        }
+    }
+
+    #[test]
+    fn a_long_recommendation_can_be_read_whole_on_a_small_screen() {
+        let mut form = kickoff_form();
+        form.questions[0].pick =
+            "A pick that is much too long to fit beside its label on this screen".into();
+        form.questions[0].why = format!("{}FINALE", "A reason that goes on. ".repeat(12));
+        let mut a = demo(false);
+        a.mode = Mode::Kickoff {
+            form,
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        let Mode::Kickoff { form, .. } = &a.mode else {
+            panic!()
+        };
+        rendered(&a, 60, 20);
+        form.scroll.set(u16::MAX);
+        let text = rendered(&a, 60, 20);
+        assert!(text.contains("FINALE"), "{text}");
+        form.scroll.set(form.scroll.get().saturating_sub(4));
+        let text = rendered(&a, 60, 20);
+        assert!(!text.contains("FINALE"), "{text}");
     }
 
     #[test]

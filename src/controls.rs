@@ -1403,6 +1403,7 @@ impl App {
             return Action::None;
         }
         match &mut self.mode {
+            Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text),
             Mode::Compose { draft, .. } => {
                 let room = MAX_WORDS.saturating_sub(draft.words.len());
                 let mut end = text.len().min(room);
@@ -1515,6 +1516,9 @@ impl App {
     pub(super) fn control_key(&mut self, key: KeyEvent) -> Option<Action> {
         match self.mode.clone() {
             Mode::Compose { draft, back } => return Some(self.compose_key(key, draft, back)),
+            Mode::Kickoff { form, back, target } => {
+                return Some(self.kickoff_key(key, form, back, target));
+            }
             Mode::Filter {
                 query,
                 sel,
@@ -2374,7 +2378,7 @@ impl App {
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {
-            response.confirmation
+            (response.confirmation || !response.questions.is_empty())
                 && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
                 && (request["override"] != true
                     || response
@@ -2398,6 +2402,12 @@ impl App {
                     } else {
                         "d"
                     };
+                    if !response.questions.is_empty() {
+                        self.fail(format!(
+                            "{reference} didn't start: it has kickoff questions for you first, and {key} on it again shows them."
+                        ));
+                        return;
+                    }
                     self.fail(format!(
                         "{reference} didn't {}: it needs a yes first, and {key} on it again asks.",
                         if request["action"] == "reopen" {
@@ -2406,6 +2416,27 @@ impl App {
                             "start"
                         }
                     ));
+                    return;
+                }
+                let title = card.as_ref().map(|c| c.title.clone()).unwrap_or_default();
+                let kept = self
+                    .kickoff_kept
+                    .get(request["id"].as_str().unwrap_or_default())
+                    .cloned()
+                    .unwrap_or_default();
+                if let Some(form) = Kickoff::from_answer(
+                    machine,
+                    &request,
+                    &response,
+                    reference.clone(),
+                    title,
+                    &kept,
+                ) {
+                    self.mode = Mode::Kickoff {
+                        form,
+                        back: Box::new(self.mode.clone()),
+                        target: from.map(Box::new),
+                    };
                     return;
                 }
                 let mut request = request;
@@ -2513,12 +2544,24 @@ impl App {
                         }
                     }
                 }
+                // Answers kept on leaving the Kickoff Questions box: how many are left.
+                if request["action"] == "answer" && response.ok {
+                    note = Some(message.clone());
+                }
+                // Started: its answers are saved, and what was kept of them is done with.
+                if request["action"] == "dispatch"
+                    && response.ok
+                    && let Some(id) = request["id"].as_str()
+                {
+                    self.kickoff_kept.remove(id);
+                }
                 if !response.ok {
                     // The card is back as it really is; say what didn't happen, and why.
                     let what = self.what_failed(&request);
+                    let kept = self.kickoff_kept_note(&request);
                     self.fail(short(match what {
-                        Some(what) => format!("{what}: {message}"),
-                        None => message,
+                        Some(what) => format!("{what}: {message}{kept}"),
+                        None => format!("{message}{kept}"),
                     }));
                 } else if let Some(note) = note {
                     // Done as shown: only what you'd need to find it is said.
@@ -2527,10 +2570,11 @@ impl App {
             }
             Err(error) => {
                 // Its result may be unknown (a timeout): the error says so in its own words.
+                let kept = self.kickoff_kept_note(&request);
                 match request["id"].as_str() {
                     Some(id) => {
                         let reference = self.reference_for(id);
-                        self.fail(short(format!("{reference}: {error}")))
+                        self.fail(short(format!("{reference}: {error}{kept}")))
                     }
                     None => self.fail(short(error)),
                 }
@@ -2650,7 +2694,7 @@ impl App {
 
     /// Whether a confirmed change still fits the card it asked about, as it was: a refresh while
     /// the question was open may have started, finished, restored or rehomed it.
-    fn confirm_still_applies(
+    pub(super) fn confirm_still_applies(
         &self,
         machine: usize,
         request: &Value,

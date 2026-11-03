@@ -228,6 +228,12 @@ peek alike:
   `q` says first when quitting would lose a version only Kerdr keeps, and a second `q` quits. An editor that opens a window of
   its own needs its waiting form, such as `code --wait`: without it Kerdr doesn't start it, and
   says which flag to add.
+- `d` or `⏎` starts it. Background work with questions only you can answer opens its **Kickoff
+  Questions** box instead, labelled a background task, since your answers are what let it run on its
+  own. It shows each question whole, one at a time, with a recommendation: `⏎` takes that or sends what
+  you typed, `↑` goes back, and it starts after the last. `Esc` keeps the answers given so far and leaves
+  the rest, and `Tab` starts it with you along instead. Which questions there are comes from the adapter
+  (docs/feed.md).
 - `y` says you still want it. Its age is the time since you last said so, falling back to
   creation when it has never been reviewed. Agent updates do not reset this age. Creation stays
   visible in expanded details.
