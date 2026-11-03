@@ -275,6 +275,7 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
     };
     let waiting = [
         (start, "start it"),
+        ("e", "edit its text"),
         ("y", "still want it"),
         ("x", "won’t do"),
         ("C", "done"),
@@ -2133,6 +2134,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         Some(c) if c.dismissed() => vec![("u", "bring it back")],
         Some(_) => vec![
             (start, "start it in its session"),
+            ("e", "edit its text"),
             ("y", "still want it"),
             ("x", "won’t do"),
             ("C", "done"),
@@ -2183,7 +2185,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
     let rect = if wide {
         centered(area, 112, 16, Some(6))
     } else {
-        centered(area, 76, if one_column { 24 } else { 16 }, Some(1))
+        centered(area, 76, if one_column { 25 } else { 16 }, Some(1))
     };
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
@@ -2223,6 +2225,7 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
     } else {
         &[
             ("d", "start it"),
+            ("e", "edit its text"),
             ("y", "still want it"),
             ("x", "won’t do"),
             ("C", "done"),
@@ -3046,7 +3049,7 @@ pub const BOARD_KEYS: &[(&str, &[KeyRow])] = &[
             (
                 "space  esc",
                 "on its screen: peek at the row / back, on the card",
-                "d y x C X s act on the row",
+                "d e y x C X s act on the row",
             ),
         ],
     ),
@@ -3119,6 +3122,11 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
                 "d",
                 "start the selected backlog intent",
                 "asks first past the usual limit",
+            ),
+            (
+                "e",
+                "edit its text, the words that started it, in your editor",
+                ":wq saves, :cq leaves it",
             ),
             ("y", "still want it: its age starts again", ""),
             (
@@ -4419,6 +4427,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                     &[
                         ("j k", "move"),
                         ("d", "start it"),
+                        ("e", "edit its text"),
                         ("y", "still want it"),
                         ("x", "won’t do"),
                         ("C", "done"),
@@ -4442,6 +4451,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                     &[
                         ("j k", "move"),
                         ("d", "start it"),
+                        ("e", "edit its text"),
                         ("y", "still want it"),
                         ("x", "won’t do"),
                         ("C", "done"),

@@ -817,6 +817,7 @@ fn footer(f: &mut Frame, rect: Rect, app: &App, holder: &Card, focus: &str, here
             }
             if crate::app::waiting_work(c) {
                 hints.push(("d".into(), "start it".into()));
+                hints.push(("e".into(), "edit its text".into()));
             }
             if c.closable() && app.actions_on() {
                 hints.push(("C".into(), "done".into()));

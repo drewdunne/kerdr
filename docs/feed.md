@@ -150,7 +150,7 @@ operation; the backend defines which additional fields that operation needs:
 ```
 
 The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore`, `move`,
-`close` and `cancel`.
+`close`, `cancel` and `edit`.
 `create` carries the user's own words, the session they were looking at, and an id for this
 submission, nothing else:
 
@@ -182,9 +182,9 @@ the record exists even when `ok` is false (saved but not published, say): Kerdr 
 same words again.
 `refresh` keeps wanted work fresh while preserving its creation date; `dismiss` drops it from
 the active backlog and `restore` brings it back. `move` changes backlog order. `reopen`,
-`close` and `cancel` are described below, and so is `dismiss` for work already started.
+`close`, `cancel` and `edit` are described below, and so is `dismiss` for work already started.
 
-Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission` and `confirm` (strings),
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission`, `confirm`, `text`, `was` and `from` (strings),
 `override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
@@ -195,8 +195,8 @@ exactly one JSON response to standard output. Send diagnostic output to standard
 ```
 
 `ok` (boolean) and `message` (string) are required. Optional fields are `confirmation` (boolean,
-default false), `used` and `limit` (nonnegative integers or null), and `session`, `id`,
-`workspace`, `label`, `tab`, `home` and `confirm` (strings or null). Unknown response fields are allowed for future additions. A valid JSON response is
+default false), `used` and `limit` (nonnegative integers or null), and `status`, `session`, `id`,
+`workspace`, `label`, `tab`, `home`, `confirm`, `text` and `was` (strings or null). Unknown response fields are allowed for future additions. A valid JSON response is
 read even if the command exits nonzero, allowing the backend to explain a refused action or ask
 for confirmation:
 
@@ -216,12 +216,17 @@ saved changes.
 Kerdr doesn't wait for an action before going on (since 0.21). It shows the change on the board at
 once, laid over the feed as Kerdr expects your backend to save it: `dispatch` marks the card
 starting where it is, and moves it out of the backlog once it's answered yes, `close` shows it done, `dismiss` and `cancel` put it in Won't do,
-`restore` takes it out, `refresh` dates it today, and `move` (with `delta`, `top` or `bottom`) reorders its group (open backlog work
-of the same owner from the same feed) as `0, 1, 2…` by `backlog_rank` and then id. The command runs
+`restore` takes it out, `refresh` dates it today, `move` (with `delta`, `top` or `bottom`) reorders its group (open backlog work
+of the same owner from the same feed) as `0, 1, 2…` by `backlog_rank` and then id, and an `edit`
+with a `text` shows that text as the card's `words` with `intake: "pending"`. The command runs
 in the background: requests for one record go one at a time, in the order they were made, and so
 do `move`s to one machine, whatever their record, since each reorders what the one before left;
 other requests for different records may run at the same time, so a backend must keep concurrent
-requests for different records safe. A success shows from the feed itself once a read has it (or
+requests for different records safe. The one exception is an `edit` without a `text`, a read that
+changes nothing: it waits for the requests made before it for its record, but nothing waits for
+it, so a later change to that record may run while it does, and `q` neither waits for it nor
+counts it as still running.
+A success shows from the feed itself once a read has it (or
 after two reads, or a minute). Anything else (`ok: false`, a confirmation, a timeout, an invalid
 response) takes the change off the board at once, so the card is as the feed last said, and Kerdr
 says what didn't happen in a red box that stays until a key is pressed, or asks the question.
@@ -255,6 +260,111 @@ the card's home machine, and a `confirmation` answer asks the same question befo
 one; a search hit starts from a peek on it, and a start from a peek stays in the peek, so the
 question still finds its card. A second `Enter` before the feed shows the work under way sends
 nothing. The backlog screen's `Enter` peeks, and in that peek `Enter` leaves starting to `d`.
+
+## Editing a backlog item's text
+
+`e` on a backlog card, on the board's Backlog column, in the backlog and in a peek, opens the
+item's text, the words that started it, full screen in your own editor. Kerdr refuses a card
+that isn't waiting in the backlog (started, done or in won't do) itself, and one still being written
+up (`intake: "pending"`) with "#416 is still being written up; edit it once that's done.", without
+asking the backend; so too a new intent's card while its words are still being saved, a card whose
+start or reopen is on its way, and one `d` asked to start once it's written up. Otherwise it reads
+the text:
+
+```json
+{"action":"edit","id":"0414","from":"amd-lzm4"}
+```
+
+`from` is the hostname of the machine Kerdr runs on, for the record's log. Answer with the text and
+`was`, a fingerprint of it that Kerdr sends back with a save (ark-sdlc's is `sha256:` and the
+text's SHA-256). Which text that is belongs to the backend (ark-sdlc's is the body of intent.md's
+first `## ` section); it never ends in a newline:
+
+```json
+{"ok":true,"message":"","text":"Need the ability to edit items in my backlog.","was":"sha256:9f2c…"}
+```
+
+Kerdr writes it, with one final newline, to `NNNN-text.md` (so the editor treats it as markdown) in
+a folder of its own in the system temp folder, readable only by you (0700, and the file 0600, on
+Unix), opens it in the editor Kerdr's `editor` setting names, else `$VISUAL`, else `$EDITOR`, else
+`nvim`, else `vim`, and removes both when the editor closes. The setting's words are split as a
+shell would split them, but no shell runs it; the file's path is its own last argument. An editor
+that opens a window of its own (`code`, `codium`, `subl`, `gvim`, `mvim`) named without its
+waiting flag (`--wait`, `-w`, `-f`) isn't started, since Kerdr would be back before you'd written
+anything: Kerdr says which flag to add to its `editor` setting, and keeps the text for `e`. When
+the editor exits with an error (`:cq`), closes without writing the file (`:q`), or leaves the text
+as it was read, nothing is sent and nothing is said. When it dies instead (killed by a signal, or
+crashed, so it has no exit code), what the file held is kept as your version, sent nowhere, and the
+red box says so. When the file can't be read back, nothing is sent and the file is kept where it
+is, in a folder renamed `kerdr-kept-…` that no Kerdr removes, and the red box names it. Otherwise Kerdr normalises it (line endings to `\n`, whitespace and newlines at
+the very end removed) and saves it, with the `was` it was read with:
+
+```json
+{"action":"edit","id":"0414","text":"Need the ability to edit a backlog item's text.","was":"sha256:9f2c…","from":"amd-lzm4"}
+```
+
+A request with `text` is a save; without it, a read. The save is a change like any other (see
+above): the moment the editor closes, the card shows the new text under "How it started", with ✎
+for being written up, and the save runs in the background in its turn, so the board is yours at
+once. Normalise what you receive the same way, refuse an empty text, and answer:
+
+- Saved: `{"ok":true,"status":"saved","message":"Saved #414's text. Its title and done-when catch up in about a minute."}`.
+  Answer as soon as the text is saved: redo any slow write-up on its own, with the card's
+  `intake: "pending"` meanwhile, so the feed goes on showing it as being written up. Kerdr says
+  nothing (the card already shows it, so `message` isn't shown) and reads the feed again, as after
+  any action that succeeds; the card shows the new text until a read's `words` have it, whatever
+  their spacing, or two reads or a minute have gone by. Words cut short with `…` prove nothing,
+  since the old text may start the same way. Until then `e` on it
+  says it's still being written up, as it does for `intake: "pending"`, and `d` on it starts it
+  once it's written up, as it does for any card being written up, trusting only a read begun after
+  the save was answered: one from before says nothing of the write-up the save began.
+- Saved, but something after it didn't happen (the write-up couldn't start, so the title and
+  done-when won't catch up until it's rerun, or the push to the other machines failed):
+  `{"ok":true,"status":"partial","message":"<what didn't happen, in plain words>"}`. Kerdr counts
+  it as saved (your version is let go, the card keeps the new text) and shows `message` in the red
+  box, since that part is a failure.
+- No change: `{"ok":true,"status":"unchanged","message":"Nothing changed; #414 is as it was."}`,
+  writing nothing. A success too, so Kerdr says nothing.
+- Changed underneath, when the current text's fingerprint isn't `was`:
+  `{"ok":false,"status":"stale","message":"#414's text changed while you had it open.","text":"<current text>","was":"sha256:<current>"}`.
+  The next `e` opens your version with the newer text below it, in a block marked as left out
+  when you save, so you keep what you want of each; the save then carries the newer `was`. The
+  block's first and closing lines carry a marker Kerdr makes for that one edit, and only lines with
+  it are left out, so a line of your text that looks like one stays as you wrote it.
+- Refused, nothing written: `ok: false` and a plain `message`, such as an agent being at it, a
+  line that looks like a token or password (never echo it), or a line that would start a new
+  section. The next `e` opens your version against the same `was`.
+- On another machine: the same `home` refusal as every action. Kerdr sends the save there with
+  your text, still showing it on the card.
+
+Anything but a success takes the new text off the card at once and says, in the red box that stays
+until it's read, that the text wasn't saved, why, and that your version is kept. Kerdr keeps your
+unsaved version, in memory, until a save of it succeeds, and `q` says first, naming it, when
+quitting would lose it; a second `q` quits. `e` opens your version without asking its machine, so it's yours to get at even while
+that machine isn't answering; what you write is kept, and sent only once it can be. When a save
+gets no answer (a timeout, a dropped connection, an answer it can't read), it may or may not have
+happened: the next `e` reads the text first, says it was saved when it now reads as your version,
+and otherwise opens your version against the fresh `was`, with the newer text below it when it's
+neither what you started from nor yours. When that check can't be made (its machine isn't
+answering, or the read is refused or gets no answer), your version opens all the same, to copy
+from: nothing is sent when it closes, what you write there is kept, and the next `e` checks first
+again. Since a save that works says nothing, what you wrote that Kerdr can't send goes in the red
+box too: an empty text, one past the 64 KiB a request may be, a machine that stopped answering
+while the editor was open, an editor that died, a file that couldn't be read back, and words written
+into your kept version of an item that can no longer be edited or whose last save couldn't be
+checked.
+
+The read isn't a change: Kerdr shows nothing for it, it waits for the requests made to that record
+before it, and nothing waits for it; `e` again while it's on its way sends nothing more. Its answer
+opens the editor only while you're still on the card you pressed `e` on, within 15 seconds of that
+`e`, with no trip into herdr since and no `Esc` on the board to let it go; otherwise Kerdr says the
+text is ready, and `e` opens it. While a red box is up the editor waits, since it would hide the
+box. All of that is checked again at the moment the editor would open: once the box is read, it
+opens only if it's still within those 15 seconds of `e` and you're still on that card, with no trip
+into herdr since; otherwise the text is said to be ready instead. A
+refused read is said in the message line, since nothing changed. An `edit`'s answer may be up to
+192 KiB, room for a text of 48 KiB however much of it JSON escapes. A backend without `edit` should
+refuse it with a plain `message`, which Kerdr shows.
 
 ## Reopening work whose workspace closed
 

@@ -413,7 +413,7 @@ impl App {
             KeyCode::Char('N') => {
                 self.step_needs_you(-1);
             }
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'C' | 'X')) => {
+            KeyCode::Char(c @ ('d' | 'e' | 'y' | 'x' | 'C' | 'X')) => {
                 return self.card_action(c, 1);
             }
             _ => {}

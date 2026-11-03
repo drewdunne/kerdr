@@ -15,6 +15,8 @@ use crate::poll::{Conn, Event};
 pub mod account_controls;
 #[path = "controls.rs"]
 mod controls;
+#[path = "edit_controls.rs"]
+pub mod edit_controls;
 #[path = "inside.rs"]
 pub mod inside;
 use account_controls::AccountScreen;
@@ -521,6 +523,19 @@ pub struct App {
     pub signin_open: Option<String>,
     pub account_batch_messages: Vec<String>,
     pub account_pending: Option<account_controls::Pending>,
+    /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
+    /// your version until a save of it succeeds.
+    pub edits: std::collections::HashMap<String, edit_controls::Held>,
+    /// The reads `e` sent that haven't answered, one per card: each opens the editor only while
+    /// you're still where you pressed it.
+    pub edit_flights: Vec<edit_controls::EditFlight>,
+    /// The card whose text the editor opens next, and when and where you asked for it: not while a
+    /// failure is up, never long after you pressed e, and only while you're still there.
+    pub edit_open: Option<String>,
+    pub edit_open_when: Option<edit_controls::OpenWhen>,
+    /// How many times the board has handed the terminal over (into herdr, to SSH, to an editor):
+    /// an edit's answer opens the editor only while this is what it was at `e`.
+    pub away: u64,
 }
 
 impl App {
@@ -581,6 +596,11 @@ impl App {
             signin_open: None,
             account_batch_messages: vec![],
             account_pending: None,
+            edits: Default::default(),
+            edit_flights: vec![],
+            edit_open: None,
+            edit_open_when: None,
+            away: 0,
         };
         app.rebuild();
         app

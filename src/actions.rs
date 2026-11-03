@@ -50,6 +50,10 @@ pub struct Response {
     /// With a start: the machine it was asked for on, when that isn't the one asked (intent
     /// 0445): it starts there within minutes.
     pub machine: Option<String>,
+    /// For an edit: a backlog item's text, as read or as it is now when a save found it changed,
+    /// and its fingerprint, sent back with a save of it (intent 0414).
+    pub text: Option<String>,
+    pub was: Option<String>,
 }
 
 impl Response {
@@ -79,8 +83,6 @@ pub fn parse_response(text: &str) -> Result<Response, serde_json::Error> {
     serde_json::from_value(value)
 }
 
-/// Metadata returned to the UI after sending; credentials never enter its result queue, and a
-/// new intent's images are only counted there.
 /// The statuses actions answer with (docs/feed.md), kept as they are by the credential scrub.
 const KNOWN_STATUSES: &[&str] = &[
     "waiting",
@@ -92,10 +94,21 @@ const KNOWN_STATUSES: &[&str] = &[
     "queued",
     "stale",
     "moved",
+    "saved",
+    "unchanged",
+    "partial",
 ];
 
+/// Metadata returned to the UI after sending; credentials never enter its result queue, and a
+/// new intent's images, and an edited item's text, are only counted there: the board keeps the
+/// text itself until it's saved (intent 0414).
 pub fn request_metadata(request: &Value) -> Value {
     let mut value = request.clone();
+    if value["action"] == "edit"
+        && let Some(text) = value["text"].as_str().map(|t| t.chars().count())
+    {
+        value["text"] = Value::from(text);
+    }
     if value["action"] == "account-signin"
         && let Some(fields) = value.as_object_mut()
     {
@@ -106,6 +119,21 @@ pub fn request_metadata(request: &Value) -> Value {
         value["images"] = Value::from(images);
     }
     value
+}
+
+/// Whether a request is past what Kerdr sends: 64 KiB, and room for a new intent's images.
+pub fn too_large(request: &Value) -> bool {
+    serde_json::to_string(request).map_or(true, |json| json.len() > most_bytes(request))
+}
+
+/// The most an answer may be: 64 KiB, and for an edit room for an item's text (at most 48 KiB)
+/// however much of it JSON escapes.
+fn most_answer_bytes(request: &Value) -> usize {
+    if request["action"] == "edit" {
+        3 * MAX_JSON_BYTES
+    } else {
+        MAX_JSON_BYTES
+    }
 }
 
 /// The most a request may be: 64 KiB, and room for the images a new intent may carry.
@@ -216,14 +244,14 @@ fn run_with_deadline(
         }
         return Err("the action timed out; its result is unknown. Check the canonical record before trying again. Do not retry automatically.".into());
     }
-    if output.stdout.len() > MAX_JSON_BYTES {
+    if output.stdout.len() > most_answer_bytes(request) {
         return Err("the action's JSON response is too large; its result is unknown. Do not retry automatically.".into());
     }
     // A backend can request confirmation with a nonzero exit code. Its JSON is the contract,
     // so parse it before interpreting process status.
     parse_response(&output.stdout).map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires, &mut response.text, &mut response.was].into_iter().flatten() {
             *text = redact(text);
         }
         // A status the protocol knows stays as it is, even when it matches what was sent (a code
@@ -234,7 +262,13 @@ fn run_with_deadline(
         response
     }).map_err(|error| {
         let status = output.status.map_or_else(|| "no exit status".into(), |s| format!("exit {s}"));
-        let detail: String = redact(output.stderr.trim()).chars().take(1024).collect();
+        // An edit's error output may quote the text it was sent (a secret its check found, say),
+        // so it's left out for a save.
+        let detail: String = if request["action"] == "edit" && request.get("text").is_some() {
+            String::new()
+        } else {
+            redact(output.stderr.trim()).chars().take(1024).collect()
+        };
         let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
         let error = redact(&error.to_string());
         format!("the action's JSON response is invalid ({status}): {error}{detail}. Its result is unknown. Do not retry automatically.")
@@ -639,6 +673,78 @@ mod tests {
         .unwrap_err();
         assert!(error.contains("20 MB of images"), "{error}");
         assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn an_edit_carries_its_text_on_stdin_and_only_counts_it_afterwards() {
+        let dir = tempfile::tempdir().unwrap();
+        let captured = dir.path().join("captured.json");
+        let text = "Line one, it's `quoted`; $(touch x)\n\n### A heading 🦀";
+        let request =
+            json!({"action":"edit","id":"0414","text":text,"was":"sha256:aa","from":"amd-lzm4"});
+        let reply = r#"{"ok":false,"status":"stale","message":"The text changed while you had it open.","text":"Newer.","was":"sha256:bb"}"#;
+        let command = fixture(
+            dir.path(),
+            &format!(
+                "cat > {}\nprintf '%s' '{reply}'\n",
+                quote(captured.to_str().unwrap())
+            ),
+            &format!(
+                "[IO.File]::WriteAllText({}, [Console]::In.ReadToEnd(), (New-Object Text.UTF8Encoding $false)); Write-Output '{reply}'",
+                transport::powershell_quote(captured.to_str().unwrap())
+            ),
+        );
+        let response = run(&machine(), &command, &request).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&fs::read_to_string(captured).unwrap()).unwrap(),
+            request
+        );
+        assert!(!response.ok);
+        assert_eq!(response.status.as_deref(), Some("stale"));
+        assert_eq!(response.text.as_deref(), Some("Newer."));
+        assert_eq!(response.was.as_deref(), Some("sha256:bb"));
+        // What comes back to the board names no text, only how long it was.
+        let metadata = request_metadata(&request);
+        assert_eq!(metadata["text"], text.chars().count());
+        assert!(!metadata.to_string().contains("Line one"));
+        // A read has no text to count.
+        let read = json!({"action":"edit","id":"0414","from":"amd-lzm4"});
+        assert_eq!(request_metadata(&read), read);
+        // Its statuses are the protocol's, kept as they are.
+        for status in ["saved", "unchanged", "partial", "stale"] {
+            assert!(KNOWN_STATUSES.contains(&status), "{status}");
+        }
+        // A save past 64 KiB is refused before anything runs, and said to be too large.
+        let big = json!({"action":"edit","id":"0414","text":"x".repeat(70_000),"was":"sha256:aa"});
+        assert!(too_large(&big));
+        assert!(!too_large(&request));
+        let sentinel = dir.path().join("ran");
+        let error = run(
+            &machine(),
+            &format!("touch {}", quote(sentinel.to_str().unwrap())),
+            &big,
+        )
+        .unwrap_err();
+        assert!(error.contains("too large"), "{error}");
+        assert!(!sentinel.exists());
+    }
+
+    #[test]
+    fn an_edit_saves_error_output_never_reaches_the_board() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = fixture(
+            dir.path(),
+            "cat >&2\necho 'leak: kerdr-fixture-secret-line' >&2\nexit 1\n",
+            "[Console]::Error.WriteLine([Console]::In.ReadToEnd()); [Console]::Error.WriteLine('leak: kerdr-fixture-secret-line'); exit 1",
+        );
+        let save = json!({"action":"edit","id":"0414","text":"kerdr-fixture-secret-line","was":"sha256:aa"});
+        let error = run(&machine(), &command, &save).unwrap_err();
+        assert!(!error.contains("kerdr-fixture-secret-line"), "{error}");
+        assert!(error.contains("invalid (exit 1)"), "{error}");
+        // A read sends no text, so its error output is shown as any action's is.
+        let read = json!({"action":"edit","id":"0414"});
+        let error = run(&machine(), &command, &read).unwrap_err();
+        assert!(error.contains("leak: kerdr-fixture-secret-line"), "{error}");
     }
 
     #[test]

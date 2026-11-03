@@ -73,6 +73,8 @@ impl Live {
 }
 
 pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
+    // A backlog item's text a killed Kerdr left in the temp folder (intent 0414).
+    crate::edit::sweep(&std::env::temp_dir());
     // One read per machine at most, the newest: while you're inside herdr nobody applies them.
     let inbox = Arc::new(Inbox::default());
     let mut live = live.then(|| Live {
@@ -254,6 +256,10 @@ fn event_loop(
                     None => app.say("Nothing else needs you right now.", Tone::Good),
                 }
             }
+        }
+        // A backlog item's text you just asked for with e: your editor, full screen (intent 0414).
+        if let Some(key) = app.editor_due() {
+            edit_text(terminal, flags, app, &bg, &key)?;
         }
         // A resend to a record's real home, or a card whose workspace closed as you went in
         // reopening (intent 0411), whatever account action runs (intent 0445).
@@ -444,6 +450,7 @@ fn event_loop(
                 let intro = format!(
                     "Kerdr: SSH to {host} needs you. Answer its question below; Kerdr comes back when it's done.\n(It runs: ssh {host} true)"
                 );
+                app.away += 1;
                 let ok = jump::foreground(
                     terminal,
                     flags,
@@ -476,6 +483,7 @@ fn event_loop(
                 let intro = format!(
                     "Kerdr: herdr's own setup for {host} runs now and asks before it installs, updates or restarts anything.\nWhen herdr opens, ctrl+space q brings you back to the board.\n(It runs: herdr --remote {host})"
                 );
+                app.away += 1;
                 let ok = jump::foreground(
                     terminal,
                     flags,
@@ -619,8 +627,13 @@ impl Runner {
                         }
                         let _ = answers.send(Answer::Dropped(n, dropped));
                     }
-                    ToRunner::Feed { machine, intakes } => {
+                    ToRunner::Feed {
+                        machine,
+                        mut intakes,
+                    } => {
                         failed = queue.written(machine, &intakes);
+                        queue.forget_rewriting(machine, &mut intakes);
+                        queue.read_passed(machine);
                         seen.insert(machine, intakes);
                     }
                 }
@@ -789,6 +802,61 @@ fn run_ready(app: &mut App, runner: &Runner) {
     }
 }
 
+/// Opens a backlog item's text in your editor, handing it the terminal as a jump hands it to
+/// herdr, and sends the save when the text changed: through the action resolution tool, so the
+/// card shows it and the board is yours again the moment the editor closes (intents 0414, 0416).
+/// Changes already with the runner go on while the editor is open (intent 0445).
+fn edit_text(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    bg: &Bg,
+    key: &str,
+) -> anyhow::Result<()> {
+    let Some((id, file, intro, marker)) = app.edit_file(key) else {
+        return Ok(());
+    };
+    let candidates = crate::edit::candidates_here(app.cfg.editor.as_deref());
+    // One that opens a window of its own and isn't told to wait would be back at once.
+    if app.editor_wont_wait(key, &candidates) {
+        return Ok(());
+    }
+    send_before_leaving(
+        terminal,
+        app,
+        bg,
+        "Sending your new intent before your editor opens: its image is still being read…",
+    );
+    app.away += 1;
+    // A hang-up while the editor is open waits until its file is gone, then ends Kerdr.
+    let stops = crate::edit::HoldStops::new();
+    let ended = crate::edit::edit_by(&id, &file, marker.as_deref(), |path| {
+        jump::hand_over(terminal, flags, || {
+            crate::edit::launch(&candidates, path, &intro)
+        })
+    });
+    if let Some(signal) = stops.held() {
+        anyhow::bail!("Kerdr was asked to stop (signal {signal}) while your editor was open.");
+    }
+    drop(stops);
+    if let Action::Mutate { machine, request } = app.edit_ended(key, ended) {
+        start_action(app, bg.answers, bg.runner, machine, request);
+    }
+    Ok(())
+}
+
+/// Before the board hands the terminal over (into herdr, or to your editor): a new intent Enter
+/// sent while its image was read goes first, so it isn't left waiting until he's back on the
+/// board (review of intent 0445).
+fn send_before_leaving(terminal: &mut DefaultTerminal, app: &mut App, bg: &Bg, sending: &str) {
+    if app.send_after_load.is_some() {
+        app.say(sending, Tone::Info);
+        let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        send_loaded_images(app, bg, Some(IMAGE_WAIT));
+        app.unsay(sending);
+    }
+}
+
 /// Opens herdr full screen on one workspace by its id, whether or not a card claims it yet: a
 /// workspace no card claims, or one a reopen just made, on the tab it opened when it names one.
 /// The outcome, when herdr opened.
@@ -879,17 +947,14 @@ fn run_jump(
     client_config: Option<&PathBuf>,
     bg: &Bg,
 ) -> Outcome {
-    // A new intent Enter sent while its image was read goes before herdr takes the screen, so
-    // it isn't left waiting until he's back on the board (review of intent 0445).
-    if app.send_after_load.is_some() {
-        const SENDING: &str =
-            "Sending your new intent before going in: its image is still being read…";
-        app.say(SENDING, Tone::Info);
-        let _ = terminal.draw(|f| crate::ui::draw(f, app));
-        send_loaded_images(app, bg, Some(IMAGE_WAIT));
-        app.unsay(SENDING);
-    }
+    send_before_leaving(
+        terminal,
+        app,
+        bg,
+        "Sending your new intent before going in: its image is still being read…",
+    );
     let opening = jump::opening(&j.label, &j.machine.name, j.machine.ssh.is_none());
+    app.away += 1;
     app.say(opening.clone(), Tone::Info);
     let _ = terminal.draw(|f| crate::ui::draw(f, app));
     let outcome = jump::run(

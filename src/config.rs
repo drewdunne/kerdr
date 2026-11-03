@@ -10,6 +10,9 @@ use serde::Deserialize;
 pub struct Config {
     /// This machine's name on the board. Defaults to its hostname.
     pub name: Option<String>,
+    /// What `e` opens a backlog item's text in, with any arguments (`code --wait`); the file's
+    /// path goes after them. None: `$VISUAL`, else `$EDITOR`, else nvim, else vim.
+    pub editor: Option<String>,
     pub board: BoardConfig,
     pub feed: FeedConfig,
     pub actions: ActionsConfig,
@@ -495,5 +498,16 @@ mod tests {
             Some("~/bin/cards-action")
         );
         assert!(toml::from_str::<Config>("[actions]\ncomand = 'oops'\n").is_err());
+    }
+
+    #[test]
+    fn the_editor_is_a_setting_of_its_own_and_none_by_default() {
+        assert!(Config::default().editor.is_none());
+        assert_eq!(
+            cfg("editor = 'code --wait'\n[board]\nslots = 3\n")
+                .editor
+                .as_deref(),
+            Some("code --wait")
+        );
     }
 }
