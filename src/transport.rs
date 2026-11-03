@@ -172,7 +172,7 @@ pub fn run_herdr(target: &Target, herdr: &str, args: &[&str], deadline: Duration
         cmd.args(args);
         clean_herdr_env(&mut cmd);
         // Never put Herdr clients in a kill-on-close job: they may start a persistent server.
-        return run(&mut cmd, None, deadline, false);
+        return run(&mut cmd, None, deadline, false, None);
     }
     let quoted: Vec<String> = args.iter().map(|a| quote(a)).collect();
     let script = format!(

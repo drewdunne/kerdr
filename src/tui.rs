@@ -1155,6 +1155,7 @@ mod tests {
     }
 
     /// What the runner says, in words: "started 1", "handed 1", "dropped 1 yes", "done 1 ok".
+    #[cfg(unix)] // its tests run real commands, on Unix
     fn heard(answer: Answer) -> String {
         match answer {
             Answer::Started(n) => format!("started {n}"),
@@ -1174,6 +1175,7 @@ mod tests {
 
     /// The next thing the runner says within `wait` ms, leaving out that a command has its
     /// request, which comes between its start and its answer.
+    #[cfg(unix)]
     fn next_heard(rx: &mpsc::Receiver<Answer>, wait: u64) -> Option<String> {
         let until = Instant::now() + Duration::from_millis(wait);
         loop {
