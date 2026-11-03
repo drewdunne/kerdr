@@ -370,6 +370,43 @@ fn main() {
     };
     rasterize(&render(&compose), &fonts, &out.join("new-intent.png"));
 
+    let mut kickoff = app(false);
+    let asked = kerdr::actions::Response {
+        confirmation: true,
+        confirm: Some("demo".into()),
+        asked: Some("demo".into()),
+        questions: vec![kerdr::actions::Question {
+            num: "1".into(),
+            question: "Whose work is this, Arkship's or Kibbelz's?".into(),
+            background: "It decides where the code's repo lives and which machine runs it. Arkship's work runs on arknet-one; Kibbelz's runs on LAB-Server.".into(),
+            pick: "Kibbelz".into(),
+            why: "\"my own version of my desk\" sounds like your personal site, not a business of Arkship's (a guess)".into(),
+        }, kerdr::actions::Question {
+            num: "2".into(),
+            question: "Where should \"localhost\" be, so you can open it?".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    kickoff.mode = Mode::Kickoff {
+        form: kerdr::app::Kickoff::from_answer(
+            0,
+            &serde_json::json!({"action":"dispatch","id":"0040"}),
+            &asked,
+            "#40".into(),
+            "Robb Morgan site on localhost".into(),
+            &[],
+        )
+        .unwrap(),
+        back: Box::new(Mode::Backlog { sel: 0 }),
+        target: None,
+    };
+    rasterize(
+        &render(&kickoff),
+        &fonts,
+        &out.join("kickoff-questions.png"),
+    );
+
     let mut confirmation = app(false);
     confirmation.mode = Mode::Confirm { plain: false, machine: 0,
         request: serde_json::json!({"action":"dispatch","id":"40","override":true}),

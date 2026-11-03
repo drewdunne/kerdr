@@ -205,6 +205,26 @@ for confirmation:
 ```
 
 A confirmation is a separate user decision before sending a new request with `override: true`.
+
+Kickoff questions: background work can have questions only you can answer before it can run on its
+own. To put them to you when `d` starts it, answer the start with `questions` and an `asked` token,
+and Kerdr opens its Kickoff Questions box, labelled a background task, instead of a yes or no:
+
+```json
+{"ok":false,"message":"#41 can't start on its own: 1 question is yours first.","confirmation":true,"confirm":"opaque",
+ "asked":"opaque","session":"web","questions":[{"num":"1","question":"Whose work is this?",
+ "background":"It decides which machine runs it.","pick":"Kibbelz","why":"it sounds personal"}]}
+```
+
+`background`, `pick` and `why` are optional, and `note` says one more thing in the box. Each question
+shows whole, one at a time. ⏎ takes its recommendation (`pick` and `why`) or sends what you typed.
+After the last, the same `dispatch` goes again with `asked` and `answers`, as
+`[{"num":"1","take":true},{"num":"2","text":"your words"}]`: save them, then start it. Esc saves what's
+answered with `{"action":"answer","id":"0041","asked":"opaque","answers":[…]}` and starts nothing, and
+is the only request that isn't a start. Tab, offered when the answer has `confirmation`, starts it with
+you along instead: `override: true` and its `confirm`, with `asked` and `answers` when some are given.
+When the questions have changed since `asked`, save nothing, and answer with them as they are now. A
+start with answers that fails keeps what you typed: `d` opens the box again with your words in it.
 Kerdr asks it for `dispatch` and `reopen`.
 Actions have a 120-second deadline, and `dispatch` and `reopen` five minutes, since a start on
 another machine can wait minutes for it there; keep your own limits under those, so your answer
