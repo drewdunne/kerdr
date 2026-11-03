@@ -595,7 +595,7 @@ pub fn run(
     flags: &TerminalFlags,
     jump: &Jump,
     client_config: &Path,
-    held: Option<&Path>,
+    held: Option<&crate::hold::HeldWay>,
     tick: &mut dyn FnMut(),
 ) -> Outcome {
     let t = target(&jump.machine);
@@ -665,10 +665,12 @@ pub fn run(
     }
     cmd.env("KERDR", "1");
 
-    // A held connection first; when that window never really opens, the usual way.
+    // A held connection first, if its machine answers through it; when that window never really
+    // opens, the usual way.
+    let held = held.filter(|h| h.answers(crate::hold::ANSWER_WITHIN));
     let mut through_held = match (&jump.machine.ssh, jump.via, held) {
-        (Some(host), Via::Remote, Some(socket)) => {
-            let mut c = held_client(host, &jump.session, socket);
+        (Some(host), Via::Remote, Some(way)) => {
+            let mut c = held_client(host, &jump.session, &way.socket);
             for var in HERDR_VARS {
                 c.env_remove(var);
             }
@@ -693,15 +695,22 @@ pub fn run(
     tty.restore();
     let attached = match first {
         Some(a) => a,
-        None => match attach(&mut cmd, &t, jump, tick) {
-            Ok(a) => a,
-            Err(e) => {
-                #[cfg(windows)]
-                drop(console_modes);
-                enter(terminal, flags);
-                return Outcome::Failed(format!("Couldn't start herdr: {e}"));
+        None => {
+            if through_held.is_some() {
+                // A client stopped short may have left its modes on, which aren't line settings.
+                leave(flags);
+                let _ = execute!(stdout(), DisableFocusChange);
             }
-        },
+            match attach(&mut cmd, &t, jump, tick) {
+                Ok(a) => a,
+                Err(e) => {
+                    #[cfg(windows)]
+                    drop(console_modes);
+                    enter(terminal, flags);
+                    return Outcome::Failed(format!("Couldn't start herdr: {e}"));
+                }
+            }
+        }
     };
     #[cfg(windows)]
     drop(console_modes);

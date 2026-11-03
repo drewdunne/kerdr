@@ -1009,10 +1009,11 @@ fn run_jump(
         client_config
             .map(|p| p.as_path())
             .unwrap_or(std::path::Path::new("")),
-        held.as_deref(),
+        held.as_ref(),
         &mut keep_up,
     );
-    bg.holds.borrow_mut().left(app);
+    let reached = matches!(outcome, Outcome::Board | Outcome::Next);
+    bg.holds.borrow_mut().left(app, reached);
     app.unsay(&opening);
     outcome
 }
