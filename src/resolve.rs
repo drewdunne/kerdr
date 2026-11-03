@@ -475,6 +475,17 @@ impl Queue {
         failed
     }
 
+    /// Takes out of a read what may be from before a text was saved: kept, it would judge a start
+    /// pressed before the next read comes (intent 0414).
+    pub fn forget_rewriting(&self, machine: usize, intakes: &mut HashMap<String, Option<String>>) {
+        let saves = self.items.iter().filter(|j| j.writes);
+        for j in saves.chain(self.rewritten.iter().map(|(j, _)| j)) {
+            if let (true, Some(record)) = (j.machine == machine, &j.record) {
+                intakes.remove(record);
+            }
+        }
+    }
+
     /// A read of `machine`'s feed has been taken in (Queue::written): saves of a text answered
     /// before it began speak for themselves from the next read on (intent 0414).
     pub fn read_passed(&mut self, machine: usize) {
@@ -2032,6 +2043,45 @@ mod tests {
         assert_eq!(read(&mut q, None), vec![3]);
         q.done(3);
         assert_eq!(q.startable(), vec![4]);
+    }
+
+    #[test]
+    fn a_read_from_before_a_new_text_is_never_kept_to_judge_a_later_start() {
+        // d pressed after the first read since the save: the runner judges it by the read it kept.
+        let key = || Some("s:7".to_string());
+        let save = json!({"action":"edit","id":"7","text":"New.","was":"sha256:aa"});
+        let start = json!({"action":"dispatch","id":"7"});
+        let intakes = |v: Option<&str>| HashMap::from([("7".to_string(), v.map(str::to_string))]);
+        let mut q = Queue::default();
+        q.push(1, 0, key(), &save);
+        assert_eq!(q.startable(), vec![1]);
+        // Both a read while the save runs and the first after it say nothing that's kept.
+        let mut during = intakes(None);
+        q.forget_rewriting(0, &mut during);
+        assert!(during.is_empty(), "the save is still on its way");
+        q.done(1);
+        let mut first = intakes(None);
+        assert!(q.written(0, &first).is_empty());
+        q.forget_rewriting(0, &mut first);
+        q.read_passed(0);
+        assert!(first.is_empty(), "it may have begun before the save landed");
+        // So the start waits, on what was kept, until a read after the save says it's done.
+        q.push_gated(2, 0, key(), &start);
+        assert!(q.written(0, &first).is_empty());
+        assert!(q.startable().is_empty());
+        let mut next = intakes(Some("pending"));
+        assert!(q.written(0, &next).is_empty());
+        q.forget_rewriting(0, &mut next);
+        assert_eq!(next, intakes(Some("pending")), "a later read is kept");
+        assert!(q.startable().is_empty());
+        assert!(q.written(0, &intakes(None)).is_empty());
+        assert_eq!(q.startable(), vec![2]);
+        // Another machine's save leaves this machine's read alone.
+        let mut q = Queue::default();
+        q.push(3, 1, key(), &save);
+        let mut here = intakes(None);
+        q.forget_rewriting(0, &mut here);
+        assert_eq!(here, intakes(None));
     }
 
     #[test]

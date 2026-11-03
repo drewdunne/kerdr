@@ -627,8 +627,12 @@ impl Runner {
                         }
                         let _ = answers.send(Answer::Dropped(n, dropped));
                     }
-                    ToRunner::Feed { machine, intakes } => {
+                    ToRunner::Feed {
+                        machine,
+                        mut intakes,
+                    } => {
                         failed = queue.written(machine, &intakes);
+                        queue.forget_rewriting(machine, &mut intakes);
                         queue.read_passed(machine);
                         seen.insert(machine, intakes);
                     }
