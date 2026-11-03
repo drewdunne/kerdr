@@ -107,6 +107,10 @@ pub struct FeedCard {
     /// when none could; absent once it's written up.
     #[serde(default)]
     pub intake: Option<String>,
+    /// The submission Kerdr sent the words with, while the record is still being written up from
+    /// them: the card shown while they were saved gives way to this one (intent 0445).
+    #[serde(default)]
+    pub submission: Option<String>,
     #[serde(default, rename = "ref")]
     pub reference: Option<String>,
     pub title: String,

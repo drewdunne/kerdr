@@ -443,9 +443,9 @@ pub struct App {
     /// A new intent Enter sent while its image was still being read: the read's number and its
     /// words, sent once the image is in (intent 0445).
     pub send_after_load: Option<(u64, Draft)>,
-    /// Backlog work d was pressed on while its intent was still being written up: it starts once
-    /// that's done (intent 0445).
-    pub start_when_written: Vec<String>,
+    /// The answer being handled is for a start or reopen whose workspace Andrew already went
+    /// into himself (intent 0445).
+    answer_went_in: bool,
     /// The intent just created here, selected in the backlog as soon as its card arrives.
     pub new_intent_id: Option<(usize, String)>,
     /// The new-intent box closed when Enter sent its words, and nothing has been pressed or pasted
@@ -539,7 +539,7 @@ impl App {
             submissions: vec![],
             returned: Default::default(),
             send_after_load: None,
-            start_when_written: vec![],
+            answer_went_in: false,
             backlog_focus: None,
             view_search: None,
             sel: Selection::default(),
@@ -775,12 +775,48 @@ impl App {
             set_misc_selection(&mut self.mode, selected);
             return;
         }
+        // The card shown while a new intent saved has given way to its record's, whichever
+        // machine's copy shows it first and before its answer comes: whatever was on the one is on
+        // the other (intent 0445).
+        for shown in [self.sel.key.clone(), self.backlog_focus.clone()]
+            .into_iter()
+            .flatten()
+        {
+            let Some((_, submission)) = shown.split_once(":saving-") else {
+                continue;
+            };
+            if self.card(&shown).is_some() {
+                continue;
+            }
+            let Some(key) = self
+                .board
+                .cards
+                .iter()
+                .find(|c| {
+                    c.detail
+                        .as_ref()
+                        .is_some_and(|d| d.submission.as_deref() == Some(submission))
+                })
+                .map(|c| c.key.clone())
+            else {
+                continue;
+            };
+            if self.sel.key.as_deref() == Some(shown.as_str()) {
+                self.sel.key = Some(key.clone());
+            }
+            if self.backlog_focus.as_deref() == Some(shown.as_str()) {
+                self.backlog_focus = Some(key);
+            }
+        }
         self.fix_selection();
-        // Only once its card is in the backlog as shown: a filter may hide it for now.
+        // Only once its card is in the backlog as shown: a filter may hide it for now. Any
+        // machine's copy of the store it went to is its card.
         if let Some((machine, id)) = self.new_intent_id.clone()
+            && let record = format!("{}:{id}", self.source_of(machine))
             && let Some(&i) = self.backlog_cards().iter().find(|&&i| {
                 let c = &self.board.cards[i];
-                c.machine_index == machine && c.detail.as_ref().is_some_and(|d| d.id == id)
+                c.key == record
+                    || (c.machine_index == machine && c.detail.as_ref().is_some_and(|d| d.id == id))
             })
         {
             let key = self.board.cards[i].key.clone();
@@ -1363,7 +1399,9 @@ impl App {
                 );
             }
             let reopen = self.pending_reopen.take().map(|k| (k, "reopen"));
-            let written: Vec<(String, &str)> = std::mem::take(&mut self.start_when_written)
+            let written: Vec<(String, &str)> = self
+                .resolver
+                .drop_awaited()
                 .into_iter()
                 .map(|k| (k, "start"))
                 .collect();
@@ -4213,10 +4251,22 @@ mod tests {
         let (key, id) = waiting_backlog_card(&app);
         let machine = app.card(&key).unwrap().machine_index;
         app.enter_backlog(false);
-        // Another machine's record with the same id is someone else's.
+        // Another store's record with the same id is someone else's.
+        if let Some(f) = app.machines[machine + 1].feed.as_mut() {
+            f.source = Some("elsewhere".into());
+        }
         app.new_intent_id = Some((machine + 1, id.clone()));
         app.rebuild();
         assert!(app.new_intent_id.is_some());
+        // Another machine's copy of the same store is the same record (intent 0445).
+        let same = app.machines[machine].feed.as_ref().unwrap().source.clone();
+        if let Some(f) = app.machines[machine + 1].feed.as_mut() {
+            f.source = same;
+        } else {
+            app.new_intent_id = Some((machine, id.clone()));
+        }
+        app.rebuild();
+        assert!(app.new_intent_id.is_none());
         app.new_intent_id = Some((machine, id));
         app.rebuild();
         assert!(app.new_intent_id.is_none());
@@ -6033,7 +6083,7 @@ mod tests {
         // Sent on quietly: nothing is said unless it fails there too.
         assert_eq!(app.message(), None);
         // Sent on in its own place in the queue, to the machine the refusal named.
-        let Some((_, machine, again)) = app.resolver.ready().into_iter().next() else {
+        let Some((_, machine, again, _)) = app.resolver.ready().into_iter().next() else {
             panic!("nothing was sent on")
         };
         assert_eq!(machine, 1);
@@ -6186,7 +6236,7 @@ mod tests {
             }),
         );
         // Sent on in its own place in the queue, to the machine the refusal named.
-        let Some((_, machine, again)) = app.resolver.ready().into_iter().next() else {
+        let Some((_, machine, again, _)) = app.resolver.ready().into_iter().next() else {
             panic!("nothing was sent on")
         };
         assert_eq!(machine, 1);
@@ -6516,7 +6566,7 @@ mod tests {
         let ready = app.resolver.ready();
         assert_eq!(ready.len(), 2);
         let mut queue = crate::resolve::Queue::default();
-        for (n, m, request) in &ready {
+        for (n, m, request, _) in &ready {
             queue.push(*n, *m, app.resolver.key_of(*n), request);
         }
         assert_eq!(
@@ -6753,6 +6803,87 @@ mod tests {
                 id: "w-new".into()
             }
         );
+        // In by his own ⏎: its answer takes him nowhere later.
+        assert!(!app.resolver.holds_you());
+    }
+
+    #[test]
+    fn a_reopen_s_answer_never_takes_you_back_into_the_workspace_you_left() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.dismissed())
+            .cloned()
+            .expect("a done card in the demo");
+        let id = card.detail.as_ref().unwrap().id.clone();
+        select_key(&mut app, &card.key);
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("⏎ didn't reopen it: {:?}", app.message())
+        };
+        app.queue_action(machine, request.clone());
+        let n = app.resolver.ready()[0].0;
+        app.resolver.started(n);
+        // Its workspace opens while ark-dispatch waits for the agent to take its brief, and he
+        // goes in (item 3), then comes back to the board with nothing else pressed.
+        app.went_into(&card.key);
+        select_key(&mut app, &card.key);
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: format!("Reopened {id}."),
+                session: Some("web".into()),
+                workspace: Some("w-re".into()),
+                ..Default::default()
+            }),
+        );
+        assert!(app.open_after.is_none(), "he's been there already");
+        assert!(
+            app.message().is_none_or(|(m, _)| !m.contains("goes in")),
+            "{:?}",
+            app.message()
+        );
+    }
+
+    #[test]
+    fn a_start_with_its_workspace_open_can_be_stopped_and_says_so_truthfully() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.is_open_workspace() && c.detail.is_some())
+            .cloned()
+            .expect("a card with its workspace open in the demo");
+        let id = card.detail.as_ref().unwrap().id.clone();
+        let n = app.resolver.add(
+            card.machine_index,
+            serde_json::json!({"action":"dispatch","id":id}),
+            None,
+            Some(card.key.clone()),
+            None,
+        );
+        // Unanswered: X goes ahead (its cancel waits its turn behind the start); anything else
+        // says what's really happening.
+        assert!(!app.still_changing(&card, "cancel"));
+        assert!(app.still_changing(&card, "close"));
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("workspace is open"), "{said}");
+        assert!(said.contains("X stops it"), "{said}");
+        assert!(!said.contains("Once its workspace opens"), "{said}");
+        // Answered (here, or by a start that ran elsewhere), the copy with its workspace is
+        // under way, and nothing is refused for it.
+        app.resolver.ready();
+        let mut job = app.resolver.take(n).unwrap();
+        job.effect = Some(crate::resolve::Effect::StartingOn("far-box".into()));
+        app.resolver.settle(job);
+        assert!(app.resolver.starting(&id).is_some());
+        assert!(!app.still_changing(&card, "close"));
     }
 
     #[test]
@@ -6776,44 +6907,97 @@ mod tests {
         };
         set_intake(&mut app, Some("pending"));
         select_key(&mut app, &key);
-        // Remembered, not refused, and not sent to a backend that would refuse it.
+        // Remembered, not refused: handed to the runner, which holds it until the write-up's
+        // done, wherever Andrew is meanwhile (intent 0445).
         assert_eq!(press(&mut app, 'd'), Action::None);
         let (said, _) = app.message().unwrap();
         assert!(said.contains("starts as soon as that's done"), "{said}");
+        assert!(app.starts_when_written(&key));
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1);
+        let (n, m, request, gated) = ready[0].clone();
+        assert!(gated, "it waits for the write-up");
         assert_eq!(
-            app.start_written_up(),
-            Action::None,
-            "still being written up"
+            (request["action"].as_str(), request["id"].as_str()),
+            (Some("dispatch"), Some(id.as_str()))
         );
+        // Shown as waiting, not as starting, and nothing else counts it as a start yet.
         let card = app.card(&key).cloned().unwrap();
         assert!(
             app.starting_line(&card)
                 .unwrap()
                 .contains("Being written up")
         );
-        // Written up: it starts, wherever he is now.
-        set_intake(&mut app, None);
-        app.mode = Mode::Keys {
-            filter: String::new(),
-            typing: false,
-            scroll: 0,
-        };
-        let Action::Mutate { request, .. } = app.start_written_up() else {
-            panic!("the start wasn't sent: {:?}", app.message())
-        };
-        assert_eq!(
-            (request["action"].as_str(), request["id"].as_str()),
-            (Some("dispatch"), Some(id.as_str()))
+        assert!(app.resolver.starting(&id).is_none());
+        assert_eq!(app.quit_held(), None);
+        assert!(
+            app.quit_loses()
+                .unwrap()
+                .contains("starts once it's written up")
         );
-        assert!(app.start_when_written.is_empty());
-        // Esc on the board drops one still waiting.
+        // A second d asks for no second start.
+        press(&mut app, 'd');
+        assert!(app.resolver.ready().is_empty());
+        // The runner holds it until its machine's feed shows it written up.
+        let mut queue = crate::resolve::Queue::default();
+        queue.push_gated(n, m, app.resolver.key_of(n), &request);
+        let intake = |v: Option<&str>| {
+            std::collections::HashMap::from([(id.clone(), v.map(str::to_string))])
+        };
+        assert!(queue.written(m, &intake(Some("pending"))).is_empty());
+        assert!(queue.startable().is_empty());
+        assert!(queue.written(m, &intake(None)).is_empty());
+        assert_eq!(queue.startable(), vec![n]);
+        // Started: it shows as starting from now.
+        assert!(app.resolver.started(n));
+        app.rebuild();
+        assert!(!app.starts_when_written(&key));
+        assert!(app.resolver.starting(&id).is_some());
+        app.finish_job(n, request, done("Started."));
+        // Esc on the board drops one still waiting, and the runner is told.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
         set_intake(&mut app, Some("pending"));
-        app.mode = Mode::Board;
         select_key(&mut app, &key);
         press(&mut app, 'd');
+        let n = app.resolver.ready()[0].0;
         esc(&mut app);
-        assert!(app.start_when_written.is_empty());
+        assert!(!app.starts_when_written(&key));
+        assert_eq!(app.resolver.take_dropped(), vec![n]);
         assert!(app.message().unwrap().0.contains("won't start after all"));
+    }
+
+    #[test]
+    fn a_start_waiting_for_a_write_up_that_fails_never_starts_and_says_so() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        for c in app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+        {
+            if c.id == id {
+                c.intake = Some("pending".into());
+            }
+        }
+        app.rebuild();
+        select_key(&mut app, &key);
+        press(&mut app, 'd');
+        let (n, m, request, _) = app.resolver.ready()[0].clone();
+        let mut queue = crate::resolve::Queue::default();
+        queue.push_gated(n, m, app.resolver.key_of(n), &request);
+        let failed = std::collections::HashMap::from([(id.clone(), Some("failed".to_string()))]);
+        assert_eq!(queue.written(m, &failed), vec![n]);
+        assert!(queue.is_empty(), "it never starts");
+        // The runner answers it with the reason, which the board shows.
+        app.finish_job(n, request, Err(crate::resolve::NOT_WRITTEN_UP.into()));
+        assert!(!app.starts_when_written(&key));
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("couldn't be written up"), "{said}");
+        assert!(said.contains("d starts it as it is"), "{said}");
     }
 
     #[test]
@@ -6839,6 +7023,29 @@ mod tests {
         let n = app.resolver.ready()[0].0;
         app.resolver.started(n);
         assert!(app.quit_held().unwrap().contains("new intent"));
+    }
+
+    #[test]
+    fn q_says_first_what_only_kerdr_keeps() {
+        let mut app = demo_app();
+        assert_eq!(app.quit_loses(), None);
+        // Words waiting for their image.
+        app.send_after_load = Some((
+            1,
+            Draft {
+                words: "Back up the NAS".into(),
+                ..Default::default()
+            },
+        ));
+        assert!(app.quit_loses().unwrap().contains("once its image is in"));
+        app.send_after_load = None;
+        // Words a failed save gave back, kept for c.
+        app.returned
+            .push_back(("Back up the NAS".into(), Vec::new()));
+        assert!(app.quit_loses().unwrap().contains("c brings them back"));
+        app.returned.clear();
+        app.draft = "half a thought".into();
+        assert!(app.quit_loses().is_some());
     }
 
     #[test]

@@ -787,10 +787,26 @@ impl App {
             return Action::None;
         }
         // d on work still being written up from his words: it starts as soon as that's done,
-        // rather than be refused until then (intent 0445).
+        // rather than be refused until then. The runner holds the start until its home's feed
+        // shows it written up, so it goes even while he's inside a workspace (intent 0445).
         if action == "dispatch" && card.intake() == Some("pending") && waiting_work(&card) {
-            if !self.start_when_written.contains(&card.key) {
-                self.start_when_written.push(card.key.clone());
+            if self.resolver.waiting_for_write_up(&card.key).is_none() {
+                let Some(machine) = self.home_machine(&card) else {
+                    return Action::None;
+                };
+                if !self.can_write(machine) {
+                    return Action::None;
+                }
+                let request = json!({"action":"dispatch","id":detail.id});
+                let effect = self.effect_for(&card.key, &request);
+                let n = self.resolver.add_gated(
+                    machine,
+                    request,
+                    Some(CardSnapshot::of(&card)),
+                    Some(card.key.clone()),
+                    effect,
+                );
+                self.note_workspaces(n, machine);
             }
             self.say(
                 format!(
@@ -1298,16 +1314,20 @@ impl App {
 
     /// The card key a new intent's card has while it's saved.
     pub(super) fn placeholder_key(&self, machine: usize, submission: &str) -> String {
-        let source = self
-            .machines
+        format!(
+            "{}:{}",
+            self.source_of(machine),
+            crate::resolve::Placeholder::id_for(submission)
+        )
+    }
+
+    /// The source of a machine's feed, which its cards' keys start with.
+    pub(super) fn source_of(&self, machine: usize) -> String {
+        self.machines
             .get(machine)
             .and_then(|m| m.feed.as_ref())
             .and_then(|f| f.source.clone())
-            .unwrap_or_else(|| "feed".into());
-        format!(
-            "{source}:{}",
-            crate::resolve::Placeholder::id_for(submission)
-        )
+            .unwrap_or_else(|| "feed".into())
     }
 
     /// Pasted text arrives whole, line breaks and all, so a pasted paragraph never sends itself.
@@ -1648,8 +1668,18 @@ impl App {
         let shows = effect.is_some();
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
         let n = self.resolver.add(machine, request, from, key, effect);
-        // The workspaces there now: one that opens meanwhile is the start's (intent 0445).
-        if starts && let Some(name) = self.machines.get(machine).map(|m| m.name()) {
+        if starts {
+            self.note_workspaces(n, machine);
+        }
+        if shows {
+            self.rebuild();
+        }
+    }
+
+    /// Notes the workspaces a start's machine has now: one that opens meanwhile is the start's
+    /// (intent 0445).
+    fn note_workspaces(&mut self, n: u64, machine: usize) {
+        if let Some(name) = self.machines.get(machine).map(|m| m.name()) {
             let before = self
                 .board
                 .workspaces
@@ -1658,9 +1688,6 @@ impl App {
                 .map(|w| (w.session.clone(), w.id.clone()))
                 .collect();
             self.resolver.note_workspaces(n, before);
-        }
-        if shows {
-            self.rebuild();
         }
     }
 
@@ -1685,6 +1712,7 @@ impl App {
                     .map(|m| m.name())
                     .unwrap_or_default(),
                 session: request["session"].as_str().unwrap_or("default").to_string(),
+                source: self.source_of(machine),
                 made: None,
             })
         });
@@ -1773,6 +1801,7 @@ impl App {
         let mut job = job;
         let machine = job.machine;
         self.action_from = job.from.clone();
+        self.answer_went_in = job.entered;
         let mut refused = None;
         if let Ok(response) = &result
             && response.ok
@@ -1843,6 +1872,7 @@ impl App {
         }
         // Not asked or taken anywhere: nothing else is owed to that card.
         self.action_from = None;
+        self.answer_went_in = false;
     }
 
     /// Whether this card's record has a start or a reopen on its way, said when so, in words for
@@ -1855,6 +1885,19 @@ impl App {
         let Some(job) = self.resolver.starting(&id) else {
             return false;
         };
+        let open = card.is_open_workspace();
+        if open {
+            // Answered, and the copy shown has its workspace: it's under way, and the usual
+            // rules speak (a start that ran on another machine, while this copy catches up).
+            if job.settled.is_some() {
+                return false;
+            }
+            // X stops it: its cancel goes once the start has answered, as every change to a
+            // record waits for the one before it (intent 0445).
+            if action == "cancel" {
+                return false;
+            }
+        }
         let verb = if job.request["action"] == "reopen" {
             "reopening"
         } else {
@@ -1862,7 +1905,11 @@ impl App {
         };
         let secs = job.asked.elapsed().as_secs();
         let reference = &card.reference;
-        let text = if matches!(action, "enter" | "dispatch" | "reopen") {
+        let text = if open {
+            format!(
+                "{reference}'s workspace is open and its agent is still taking its brief ({secs} s so far): ⏎ goes in, and X stops it."
+            )
+        } else if matches!(action, "enter" | "dispatch" | "reopen") {
             format!(
                 "{reference} is {verb} ({secs} s so far); ⏎ goes in as soon as its workspace opens."
             )
@@ -1898,12 +1945,18 @@ impl App {
             return None;
         }
         let job = self.resolver.starting(&id)?;
-        let machine = self.machines.get(job.machine).map(|m| m.name())?;
+        // Where it asked, and where a start that ran on another machine runs (intent 0445).
+        let mut machines = vec![self.machines.get(job.machine).map(|m| m.name())?];
+        if let Some(Effect::StartingOn(there)) = &job.effect
+            && let Some(i) = self.machine_index(there)
+        {
+            machines.push(self.machines[i].name());
+        }
         let digits: String = id.chars().filter(|c| c.is_ascii_digit()).collect();
         let named = (digits.len() >= 2).then(|| format!("{}-", &digits[digits.len() - 2..]));
         let opened = named.and_then(|named| {
             self.board.workspaces.iter().find(|w| {
-                w.machine == machine
+                machines.contains(&w.machine)
                     && w.label.starts_with(&named)
                     && !job
                         .before
@@ -1915,14 +1968,62 @@ impl App {
             })
         });
         if let Some(w) = opened {
-            return Some(Action::JumpWorkspace {
+            let action = Action::JumpWorkspace {
                 machine: w.machine.clone(),
                 session: w.session.clone(),
                 id: w.id.clone(),
-            });
+            };
+            // In by his own ⏎: its answer takes him nowhere later.
+            self.resolver.went_in(&id);
+            return Some(action);
         }
         self.still_changing(card, "enter");
         Some(Action::None)
+    }
+
+    /// Going into a card's workspace yourself: a start or reopen still on its way for it neither
+    /// asks nor takes you in when it answers, since you're already there (intent 0445).
+    pub fn went_into(&mut self, key: &str) {
+        if let Some(id) = self
+            .card(key)
+            .and_then(|c| c.detail.as_ref())
+            .map(|d| d.id.clone())
+        {
+            self.resolver.went_in(&id);
+        }
+    }
+
+    /// The same, going into a workspace by its id: the card it's for, if any.
+    pub fn went_into_workspace(&mut self, machine: usize, session: &str, id: &str) {
+        let Some(name) = self.machines.get(machine).map(|m| m.name()) else {
+            return;
+        };
+        let keys: Vec<String> = self
+            .board
+            .workspaces
+            .iter()
+            .filter(|w| w.machine == name && w.session == session && w.id == id)
+            .filter_map(|w| w.card.clone())
+            .chain(
+                self.board
+                    .cards
+                    .iter()
+                    .filter(|c| {
+                        c.machine_index == machine
+                            && c.session.as_deref() == Some(session)
+                            && c.workspace_id.as_deref() == Some(id)
+                    })
+                    .map(|c| c.key.clone()),
+            )
+            .collect();
+        for key in keys {
+            self.went_into(&key);
+        }
+    }
+
+    /// Whether a start d asked for waits for this card's write-up.
+    pub fn starts_when_written(&self, key: &str) -> bool {
+        self.resolver.waiting_for_write_up(key).is_some()
     }
 
     /// What a card's own screen and its peek say while a change to it is on its way: "◐ Starting
@@ -1933,7 +2034,7 @@ impl App {
         if card.intake() == Some(crate::resolve::SAVING) {
             return Some("Saving your new intent… it gets its number in a moment.".into());
         }
-        if self.start_when_written.contains(&card.key) {
+        if self.starts_when_written(&card.key) {
             return Some(
                 "Being written up from your words; it starts as soon as that's done.".into(),
             );
@@ -1967,31 +2068,6 @@ impl App {
         ))
     }
 
-    /// Work d was pressed on while it was being written up, now written up: its start, sent now.
-    /// One at a time; None once there's nothing to send (intent 0445).
-    pub fn start_written_up(&mut self) -> Action {
-        while let Some(i) = self.start_when_written.iter().position(|k| {
-            self.card(k)
-                .is_none_or(|c| c.intake() != Some("pending") || !waiting_work(c))
-        }) {
-            let key = self.start_when_written.remove(i);
-            let Some(card) = self.card(&key).cloned() else {
-                continue;
-            };
-            if !waiting_work(&card) {
-                continue;
-            }
-            // Sent from wherever you are now: nothing moves your selection.
-            let focus = self.backlog_focus.clone();
-            let action = self.intent_action_on(card, "dispatch", json!({}));
-            self.backlog_focus = focus;
-            if matches!(action, Action::Mutate { .. }) {
-                return action;
-            }
-        }
-        Action::None
-    }
-
     /// What holds Kerdr open on q, said: a change not yet sent, which would never be, or a new
     /// intent whose words may still be on their way to its command (intent 0445).
     pub fn quit_held(&self) -> Option<String> {
@@ -2013,6 +2089,39 @@ impl App {
             "{}'s change hasn't been sent yet; it goes once the one before it answers. Wait a moment before quitting.",
             names.first().cloned().unwrap_or_else(|| "A card".into())
         ))
+    }
+
+    /// What quitting would drop that Kerdr alone keeps, for q to say first, a second q quitting:
+    /// a start waiting for its write-up, which Kerdr sends; words waiting for their image; words
+    /// a failed save gave back, or written and not yet sent (intent 0445).
+    pub fn quit_loses(&self) -> Option<String> {
+        let awaited = self.resolver.write_ups_awaited();
+        if let Some(first) = awaited.first() {
+            let reference = first
+                .id()
+                .map(|id| self.reference_for(id))
+                .unwrap_or_else(|| "A card".into());
+            let more = match awaited.len() {
+                1 => String::new(),
+                n => format!(" ({} more like it)", n - 1),
+            };
+            return Some(format!(
+                "{reference} starts once it's written up{more}, and only Kerdr sends that start: quitting drops it."
+            ));
+        }
+        if self.send_after_load.is_some() {
+            return Some(
+                "Your new intent is sent once its image is in, in a moment: quitting drops it."
+                    .into(),
+            );
+        }
+        if !self.returned.is_empty() || !self.draft.trim().is_empty() {
+            return Some(
+                "Words for a new intent are kept only while Kerdr is open (c brings them back): quitting drops them."
+                    .into(),
+            );
+        }
+        None
     }
 
     /// What's still running and finishes without Kerdr, for q to say before it quits: "#41 is
@@ -2284,6 +2393,8 @@ impl App {
                                 from,
                             })
                         }
+                        // He went in himself while it was on its way: nothing to say.
+                        None if self.answer_went_in => {}
                         None => {
                             message.push_str(" ⏎ on its card goes in.");
                             note = Some(message.clone());
@@ -2341,8 +2452,18 @@ impl App {
             ),
         };
         let shown = self.placeholder_key(machine, &submission);
-        let on_it = self.backlog_focus.as_deref() == Some(shown.as_str())
-            || self.sel.key.as_deref() == Some(shown.as_str());
+        // On its card: the one shown while it saved, or the record's, which may have taken its
+        // place before this answer came (intent 0445).
+        let on_it = [self.backlog_focus.as_deref(), self.sel.key.as_deref()]
+            .into_iter()
+            .flatten()
+            .any(|k| {
+                k == shown
+                    || self
+                        .card(k)
+                        .and_then(|c| c.detail.as_ref())
+                        .is_some_and(|d| d.submission.as_deref() == Some(submission.as_str()))
+            });
         let back = |into_box: bool| {
             if into_box {
                 "c opens it again with your words".to_string()

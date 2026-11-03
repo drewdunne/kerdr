@@ -1259,7 +1259,7 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
         let (mut glyph, mut gcolor, mut meta, mut mcolor) = list_glyph(c, now);
-        if app.start_when_written.contains(&c.key) {
+        if app.starts_when_written(&c.key) {
             meta = "starts once written up".into();
         }
         // A card holding work says so with ▸; a done one with work still open says how much,
@@ -4176,7 +4176,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                 Span::styled(c.title.clone(), fg(FG)),
             ],
             if c.intake().is_some() || meta_color == BLUE {
-                let meta = if app.start_when_written.contains(&c.key) {
+                let meta = if app.starts_when_written(&c.key) {
                     format!("{meta} · starts once done")
                 } else {
                     meta

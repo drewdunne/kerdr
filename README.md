@@ -230,7 +230,8 @@ Shift+Enter, Alt+Enter or Ctrl+J starts a new line, and a paste keeps its
 line breaks. Escape keeps your words for the next time you open it. The adapter files it in the backlog of the
 session you're looking at and writes it up (see [docs/feed.md](docs/feed.md#actions)); Kerdr
 shows it as being written up until that's done, and creating it never starts an agent by itself:
-`d` on it meanwhile starts it as soon as it's written up (`Esc` on the board drops that).
+`d` on it meanwhile starts it as soon as it's written up, even while you're inside a workspace (`Esc` on
+the board drops that); if it can't be written up, it doesn't start, and Kerdr says so.
 
 Ctrl+V in the box attaches the image on your clipboard, as Claude Code does: it goes in at the end
 of your words as an `[Image #1]` tag, numbered within that intent, and travels with them to the
@@ -404,7 +405,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `M` | machines |
 | `r` / `R` | retry a machine that isn't answering / read every machine now, trying again any that aren't |
 | `?` | keys |
-| `q` | quit (every session keeps running; with a start still running, it says so and a second `q` quits) |
+| `q` | quit (every session keeps running; with a start still running, a start waiting for its write-up, or words for a new intent only Kerdr holds, it says so and a second `q` quits) |
 
 | Inside herdr | |
 |---|---|

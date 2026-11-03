@@ -141,6 +141,17 @@ fn event_loop(
 ) -> anyhow::Result<()> {
     let (action_tx, action_rx) = mpsc::channel::<Answer>();
     let runner = Runner::spawn(action_tx.clone());
+    // Every feed reaches the runner as it's read, so a start waiting for its write-up goes as
+    // soon as it's done, wherever Andrew is (intent 0445).
+    let feeds = runner.tx.clone();
+    inbox.watch_feeds(move |machine, feed| {
+        let intakes = feed
+            .cards
+            .iter()
+            .map(|c| (c.id.clone(), c.intake.clone()))
+            .collect();
+        let _ = feeds.send(ToRunner::Feed { machine, intakes });
+    });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
     // When q last said what still runs: a second q soon after quits (intent 0445).
     let mut quit_asked: Option<Instant> = None;
@@ -158,7 +169,10 @@ fn event_loop(
         while let Ok(answer) = action_rx.try_recv() {
             let (job, machine, request, result) = match answer {
                 Answer::Started(n) => {
-                    app.resolver.started(n);
+                    // A start that waited for its write-up shows from now.
+                    if app.resolver.started(n) {
+                        app.rebuild();
+                    }
                     continue;
                 }
                 Answer::Done(done) => *done,
@@ -243,10 +257,6 @@ fn event_loop(
         for ev in inbox.take() {
             app.apply(ev);
         }
-        // A start that waited for its intent to be written up goes once it is (intent 0445).
-        while let Action::Mutate { machine, request } = app.start_written_up() {
-            start_action(app, &action_tx, &runner, machine, request);
-        }
         if let Some(key) = app.pending_jump_ready() {
             jump_cards(
                 terminal,
@@ -309,11 +319,16 @@ fn event_loop(
                         "An account change is still running. Wait for its result before quitting.",
                         Tone::Warn,
                     );
-                } else if let Some(text) = app.still_running()
+                } else if let Some((text, tone)) = app
+                    .quit_loses()
+                    .map(|t| (t, Tone::Warn))
+                    .or_else(|| app.still_running().map(|t| (t, Tone::Info)))
                     && quit_asked.is_none_or(|at| at.elapsed() > Duration::from_secs(5))
                 {
+                    // What only Kerdr keeps, or what finishes without it: said once, and a
+                    // second q soon after quits (intent 0445).
                     quit_asked = Some(Instant::now());
-                    app.say(format!("{text} q again quits."), Tone::Info);
+                    app.say(format!("{text} q again quits."), tone);
                 } else {
                     return Ok(());
                 }
@@ -521,8 +536,17 @@ enum ToRunner {
         target: Machine,
         command: String,
         request: serde_json::Value,
+        /// A start that waits for its intent's write-up, as that machine's feed shows it.
+        gated: bool,
     },
     Done(u64),
+    /// A change dropped before it started (Esc on a start waiting for its write-up).
+    Drop(u64),
+    /// A machine's feed as its reader brought it: each record by id, with its intake.
+    Feed {
+        machine: usize,
+        intakes: std::collections::HashMap<String, Option<String>>,
+    },
 }
 
 /// Runs changes to cards in their turn on a thread of its own, which never touches App: a change
@@ -542,7 +566,14 @@ impl Runner {
                 u64,
                 (usize, Machine, String, serde_json::Value),
             > = Default::default();
+            // Each machine's newest feed, by record: a start that waits for its write-up checks
+            // it as soon as it's asked for, not only at the next read.
+            let mut seen: std::collections::HashMap<
+                usize,
+                std::collections::HashMap<String, Option<String>>,
+            > = Default::default();
             for msg in rx {
+                let mut failed = vec![];
                 match msg {
                     ToRunner::Run {
                         n,
@@ -551,11 +582,40 @@ impl Runner {
                         target,
                         command,
                         request,
+                        gated,
                     } => {
-                        queue.push(n, machine, key, &request);
+                        if gated {
+                            queue.push_gated(n, machine, key, &request);
+                            if let Some(intakes) = seen.get(&machine) {
+                                failed = queue.written(machine, intakes);
+                            }
+                        } else {
+                            queue.push(n, machine, key, &request);
+                        }
                         waiting.insert(n, (machine, target, command, request));
                     }
                     ToRunner::Done(n) => queue.done(n),
+                    ToRunner::Drop(n) => {
+                        if queue.drop_unstarted(n) {
+                            waiting.remove(&n);
+                        }
+                    }
+                    ToRunner::Feed { machine, intakes } => {
+                        failed = queue.written(machine, &intakes);
+                        seen.insert(machine, intakes);
+                    }
+                }
+                // Its write-up failed: it never starts, and the board says so.
+                for n in failed {
+                    if let Some((machine, _, _, request)) = waiting.remove(&n) {
+                        let metadata = crate::actions::request_metadata(&request);
+                        let _ = answers.send(Answer::Done(Box::new((
+                            Some(n),
+                            machine,
+                            metadata,
+                            Err(crate::resolve::NOT_WRITTEN_UP.into()),
+                        ))));
+                    }
                 }
                 for n in queue.startable() {
                     let Some((machine, target, command, request)) = waiting.remove(&n) else {
@@ -641,7 +701,10 @@ fn start_action(
 
 /// Hands every new change to a card to the runner, which starts each in its turn.
 fn run_ready(app: &mut App, runner: &Runner) {
-    for (n, machine, request) in app.resolver.ready() {
+    for n in app.resolver.take_dropped() {
+        let _ = runner.tx.send(ToRunner::Drop(n));
+    }
+    for (n, machine, request, gated) in app.resolver.ready() {
         let command = app.cfg.actions.command.clone();
         let target = app.machines.get(machine).map(|m| m.machine.clone());
         let (Some(command), Some(target)) = (command, target) else {
@@ -661,6 +724,7 @@ fn run_ready(app: &mut App, runner: &Runner) {
             target,
             command,
             request,
+            gated,
         });
     }
 }
@@ -698,6 +762,8 @@ fn jump_workspace(
                 .map(|w| w.label.clone())
         })
         .unwrap_or_else(|| id.clone());
+    // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
+    app.went_into_workspace(mi, &session, &id);
     let via = via_for(app, mi, &session);
     let j = workspace_jump(app, mi, session, id, label, tab, via);
     let outcome = run_jump(terminal, flags, app, &j, client_config);
@@ -834,6 +900,8 @@ fn jump_cards(
             col: card.stage.index(),
             key: Some(key.clone()),
         };
+        // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
+        app.went_into(&key);
         let others = app.needs_you_order().iter().filter(|k| **k != key).count();
         let via = via_for(app, mi, &session);
         // Its own tab, never another's: a child's, or the card's own agent's (intent 0349).
@@ -1039,6 +1107,7 @@ mod tests {
                     target: machine.clone(),
                     command: command.into(),
                     request: serde_json::json!({"action":"move","id":"7","delta":1}),
+                    gated: false,
                 })
                 .unwrap();
         }
@@ -1079,6 +1148,7 @@ mod tests {
             target: machine.clone(),
             command: command.into(),
             request: serde_json::json!({"action":"move","id":"7","delta":1}),
+            gated: false,
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
@@ -1093,5 +1163,81 @@ mod tests {
         runner.tx.send(run(1, 1, &ok)).unwrap();
         let seen: Vec<String> = (0..4).filter_map(|_| next(10_000)).collect();
         assert_eq!(seen, ["started 1", "done 1", "started 2", "done 2"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_runner_starts_a_start_once_its_write_up_is_read_and_never_after_a_failed_one() {
+        // Feeds reach it from the readers' threads, so this happens while Andrew is inside a
+        // workspace too (intent 0445).
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let command = "cat >/dev/null\nprintf '%s' '{\"ok\":true,\"message\":\"started\"}'\n";
+        let intakes = |pairs: &[(&str, Option<&str>)]| {
+            pairs
+                .iter()
+                .map(|(id, v)| (id.to_string(), v.map(str::to_string)))
+                .collect()
+        };
+        // Already read as written up before it's asked for: it goes at once.
+        runner
+            .tx
+            .send(ToRunner::Feed {
+                machine: 0,
+                intakes: intakes(&[("8", None)]),
+            })
+            .unwrap();
+        for (n, id) in [(1, "7"), (2, "8"), (3, "9")] {
+            runner
+                .tx
+                .send(ToRunner::Run {
+                    n,
+                    machine: 0,
+                    key: Some(format!("here:{id}")),
+                    target: machine.clone(),
+                    command: command.into(),
+                    request: serde_json::json!({"action":"dispatch","id":id}),
+                    gated: true,
+                })
+                .unwrap();
+        }
+        let next = || match rx.recv_timeout(Duration::from_secs(10)).unwrap() {
+            Answer::Started(n) => format!("started {n}"),
+            Answer::Done(done) => format!(
+                "done {} {}",
+                done.0.unwrap(),
+                if done.3.is_ok() { "ok" } else { "failed" }
+            ),
+        };
+        assert_eq!(next(), "started 2");
+        assert_eq!(next(), "done 2 ok");
+        runner
+            .tx
+            .send(ToRunner::Feed {
+                machine: 0,
+                intakes: intakes(&[("7", Some("pending")), ("9", Some("failed"))]),
+            })
+            .unwrap();
+        assert_eq!(
+            next(),
+            "done 3 failed",
+            "its write-up failed: never started"
+        );
+        runner
+            .tx
+            .send(ToRunner::Feed {
+                machine: 0,
+                intakes: intakes(&[("7", None)]),
+            })
+            .unwrap();
+        assert_eq!(next(), "started 1");
+        assert_eq!(next(), "done 1 ok");
     }
 }

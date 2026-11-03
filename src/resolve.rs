@@ -9,6 +9,7 @@
 //! then the feed alone speaks. When it fails, or the backend asks a question first, the effect goes
 //! at once, so the card is back as it really is, and the app says so where it can't be missed.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -20,6 +21,10 @@ use crate::model::CardSnapshot;
 /// The intake a new intent's card has while its words are still being saved (intent 0445): no
 /// record exists yet, so nothing may be done to it.
 pub const SAVING: &str = "saving";
+
+/// What a start that waited for its intent's write-up says when the write-up failed (intent 0445).
+pub const NOT_WRITTEN_UP: &str =
+    "couldn't be written up from your words, so it didn't start; d starts it as it is.";
 
 /// How long a settled effect may stay without the feed showing it.
 const SETTLED_MOST: Duration = Duration::from_secs(60);
@@ -68,6 +73,8 @@ pub struct Placeholder {
     pub title: String,
     pub machine: String,
     pub session: String,
+    /// The source of the store it's saved in (its machine's feed's), where `made` is a record.
+    pub source: String,
     /// The record the save made, once its answer names it: the card goes once the feed has it.
     pub made: Option<String>,
 }
@@ -85,6 +92,23 @@ impl Placeholder {
             Some((at, _)) => format!("{}…", line[..at].trim_end()),
             None => line,
         }
+    }
+
+    /// The submission it was sent with.
+    pub fn submission(&self) -> &str {
+        self.id.strip_prefix("saving-").unwrap_or(&self.id)
+    }
+
+    /// Whether this feed, any machine's, has the record the save made: one that carries its
+    /// submission, which the record's header has from the moment it's written, before the answer
+    /// comes; or the record the answer named, in a copy of the store it went to (intent 0445).
+    pub fn made_in(&self, feed: &Feed) -> bool {
+        let source = feed.source.as_deref().unwrap_or("feed");
+        let submission = self.submission();
+        feed.cards.iter().any(|c| {
+            c.submission.as_deref() == Some(submission)
+                || (source == self.source && self.made.as_ref().is_some_and(|id| &c.id == id))
+        })
     }
 
     fn card(&self) -> FeedCard {
@@ -116,8 +140,13 @@ impl Effect {
                 fc.no_agent = false;
             }
             Effect::StartingOn(machine) => {
-                fc.status = Some(format!("Starting on {machine}…"));
-                fc.no_agent = false;
+                // A copy that already shows it under way speaks for itself (intent 0445).
+                let state = fc.state.as_deref().unwrap_or("active");
+                let open = fc.workspace.as_ref().is_some_and(|w| w.id.is_some());
+                if matches!(state, "queued" | "shelved" | "none") && !open {
+                    fc.status = Some(format!("Starting on {machine}…"));
+                    fc.no_agent = false;
+                }
             }
             Effect::Started => {
                 fc.state = Some("active".into());
@@ -210,10 +239,7 @@ impl Effect {
                     .iter()
                     .all(|(k, r)| rank(k).is_none_or(|got| got == Some(*r)))
             }
-            Effect::Saving(p) => p
-                .made
-                .as_ref()
-                .is_some_and(|id| feed.cards.iter().any(|c| &c.id == id)),
+            Effect::Saving(p) => p.made_in(feed),
         }
     }
 }
@@ -240,6 +266,11 @@ pub struct Job {
     pub before: Vec<(String, String)>,
     /// Succeeded: when, and how many of its machine's reads have come since.
     pub settled: Option<(Instant, u8)>,
+    /// A start d asked for while its intent was still being written up: the runner holds it until
+    /// its machine's feed shows the write-up done, wherever Andrew is meanwhile (intent 0445).
+    pub gated: bool,
+    /// Andrew has gone into the workspace it opened himself, so its answer takes him nowhere.
+    pub entered: bool,
 }
 
 impl Job {
@@ -270,6 +301,17 @@ impl Job {
     pub fn id(&self) -> Option<&str> {
         self.record()
     }
+
+    /// Whether it's a start still waiting for its intent's write-up: not started, nor shown.
+    pub fn waits_for_write_up(&self) -> bool {
+        self.gated && self.running.is_none() && self.settled.is_none()
+    }
+
+    /// Whether any machine's read may show it: a start that ran on another machine reaches
+    /// copies there first, and a new intent may reach any copy of its store first.
+    fn shows_anywhere(&self) -> bool {
+        matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
+    }
 }
 
 /// The order changes run in, kept by the runner away from the board's thread, so a change whose
@@ -289,6 +331,8 @@ struct Queued {
     key: Option<String>,
     moves: bool,
     started: bool,
+    /// Waiting for its record's write-up (a start d asked for while it was written up).
+    gated: bool,
 }
 
 impl Queued {
@@ -312,11 +356,52 @@ impl Queue {
             key,
             moves: request["action"] == "move",
             started: false,
+            gated: false,
         };
         match self.items.iter_mut().find(|j| j.n == n) {
             Some(held) => *held = item,
             None => self.items.push(item),
         }
+    }
+
+    /// A start that waits for its record's write-up before it may start, as `written` finds it.
+    pub fn push_gated(&mut self, n: u64, machine: usize, key: Option<String>, request: &Value) {
+        self.push(n, machine, key, request);
+        if let Some(item) = self.items.iter_mut().find(|j| j.n == n) {
+            item.gated = item.record.is_some();
+        }
+    }
+
+    /// A read of `machine`'s feed: each record there by id, with its intake. Starts waiting for a
+    /// record it shows written up may start; ones whose write-up failed are taken out, and
+    /// returned, since starting an intent nobody wrote up isn't what d was pressed for.
+    pub fn written(
+        &mut self,
+        machine: usize,
+        intakes: &HashMap<String, Option<String>>,
+    ) -> Vec<u64> {
+        let mut failed = vec![];
+        for q in self
+            .items
+            .iter_mut()
+            .filter(|q| q.gated && q.machine == machine)
+        {
+            match q.record.as_ref().and_then(|r| intakes.get(r)) {
+                Some(None) => q.gated = false,
+                Some(Some(intake)) if intake == "failed" => failed.push(q.n),
+                _ => {}
+            }
+        }
+        self.items.retain(|q| !failed.contains(&q.n));
+        failed
+    }
+
+    /// Takes out a change that hasn't started (a start Esc dropped). Whether it was still there
+    /// unstarted.
+    pub fn drop_unstarted(&mut self, n: u64) -> bool {
+        let before = self.items.len();
+        self.items.retain(|q| q.n != n || q.started);
+        self.items.len() != before
     }
 
     /// The changes that can start now, marked started: each record's oldest one, once nothing
@@ -326,7 +411,7 @@ impl Queue {
         let mut out = vec![];
         for i in 0..self.items.len() {
             let job = &self.items[i];
-            if job.started {
+            if job.started || job.gated {
                 continue;
             }
             let ahead = self.items[..i]
@@ -356,6 +441,8 @@ impl Queue {
 pub struct Resolver {
     jobs: Vec<Job>,
     next: u64,
+    /// Changes the runner holds that were dropped before they started: it's told on its next pass.
+    dropped: Vec<u64>,
 }
 
 impl Resolver {
@@ -381,19 +468,39 @@ impl Resolver {
             running: None,
             before: vec![],
             settled: None,
+            gated: false,
+            entered: false,
         });
         self.next
     }
 
-    /// The changes not yet handed to the runner, marked handed: it starts each in its turn
-    /// (Queue), so this needs nothing from the board's thread later (intent 0445).
-    pub fn ready(&mut self) -> Vec<(u64, usize, Value)> {
+    /// Takes a start d asked for while its intent is still being written up: it shows nothing,
+    /// and the runner starts it once its machine's feed shows the write-up done (intent 0445).
+    pub fn add_gated(
+        &mut self,
+        machine: usize,
+        request: Value,
+        from: Option<CardSnapshot>,
+        key: Option<String>,
+        effect: Option<Effect>,
+    ) -> u64 {
+        let n = self.add(machine, request, from, key, effect);
+        if let Some(j) = self.jobs.last_mut() {
+            j.gated = true;
+        }
+        n
+    }
+
+    /// The changes not yet handed to the runner, marked handed, each with whether it waits for a
+    /// write-up: it starts each in its turn (Queue), so this needs nothing from the board's thread
+    /// later (intent 0445).
+    pub fn ready(&mut self) -> Vec<(u64, usize, Value, bool)> {
         self.jobs
             .iter_mut()
             .filter(|j| !j.sent && j.settled.is_none())
             .map(|j| {
                 j.sent = true;
-                (j.n, j.machine, j.request.clone())
+                (j.n, j.machine, j.request.clone(), j.gated)
             })
             .collect()
     }
@@ -415,10 +522,64 @@ impl Resolver {
             .any(|j| j.n == n && !j.sent && j.settled.is_none())
     }
 
-    /// The runner has started this change's command.
-    pub fn started(&mut self, n: u64) {
-        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
-            j.running.get_or_insert_with(Instant::now);
+    /// The runner has started this change's command. Whether it's a start that waited for its
+    /// write-up, which shows only from now.
+    pub fn started(&mut self, n: u64) -> bool {
+        match self.jobs.iter_mut().find(|j| j.n == n) {
+            Some(j) => {
+                let shows_now = j.waits_for_write_up() && j.effect.is_some();
+                j.running.get_or_insert_with(Instant::now);
+                shows_now
+            }
+            None => false,
+        }
+    }
+
+    /// The start waiting for this card's write-up, if one is.
+    pub fn waiting_for_write_up(&self, key: &str) -> Option<&Job> {
+        self.jobs
+            .iter()
+            .find(|j| j.waits_for_write_up() && j.key.as_deref() == Some(key))
+    }
+
+    /// Every start waiting for a write-up.
+    pub fn write_ups_awaited(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| j.waits_for_write_up())
+            .collect()
+    }
+
+    /// Esc on the board: starts waiting for their write-up won't start after all. The cards they
+    /// were for, by key.
+    pub fn drop_awaited(&mut self) -> Vec<String> {
+        let mut keys = vec![];
+        let mut dropped = vec![];
+        self.jobs.retain(|j| {
+            if !j.waits_for_write_up() {
+                return true;
+            }
+            dropped.push(j.n);
+            keys.extend(j.key.clone());
+            false
+        });
+        self.dropped.extend(dropped);
+        keys
+    }
+
+    /// The changes dropped since the runner was last told.
+    pub fn take_dropped(&mut self) -> Vec<u64> {
+        std::mem::take(&mut self.dropped)
+    }
+
+    /// Andrew has gone into this record's workspace himself while its start or reopen is on its
+    /// way: its answer neither asks him anything nor takes him in again (intent 0445).
+    pub fn went_in(&mut self, id: &str) {
+        for j in self.jobs.iter_mut().filter(|j| {
+            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.record() == Some(id)
+        }) {
+            j.from = None;
+            j.entered = true;
         }
     }
 
@@ -444,7 +605,9 @@ impl Resolver {
         self.jobs
             .iter()
             .filter(|j| {
-                j.settled.is_none() && (j.running.is_none() || j.request["action"] == "create")
+                j.settled.is_none()
+                    && !j.waits_for_write_up()
+                    && (j.running.is_none() || j.request["action"] == "create")
             })
             .collect()
     }
@@ -489,8 +652,10 @@ impl Resolver {
         job.machine = machine;
         job.request = request;
         job.from = from;
-        // Handed to the runner again, which still holds its place (intent 0445).
+        // Handed to the runner again, which still holds its place (intent 0445); a start that
+        // waited for its write-up has had it.
         job.sent = false;
+        job.gated = false;
         job.running = None;
         job.settled = None;
         let at = self.jobs.partition_point(|j| j.n < job.n);
@@ -584,9 +749,11 @@ impl Resolver {
             }
             at.elapsed() < life
         });
-        // What the feed shows now speaks for itself.
-        self.jobs
-            .retain(|j| !(j.settled.is_some() && j.machine == machine && shown(j)));
+        // What the feed shows now speaks for itself: for a start that ran elsewhere, or a new
+        // intent, any machine's copy may show it first (intent 0445).
+        self.jobs.retain(|j| {
+            !(j.settled.is_some() && (j.machine == machine || j.shows_anywhere()) && shown(j))
+        });
         self.jobs.len() != before
     }
 
@@ -611,14 +778,20 @@ impl Resolver {
             let (Some(key), Some(effect)) = (&job.key, &job.effect) else {
                 continue;
             };
+            if job.waits_for_write_up() {
+                continue;
+            }
             if let Effect::Saving(p) = effect {
-                // A new card in the backlog it went to, until the feed has the record it made.
-                if let Some(feed) = out.get_mut(job.machine).and_then(|m| m.feed.as_mut())
-                    && !p
-                        .made
-                        .as_ref()
-                        .is_some_and(|id| feed.cards.iter().any(|c| &c.id == id))
+                // A new card in the backlog it went to, until any machine's feed has the record it
+                // made: never two cards for one intent (intent 0445).
+                if machines
+                    .iter()
+                    .filter_map(|m| m.feed.as_ref())
+                    .any(|f| p.made_in(f))
                 {
+                    continue;
+                }
+                if let Some(feed) = out.get_mut(job.machine).and_then(|m| m.feed.as_mut()) {
                     feed.cards.push(p.card());
                 }
                 continue;
@@ -652,7 +825,7 @@ impl Resolver {
         for j in self
             .jobs
             .iter_mut()
-            .filter(|j| j.settled.is_none() && j.starts())
+            .filter(|j| j.settled.is_none() && j.starts() && !j.waits_for_write_up())
         {
             any |= j.from.take().is_some();
         }
@@ -664,15 +837,17 @@ impl Resolver {
     pub fn starting(&self, id: &str) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.starts() && j.record() == Some(id))
+            .find(|j| j.starts() && !j.waits_for_write_up() && j.record() == Some(id))
     }
 
     /// The newest unanswered change shown on this card, by its key.
     pub fn unanswered_on(&self, key: &str) -> Option<&Job> {
-        self.jobs
-            .iter()
-            .rev()
-            .find(|j| j.settled.is_none() && j.effect.is_some() && j.key.as_deref() == Some(key))
+        self.jobs.iter().rev().find(|j| {
+            j.settled.is_none()
+                && !j.waits_for_write_up()
+                && j.effect.is_some()
+                && j.key.as_deref() == Some(key)
+        })
     }
 
     /// The unanswered change sending this action for this record, oldest first.
@@ -686,9 +861,9 @@ impl Resolver {
     /// Whether an unanswered change may still ask you something or take you somewhere: Esc on the
     /// board lets that go.
     pub fn holds_you(&self) -> bool {
-        self.jobs
-            .iter()
-            .any(|j| j.settled.is_none() && j.starts() && j.from.is_some())
+        self.jobs.iter().any(|j| {
+            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.from.is_some()
+        })
     }
 
     /// The oldest unanswered change whose request `matches`.
@@ -1085,7 +1260,7 @@ mod tests {
         );
         // The runner takes both, by card.
         let hand = |r: &mut Resolver, q: &mut Queue| {
-            for (n, machine, request) in r.ready() {
+            for (n, machine, request, _) in r.ready() {
                 q.push(n, machine, r.key_of(n), &request);
             }
             q.startable()
@@ -1163,6 +1338,7 @@ mod tests {
             title: Placeholder::title_for("Back up\nthe NAS"),
             machine: "here".into(),
             session: "web".into(),
+            source: "s".into(),
             made: None,
         };
         assert_eq!(p.title, "Back up the NAS");
@@ -1205,6 +1381,212 @@ mod tests {
         );
         r.read(0, Some(&with));
         assert!(!r.shows());
+    }
+
+    fn placeholder() -> Placeholder {
+        Placeholder {
+            id: Placeholder::id_for("kerdr-1"),
+            title: "Back up the NAS".into(),
+            machine: "here".into(),
+            session: "web".into(),
+            source: "s".into(),
+            made: None,
+        }
+    }
+
+    fn cards_in(shown: &[MachineState], i: usize) -> Vec<String> {
+        shown[i]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .map(|c| c.id.clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_new_intent_s_record_read_before_its_answer_takes_the_card_s_place() {
+        // create writes the record, submission and all, seconds before it answers: a read
+        // meanwhile shows it, and the card shown while it saved gives way (intent 0445).
+        let mut r = Resolver::default();
+        r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(placeholder())),
+        );
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(json!([{"id":"1","title":"a"}])));
+        assert_eq!(
+            cards_in(&r.overlay(std::slice::from_ref(&m)), 0),
+            ["1", "saving-kerdr-1"]
+        );
+        m.feed = Some(feed(
+            json!([{"id":"1","title":"a"},{"id":"9001","title":"back up nas","intake":"pending","submission":"kerdr-1"}]),
+        ));
+        assert_eq!(
+            cards_in(&r.overlay(std::slice::from_ref(&m)), 0),
+            ["1", "9001"],
+            "never two cards for one intent"
+        );
+        r.read(0, m.feed.as_ref());
+        assert!(r.shows(), "unanswered, its answer still finds it");
+    }
+
+    #[test]
+    fn a_new_intent_s_record_on_another_machine_first_takes_the_card_s_place() {
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"create","words":"Back up the NAS","submission":"kerdr-1"}),
+            None,
+            Some("s:saving-kerdr-1".into()),
+            Some(Effect::Saving(placeholder())),
+        );
+        let mut here_m = MachineState::new(here());
+        here_m.feed = Some(feed(json!([{"id":"1","title":"a"}])));
+        let mut there = MachineState::new(here());
+        there.feed = Some(feed(
+            json!([{"id":"1","title":"a"},{"id":"9001","title":"t"}]),
+        ));
+        let both = [here_m.clone(), there.clone()];
+        // Answered: the record it made, by id, on another machine's copy of the same store.
+        let mut job = r.take(n).unwrap();
+        if let Some(Effect::Saving(p)) = job.effect.as_mut() {
+            p.made = Some("9001".into());
+        }
+        r.settle(job);
+        let shown = r.overlay(&both);
+        assert_eq!(cards_in(&shown, 0), ["1"], "no card shown while it saved");
+        assert_eq!(cards_in(&shown, 1), ["1", "9001"]);
+        // Another store's record with that number isn't it.
+        let mut other = there.clone();
+        other.feed.as_mut().unwrap().source = Some("elsewhere".into());
+        let shown = r.overlay(&[here_m.clone(), other]);
+        assert_eq!(cards_in(&shown, 0), ["1", "saving-kerdr-1"]);
+        // The other machine's read retires it.
+        assert!(r.read(1, there.feed.as_ref()));
+        assert!(!r.shows());
+    }
+
+    #[test]
+    fn a_start_that_ran_elsewhere_goes_once_any_copy_shows_it_under_way() {
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"dispatch","id":"7"}),
+            None,
+            Some("s:7".into()),
+            Some(Effect::Starting),
+        );
+        let mut job = r.take(n).unwrap();
+        job.effect = Some(Effect::StartingOn("far-box".into()));
+        r.settle(job);
+        let mut here_m = MachineState::new(here());
+        here_m.feed = Some(feed(json!([{"id":"7","title":"t","state":"queued"}])));
+        let mut there = MachineState::new(here());
+        there.feed = Some(feed(
+            json!([{"id":"7","title":"t","state":"active","status":"Working"}]),
+        ));
+        let shown = r.overlay(&[here_m, there.clone()]);
+        let status = |i: usize| shown[i].feed.as_ref().unwrap().cards[0].status.clone();
+        assert_eq!(status(0).as_deref(), Some("Starting on far-box…"));
+        assert_eq!(
+            status(1).as_deref(),
+            Some("Working"),
+            "a copy under way speaks for itself"
+        );
+        assert!(r.starting("7").is_some());
+        assert!(r.read(1, there.feed.as_ref()));
+        assert!(r.starting("7").is_none(), "the far machine's read shows it");
+    }
+
+    #[test]
+    fn a_start_waiting_for_its_write_up_shows_nothing_and_counts_for_nothing_yet() {
+        let mut r = Resolver::default();
+        let n = r.add_gated(
+            0,
+            json!({"action":"dispatch","id":"7"}),
+            Some(CardSnapshot::default()),
+            Some("s:7".into()),
+            Some(Effect::Starting),
+        );
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(json!([{"id":"7","title":"t","state":"queued"}])));
+        let status = |r: &Resolver| {
+            r.overlay(std::slice::from_ref(&m))[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .cards[0]
+                .status
+                .clone()
+        };
+        assert_eq!(status(&r), None);
+        assert!(r.starting("7").is_none());
+        assert!(r.holding_quit().is_empty());
+        assert!(!r.holds_you());
+        assert!(r.waiting_for_write_up("s:7").is_some());
+        assert!(r.ready()[0].3);
+        assert!(r.started(n), "it shows from now");
+        assert_eq!(status(&r).as_deref(), Some("Starting…"));
+        assert!(r.starting("7").is_some());
+        assert!(
+            r.drop_awaited().is_empty(),
+            "started: Esc no longer drops it"
+        );
+    }
+
+    #[test]
+    fn the_runner_holds_a_start_until_its_write_up_and_drops_one_that_failed() {
+        let mut q = Queue::default();
+        let start = json!({"action":"dispatch","id":"7"});
+        q.push_gated(1, 0, None, &start);
+        q.push(2, 0, None, &json!({"action":"move","id":"7","delta":1}));
+        q.push(3, 0, None, &json!({"action":"close","id":"8"}));
+        assert_eq!(
+            q.startable(),
+            vec![3],
+            "the record's later change waits behind it"
+        );
+        let feed =
+            |intake: Option<&str>| HashMap::from([("7".to_string(), intake.map(str::to_string))]);
+        assert!(
+            q.written(1, &feed(None)).is_empty(),
+            "another machine's feed isn't its home's"
+        );
+        assert!(q.startable().is_empty());
+        assert!(q.written(0, &feed(Some("pending"))).is_empty());
+        assert!(q.written(0, &feed(None)).is_empty());
+        assert_eq!(q.startable(), vec![1]);
+        let mut q = Queue::default();
+        q.push_gated(1, 0, None, &start);
+        assert_eq!(q.written(0, &feed(Some("failed"))), vec![1]);
+        assert!(q.is_empty());
+        let mut q = Queue::default();
+        q.push_gated(1, 0, None, &start);
+        assert!(q.drop_unstarted(1));
+        assert!(q.is_empty());
+    }
+
+    #[test]
+    fn going_in_yourself_lets_a_start_s_answer_go() {
+        let mut r = Resolver::default();
+        r.add(
+            0,
+            json!({"action":"reopen","id":"7"}),
+            Some(CardSnapshot::default()),
+            Some("s:7".into()),
+            Some(Effect::Reopening),
+        );
+        assert!(r.holds_you());
+        r.went_in("8");
+        assert!(r.holds_you(), "another record's");
+        r.went_in("7");
+        assert!(!r.holds_you());
+        assert!(r.starting("7").unwrap().entered);
     }
 
     #[test]
