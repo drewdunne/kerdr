@@ -47,6 +47,17 @@ pub struct Response {
     /// With `account-current`: the current account as the machine asked sees it now, null once
     /// cleared.
     pub current: Option<crate::accounts::Current>,
+    /// With a start: the machine it was asked for on, when that isn't the one asked (intent
+    /// 0445): it starts there within minutes.
+    pub machine: Option<String>,
+}
+
+impl Response {
+    /// A refusal naming another home: Kerdr may send the change on there, in its place (intents
+    /// 0411 and 0416).
+    pub fn sends_on(&self) -> bool {
+        !self.ok && !self.confirmation && self.home.is_some()
+    }
 }
 
 fn confirmation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
@@ -194,7 +205,7 @@ fn run_with_deadline(
     // so parse it before interpreting process status.
     parse_response(&output.stdout).map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.user_code, &mut response.expires].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires].into_iter().flatten() {
             *text = redact(text);
         }
         // A status the protocol knows stays as it is, even when it matches what was sent (a code

@@ -139,23 +139,43 @@ fn event_loop(
     inbox: &Inbox,
     client_config: Option<PathBuf>,
 ) -> anyhow::Result<()> {
-    let (action_tx, action_rx) = mpsc::channel::<ActionResult>();
+    let (action_tx, action_rx) = mpsc::channel::<Answer>();
+    let runner = Runner::spawn(action_tx.clone());
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
+    // When q last said what still runs: a second q soon after quits (intent 0445).
+    let mut quit_asked: Option<Instant> = None;
     // Colours from the desktop theme, read again when it changes (palette.rs).
     let mut theme = crate::palette::ThemeWatch::new(app.cfg.theme.colors.as_deref());
     theme.check(true);
     loop {
         theme.check(false);
         while let Ok((id, loading)) = image_rx.try_recv() {
-            app.images_loaded(id, loading);
+            // A new intent sent while its image was still being read goes now (intent 0445).
+            if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {
+                start_action(app, &action_tx, &runner, machine, request);
+            }
         }
-        while let Ok((job, machine, request, result)) = action_rx.try_recv() {
+        while let Ok(answer) = action_rx.try_recv() {
+            let (job, machine, request, result) = match answer {
+                Answer::Started(n) => {
+                    app.resolver.started(n);
+                    continue;
+                }
+                Answer::Done(done) => *done,
+            };
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
                 r.ok && !(request["action"] == "account-signin"
                     && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
             });
             match job {
-                Some(n) => app.finish_job(n, request, result),
+                Some(n) => {
+                    app.finish_job(n, request, result);
+                    // Finished with: its record's next change may start. One sent on to another
+                    // machine keeps its place in the runner's queue, and runs again from there.
+                    if !app.resolver.sent_on(n) {
+                        let _ = runner.tx.send(ToRunner::Done(n));
+                    }
+                }
                 None => app.finish_action(machine, request, result),
             }
             if succeeded && let Some(l) = live.as_deref() {
@@ -164,8 +184,8 @@ fn event_loop(
                 }
             }
         }
-        // Changes to cards whose turn has come run now, each on its own (intent 0416).
-        run_ready(app, &action_tx);
+        // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
+        run_ready(app, &runner);
         if app.resolver.expire() {
             app.rebuild();
         }
@@ -175,7 +195,7 @@ fn event_loop(
         if !app.demo
             && let Action::Mutate { machine, request } = app.account_tick()
         {
-            start_action(app, &action_tx, machine, request);
+            start_action(app, &action_tx, &runner, machine, request);
         }
         // A reopen answered with its workspace while you're still on its card: go in, and on
         // ctrl+space space carry on to the next card that needs you, as from any other.
@@ -213,28 +233,19 @@ fn event_loop(
                 }
             }
         }
-        // Once nothing runs: a card whose workspace closed as you went in reopens, or a ⏎ pressed
-        // while another action ran opens its card (intent 0411).
-        if !app.demo {
-            match app.next_owed() {
-                Action::Mutate { machine, request } => {
-                    start_action(app, &action_tx, machine, request)
-                }
-                Action::Jump(key) => jump_cards(
-                    terminal,
-                    flags,
-                    app,
-                    live.as_deref_mut(),
-                    inbox,
-                    client_config.as_ref(),
-                    key,
-                    true,
-                ),
-                _ => {}
-            }
+        // A resend to a record's real home, or a card whose workspace closed as you went in
+        // reopening (intent 0411), whatever account action runs (intent 0445).
+        if !app.demo
+            && let Action::Mutate { machine, request } = app.next_owed()
+        {
+            start_action(app, &action_tx, &runner, machine, request);
         }
         for ev in inbox.take() {
             app.apply(ev);
+        }
+        // A start that waited for its intent to be written up goes once it is (intent 0445).
+        while let Action::Mutate { machine, request } = app.start_written_up() {
+            start_action(app, &action_tx, &runner, machine, request);
         }
         if let Some(key) = app.pending_jump_ready() {
             jump_cards(
@@ -258,6 +269,9 @@ fn event_loop(
             Event::Paste(text) => app.on_paste(&text),
             _ => continue,
         };
+        if !matches!(action, Action::Quit) {
+            quit_asked = None;
+        }
         match action {
             Action::None => {}
             Action::LoadImages(source) => {
@@ -285,21 +299,21 @@ fn event_loop(
             }
             Action::OpenLink(url) => open_signin(app, &url),
             Action::Quit => {
-                let changes = app.resolver.unanswered();
-                if changes > 0 {
-                    app.say(
-                        if changes == 1 {
-                            "A change is still being saved. Wait for it before quitting.".to_string()
-                        } else {
-                            format!("{changes} changes are still being saved. Wait for them before quitting.")
-                        },
-                        Tone::Warn,
-                    );
+                // Only what would be lost holds Kerdr open: a change not yet sent, or a new
+                // intent's words still on their way. A start or move already running finishes
+                // without Kerdr, so a second q quits (intent 0445).
+                if let Some(text) = app.quit_held() {
+                    app.say(text, Tone::Warn);
                 } else if app.busy || !app.account_queue.is_empty() {
                     app.say(
                         "An account change is still running. Wait for its result before quitting.",
                         Tone::Warn,
                     );
+                } else if let Some(text) = app.still_running()
+                    && quit_asked.is_none_or(|at| at.elapsed() > Duration::from_secs(5))
+                {
+                    quit_asked = Some(Instant::now());
+                    app.say(format!("{text} q again quits."), Tone::Info);
                 } else {
                     return Ok(());
                 }
@@ -312,7 +326,7 @@ fn event_loop(
                     );
                     continue;
                 }
-                start_action(app, &action_tx, machine, request);
+                start_action(app, &action_tx, &runner, machine, request);
             }
             Action::Jump(card) => {
                 if app.demo {
@@ -369,17 +383,24 @@ fn event_loop(
                         );
                     }
                     None => {
+                        // Machines not answering are tried again; the rest are read now, feeds
+                        // and all, so R brings the board up to date (intent 0445).
                         let mut n = 0;
                         for i in 0..app.machines.len() {
-                            if !app.machines[i].conn.is_live() && app.machines[i].is_shown() {
+                            if !app.machines[i].is_shown() {
+                                continue;
+                            }
+                            if app.machines[i].conn.is_live() {
+                                l.wake_feed(i);
+                            } else {
                                 l.wake(i);
                                 n += 1;
                             }
                         }
                         let text = if n == 0 {
-                            "Every machine is answering.".to_string()
+                            "Reading every machine now.".to_string()
                         } else {
-                            format!("Trying {n} machines again now.")
+                            format!("Reading every machine now, and trying {n} again.")
                         };
                         app.say(text, Tone::Info);
                     }
@@ -485,12 +506,96 @@ type ActionResult = (
     Result<crate::actions::Response, String>,
 );
 
+/// What comes back to the board's thread: a change's command has started, or an action answered.
+enum Answer {
+    Started(u64),
+    Done(Box<ActionResult>),
+}
+
+/// What the runner is told: a change to run in its turn, or that one has answered.
+enum ToRunner {
+    Run {
+        n: u64,
+        machine: usize,
+        key: Option<String>,
+        target: Machine,
+        command: String,
+        request: serde_json::Value,
+    },
+    Done(u64),
+}
+
+/// Runs changes to cards in their turn on a thread of its own, which never touches App: a change
+/// whose turn comes while Andrew is inside a workspace starts then, not once he's back (intent
+/// 0445). Its answers wait on the channel until the board reads them.
+struct Runner {
+    tx: mpsc::Sender<ToRunner>,
+}
+
+impl Runner {
+    fn spawn(answers: mpsc::Sender<Answer>) -> Runner {
+        let (tx, rx) = mpsc::channel::<ToRunner>();
+        let back = tx.clone();
+        std::thread::spawn(move || {
+            let mut queue = crate::resolve::Queue::default();
+            let mut waiting: std::collections::HashMap<
+                u64,
+                (usize, Machine, String, serde_json::Value),
+            > = Default::default();
+            for msg in rx {
+                match msg {
+                    ToRunner::Run {
+                        n,
+                        machine,
+                        key,
+                        target,
+                        command,
+                        request,
+                    } => {
+                        queue.push(n, machine, key, &request);
+                        waiting.insert(n, (machine, target, command, request));
+                    }
+                    ToRunner::Done(n) => queue.done(n),
+                }
+                for n in queue.startable() {
+                    let Some((machine, target, command, request)) = waiting.remove(&n) else {
+                        continue;
+                    };
+                    let _ = answers.send(Answer::Started(n));
+                    let (answers, back) = (answers.clone(), back.clone());
+                    std::thread::spawn(move || {
+                        let result = crate::actions::run(&target, &command, &request);
+                        let metadata = crate::actions::request_metadata(&request);
+                        drop(request);
+                        // A refusal naming another home holds its record's place until the board
+                        // has sent it on there, or not (intent 0416).
+                        let held = result
+                            .as_ref()
+                            .is_ok_and(crate::actions::Response::sends_on);
+                        let _ = answers.send(Answer::Done(Box::new((
+                            Some(n),
+                            machine,
+                            metadata,
+                            result,
+                        ))));
+                        if !held {
+                            let _ = back.send(ToRunner::Done(n));
+                        }
+                    });
+                }
+            }
+        });
+        Runner { tx }
+    }
+}
+
 /// Runs an action in the background; its answer comes back on the channel. A change to a card goes
 /// to the action resolution tool, which shows it at once and runs it in its turn (intent 0416); an
 /// account action waits for its answer, one at a time.
 fn start_action(
     app: &mut App,
-    tx: &mpsc::Sender<ActionResult>,
+    tx: &mpsc::Sender<Answer>,
+    runner: &Runner,
     machine: usize,
     request: serde_json::Value,
 ) {
@@ -506,7 +611,7 @@ fn start_action(
         .is_some_and(|a| a.starts_with("account-"))
     {
         app.queue_action(machine, request);
-        run_ready(app, tx);
+        run_ready(app, runner);
         return;
     }
     if app.busy {
@@ -530,12 +635,12 @@ fn start_action(
         let result = crate::actions::run(&target, &command, &request);
         let metadata = crate::actions::request_metadata(&request);
         drop(request);
-        let _ = tx.send((None, machine, metadata, result));
+        let _ = tx.send(Answer::Done(Box::new((None, machine, metadata, result))));
     });
 }
 
-/// Starts every change to a card whose turn has come, each on a thread of its own.
-fn run_ready(app: &mut App, tx: &mpsc::Sender<ActionResult>) {
+/// Hands every new change to a card to the runner, which starts each in its turn.
+fn run_ready(app: &mut App, runner: &Runner) {
     for (n, machine, request) in app.resolver.ready() {
         let command = app.cfg.actions.command.clone();
         let target = app.machines.get(machine).map(|m| m.machine.clone());
@@ -548,12 +653,14 @@ fn run_ready(app: &mut App, tx: &mpsc::Sender<ActionResult>) {
             );
             continue;
         };
-        let tx = tx.clone();
-        std::thread::spawn(move || {
-            let result = crate::actions::run(&target, &command, &request);
-            let metadata = crate::actions::request_metadata(&request);
-            drop(request);
-            let _ = tx.send((Some(n), machine, metadata, result));
+        let key = app.resolver.key_of(n);
+        let _ = runner.tx.send(ToRunner::Run {
+            n,
+            machine,
+            key,
+            target,
+            command,
+            request,
         });
     }
 }
@@ -710,6 +817,14 @@ fn jump_cards(
         }
         if !app.machines[mi].conn.is_live() {
             app.wait_to_jump(&card);
+            app.say(
+                format!(
+                    "{} is on {}, which isn't answering: Kerdr goes in when it answers. Esc on the board stops waiting.",
+                    card.reference,
+                    app.machines[mi].name()
+                ),
+                Tone::Info,
+            );
             if let Some(l) = live.as_deref() {
                 l.wake(mi);
             }
@@ -739,8 +854,16 @@ fn jump_cards(
             keys: keys_on(app, mi),
         };
         let outcome = run_jump(terminal, flags, app, &j, client_config);
-        let choosing_next = matches!(outcome, Outcome::Next | Outcome::Closed | Outcome::Stopped);
+        // The next card is chosen only on ctrl+space space, or when one Kerdr picked has gone.
+        let choosing_next = matches!(outcome, Outcome::Next)
+            || (!yours && matches!(outcome, Outcome::Closed | Outcome::Stopped));
+        if choosing_next {
+            // The board shows while the machines are read, not a blank screen (intent 0445).
+            app.say("Finding the next card that needs you…", Tone::Info);
+            let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        }
         read_again(app, live.as_deref(), inbox, mi, choosing_next);
+        app.unsay("Finding the next card that needs you…");
         match outcome {
             Outcome::Board => return,
             Outcome::Failed(e) => {
@@ -804,6 +927,11 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
         let since = Instant::now();
         for &i in &machines {
             if i == mi {
+                // What herdr shows comes first and fast; the feed follows on its own, so the
+                // wait below never waits out a feed read (intent 0445).
+                if choosing_next {
+                    l.wake(i);
+                }
                 l.wake_feed(i);
             } else {
                 l.wake(i);

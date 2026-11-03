@@ -104,10 +104,15 @@ fn action_status(f: &mut Frame, area: Rect, app: &App) {
         if let Some((text, tone)) = app.message_since_busy() {
             (text, tone_color(tone))
         } else if let Some(line) = app.busy_line() {
-            working = format!("{line} · navigation stays available");
+            // On an account screen its keys wait for the answer; elsewhere the board is free.
+            working = if matches!(app.mode, Mode::Accounts { .. }) {
+                format!("{line} · saving; this screen's keys wait for it, Esc leaves it")
+            } else {
+                format!("{line} · the board is yours meanwhile")
+            };
             (working.as_str(), BLUE)
         } else {
-            ("Action in progress · navigation stays available", BLUE)
+            ("Action in progress", BLUE)
         }
     } else if let Some((text, tone)) = app.message() {
         (text, tone_color(tone))
@@ -540,8 +545,20 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             height: rows[3].height.saturating_sub(3),
             ..rows[3]
         };
+        // Machines still giving their first read: the board is loading, not empty (intent 0445).
+        let reading: Vec<String> = app
+            .machines
+            .iter()
+            .filter(|m| matches!(m.conn, crate::poll::Conn::Connecting))
+            .map(|m| m.name())
+            .collect();
+        let first = if reading.is_empty() {
+            "No work cards in this view.".to_string()
+        } else {
+            format!("Reading {}…", reading.join(", "))
+        };
         let lines = vec![
-            Line::styled("No work cards in this view.", bold(FG2)),
+            Line::styled(first, bold(FG2)),
             Line::raw(""),
             Line::styled(
                 if app.machine.is_none() {
@@ -1242,6 +1259,9 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
         let (mut glyph, mut gcolor, mut meta, mut mcolor) = list_glyph(c, now);
+        if app.start_when_written.contains(&c.key) {
+            meta = "starts once written up".into();
+        }
         // A card holding work says so with ▸; a done one with work still open says how much,
         // yellow only when some of it needs you. One whose card is out of view names that card.
         let holds = app.holds(i);
@@ -1324,9 +1344,10 @@ fn list_glyph(
     String,
     ratatui::style::Color,
 ) {
-    // A start or a reopen on its way (intent 0416): shown the moment it's sent, whatever the column.
+    // A start or a reopen on its way (intents 0416 and 0445): shown the moment it's sent,
+    // whatever the column, a start on another machine too.
     match c.detail.as_ref().and_then(|d| d.status.as_deref()) {
-        Some("Starting…") => return ("◐", BLUE, "starting".into(), BLUE),
+        Some(s) if s.starts_with("Starting") => return ("◐", BLUE, "starting up".into(), BLUE),
         Some("Reopening…") => return ("◐", BLUE, "reopening".into(), BLUE),
         _ => {}
     }
@@ -1349,6 +1370,8 @@ fn list_glyph(
                 ("✓", GREEN, when, DIM)
             }
         }
+        // A new intent still being saved (intent 0445).
+        _ if c.intake() == Some(crate::resolve::SAVING) => ("◐", BLUE, "saving…".into(), BLUE),
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
         _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
         // Not started, but waiting on you all the same: questions asked before it starts.
@@ -1749,8 +1772,17 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             facts.push(format!("last affirmed: {created} (created)"));
         }
     }
-    if c.workspace_id.is_none() {
+    // What's on its way for it says so first: a save, a start or a reopen (intent 0445).
+    if let Some(line) = app.starting_line(c) {
+        facts.push(line);
+    } else if c.workspace_id.is_none() {
         facts.push(match c.stage {
+            Stage::Backlog if c.intake() == Some("pending") => {
+                "✎ being written up from your words; d starts it once that's done".into()
+            }
+            Stage::Backlog if c.intake() == Some("failed") => {
+                "✎ not written up: the agent that starts it writes it up".into()
+            }
             Stage::Backlog => "not started".into(),
             Stage::Maintain => "closed".into(),
             _ => "no workspace open".into(),
@@ -2392,7 +2424,7 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
             .iter()
             .map(|i| crate::images::tag(i.tag))
             .collect();
-        field_lines(&draft.words, text.width.max(1) as usize, rows, !app.busy)
+        field_lines(&draft.words, text.width.max(1) as usize, rows, true)
             .into_iter()
             .map(|l| tagged(l, &tags))
             .collect()
@@ -2432,17 +2464,15 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
             vec![Span::styled(line, fg(DIM))],
         );
     }
-    let hints = if app.busy {
-        vec![Span::styled("◐ saving it…", fg(BLUE))]
-    } else {
-        key_hints(&[
-            ("⏎", "send"),
-            ("shift+⏎ / alt+⏎", "new line"),
-            ("ctrl+v", "image"),
-            ("ctrl+u", "clear"),
-            ("esc", "keep for later"),
-        ])
-    };
+    // Nothing of his holds the box: an account action, or an earlier intent still saving, runs
+    // on its own (intent 0445).
+    let hints = key_hints(&[
+        ("⏎", "send"),
+        ("shift+⏎ / alt+⏎", "new line"),
+        ("ctrl+v", "image"),
+        ("ctrl+u", "clear"),
+        ("esc", "keep for later"),
+    ]);
     put(
         buf,
         inner.x,
@@ -4141,7 +4171,12 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                 Span::styled(format!("{:<6}", c.reference), bold(FG)),
                 Span::styled(c.title.clone(), fg(FG)),
             ],
-            if c.intake().is_some() {
+            if c.intake().is_some() || meta_color == BLUE {
+                let meta = if app.start_when_written.contains(&c.key) {
+                    format!("{meta} · starts once done")
+                } else {
+                    meta
+                };
                 vec![Span::styled(meta, fg(meta_color))]
             } else {
                 vec![Span::styled(
@@ -5059,7 +5094,7 @@ mod tests {
             ));
             let text = rendered(&a, 176, 44);
             assert!(
-                text.contains("Reopening #39… 1 s · navigation stays available"),
+                text.contains("Reopening #39… 1 s · the board is yours meanwhile"),
                 "{text}"
             );
         }
@@ -5076,7 +5111,7 @@ mod tests {
             a.mode = mode;
             let text = rendered(&a, 176, 44);
             assert!(
-                text.contains("Reopening #39… 20 s · navigation stays available"),
+                text.contains("Reopening #39… 20 s · the board is yours meanwhile"),
                 "{text}"
             );
         }
@@ -5818,7 +5853,9 @@ mod tests {
         done.detail.as_mut().unwrap().status = Some("Reopening…".into());
         assert_eq!(list_glyph(&done, a.now()).2, "reopening");
         done.detail.as_mut().unwrap().status = Some("Starting…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "starting");
+        assert_eq!(list_glyph(&done, a.now()).2, "starting up");
+        done.detail.as_mut().unwrap().status = Some("Starting on arknet-one…".into());
+        assert_eq!(list_glyph(&done, a.now()).2, "starting up");
     }
 
     /// Intent 0455: a current account shows on the top bar, even when its usage doesn't fit, and on

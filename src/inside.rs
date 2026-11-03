@@ -733,10 +733,6 @@ impl App {
             self.say(format!("{said} o shows what's inside."), Tone::Info);
             return Action::None;
         }
-        // Another action runs: this ⏎ waits its turn, and asks then (intent 0411).
-        if self.busy {
-            return self.enter_while_busy(card);
-        }
         let back = self.mode.clone();
         match self.reopen_action(card) {
             Action::Mutate { machine, request } => {
@@ -1570,22 +1566,13 @@ mod tests {
     }
 
     #[test]
-    fn with_no_tab_of_its_own_on_record_enter_while_busy_asks_in_its_turn() {
+    fn with_no_tab_of_its_own_on_record_enter_asks_at_once_while_an_account_action_runs() {
+        // An account action running is no reason for ⏎ on a card to wait (intent 0445).
         let mut app = two_unknown_tabs();
         app.busy = true;
         app.busy_id = Some("0999".into());
         select(&mut app, "0256");
         assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
-        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
-        let key = app.sel.key.clone().unwrap();
-        assert_eq!(app.pending_enter.as_deref(), Some(key.as_str()));
-        let said = app.message().unwrap().0.to_string();
-        assert!(said.contains("#256 opens once"), "{said}");
-        assert!(!said.contains("still running"), "{said}");
-        // Its turn: the question it would have asked.
-        app.busy = false;
-        app.busy_id = None;
-        assert_eq!(app.next_owed(), Action::None);
         let Mode::Confirm { title, .. } = &app.mode else {
             panic!("{:?}", app.mode)
         };
@@ -1934,7 +1921,7 @@ mod tests {
     }
 
     #[test]
-    fn a_childs_closed_tab_reopens_once_the_running_action_answers() {
+    fn a_childs_closed_tab_reopens_whatever_account_action_runs() {
         let mut app = families(Some("w2K:t1"));
         let k = key(&app, "0262");
         let i = app.board.cards.iter().position(|c| c.key == k).unwrap();
@@ -1946,16 +1933,6 @@ mod tests {
         app.busy_since = Some(std::time::Instant::now());
         app.tab_gone(&k);
         assert_eq!(app.pending_reopen.as_deref(), Some(k.as_str()));
-        assert_eq!(app.next_owed(), Action::None);
-        assert!(
-            app.message()
-                .unwrap()
-                .0
-                .contains("tab has closed; it reopens as soon as"),
-            "{:?}",
-            app.message()
-        );
-        app.busy = false;
         let Action::Mutate { request, .. } = app.next_owed() else {
             panic!("the owed reopen sent nothing: {:?}", app.message())
         };
