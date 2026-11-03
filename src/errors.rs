@@ -3,6 +3,7 @@
 
 use serde_json::Value;
 
+use super::account_controls::AccountScreen;
 use super::{App, Mode};
 use crate::actions::Response;
 use crate::errlog::Entry;
@@ -63,6 +64,7 @@ impl App {
 
     /// The answer has been taken in. A failure nothing said anything about is kept all the same.
     pub(super) fn answer_done(&mut self) {
+        self.keep_box_errors();
         let Some(Answering {
             failed: true,
             kept: false,
@@ -77,11 +79,45 @@ impl App {
         self.answering = None;
     }
 
+    /// The sign-in box says its failures itself, from many places: anything new in it is kept.
+    /// Called whenever an answer has been taken in, and before each drawing of the board.
+    pub fn keep_box_errors(&mut self) {
+        let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &self.mode
+        else {
+            return;
+        };
+        if !s.failed || s.message.is_empty() || self.last_kept == s.message {
+            return;
+        }
+        let message = s.message.clone();
+        let machine = s.machines.get(s.current).copied();
+        // Not from an answer: from what the box is about.
+        let answering = self.answering.is_some();
+        if !answering {
+            self.answering = Some(Answering {
+                machine: machine
+                    .and_then(|m| self.machines.get(m))
+                    .map(|m| m.name())
+                    .unwrap_or_default(),
+                action: "account-signin".into(),
+                ..Default::default()
+            });
+        }
+        self.keep_error(&message, "fail");
+        if !answering {
+            self.answering = None;
+        }
+    }
+
     /// Keeps an error being shown, with where it came from.
     pub(crate) fn keep_error(&mut self, text: &str, shown: &'static str) {
         if self.demo {
             return;
         }
+        self.last_kept = text.to_string();
         let entry = match &self.answering {
             Some(a) => Entry {
                 source: "action",
@@ -132,6 +168,13 @@ impl App {
         );
         typed.extend(self.edits.values().map(|h| h.current.as_str()));
         typed.extend(kickoff_drafts(&self.mode));
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &self.mode
+        {
+            typed.extend([s.code.as_str(), s.page_code.as_str()]);
+        }
         if let Some(a) = &self.answering {
             typed.extend(a.typed.iter().map(String::as_str));
         }

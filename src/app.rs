@@ -558,6 +558,7 @@ pub struct App {
     /// What the command behind the answer about to arrive printed on standard error.
     pub answer_stderr: String,
     pub(crate) answering: Option<errors::Answering>,
+    pub(crate) last_kept: String,
     pub(crate) machine_problems: std::collections::HashMap<(usize, String), String>,
     /// How many times the board has handed the terminal over (into herdr, to SSH, to an editor):
     /// an edit's answer opens the editor only while this is what it was at `e`.
@@ -630,6 +631,7 @@ impl App {
             error_log: crate::errlog::ErrorLog::on_this_machine(),
             answer_stderr: String::new(),
             answering: None,
+            last_kept: String::new(),
             machine_problems: Default::default(),
             away: 0,
         };
@@ -651,8 +653,10 @@ impl App {
 
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
         let text = text.into();
-        if tone == Tone::Warn {
-            self.keep_error(&text, "warn");
+        match tone {
+            Tone::Warn => self.keep_error(&text, "warn"),
+            Tone::Fail => self.keep_error(&text, "fail"),
+            _ => {}
         }
         self.show(text, tone);
     }

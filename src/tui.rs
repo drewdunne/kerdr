@@ -287,6 +287,7 @@ fn event_loop(
             );
         }
         app.width = terminal.size()?.width;
+        app.keep_box_errors();
         terminal.draw(|f| crate::ui::draw(f, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;

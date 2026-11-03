@@ -3175,6 +3175,31 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_the_signin_box_says_itself_is_kept_once() {
+        let (_dir, log, path) = crate::errlog::tests::log();
+        let mut a = app();
+        a.demo = false;
+        a.error_log = log;
+        a.machines[0].conn = crate::poll::Conn::Connecting;
+        assert_eq!(token_signin(&mut a), Action::None);
+        assert_eq!(press(&mut a, 'r'), Action::None);
+        a.keep_box_errors();
+        a.keep_box_errors();
+        let got: Vec<_> = crate::errlog::tests::lines(&path)
+            .into_iter()
+            .filter(|l| l["action"] == "account-signin")
+            .collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not answering")
+        );
+        assert_eq!(got[0]["machine"], a.machines[0].name().as_str());
+    }
+
+    #[test]
     fn offline_retry_and_token_submission_stay_retryable() {
         let mut a = app();
         a.machines[0].conn = crate::poll::Conn::Connecting;
