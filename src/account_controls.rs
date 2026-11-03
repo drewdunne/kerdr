@@ -3197,6 +3197,23 @@ mod tests {
                 .contains("not answering")
         );
         assert_eq!(got[0]["machine"], a.machines[0].name().as_str());
+        // Another warning meanwhile, an answer about something else: still only the once, and that
+        // answer's stderr isn't put on it.
+        a.say("Something else went wrong.", Tone::Warn);
+        a.keep_box_errors();
+        a.answer_stderr = "another's stderr".into();
+        a.finish_action(
+            0,
+            serde_json::json!({"action":"dispatch","id":"0009"}),
+            Err("no".into()),
+        );
+        let lines = crate::errlog::tests::lines(&path);
+        let signins: Vec<_> = lines
+            .iter()
+            .filter(|l| l["action"] == "account-signin")
+            .collect();
+        assert_eq!(signins.len(), 1, "{lines:?}");
+        assert!(signins[0].get("stderr").is_none(), "{lines:?}");
     }
 
     #[test]

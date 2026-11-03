@@ -504,7 +504,8 @@ a quote of it, whole or in part, is written `[typed]`, and so is every word of f
 what you sent in the request a failure answers, even in a path made from them, which can leave `[typed]`
 in place of an ordinary word you happened to use. Anything that looks like a token is written
 `[redacted]`. Past 1 MiB it moves to `errors.log.1`, replacing the one before, so it stays near 2 MiB
-at most. A log that can't be written changes nothing else.
+at most. A log that can't be written changes nothing else. On Windows its privacy is that of your
+`%LOCALAPPDATA%`, which only you and administrators can read unless you've changed it.
 
 ## Install
 

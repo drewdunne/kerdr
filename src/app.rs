@@ -558,7 +558,7 @@ pub struct App {
     /// What the command behind the answer about to arrive printed on standard error.
     pub answer_stderr: String,
     pub(crate) answering: Option<errors::Answering>,
-    pub(crate) last_kept: String,
+    pub(crate) signin_kept: Option<String>,
     pub(crate) machine_problems: std::collections::HashMap<(usize, String), String>,
     /// How many times the board has handed the terminal over (into herdr, to SSH, to an editor):
     /// an edit's answer opens the editor only while this is what it was at `e`.
@@ -631,7 +631,7 @@ impl App {
             error_log: crate::errlog::ErrorLog::on_this_machine(),
             answer_stderr: String::new(),
             answering: None,
-            last_kept: String::new(),
+            signin_kept: None,
             machine_problems: Default::default(),
             away: 0,
         };

@@ -27,6 +27,8 @@ const CREDENTIAL_RUN: usize = 8;
 const TOKEN_RUN: usize = 32;
 const TYPED: &str = "[typed]";
 const LOCK_TRIES: u32 = 5;
+/// How far past its limit the log may go while its lock can't be had.
+const UNLOCKED_SLACK: u64 = 256 * 1024;
 const SECRET: &str = "[redacted]";
 
 /// What one line says. Anything it doesn't know is left out.
@@ -155,7 +157,8 @@ pub fn last_part(text: &str, most: usize) -> &str {
 /// Takes out what was typed and what looks like a token: `typed` wherever it's quoted, every word
 /// of `sent`.
 pub fn scrub(text: &str, typed: &[&str], sent: &[&str]) -> String {
-    tokens_out(&words_out(&typed_out(text, typed), sent))
+    // Tokens first: a secret's name you also typed still says what follows it is one.
+    words_out(&typed_out(&tokens_out(text), typed), sent)
 }
 
 /// Takes out whatever is in `typed`, whole or quoted in part: a backend may give back only a line
@@ -288,59 +291,35 @@ const SECRET_NAMES: &[&str] = &[
     "credential",
 ];
 
-/// Takes out what looks like a token: a word that starts as one does, the value of a name like
-/// `token=` or `"password": `, what follows `Bearer`, and any very long run of letters and digits.
+/// Takes out what looks like a token: the value of a name like `token=` or `"password": `, what
+/// follows `Bearer`, a word that starts as a token does, and any very long run of letters and digits.
 fn tokens_out(text: &str) -> String {
+    let text = named_values_out(text);
     let mut out = String::with_capacity(text.len());
-    let mut secret_next = false;
-    let mut last_named = false;
-    // Inside a quoted value given a secret's name, which may run over several words.
-    let mut in_value: Option<char> = None;
+    let mut after_bearer = false;
     for piece in text.split_inclusive(char::is_whitespace) {
         let word = piece.trim_end();
         let gap = &piece[word.len()..];
         if word.is_empty() {
             out.push_str(piece);
-            continue;
-        }
-        if let Some(quote) = in_value {
-            if word.contains(quote) {
-                in_value = None;
-            }
-            out.push_str(gap);
-            continue;
-        }
-        if secret_next {
-            // `Authorization: Bearer abc`: the word after Bearer is the one.
-            secret_next = word.eq_ignore_ascii_case("bearer");
-            let opening = word.chars().next().filter(|c| matches!(c, '"' | '\''));
-            if let Some(quote) = opening
-                && !word[quote.len_utf8()..].contains(quote)
-            {
-                in_value = Some(quote);
-            }
+        } else if after_bearer {
+            after_bearer = false;
             out.push_str(SECRET);
-            if in_value.is_none() {
-                out.push_str(gap);
-            }
-            continue;
+            out.push_str(gap);
+        } else {
+            after_bearer = word
+                .trim_matches(|c: char| !c.is_alphanumeric())
+                .eq_ignore_ascii_case("bearer");
+            out.push_str(&word_out(word));
+            out.push_str(gap);
         }
-        // `api_key = abc` too: a separator on its own, after a secret's name.
-        secret_next = word.eq_ignore_ascii_case("bearer")
-            || names_a_secret_next(word)
-            || (matches!(word, "=" | ":") && last_named);
-        last_named = secret_name(word.trim_matches(|c: char| !c.is_alphanumeric() && c != '_'));
-        out.push_str(&word_out(word));
-        out.push_str(gap);
     }
     out
 }
 
-/// Whether a word is a secret's name with nothing after its separator: `token:`, `"password":`.
-fn names_a_secret_next(word: &str) -> bool {
-    let name = word.trim_end_matches(|c: char| !c.is_alphanumeric());
-    let tail = &word[name.len()..];
-    tail.contains([':', '=']) && secret_name(name)
+/// Whether a character can be part of a name, as in `api_key` or `x.token-id`.
+fn name_char(c: char) -> bool {
+    c.is_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
 fn secret_name(name: &str) -> bool {
@@ -348,14 +327,74 @@ fn secret_name(name: &str) -> bool {
     SECRET_NAMES.iter().any(|s| name.contains(s))
 }
 
-fn word_out(word: &str) -> String {
-    // A value given a secret's name: everything after the first = or : goes.
-    if let Some(at) = word.find(['=', ':']) {
-        let value = word[at + 1..].trim_matches(|c: char| !c.is_alphanumeric());
-        if !value.is_empty() && secret_name(&word[..at]) {
-            return format!("{}{SECRET}", &word[..=at]);
+/// Takes the value from after each secret's name, however it's written: `token=x`, `password: x`,
+/// `api_key = x`, `{"token":"x y"}`, `{\\"token\\": \\"x\\"}`.
+fn named_values_out(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(start) = rest.find(name_char) {
+        let name_len = rest[start..]
+            .find(|c: char| !name_char(c))
+            .unwrap_or(rest.len() - start);
+        let end = start + name_len;
+        let name = &rest[start..end];
+        out.push_str(&rest[..end]);
+        rest = &rest[end..];
+        if !secret_name(name) {
+            continue;
+        }
+        // Past any closing quote and spaces, its separator, and spaces.
+        let after_quote = rest.trim_start_matches(['\\', '"', '\'']);
+        let after_gap = after_quote.trim_start();
+        let Some(value) = after_gap.strip_prefix(['=', ':']) else {
+            continue;
+        };
+        let value = value.trim_start();
+        out.push_str(&rest[..rest.len() - value.len()]);
+        let mut taken = value_len(value);
+        // `Authorization: Bearer abc`: the word after Bearer is the one.
+        if value[..taken].eq_ignore_ascii_case("bearer") {
+            let next = value[taken..].trim_start();
+            taken = value.len() - next.len() + value_len(next);
+        }
+        if taken == 0 {
+            rest = value;
+            continue;
+        }
+        out.push_str(SECRET);
+        rest = &value[taken..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// How much of `text` is the value it starts with: a quoted one to its closing quote, which a
+/// backslash can hide, or one word up to the next punctuation that would end it.
+fn value_len(text: &str) -> usize {
+    // Quoted JSON inside a string: it ends at the next quote, which has its own backslash.
+    if let Some(inner) = text.strip_prefix("\\\"") {
+        return inner.find('"').map_or(text.len(), |at| 2 + at + 1);
+    }
+    let Some(quote) = text.chars().next().filter(|c| matches!(c, '"' | '\'')) else {
+        return text
+            .find(|c: char| c.is_whitespace() || matches!(c, '"' | '\'' | ',' | ';' | '}' | ')'))
+            .unwrap_or(text.len());
+    };
+    let open = quote.len_utf8();
+    let mut escaped = false;
+    for (at, c) in text[open..].char_indices() {
+        if escaped {
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == quote {
+            return open + at + c.len_utf8();
         }
     }
+    text.len()
+}
+
+fn word_out(word: &str) -> String {
     // Quotes, brackets and the like may hold a token on either side.
     let mut out = String::with_capacity(word.len());
     let mut rest = word;
@@ -403,14 +442,18 @@ fn append(path: &Path, line: &str) -> std::io::Result<()> {
         private_folder(dir)?;
     }
     // Held until the line is written, so two writers can't both move the log and lose its history.
-    // Taken only for a moment: without it the line goes in and the moving waits for another.
+    // Taken only for a moment: without it the line still goes in unless the log is well over, so
+    // a writer stuck holding it can't make the log grow without limit.
     let lock = rotation_lock(path);
-    if lock.is_some()
-        && fs::symlink_metadata(path).is_ok_and(|m| m.len() + line.len() as u64 > MOST_BYTES)
-    {
-        let mut old = path.as_os_str().to_owned();
-        old.push(".1");
-        fs::rename(path, &old)?;
+    let size = fs::symlink_metadata(path).map_or(0, |m| m.len()) + line.len() as u64;
+    if lock.is_some() {
+        if size > MOST_BYTES {
+            let mut old = path.as_os_str().to_owned();
+            old.push(".1");
+            fs::rename(path, &old)?;
+        }
+    } else if size > MOST_BYTES + UNLOCKED_SLACK {
+        return Ok(());
     }
     let mut file = open_private(OpenOptions::new().create(true).append(true), path)?;
     file.write_all(line.as_bytes())
@@ -680,6 +723,13 @@ pub mod tests {
             ("{\"token\":\"dummy-private-value\"}", "dummy-private"),
             ("{\"password\": \"two private words\"}", "private"),
             ("api_key = dummy-private-value", "dummy-private"),
+            (
+                "{\"authorization\":\"Bearer dummy-private-value\"}",
+                "dummy-private",
+            ),
+            ("{\"password\":\"two private words\"}", "private"),
+            ("{\"password\":\"esc\\\" private\"}", "private"),
+            ("{\\\"token\\\": \\\"two private words\\\"}", "private"),
         ] {
             let got = scrub(text, &[], &[]);
             assert!(!got.contains(secret), "{text} -> {got}");
@@ -690,7 +740,7 @@ pub mod tests {
         // What follows a quoted secret carries on as usual.
         assert_eq!(
             scrub("{\"password\": \"two words\", \"who\": \"me\"}", &[], &[]),
-            "{\"password\": [redacted] \"who\": \"me\"}"
+            "{\"password\": [redacted], \"who\": \"me\"}"
         );
         // Ordinary words and paths come through.
         for text in [
@@ -701,6 +751,16 @@ pub mod tests {
         ] {
             assert_eq!(scrub(text, &[], &[]), text);
         }
+    }
+
+    #[test]
+    fn a_secrets_name_you_also_typed_still_marks_its_value() {
+        let got = scrub(
+            "token: dummy-private-value",
+            &["Debug token parsing"],
+            &["Debug token parsing"],
+        );
+        assert!(!got.contains("dummy-private"), "{got}");
     }
 
     #[test]
@@ -788,6 +848,28 @@ pub mod tests {
         assert!(size(&path) <= most, "{}", size(&path));
         lines(&path);
         lines(&old);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_lock_cant_make_it_grow_without_limit() {
+        use std::os::fd::AsRawFd;
+        let (_dir, log, path) = log();
+        log.write(&entry("first"), &[], &[]);
+        let mut name = path.as_os_str().to_owned();
+        name.push(".lock");
+        let holder = fs::File::open(&name).unwrap();
+        // SAFETY: flock only reads the descriptor `holder` keeps open.
+        assert_eq!(
+            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let long = "word ".repeat(1500);
+        for _ in 0..200 {
+            log.write(&entry(&long), &[], &[]);
+        }
+        let size = fs::metadata(&path).unwrap().len();
+        assert!(size > 0 && size <= MOST_BYTES + UNLOCKED_SLACK, "{size}");
     }
 
     #[cfg(unix)]

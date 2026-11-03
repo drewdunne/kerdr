@@ -21,10 +21,15 @@ pub struct Answering {
     typed: Vec<String>,
     /// A failure, which is kept even if nothing on screen says so.
     failed: bool,
-    kept: bool,
+    /// What's been kept of what it led Kerdr to say.
+    kept: Vec<String>,
 }
 
 impl Answering {
+    fn said(&self, text: &str) -> bool {
+        self.kept.iter().any(|k| k == text)
+    }
+
     fn sent(&self) -> impl Iterator<Item = &str> {
         self.typed.iter().map(String::as_str)
     }
@@ -75,58 +80,64 @@ impl App {
             stderr: std::mem::take(&mut self.answer_stderr),
             typed,
             failed,
-            kept: false,
+            kept: vec![],
         });
     }
 
     /// The answer has been taken in. A failure nothing said anything about is kept all the same.
     pub(super) fn answer_done(&mut self) {
         self.keep_box_errors();
-        let Some(Answering {
-            failed: true,
-            kept: false,
-            answer,
-            ..
-        }) = self.answering.clone()
-        else {
-            self.answering = None;
-            return;
-        };
-        self.keep_error(&answer, "quiet");
+        if let Some(a) = self.answering.clone()
+            && a.failed
+            && a.kept.is_empty()
+        {
+            self.keep_error(&a.answer, "quiet");
+        }
         self.answering = None;
     }
 
-    /// The sign-in box says its failures itself, from many places: anything new in it is kept.
+    /// The sign-in box says its failures itself, from many places: each new one is kept once.
     /// Called whenever an answer has been taken in, and before each drawing of the board.
     pub fn keep_box_errors(&mut self) {
-        let Mode::Accounts {
-            screen: AccountScreen::Signin(s),
-            ..
-        } = &self.mode
-        else {
+        let failure = match &self.mode {
+            Mode::Accounts {
+                screen: AccountScreen::Signin(s),
+                ..
+            } if s.failed && !s.message.is_empty() => {
+                Some((s.message.clone(), s.machines.get(s.current).copied()))
+            }
+            _ => None,
+        };
+        let Some((message, machine)) = failure else {
+            self.signin_kept = None;
             return;
         };
-        if !s.failed || s.message.is_empty() || self.last_kept == s.message {
+        if self.signin_kept.as_deref() == Some(message.as_str()) {
             return;
         }
-        let message = s.message.clone();
-        let machine = s.machines.get(s.current).copied();
-        // Not from an answer: from what the box is about.
-        let answering = self.answering.is_some();
-        if !answering {
-            self.answering = Some(Answering {
-                machine: machine
-                    .and_then(|m| self.machines.get(m))
-                    .map(|m| m.name())
-                    .unwrap_or_default(),
-                action: "account-signin".into(),
-                ..Default::default()
-            });
+        self.signin_kept = Some(message.clone());
+        // The answer that said it already may have kept it, and any other isn't what it's about.
+        let by_answer = self
+            .answering
+            .as_ref()
+            .is_some_and(|a| a.action.starts_with("account-"));
+        if by_answer {
+            if !self.answering.as_ref().is_some_and(|a| a.said(&message)) {
+                self.keep_error(&message, "fail");
+            }
+            return;
         }
+        let other = self.answering.take();
+        self.answering = Some(Answering {
+            machine: machine
+                .and_then(|m| self.machines.get(m))
+                .map(|m| m.name())
+                .unwrap_or_default(),
+            action: "account-signin".into(),
+            ..Default::default()
+        });
         self.keep_error(&message, "fail");
-        if !answering {
-            self.answering = None;
-        }
+        self.answering = other;
     }
 
     /// Keeps an error being shown, with where it came from.
@@ -134,7 +145,6 @@ impl App {
         if self.demo {
             return;
         }
-        self.last_kept = text.to_string();
         let entry = match &self.answering {
             Some(a) => Entry {
                 source: "action",
@@ -161,7 +171,7 @@ impl App {
         let sent: Vec<&str> = self.answering.iter().flat_map(Answering::sent).collect();
         self.error_log.write(&entry, &self.typed_now(), &sent);
         if let Some(a) = &mut self.answering {
-            a.kept = true;
+            a.kept.push(text.to_string());
         }
     }
 
