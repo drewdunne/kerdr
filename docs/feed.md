@@ -188,7 +188,8 @@ Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `p
 `override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
-exactly one JSON response to standard output. Send diagnostic output to standard error.
+exactly one JSON response to standard output. Send diagnostic output to standard error: Kerdr keeps it
+with any failure it shows, in the log the README's "Errors are kept" describes.
 
 ```json
 {"ok":true,"message":"Work started","id":"0041","session":"web"}

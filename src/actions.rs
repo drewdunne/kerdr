@@ -168,7 +168,7 @@ fn most_bytes(request: &Value) -> usize {
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
-    run_with_deadline(machine, command, request, deadline_for(request), None)
+    run_with_deadline(machine, command, request, deadline_for(request), None).0
 }
 
 /// As run, calling `handed` once the adapter has the whole request: from then on it carries on
@@ -178,14 +178,19 @@ pub fn run_handing(
     command: &str,
     request: &Value,
     handed: transport::Handed,
-) -> Result<Response, String> {
-    run_with_deadline(
+) -> Answered {
+    answer_with_stderr(
         machine,
         command,
         request,
         deadline_for(request),
         Some(handed),
     )
+}
+
+/// As run, with what the command printed on standard error, for the error log.
+pub fn run_keeping_stderr(machine: &Machine, command: &str, request: &Value) -> Answered {
+    answer_with_stderr(machine, command, request, deadline_for(request), None)
 }
 
 /// How long an action may take before Kerdr stops waiting. Starting or reopening work can take
@@ -217,26 +222,71 @@ fn reference(request: &Value) -> String {
     }
 }
 
+/// An action's answer, and what its command printed on standard error, ready for the error log:
+/// nothing in it that was typed into the request, or a credential.
+pub struct Answered {
+    pub result: Result<Response, String>,
+    pub stderr: String,
+}
+
+fn answer_with_stderr(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    deadline: Duration,
+    handed: Option<transport::Handed>,
+) -> Answered {
+    let (result, stderr) = run_with_deadline(machine, command, request, deadline, handed);
+    // An edit's error output may quote the text it was sent, a piece too small to recognise
+    // included, so a save's is left out here as it is from the message.
+    let stderr = if request["action"] == "edit" && request.get("text").is_some() {
+        String::new()
+    } else {
+        crate::errlog::scrub(&redact_credentials(&stderr, request), &typed_in(request))
+    };
+    Answered { result, stderr }
+}
+
+/// What was typed into a request: a new intent's words, an edit, an answer.
+pub fn typed_in(request: &Value) -> Vec<&str> {
+    let mut typed: Vec<&str> = ["words", "title", "text", "token", "page_code"]
+        .iter()
+        .filter_map(|field| request[*field].as_str())
+        .collect();
+    if let Some(answers) = request["answers"].as_array() {
+        typed.extend(answers.iter().filter_map(|a| a["text"].as_str()));
+    }
+    typed
+}
+
+/// The answer, and what the command printed on standard error, unscrubbed.
 fn run_with_deadline(
     machine: &Machine,
     command: &str,
     request: &Value,
     deadline: Duration,
     handed: Option<transport::Handed>,
-) -> Result<Response, String> {
+) -> (Result<Response, String>, String) {
     if command.trim().is_empty() {
-        return Err("actions are disabled; configure [actions] command".into());
+        return (
+            Err("actions are disabled; configure [actions] command".into()),
+            String::new(),
+        );
     }
-    let json = serde_json::to_string(request).map_err(|e| format!("the action request: {e}"))?;
+    let json = match serde_json::to_string(request) {
+        Ok(json) => json,
+        Err(e) => return (Err(format!("the action request: {e}")), String::new()),
+    };
     if json.len() > most_bytes(request) {
-        return Err(if most_bytes(request) > MAX_JSON_BYTES {
+        let said = if most_bytes(request) > MAX_JSON_BYTES {
             format!(
                 "the action request is too large (maximum 64 KiB, and {} of images)",
                 crate::images::size(crate::images::MAX_IMAGES_BYTES)
             )
         } else {
             "the action request is too large (maximum 64 KiB)".into()
-        });
+        };
+        return (Err(said), String::new());
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -244,6 +294,16 @@ fn run_with_deadline(
     };
     // The configured command is source; user data is JSON on stdin, never source.
     let output = transport::run_adapter_handing(&target, command, Some(&json), deadline, handed);
+    let stderr = output.stderr.clone();
+    (answer_of(&output, request, deadline), stderr)
+}
+
+/// What a command's output means.
+fn answer_of(
+    output: &transport::Output,
+    request: &Value,
+    deadline: Duration,
+) -> Result<Response, String> {
     let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
         if starts_work(request) {
@@ -324,6 +384,16 @@ mod tests {
     use crate::transport::quote;
     use serde_json::json;
     use std::fs;
+
+    fn deadline_answer(
+        machine: &Machine,
+        command: &str,
+        request: &Value,
+        deadline: Duration,
+        handed: Option<transport::Handed>,
+    ) -> Result<Response, String> {
+        run_with_deadline(machine, command, request, deadline, handed).0
+    }
 
     fn machine() -> Machine {
         Config::default().machines("here", &[]).remove(0)
@@ -510,6 +580,49 @@ mod tests {
         assert_eq!(queued.message, "handing over to HAND_X");
     }
 
+    #[cfg(not(windows))]
+    #[test]
+    fn stderr_comes_back_for_the_log_without_what_was_typed() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\necho 'the push failed: rejected' >&2\necho 'quoting my private secret words' >&2\nprintf '%s' '{\"ok\":false,\"message\":\"no\"}'\n",
+            "",
+        );
+        let answered = run_keeping_stderr(
+            &machine(),
+            &command,
+            &json!({"action":"create","words":"my private secret words"}),
+        );
+        assert!(!answered.result.unwrap().ok);
+        assert!(answered.stderr.contains("the push failed: rejected"));
+        assert!(!answered.stderr.contains("private"), "{}", answered.stderr);
+        // A save's is left out whole: it may quote its text in pieces too small to recognise.
+        let answered = run_keeping_stderr(
+            &machine(),
+            &command,
+            &json!({"action":"edit","id":"1","text":"my text","was":"x"}),
+        );
+        assert_eq!(answered.stderr, "");
+        // A sign-in's token doesn't come back either.
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\necho 'bad token fixture-private-value' >&2\nprintf 'not json'\n",
+            "",
+        );
+        let answered = run_keeping_stderr(
+            &machine(),
+            &command,
+            &json!({"action":"account-signin","token":"fixture-private-value"}),
+        );
+        assert!(answered.result.is_err());
+        assert!(
+            !answered.stderr.contains("fixture-private"),
+            "{}",
+            answered.stderr
+        );
+    }
+
     #[test]
     fn redaction_covers_trimmed_credential_echoes() {
         assert_eq!(
@@ -590,7 +703,7 @@ mod tests {
             "cat >/dev/null\nsleep 5\n",
             "[Console]::In.ReadToEnd() | Out-Null; Start-Sleep 5",
         );
-        let error = run_with_deadline(
+        let error = deadline_answer(
             &machine(),
             &command,
             &json!({"action":"refresh","id":"4"}),
@@ -627,7 +740,7 @@ mod tests {
             "[Console]::In.ReadToEnd() | Out-Null; Start-Sleep 5",
         );
         for (action, verb) in [("dispatch", "Starting #391"), ("reopen", "Reopening #391")] {
-            let error = run_with_deadline(
+            let error = deadline_answer(
                 &machine(),
                 &command,
                 &json!({"action":action,"id":"0391"}),

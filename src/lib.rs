@@ -7,6 +7,7 @@ pub mod board;
 pub mod config;
 pub mod demo;
 pub mod edit;
+pub mod errlog;
 pub mod family;
 pub mod feed;
 pub mod herdr;

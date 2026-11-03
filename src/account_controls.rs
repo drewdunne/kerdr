@@ -2146,6 +2146,7 @@ impl App {
                     s.note = Some(response.message.clone());
                     s.editing = true;
                     s.poll_at = Instant::now() + Duration::from_secs(2);
+                    self.keep_error(&response.message, "warn");
                     return;
                 }
                 s.message = response.message.clone();
