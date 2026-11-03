@@ -1247,6 +1247,21 @@ impl App {
                             *model = 0;
                         }
                     }
+                    // C takes the current account off, from any line (intent 0455).
+                    KeyCode::Char('C') => {
+                        match self.account_feed(*machine).and_then(|f| f.current.as_ref()) {
+                            Some(_) => {
+                                request = Some((
+                                    *machine,
+                                    json!({"action":"account-current","clear":true}),
+                                ))
+                            }
+                            None => self.say(
+                                "No current account is set: each owner's list chooses. c on an account makes it current.",
+                                Tone::Info,
+                            ),
+                        }
+                    }
                     KeyCode::Char('+') => {
                         let machine = *machine;
                         let mut choices = self.offered(machine).list();
@@ -1307,6 +1322,25 @@ impl App {
                                             let machines =
                                                 self.signin_order(&code, copy.is_some(), *machine);
                                             return self.begin_needed_signin(code, copy, machines);
+                                        }
+                                        // c makes it the current account, for every
+                                        // machine (intent 0455).
+                                        KeyCode::Char('c') => {
+                                            if self
+                                                .account_feed(*machine)
+                                                .and_then(|f| f.current.as_ref())
+                                                .is_some_and(|c| c.account == code)
+                                            {
+                                                self.say(
+                                                    format!("{code} is already the current account. C clears it."),
+                                                    Tone::Info,
+                                                );
+                                            } else {
+                                                request = Some((
+                                                    *machine,
+                                                    json!({"action":"account-current","to":code}),
+                                                ));
+                                            }
                                         }
                                         KeyCode::Char('t') => {
                                             request = Some((
@@ -1992,6 +2026,19 @@ impl App {
         let action = request["action"].as_str().unwrap_or("");
         if action == "account-models" && response.ok {
             self.saved_models(machine, &request);
+        }
+        if action == "account-current" && response.ok {
+            // Shown at once on the machine asked; the others' feeds follow as their machines do.
+            let current = if request["clear"] == true {
+                None
+            } else {
+                response.current.clone()
+            };
+            if let Some(feed) = self.machines.get_mut(machine).and_then(|m| m.feed.as_mut())
+                && (current.is_some() || request["clear"] == true)
+            {
+                feed.current = current;
+            }
         }
         if action == "account-move-waiting" {
             self.account_batch_messages.push(format!(
@@ -4317,5 +4364,66 @@ mod tests {
         assert!(!code_ok("KBZ_C", "X") && !code_ok("KBZX", "X") && !code_ok("K_X", "X"));
         assert!(!code_ok("4BZ_X", "X") && !code_ok("ANETS_X", "X") && !code_ok("kbz_x", "X"));
         assert!(code_ok("KBZ", "") && !code_ok("KBZ_C", ""));
+    }
+
+    /// Intent 0455: c makes the selected account current, C clears it, each saying what it did,
+    /// and the answer shows at once on the machine asked.
+    #[test]
+    fn c_sets_the_current_account_and_shift_c_clears_it() {
+        let mut a = app();
+        a.open_accounts();
+        // Nothing set: C says so and sends nothing.
+        assert!(matches!(press(&mut a, 'C'), Action::None));
+        let action = press(&mut a, 'c');
+        let (mi, request) = sent(action.clone());
+        assert_eq!(mi, 0);
+        assert_eq!(request, json!({"action":"account-current","to":"KBZ_C"}));
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"KBZ_C (Personal) is the current account","current":{"account":"KBZ_C","name":"Personal","since":"2026-11-02T10:00:00-06:00","status":"out","until":"2026-11-03T09:00:00-06:00","machine":"laptop"}}),
+        );
+        let current = a.machines[0]
+            .feed
+            .as_ref()
+            .unwrap()
+            .current
+            .clone()
+            .unwrap();
+        assert_eq!(current.account, "KBZ_C");
+        assert!(!current.starts_sessions());
+        assert!(current.held_back("here").unwrap().starts_with("out until"));
+        assert!(
+            a.message().unwrap().0.contains("is the current account"),
+            "{:?}",
+            a.message()
+        );
+        // c on the current one sends nothing: it's already current.
+        assert!(matches!(press(&mut a, 'c'), Action::None));
+        let action = press(&mut a, 'C');
+        assert_eq!(
+            sent(action.clone()).1,
+            json!({"action":"account-current","clear":true})
+        );
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"No current account now","current":null}),
+        );
+        assert!(a.machines[0].feed.as_ref().unwrap().current.is_none());
+    }
+
+    /// A refused set changes nothing shown.
+    #[test]
+    fn a_refused_current_account_leaves_the_feed_as_it_was() {
+        let mut a = app();
+        a.open_accounts();
+        let action = press(&mut a, 'c');
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"no account KBZ_C"}),
+        );
+        assert!(a.machines[0].feed.as_ref().unwrap().current.is_none());
     }
 }

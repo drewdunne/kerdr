@@ -44,6 +44,9 @@ pub struct Response {
     /// With a refusal: the intent's home, `<Machine>/<Session>`, when it lives on another machine
     /// than the one asked. Kerdr asks that machine instead, once (intent 0411).
     pub home: Option<String>,
+    /// With `account-current`: the current account as the machine asked sees it now, null once
+    /// cleared.
+    pub current: Option<crate::accounts::Current>,
 }
 
 fn confirmation<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {

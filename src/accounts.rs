@@ -39,6 +39,47 @@ pub struct Account {
     pub paste: Option<bool>,
 }
 
+/// The current account: the one new sessions start on ahead of every owner's list, set for every
+/// machine at once. `status` is the account's as this feed's machine sees it, so a machine where
+/// it's out or has no sign-in says so: new sessions there use their lists.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct Current {
+    #[serde(deserialize_with = "null_default")]
+    pub account: String,
+    #[serde(deserialize_with = "null_default")]
+    pub name: String,
+    pub since: Option<String>,
+    #[serde(deserialize_with = "null_default")]
+    pub status: String,
+    pub until: Option<String>,
+    pub machine: Option<String>,
+}
+
+impl Current {
+    /// Whether new sessions on its machine start on it now.
+    pub fn starts_sessions(&self) -> bool {
+        self.status == "ready"
+    }
+
+    /// Why new sessions on its machine don't start on it, in a few words: `out until Mon 14:00`,
+    /// `no sign-in here` (with `place` "here"). None while it's ready.
+    pub fn held_back(&self, place: &str) -> Option<String> {
+        match self.status.as_str() {
+            "ready" => None,
+            "out" => Some(format!(
+                "out until {}",
+                self.until
+                    .as_deref()
+                    .map(reset_time)
+                    .unwrap_or_else(|| "reset".into())
+            )),
+            "sign_in" | "missing" => Some(format!("no sign-in {place}")),
+            _ => Some(format!("not known to be ready {place}")),
+        }
+    }
+}
+
 /// One provider the backend knows (the feed's `providers`): everything Kerdr needs to list, add,
 /// sign in and show its accounts, so a provider added later needs no Kerdr release.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

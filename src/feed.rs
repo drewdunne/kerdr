@@ -42,6 +42,10 @@ pub struct Feed {
     #[serde(default)]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub providers: Vec<crate::accounts::Provider>,
+    /// The one account new sessions start on ahead of every owner's list, as this machine sees
+    /// it; absent or null when none is set (and on older feeds).
+    #[serde(default)]
+    pub current: Option<crate::accounts::Current>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]

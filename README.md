@@ -273,7 +273,8 @@ A code is never cut short: on a narrow card the age gives way to it. `⇄` besid
 means the work was handed over from another program (a Claude Code agent's account ran out,
 say, and a fresh Codex agent took over from the work's log); its peek says from which account
 and program, why, and when.
-The bottom line names the first ready account for new work in the session you are viewing.
+The bottom line names the first ready account for new work in the session you are viewing,
+or the current account when one is set and ready there.
 Older feeds retain the original board layout.
 
 Accounts can be of any provider the feed describes: Claude and Codex today, a local model
@@ -297,6 +298,15 @@ viewed session’s list as a draft, each line naming its provider, so the list r
 provider order: whatever is first and ready is what new work runs. Reorder, optionally tick
 “move waiting sessions,” then save.
 The tick sends a separate move request to every reachable configured feed machine.
+
+A **current account** puts one account ahead of every owner's list, on every machine: new
+sessions start on it wherever it's ready, and on their lists where it's out or has no sign-in.
+On the accounts screen, `c` makes the selected account current and `C` clears it, each saying
+in a line what it did. While one is set it can't be missed: `★ current KBZ_C` leads the top
+bar (and stays when the usage figures don't fit), the accounts screen opens with a block naming
+it and what each machine makes of it, and its line is marked. A machine where it can't start
+sessions shows it in yellow with why (`out until Thu 09:00`, `no sign-in here`). Sessions
+already running stay where they are; `s` on a card moves one.
 
 ![Accounts and tenant model lists](docs/screenshots/accounts.png)
 

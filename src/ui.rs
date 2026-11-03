@@ -768,9 +768,19 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
                 m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
             })
         });
+    // The current account leads, and stays when the usage figures don't fit (intent 0455).
+    let current = usage_machine
+        .map(|mi| account_ui::current_tag(app, mi))
+        .unwrap_or_default();
     let mut usage = usage_machine
         .map(|mi| account_ui::usage(app, mi))
         .unwrap_or_default();
+    if !current.is_empty() {
+        let mut both = current.clone();
+        both.push(Span::raw(" "));
+        both.extend(usage);
+        usage = both;
+    }
     if app.machine.is_none()
         && !usage.is_empty()
         && let Some(mi) = usage_machine
@@ -827,8 +837,14 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
     right.push(Span::styled(format!(" · {}", clock(app.now())), fg(DIM)));
     let lw: usize = left.iter().map(|s| width(&s.content)).sum();
     let rw: usize = right.iter().map(|s| width(&s.content)).sum();
+    let cw: usize = current.iter().map(|s| width(&s.content)).sum();
     if lw + rw + 2 <= rect.width as usize {
         put_lr(buf, rect, rect.y, left, right);
+    } else if cw > 0 && lw + cw + 2 <= rect.width as usize {
+        put_lr(buf, rect, rect.y, left, current);
+    } else if cw > 0 {
+        let room = (rect.width as usize).saturating_sub(cw + 2);
+        put_lr(buf, rect, rect.y, fit(left, room), current);
     } else {
         put(
             buf,
@@ -1774,6 +1790,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
                         "manual" => "moved by hand",
                         "next" => "next in the list",
                         "handed_over" => "handed over to a fresh agent",
+                        "current" => "started on the current account",
                         _ => "follows the list",
                     }
                 )
@@ -3044,6 +3061,11 @@ pub const WORK_KEYS: &[(&str, &[KeyRow])] = &[
                 "S",
                 "the viewed session owner's ordered models",
                 "for agents that start next; moves none running",
+            ),
+            (
+                "c C",
+                "in accounts: make one current, or clear it",
+                "new sessions everywhere start on it first",
             ),
         ],
     ),
@@ -5789,5 +5811,76 @@ mod tests {
         assert_eq!(list_glyph(&done, a.now()).2, "reopening");
         done.detail.as_mut().unwrap().status = Some("Starting…".into());
         assert_eq!(list_glyph(&done, a.now()).2, "starting");
+    }
+
+    /// Intent 0455: a current account shows on the top bar, even when its usage doesn't fit, and on
+    /// the accounts screen; a machine where it can't start sessions says why, in another colour.
+    #[test]
+    fn the_current_account_shows_on_the_top_bar_and_the_accounts_screen() {
+        let mut a = demo(false);
+        let plain = rendered(&a, 176, 44);
+        assert!(
+            !plain.contains("★"),
+            "nothing new without a current account"
+        );
+        for m in a.machines.iter_mut() {
+            let name = m.name();
+            let Some(feed) = m.feed.as_mut() else {
+                continue;
+            };
+            feed.current = Some(crate::accounts::Current {
+                account: "KBZ_X".into(),
+                name: "Personal Codex".into(),
+                since: Some("2026-10-21T16:00:00-05:00".into()),
+                status: "ready".into(),
+                until: None,
+                machine: Some(name),
+            });
+        }
+        let board = rendered(&a, 176, 44);
+        assert!(board.contains("★ current KBZ_X"), "{board}");
+        let narrow = rendered(&a, 80, 24);
+        assert!(narrow.contains("★ current KBZ_X"), "{narrow}");
+        a.open_accounts();
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("CURRENT ACCOUNT"), "{text}");
+        assert!(
+            text.contains("new sessions start on it, ahead of their lists"),
+            "{text}"
+        );
+        assert!(text.contains("laptop: new sessions start on it"), "{text}");
+        assert!(text.contains("Personal Codex   Codex"), "{text}");
+        assert!(text.contains("★ current"), "{text}");
+        // Out on the build box: that machine's line says so, and its lists start new work there.
+        let c = a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .current
+            .as_mut()
+            .unwrap();
+        c.status = "sign_in".into();
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("build-box: no sign-in there, so new sessions use their lists"),
+            "{text}"
+        );
+    }
+
+    /// A feed from before the current account, with no `current` or a null one, reads as none.
+    #[test]
+    fn a_feed_without_a_current_account_reads_as_none() {
+        let old: crate::feed::Feed = serde_json::from_str(r#"{"kerdr_feed":1}"#).unwrap();
+        assert!(old.current.is_none());
+        let null: crate::feed::Feed =
+            serde_json::from_str(r#"{"kerdr_feed":1,"current":null}"#).unwrap();
+        assert!(null.current.is_none());
+        let set: crate::feed::Feed = serde_json::from_str(
+            r#"{"kerdr_feed":1,"current":{"account":"KBZ_C","name":null,"status":"out","until":null}}"#,
+        )
+        .unwrap();
+        let c = set.current.unwrap();
+        assert_eq!((c.account.as_str(), c.name.as_str()), ("KBZ_C", ""));
+        assert_eq!(c.held_back("here").as_deref(), Some("out until reset"));
     }
 }
