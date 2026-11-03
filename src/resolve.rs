@@ -1,6 +1,7 @@
 //! The action resolution tool (intent 0416): every change to a card (start, reopen, close, won't
-//! do, restore, refresh, cancel, move, and a new intent) goes through here instead of holding the
-//! board until its command answers.
+//! do, restore, refresh, cancel, move, a backlog item's new text, and a new intent) goes through
+//! here instead of holding the board until its command answers. So does the read `e` sends for an
+//! item's text (intent 0414), which isn't a change: nothing waits for it.
 //!
 //! A change shows on the board the moment it's asked for: its expected effect is laid over the
 //! feeds the board is built from. Its command runs in the background, one at a time for each record
@@ -62,6 +63,9 @@ pub enum Effect {
     /// `create`: a card for the new intent in its machine's backlog, saying it's being saved, until
     /// the feed has the record the answer names (intent 0445).
     Saving(Placeholder),
+    /// `edit` with a new text (intent 0414): the new words under "How it started", and being
+    /// written up again (✎), as the backend marks it while it redoes the write-up.
+    Text(String),
 }
 
 /// The card a new intent shows as while it's saved: Andrew's first words, in the backlog of the
@@ -215,6 +219,10 @@ impl Effect {
             }
             // Its card is added, not changed: Resolver::overlay.
             Effect::Saving(_) => {}
+            Effect::Text(text) => {
+                fc.words = Some(text.clone());
+                fc.intake = Some("pending".into());
+            }
         }
     }
 
@@ -248,8 +256,19 @@ impl Effect {
                     .all(|(k, r)| rank(k).is_none_or(|got| got == Some(*r)))
             }
             Effect::Saving(p) => p.made_in(feed),
+            Effect::Text(text) => fc.words.as_deref().is_some_and(|w| same_words(w, text)),
         }
     }
+}
+
+/// Whether a feed's words for a record are this text: the same words, whatever the spacing. Words
+/// the feed cut short with "…" (ark-sdlc's feed keeps 200 characters) prove nothing, since the old
+/// text may start the same way: the effect then goes as any other does, after two reads or a
+/// minute.
+fn same_words(feed: &str, text: &str) -> bool {
+    let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    let feed = words(feed);
+    !feed.ends_with('…') && feed == words(text)
 }
 
 /// What the runner starting a change means for the board (Resolver::started).
@@ -312,6 +331,13 @@ impl Job {
         self.request["action"] == "move"
     }
 
+    /// Whether it only reads: `edit` without a text, for the editor `e` opens (intent 0414). It
+    /// waits for the changes to its record made before it, but it isn't a change: nothing waits
+    /// for it, and q neither waits for it nor counts it as running.
+    pub fn reads(&self) -> bool {
+        reads(&self.request)
+    }
+
     /// How long its effect may stay, settled, without the feed showing it. A new intent's card
     /// stays until its record is read, however long that takes: its card says so once it's late
     /// (review of intent 0445).
@@ -352,6 +378,15 @@ impl Job {
 #[derive(Debug, Default)]
 pub struct Queue {
     items: Vec<Queued>,
+    /// Saves of an item's text just answered, each with how many more reads of its machine to
+    /// pass over: its write-up starts again, and a read begun before the save landed would say
+    /// it's done (intent 0414).
+    rewritten: Vec<(Queued, u8)>,
+}
+
+/// Whether a request only reads: `edit` without a text (intent 0414).
+fn reads(request: &Value) -> bool {
+    request["action"] == "edit" && request.get("text").is_none()
 }
 
 #[derive(Debug)]
@@ -361,6 +396,10 @@ struct Queued {
     record: Option<String>,
     key: Option<String>,
     moves: bool,
+    /// A read of an item's text (intent 0414): it waits its turn, but nothing waits for it.
+    reads: bool,
+    /// A save of an item's text, after which the backend writes it up again (intent 0414).
+    writes: bool,
     started: bool,
     /// Waiting for its record's write-up (a start d asked for while it was written up).
     gated: bool,
@@ -386,6 +425,8 @@ impl Queue {
             record: request["id"].as_str().map(str::to_string),
             key,
             moves: request["action"] == "move",
+            reads: reads(request),
+            writes: request["action"] == "edit" && request.get("text").is_some(),
             started: false,
             gated: false,
         };
@@ -405,26 +446,44 @@ impl Queue {
 
     /// A read of `machine`'s feed: each record there by id, with its intake. Starts waiting for a
     /// record it shows written up may start; ones whose write-up failed are taken out, and
-    /// returned, since starting an intent nobody wrote up isn't what d was pressed for.
+    /// returned, since starting an intent nobody wrote up isn't what d was pressed for. A start
+    /// behind a save of its record's text, or just after one, isn't judged by a read from before
+    /// that save landed: its write-up starts again then (intent 0414).
     pub fn written(
         &mut self,
         machine: usize,
         intakes: &HashMap<String, Option<String>>,
     ) -> Vec<u64> {
         let mut failed = vec![];
-        for q in self
-            .items
-            .iter_mut()
-            .filter(|q| q.gated && q.machine == machine)
-        {
+        for i in 0..self.items.len() {
+            let q = &self.items[i];
+            if !q.gated || q.machine != machine {
+                continue;
+            }
+            let rewriting = self.items[..i].iter().any(|j| j.writes && q.same(j))
+                || self.rewritten.iter().any(|(j, _)| q.same(j));
+            if rewriting {
+                continue;
+            }
             match q.record.as_ref().and_then(|r| intakes.get(r)) {
-                Some(None) => q.gated = false,
+                Some(None) => self.items[i].gated = false,
                 Some(Some(intake)) if intake == "failed" => failed.push(q.n),
                 _ => {}
             }
         }
         self.items.retain(|q| !failed.contains(&q.n));
         failed
+    }
+
+    /// A read of `machine`'s feed has been taken in (Queue::written): saves of a text answered
+    /// before it began speak for themselves from the next read on (intent 0414).
+    pub fn read_passed(&mut self, machine: usize) {
+        for (j, left) in &mut self.rewritten {
+            if j.machine == machine {
+                *left = left.saturating_sub(1);
+            }
+        }
+        self.rewritten.retain(|(_, left)| *left > 0);
     }
 
     /// Takes out a change that hasn't started (a start Esc dropped). Whether it was still there
@@ -439,7 +498,8 @@ impl Queue {
     /// ahead of it for that record (or, for a move, that machine's backlog) is still running or
     /// held, and nothing behind it that it would clash with is running: a change refused and sent
     /// on goes back in its place, but a later move may already be running where it now goes.
-    /// A request with no record (a new intent) starts straight away.
+    /// A request with no record (a new intent) starts straight away, and a read holds nothing up
+    /// (intent 0414).
     pub fn startable(&mut self) -> Vec<u64> {
         let mut out = vec![];
         for i in 0..self.items.len() {
@@ -447,8 +507,9 @@ impl Queue {
             if job.started || job.gated {
                 continue;
             }
-            let clashes =
-                |j: &Queued| job.same(j) || (job.moves && j.moves && j.machine == job.machine);
+            let clashes = |j: &Queued| {
+                !j.reads && (job.same(j) || (job.moves && j.moves && j.machine == job.machine))
+            };
             let ahead = self.items[..i].iter().any(clashes);
             let running_behind = self.items[i + 1..].iter().any(|j| j.started && clashes(j));
             if ahead || running_behind {
@@ -463,7 +524,13 @@ impl Queue {
     /// A change's command has answered and it's finished with: the next for its record may start.
     /// One whose refusal may send it on stays held until the board says (Resolver::sent_on).
     pub fn done(&mut self, n: u64) {
-        self.items.retain(|j| j.n != n);
+        if let Some(i) = self.items.iter().position(|j| j.n == n) {
+            let item = self.items.remove(i);
+            // The read that comes next may have begun before it landed (intent 0414).
+            if item.writes {
+                self.rewritten.push((item, 1));
+            }
+        }
     }
 
     pub fn is_empty(&self) -> bool {
@@ -672,16 +739,18 @@ impl Resolver {
             .filter(|j| {
                 j.settled.is_none()
                     && !j.waits_for_write_up()
+                    && !j.reads()
                     && (!j.handed || j.request["action"] == "create")
             })
             .collect()
     }
 
-    /// Unanswered changes whose commands have their whole request and carry on without Kerdr.
+    /// Unanswered changes whose commands have their whole request and carry on without Kerdr. A
+    /// read isn't one: quitting loses nothing but its answer.
     pub fn running(&self) -> Vec<&Job> {
         self.jobs
             .iter()
-            .filter(|j| j.settled.is_none() && j.handed)
+            .filter(|j| j.settled.is_none() && j.handed && !j.reads())
             .collect()
     }
 
@@ -889,12 +958,13 @@ impl Resolver {
     /// answer. Whether any would have.
     pub fn let_go(&mut self) -> bool {
         let mut any = false;
-        // Only a start or a reopen ever asks or takes you in; other changes keep where they were
-        // asked, for a resend to the record's real home (intent 0445).
+        // Only a start or a reopen ever asks or takes you in, and a read of an item's text opens
+        // your editor (intent 0414); other changes keep where they were asked, for a resend to the
+        // record's real home (intent 0445).
         for j in self
             .jobs
             .iter_mut()
-            .filter(|j| j.settled.is_none() && j.starts() && !j.waits_for_write_up())
+            .filter(|j| j.settled.is_none() && (j.starts() || j.reads()) && !j.waits_for_write_up())
         {
             any |= j.from.take().is_some();
         }
@@ -931,7 +1001,10 @@ impl Resolver {
     /// board lets that go.
     pub fn holds_you(&self) -> bool {
         self.jobs.iter().any(|j| {
-            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.from.is_some()
+            j.settled.is_none()
+                && (j.starts() || j.reads())
+                && !j.waits_for_write_up()
+                && j.from.is_some()
         })
     }
 
@@ -943,9 +1016,17 @@ impl Resolver {
             .map(|j| j.n)
     }
 
-    /// How many changes haven't been answered yet.
+    /// What's on its way, unanswered, oldest first: changes and reads alike.
+    pub fn on_its_way(&self) -> impl Iterator<Item = &Job> {
+        self.jobs.iter().filter(|j| j.settled.is_none())
+    }
+
+    /// How many changes haven't been answered yet; a read isn't one.
     pub fn unanswered(&self) -> usize {
-        self.jobs.iter().filter(|j| j.settled.is_none()).count()
+        self.jobs
+            .iter()
+            .filter(|j| j.settled.is_none() && !j.reads())
+            .count()
     }
 }
 
@@ -1845,5 +1926,199 @@ mod tests {
         assert!(r.holds_you());
         assert!(r.let_go());
         assert!(!r.holds_you());
+        // A read of an item's text would open your editor: Esc lets that go too (intent 0414).
+        r.add(0, json!({"action":"edit","id":"3"}), snap(), None, None);
+        assert!(r.holds_you());
+        assert!(r.let_go());
+        assert!(!r.holds_you());
+        // A save of one asks nothing and takes you nowhere.
+        r.add(
+            0,
+            json!({"action":"edit","id":"3","text":"New.","was":"sha256:aa"}),
+            snap(),
+            None,
+            None,
+        );
+        assert!(!r.holds_you());
+    }
+
+    #[test]
+    fn a_read_waits_for_the_changes_before_it_and_holds_up_nothing() {
+        // Intent 0414: e's read of an item's text isn't a change. The runner's queue keeps the
+        // order: it waits for the move made before it, and nothing waits for it.
+        let card = || Some("s:1".to_string());
+        let mut q = Queue::default();
+        let move_first = json!({"action":"move","id":"1","delta":1});
+        let read = json!({"action":"edit","id":"1"});
+        let after = json!({"action":"refresh","id":"1"});
+        let save = json!({"action":"edit","id":"1","text":"New.","was":"sha256:aa"});
+        q.push(1, 0, card(), &move_first);
+        q.push(2, 0, card(), &read);
+        q.push(3, 0, card(), &after);
+        assert_eq!(q.startable(), vec![1], "the read waits for the move");
+        q.done(1);
+        assert_eq!(q.startable(), vec![2, 3], "nothing waits for the read");
+        // A save is a change like any other: it waits for the refresh, never for the read.
+        q.push(4, 0, card(), &save);
+        assert!(q.startable().is_empty(), "the save waits for the refresh");
+        q.done(3);
+        assert_eq!(q.startable(), vec![4]);
+        for n in [2, 4] {
+            q.done(n);
+        }
+        assert!(q.is_empty());
+        // q neither waits for a read nor counts it as running; it does for the changes.
+        let mut r = Resolver::default();
+        let changes = [
+            r.add(0, move_first, None, card(), None),
+            r.add(0, read, None, card(), None),
+            r.add(0, after, None, card(), None),
+        ];
+        r.ready();
+        assert_eq!(r.holding_quit().len(), 2, "the move and the refresh");
+        for n in changes {
+            r.started(n);
+            r.handed(n);
+        }
+        assert!(r.holding_quit().is_empty());
+        assert_eq!(r.running().len(), 2, "the read isn't running work");
+        assert_eq!(r.unanswered(), 2);
+        assert_eq!(r.on_its_way().count(), 3);
+    }
+
+    #[test]
+    fn a_start_waiting_for_its_write_up_trusts_no_read_from_before_its_new_text_was_saved() {
+        // d on a card showing ✎ for a text just saved (intent 0414): its write-up starts again
+        // once the save lands, so a read from before then mustn't start it (intent 0445's gate).
+        let key = || Some("s:7".to_string());
+        let save = json!({"action":"edit","id":"7","text":"New.","was":"sha256:aa"});
+        let start = json!({"action":"dispatch","id":"7"});
+        let intakes = |v: Option<&str>| HashMap::from([("7".to_string(), v.map(str::to_string))]);
+        let mut q = Queue::default();
+        q.push(1, 0, key(), &save);
+        q.push_gated(2, 0, key(), &start);
+        assert_eq!(q.startable(), vec![1]);
+        let read = |q: &mut Queue, intake: Option<&str>| {
+            assert!(q.written(0, &intakes(intake)).is_empty());
+            q.read_passed(0);
+            q.startable()
+        };
+        assert!(
+            read(&mut q, None).is_empty(),
+            "the save is still on its way"
+        );
+        q.done(1);
+        assert!(
+            read(&mut q, None).is_empty(),
+            "the first read after it may have begun before it landed"
+        );
+        assert!(read(&mut q, Some("pending")).is_empty(), "written up again");
+        assert_eq!(read(&mut q, None), vec![2], "then it starts");
+        // Another machine's reads count for nothing here.
+        let mut q = Queue::default();
+        q.push(1, 0, key(), &save);
+        q.push_gated(2, 0, key(), &start);
+        q.startable();
+        q.done(1);
+        assert!(q.written(1, &intakes(None)).is_empty());
+        q.read_passed(1);
+        assert!(read(&mut q, None).is_empty());
+        assert_eq!(read(&mut q, None), vec![2]);
+        // Any other change ahead: the gate is 0.23.0's, a read saying it's written up starts it
+        // once that change has gone.
+        let mut q = Queue::default();
+        q.push(3, 0, key(), &json!({"action":"refresh","id":"7"}));
+        q.push_gated(4, 0, key(), &start);
+        assert_eq!(read(&mut q, None), vec![3]);
+        q.done(3);
+        assert_eq!(q.startable(), vec![4]);
+    }
+
+    #[test]
+    fn a_new_text_shows_at_once_and_goes_once_the_feed_has_its_words() {
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"edit","id":"1","text":"New words,\nas written.","was":"sha256:aa"}),
+            None,
+            Some("s:1".into()),
+            Some(Effect::Text("New words,\nas written.".into())),
+        );
+        let mut m = MachineState::new(here());
+        m.feed = Some(feed(
+            json!([{"id":"1","title":"t","state":"queued","words":"Old words."}]),
+        ));
+        let shown = r.overlay(std::slice::from_ref(&m));
+        let fc = &shown[0].feed.as_ref().unwrap().cards[0];
+        assert_eq!(
+            (fc.words.as_deref(), fc.intake.as_deref()),
+            (Some("New words,\nas written."), Some("pending"))
+        );
+        r.ready();
+        r.started(n);
+        let job = r.take(n).unwrap();
+        r.settle(job);
+        // A read with the old words: it may have begun before the save.
+        assert!(!r.read(0, m.feed.as_ref()));
+        assert!(r.shows());
+        // The feed's own spacing counts as having it; its words cut short don't.
+        let text = Effect::Text("New words,\nas written.".into());
+        let card = |words: &str| {
+            feed(json!([{"id":"1","title":"t","words":words}]))
+                .cards
+                .remove(0)
+        };
+        let f = feed(json!([]));
+        assert!(text.shown(&card("New words, as written."), &f));
+        assert!(
+            !text.shown(&card("New words…"), &f),
+            "cut short proves nothing"
+        );
+        assert!(!text.shown(&card("Old words."), &f));
+        assert!(!text.shown(&card("New words, as written. More…"), &f));
+        assert!(!text.shown(&card("…"), &f));
+        assert!(r.read(
+            0,
+            Some(&feed(
+                json!([{"id":"1","title":"t","words":"New words, as written."}])
+            ))
+        ));
+        assert!(!r.shows());
+    }
+
+    #[test]
+    fn a_feed_cut_short_never_proves_a_new_text_and_it_goes_after_two_reads() {
+        // Old and new texts the same for the feed's first 200 characters: a read of the old text,
+        // begun before the save, looks just like one of the new.
+        let start = "a".repeat(200);
+        let (old, new) = (
+            format!("{start} old ending."),
+            format!("{start} new ending."),
+        );
+        let mut r = Resolver::default();
+        let n = r.add(
+            0,
+            json!({"action":"edit","id":"1","text":new,"was":"sha256:aa"}),
+            None,
+            Some("s:1".into()),
+            Some(Effect::Text(new.clone())),
+        );
+        r.ready();
+        r.started(n);
+        let job = r.take(n).unwrap();
+        r.settle(job);
+        let cut = |text: &str| {
+            let shown: String = text.chars().take(200).collect();
+            feed(json!([{"id":"1","title":"t","words":format!("{shown}…")}]))
+        };
+        assert_eq!(cut(&old).cards[0].words, cut(&new).cards[0].words);
+        assert!(
+            !r.read(0, Some(&cut(&old))),
+            "the first read proves nothing"
+        );
+        assert!(r.shows());
+        // The second read retires it, as any settled effect: the bounded rule, not the words.
+        assert!(r.read(0, Some(&cut(&new))));
+        assert!(!r.shows());
     }
 }

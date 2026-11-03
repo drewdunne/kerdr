@@ -16,7 +16,7 @@ const MAX_WORDS: usize = 48_000;
 const MAX_ANSWER: usize = 300;
 
 /// An action's answer cut to what the board shows, ending in "…" when it was longer.
-fn short(text: String) -> String {
+pub(super) fn short(text: String) -> String {
     match text.char_indices().nth(MAX_ANSWER) {
         Some((at, _)) => format!("{}…", text[..at].trim_end()),
         None => text,
@@ -562,7 +562,7 @@ impl App {
         (card.closable() && !waiting_work(card)).then_some(card)
     }
 
-    fn selected_for_control(&self) -> Option<&Card> {
+    pub(super) fn selected_for_control(&self) -> Option<&Card> {
         match &self.mode {
             Mode::Backlog { sel } => self
                 .backlog_cards()
@@ -696,7 +696,7 @@ impl App {
     /// Whether you're still on this work, in the view you're looking at (the board, a peek, the
     /// backlog or Misc), and it hasn't changed since the action started: where a late answer may
     /// ask you something or take you in. Typing a search, a filter or a new intent isn't.
-    fn still_on(&self, from: &CardSnapshot, made: Option<&str>) -> bool {
+    pub(super) fn still_on(&self, from: &CardSnapshot, made: Option<&str>) -> bool {
         matches!(
             self.mode,
             Mode::Board
@@ -1094,7 +1094,7 @@ impl App {
         self.mode = (*back).clone();
         let card_key = matches!(
             key.code,
-            KeyCode::Char('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X' | 's')
+            KeyCode::Char('d' | 'e' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X' | 's')
         );
         // A refresh while the menu was open may have moved or removed the card it opened on;
         // its keys then act on nothing rather than on whatever took its place.
@@ -1105,7 +1105,9 @@ impl App {
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {}
             KeyCode::Char('c') => self.new_intent(),
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X')) => {
+            KeyCode::Char(
+                c @ ('d' | 'e' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X'),
+            ) => {
                 return self.card_action(c, 1);
             }
             // The menu's s is the board's: the selected card's agent to another account.
@@ -1138,6 +1140,7 @@ impl App {
     pub(super) fn card_action(&mut self, key: char, count: i64) -> Action {
         match key {
             'd' => self.intent_action("dispatch", json!({})),
+            'e' => self.edit_action(),
             'y' => self.intent_action("refresh", json!({})),
             'x' => self.intent_action("dismiss", json!({})),
             'C' => self.intent_action("close", json!({})),
@@ -1662,7 +1665,9 @@ impl App {
         }
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
-            KeyCode::Char(c @ ('d' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X')) => {
+            KeyCode::Char(
+                c @ ('d' | 'e' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X'),
+            ) => {
                 return Some(self.card_action(c, count));
             }
             KeyCode::Char('{') | KeyCode::Char('}')
@@ -1702,7 +1707,11 @@ impl App {
         }
         let from = self.action_from.take();
         let id = request["id"].as_str().unwrap_or_default().to_string();
-        let key = from.as_ref().map(|f| f.key.clone()).or_else(|| {
+        // An item's new text is for the card whose text Kerdr holds (intent 0414).
+        let held = (request["action"] == "edit")
+            .then(|| self.edit_card(&id, machine))
+            .flatten();
+        let key = from.as_ref().map(|f| f.key.clone()).or(held).or_else(|| {
             let mine = |c: &&Card| c.detail.as_ref().is_some_and(|d| d.id == id);
             let cards = &self.board.cards;
             cards
@@ -1791,6 +1800,8 @@ impl App {
             "dismiss" | "cancel" => Effect::SetAside,
             "restore" => Effect::Restore,
             "refresh" => Effect::Refresh(chrono::Local::now().date_naive().to_string()),
+            // A save of a backlog item's text; its read shows nothing (intent 0414).
+            "edit" => Effect::Text(request["text"].as_str()?.to_string()),
             "move" => {
                 // As the backend orders it: the card's own group of open backlog work, by rank
                 // and then number, the card moved, everything numbered again from 0.
@@ -2132,6 +2143,7 @@ impl App {
                 Some("restore") => "Bringing it back",
                 Some("refresh") => "Saving that you still want it",
                 Some("move") => "Moving it",
+                Some("edit") => "Saving its new text",
                 _ => "Saving the change",
             };
             return Some(format!("◐ {what}… {secs} s"));
@@ -2180,8 +2192,10 @@ impl App {
 
     /// What quitting would drop that Kerdr alone keeps, for q to say first, a second q quitting:
     /// a start waiting for its write-up, which Kerdr sends; words waiting for their image; words
-    /// a failed save gave back, or written and not yet sent (intent 0445).
+    /// a failed save gave back, or written and not yet sent (intent 0445); your version of an
+    /// item's text, kept until a save of it lands (intent 0414). Each is named.
     pub fn quit_loses(&self) -> Option<String> {
+        let mut lost = vec![];
         let awaited = self.resolver.write_ups_awaited();
         if let Some(first) = awaited.first() {
             let reference = first
@@ -2192,23 +2206,24 @@ impl App {
                 1 => String::new(),
                 n => format!(" ({} more like it)", n - 1),
             };
-            return Some(format!(
+            lost.push(format!(
                 "{reference} starts once it's written up{more}, and only Kerdr sends that start: quitting drops it."
             ));
         }
         if self.send_after_load.is_some() {
-            return Some(
+            lost.push(
                 "Your new intent is sent once its image is in, in a moment: quitting drops it."
                     .into(),
             );
         }
         if !self.returned.is_empty() || !self.draft.trim().is_empty() {
-            return Some(
+            lost.push(
                 "Words for a new intent are kept only while Kerdr is open (c brings them back): quitting drops them."
                     .into(),
             );
         }
-        None
+        lost.extend(self.edits_lost());
+        (!lost.is_empty()).then(|| lost.join(" "))
     }
 
     /// What's still running and carries on without Kerdr, for q to say before it quits: "#41 is
@@ -2304,10 +2319,12 @@ impl App {
                 .get(machine)
                 .map(|m| m.name())
                 .unwrap_or_default();
+            // A save of an item's text that can't go on: his version stays (intent 0414).
+            let kept = self.edit_kept(&request);
             match self.machine_index(host) {
                 None => {
                     self.fail(
-                        format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't change it there."),
+                        format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't change it there.{kept}"),
                     );
                     return;
                 }
@@ -2315,7 +2332,7 @@ impl App {
                 Some(_) if was_resent => {
                     self.moved_home.retain(|(i, ..)| *i != id);
                     self.fail(
-                        format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again."),
+                        format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again.{kept}"),
                     );
                     return;
                 }
@@ -2333,7 +2350,7 @@ impl App {
                     let name = self.machines[to].name();
                     if !self.machines[to].conn.is_live() {
                         self.fail(
-                            format!("{reference} lives on {name} now, and {name} isn't answering; nothing changed. Try again once it's back."),
+                            format!("{reference} lives on {name} now, and {name} isn't answering; nothing changed. Try again once it's back.{kept}"),
                         );
                         return;
                     }
@@ -2341,12 +2358,19 @@ impl App {
                     if request["action"] == "reopen" && !session.is_empty() {
                         request["session"] = json!(session);
                     }
+                    // A save's text came back only counted: it goes again as he wrote it.
+                    if request["action"] == "edit" {
+                        self.edit_resend(&mut request);
+                    }
                     // Sent on quietly: the card still shows the change while it goes there.
                     self.resent.push((to, id));
                     self.resend.push_back((to, request, from));
                     return;
                 }
             }
+        }
+        if request["action"] == "edit" {
+            return self.finish_edit(machine, request, result, from);
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {

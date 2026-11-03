@@ -213,6 +213,21 @@ peek alike:
 
 - `d` starts it in its recorded machine and session. At the usual work limit, Kerdr asks before
   starting another; the adapter still enforces its hard limit.
+- `e` opens its text, the words that started it, full screen in your own editor: Kerdr's `editor`
+  setting, else `$VISUAL`, else `$EDITOR`, else nvim, else vim. `:wq` and you're back on the board
+  at once, the card already showing the new words with ✎ while the adapter saves them and writes
+  the card up again, and you can carry on meanwhile; when the save lands nothing more is said.
+  Changes already on their way carry on while the editor is open. `d` on it meanwhile starts it
+  once it's written up again, as for any card being written up.
+  `:cq`, or quitting with nothing changed, leaves it as it was, saying nothing. A card still being
+  written up, or a new intent's card still being saved, says so instead. When a save can't land (a refusal, a change made meanwhile, no
+  answer), the card goes back as it was, the red **Not done** box says so, and Kerdr keeps your
+  version: the next `e` opens it, with any newer text below it. Once the item has started, `e`
+  still opens your version so you can copy it, and sends nothing; so does a machine that isn't
+  answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
+  `q` says first when quitting would lose a version only Kerdr keeps, and a second `q` quits. An editor that opens a window of
+  its own needs its waiting form, such as `code --wait`: without it Kerdr doesn't start it, and
+  says which flag to add.
 - `y` says you still want it. Its age is the time since you last said so, falling back to
   creation when it has never been reviewed. Agent updates do not reset this age. Creation stays
   visible in expanded details.
@@ -264,7 +279,7 @@ Controls are optional: [the action adapter contract](docs/feed.md#actions) lets 
 own record system validate and persist changes. Without an adapter, Kerdr remains a reader.
 
 Every change shows on the board the moment you make it: a start marks the card starting (and
-moves it out of the backlog once your adapter has started it), `C` shows it done, `x` and `X` put it in Won't do, `J` and `K` reorder at once. The
+moves it out of the backlog once your adapter has started it), `C` shows it done, `x` and `X` put it in Won't do, `J` and `K` reorder at once, and a text saved with `e` shows on its card. The
 command behind it carries on in the background, so the board, and other cards' changes, never
 wait for it; changes to one card reach your adapter in the order you made them. When it succeeds
 nothing more is said. When it fails, the card goes back to how it really is and a red **Not done**
@@ -275,7 +290,9 @@ asks first (a full session, reopening done work) is still asked while you're on 
 whose turn comes while you're inside a workspace starts then, not once you're back. `q` waits only
 for what would be lost (a change whose command doesn't have all of it yet, or a new intent still
 saving); when a start or another change is still running, its command already has the whole
-request and carries on after Kerdr quits: `q` says so, and a second `q` quits.
+request and carries on after Kerdr quits: `q` says so, and a second `q` quits. It says first, too,
+what only Kerdr keeps (a start waiting for its write-up, words for a new intent, your version of an
+item's text until a save of it lands), naming each.
 
 ### Accounts and ordered models
 
@@ -391,7 +408,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `h j k l` or arrows | move between columns and cards |
 | `Enter` | jump in; on work nobody started, start it, as `d` does; on work whose workspace closed, reopen it; on done work, ask to reopen it (all three with actions) |
 | `m` or `Space` | peek |
-| `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
+| `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `e` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
 | `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`; in the backlog and Done too) |
 | `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
 | `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
@@ -399,6 +416,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `/` | search everything; in the backlog, Won't do, Done or Misc, search only that list (`Esc` clears it) |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` `B` | start, still want it, won't do, bring back, move down / up, to the top, to the bottom (the selected backlog intent) |
+| `e` | edit the selected backlog intent's text, the words that started it, in your own editor: `:wq` saves it, `:cq` leaves it as it was (with actions) |
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
 | `X` | cancel: stop the selected card's agent, close its workspace (or only a child's tab), and set it aside in Won't do (work an agent is at; asks first) |
 | `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
@@ -412,7 +430,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `M` | machines |
 | `r` / `R` | retry a machine that isn't answering / read every machine now, trying again any that aren't |
 | `?` | keys |
-| `q` | quit (every session keeps running; with a start still running, a start waiting for its write-up, or words for a new intent only Kerdr holds, it says so and a second `q` quits) |
+| `q` | quit (every session keeps running; with a start still running, a start waiting for its write-up, or words for a new intent or your version of an item's text only Kerdr holds, it says so and a second `q` quits) |
 
 | Inside herdr | |
 |---|---|
@@ -506,6 +524,11 @@ Kerdr works with no config: it shows this machine. To add machines and a feed, w
 `~/.config/kerdr/config.toml` (Windows: `%APPDATA%\kerdr\config.toml`):
 
 ```toml
+# What e opens a backlog item's text in, with its arguments; it goes above every [section].
+# Without it: $VISUAL, else $EDITOR, else nvim, else vim. One that opens a window of its own needs
+# its waiting flag (code --wait, subl -w, gvim -f), or Kerdr won't start it.
+# editor = "code --wait"
+
 [feed]
 # A command each machine runs to print its cards (docs/feed.md). Optional.
 command = "~/bin/my-cards --json"

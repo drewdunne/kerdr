@@ -687,6 +687,29 @@ pub fn close_client(child: &mut std::process::Child) {
     }
 }
 
+/// Hands the whole terminal to something that needs it (your editor, for a backlog item's text)
+/// as a jump hands it to herdr, runs `f`, and takes it back; the board redraws after. Ctrl+C
+/// belongs to it meanwhile, and the terminal's own settings are put back however it ended.
+pub fn hand_over<T>(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    f: impl FnOnce() -> T,
+) -> T {
+    let ctrl_c = CtrlCToHerdr::new();
+    drop_pending_keys();
+    leave(flags);
+    let tty = TtyModes::capture();
+    #[cfg(windows)]
+    let console_modes = crate::windows::ConsoleModes::capture();
+    let out = f();
+    #[cfg(windows)]
+    drop(console_modes);
+    tty.restore();
+    enter(terminal, flags);
+    drop(ctrl_c);
+    out
+}
+
 /// Runs a command in the foreground on the plain terminal, for things that need you: answering
 /// SSH, or herdr's own setup. Returns whether it exited cleanly.
 pub fn foreground(
