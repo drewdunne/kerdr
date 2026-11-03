@@ -15,7 +15,7 @@ fn account_color(a: &Account) -> ratatui::style::Color {
 /// `★ current KBZ_C`, and on a machine where it can't start new sessions, why (`out until Mon
 /// 14:00 here`), in a warning colour, since new sessions there use their lists (intent 0455).
 pub(super) fn current_tag(app: &App, mi: usize) -> Vec<Span<'static>> {
-    let Some(c) = app.account_feed(mi).and_then(|f| f.current.as_ref()) else {
+    let Some(c) = app.account_feed(mi).and_then(|f| f.current_account()) else {
         return vec![];
     };
     match c.held_back("here") {
@@ -27,11 +27,41 @@ pub(super) fn current_tag(app: &App, mi: usize) -> Vec<Span<'static>> {
     }
 }
 
+/// The current account's code alone, `★ KBZ_C`, in the same colour: what's left when the bar is
+/// too narrow for why.
+pub(super) fn current_short(app: &App, mi: usize) -> Vec<Span<'static>> {
+    let Some(c) = app.account_feed(mi).and_then(|f| f.current_account()) else {
+        return vec![];
+    };
+    let color = if c.starts_sessions() { CYAN } else { YELLOW };
+    vec![Span::styled(format!("★ {}", c.account), bold(color))]
+}
+
+/// What fits first of: the current account and every usage figure, the current account with
+/// why, then its code alone. Usage gives way before the current account does.
+pub(super) fn current_and_usage(app: &App, mi: usize, room: usize) -> Vec<Span<'static>> {
+    let spans_w = |s: &[Span<'static>]| s.iter().map(|s| width(&s.content)).sum::<usize>();
+    let tag = current_tag(app, mi);
+    let mut full = tag.clone();
+    let usage = usage(app, mi);
+    if !full.is_empty() && !usage.is_empty() {
+        full.push(Span::raw(" "));
+    }
+    full.extend(usage);
+    if spans_w(&full) <= room || tag.is_empty() {
+        return full;
+    }
+    if spans_w(&tag) <= room {
+        return tag;
+    }
+    current_short(app, mi)
+}
+
 /// The accounts screen's block about the current account: which it is and since when, what each
 /// machine makes of it, and the keys that set and clear it.
 fn current_block(app: &App, mi: usize, w: usize) -> Vec<Line<'static>> {
     let mut lines = vec![heading("CURRENT ACCOUNT")];
-    let Some(c) = app.account_feed(mi).and_then(|f| f.current.as_ref()) else {
+    let Some(c) = app.account_feed(mi).and_then(|f| f.current_account()) else {
         lines.extend(wrapped(
             "None: each owner's list chooses. c on an account sets one for every new session.",
             w,
@@ -61,7 +91,7 @@ fn current_block(app: &App, mi: usize, w: usize) -> Vec<Line<'static>> {
     for m in app.machines.iter().filter(|m| m.is_shown()) {
         let Some(feed) = &m.feed else { continue };
         let cached = if m.conn.is_live() { "" } else { " (cached)" };
-        let (text, color) = match &feed.current {
+        let (text, color) = match feed.current_account() {
             Some(here) if here.account != c.account => (
                 format!(
                     "{}: still on {} until it catches up{cached}",
@@ -83,7 +113,7 @@ fn current_block(app: &App, mi: usize, w: usize) -> Vec<Line<'static>> {
                     YELLOW,
                 ),
             },
-            None if feed.accounts.is_empty() => continue,
+            None if feed.accounts.is_empty() || !feed.knows_current() => continue,
             None => (
                 format!(
                     "{}: not set there yet; it follows within minutes{cached}",
@@ -147,7 +177,7 @@ pub(super) fn new_intents(app: &App) -> Vec<Span<'static>> {
         && let Some(mi) = app.machine_index(machine)
         && let Some(c) = app
             .account_feed(mi)
-            .and_then(|f| f.current.as_ref())
+            .and_then(|f| f.current_account())
             .filter(|c| c.starts_sessions())
     {
         let provider = app
@@ -478,9 +508,21 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 .find(|a| a.ready())
                 .or_else(|| models.first().and_then(|c| find(c)))
             {
+                // A current account goes ahead of the list wherever it's ready (intent 0455).
+                let current = app
+                    .account_feed(*machine)
+                    .and_then(|f| f.current_account())
+                    .map(|c| {
+                        if c.starts_sessions() {
+                            format!(" While {} is the current account, new work starts on it instead; this list chooses once it's cleared.", c.account)
+                        } else {
+                            format!(" {} is the current account, but it can't start sessions here now, so this list chooses.", c.account)
+                        }
+                    })
+                    .unwrap_or_default();
                 lines.extend(wrapped(
                     &format!(
-                        "New {} work starts on {} and runs {}. Agents already running stay on what they run.",
+                        "New {} work starts on {} and runs {}.{current} Agents already running stay on what they run.",
                         owner.name,
                         a.code,
                         providers.program_label(&a.runs)
@@ -1000,7 +1042,7 @@ fn account_line(app: &App, mi: usize, a: &Account, yes: bool) -> Line<'static> {
 /// Whether this machine's feed names the account as the current one.
 fn is_current(app: &App, mi: usize, code: &str) -> bool {
     app.account_feed(mi)
-        .and_then(|f| f.current.as_ref())
+        .and_then(|f| f.current_account())
         .is_some_and(|c| c.account == code)
 }
 
@@ -1123,8 +1165,12 @@ fn in_the_lists(feed: &crate::feed::Feed, code: &str, w: usize) -> Vec<Line<'sta
             None => places.push((place, vec![o.name.clone()])),
         }
     }
-    let text = if places.is_empty() {
-        "In no list yet: nothing runs on it until you add it with S.".to_string()
+    let current = feed.current_account().is_some_and(|c| c.account == code);
+    let text = if places.is_empty() && current {
+        "In no list, but it's the current account: new sessions start on it wherever it's ready. Add it with S for when it's cleared.".to_string()
+    } else if places.is_empty() {
+        "In no list yet: nothing runs on it until you add it with S, or make it current with c."
+            .to_string()
     } else {
         let said: Vec<String> = places
             .into_iter()
@@ -1133,7 +1179,7 @@ fn in_the_lists(feed: &crate::feed::Feed, code: &str, w: usize) -> Vec<Line<'sta
         format!(
             "{}. Whatever is first is what new work runs{}.",
             said.join("; "),
-            if feed.current.is_some() {
+            if feed.current_account().is_some() {
                 ", whenever the current account can't"
             } else {
                 ""
@@ -1158,22 +1204,16 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
     f.render_widget(Block::default().style(fg(FG).bg(BG)), area);
     let inner = pad(area, 2, 1);
     let name = app.machines.get(mi).map(|m| m.name()).unwrap_or_default();
+    let title = format!("kerdr › accounts   {name}");
+    let room = (inner.width as usize).saturating_sub(width(&title) + 2);
+    // put_lr cuts the title short before the current account, which always fits.
+    let right = current_and_usage(app, mi, room);
     put_lr(
         f.buffer_mut(),
         inner,
         inner.y,
-        vec![Span::styled(
-            format!("kerdr › accounts   {name}"),
-            bold(CYAN),
-        )],
-        {
-            let mut right = current_tag(app, mi);
-            if !right.is_empty() {
-                right.push(Span::raw("  "));
-            }
-            right.extend(usage(app, mi));
-            right
-        },
+        vec![Span::styled(title, bold(CYAN))],
+        right,
     );
     let Some(feed) = app.account_feed(mi) else {
         f.render_widget(Paragraph::new("This machine's feed has no account information yet.\n\nTab another machine · Esc board").style(fg(DIM)),Rect{y:inner.y+2,height:inner.height.saturating_sub(2),..inner});
@@ -1190,8 +1230,12 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
         Layout::horizontal([Constraint::Percentage(100), Constraint::Length(0)]).split(content)
     };
     let tw = panels[0].width.saturating_sub(2) as usize;
-    let mut lines = current_block(app, mi, tw);
-    lines.extend([Line::raw(""), heading("ACCOUNTS"), table_edge(tw, true)]);
+    let mut lines = vec![];
+    if feed.knows_current() {
+        lines.extend(current_block(app, mi, tw));
+        lines.push(Line::raw(""));
+    }
+    lines.extend([heading("ACCOUNTS"), table_edge(tw, true)]);
     let mut owner_section = false;
     let mut selected_line = 0;
     let cols = CopyColumns::of(&feed.accounts);
@@ -1382,8 +1426,9 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                     }
                     detail.extend(usage_detail(app, a, w));
                     detail.extend(in_the_lists(feed, &a.code, w));
-                    detail.push(Line::raw(""));
-                    if is_current(app, mi, &a.code) {
+                    if !feed.knows_current() {
+                    } else if is_current(app, mi, &a.code) {
+                        detail.push(Line::raw(""));
                         detail.extend(wrapped(
                             "★ The current account: new sessions on every machine start on it, ahead of their lists, wherever it's ready. C clears it.",
                             w,
@@ -1391,6 +1436,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                             None,
                         ));
                     } else {
+                        detail.push(Line::raw(""));
                         detail.extend(wrapped(
                             "c makes it the current account: new sessions on every machine start on it, ahead of their lists.",
                             w,
@@ -1429,14 +1475,19 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
             }
             _ => None,
         };
-        let clear = if feed.current.is_some() {
+        let make = if feed.knows_current() {
+            " · c make current"
+        } else {
+            ""
+        };
+        let clear = if feed.current_account().is_some() {
             " · C clear current"
         } else {
             ""
         };
         let hints = match account_hint {
             Some(hint) => format!(
-                "j k move · {hint} · e rename · x remove · c make current{clear} · + new · tab machine · esc board"
+                "j k move · {hint} · e rename · x remove{make}{clear} · + new · tab machine · esc board"
             ),
             None => format!(
                 "j k move · h l model · ⏎ first · J K reorder · a d add/drop · + new · e t x{clear} · tab machine · esc board"

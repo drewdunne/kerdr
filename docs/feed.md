@@ -464,8 +464,9 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
 ```
 
 `current` is the **current account**: the one new sessions start on ahead of every owner's
-list, set for every machine at once. It's `null` or absent when none is set (absent on older
-feeds, which Kerdr reads as none). `status` and `until` are the account's as this feed's machine
+list, set for every machine at once. It's `null` when none is set. A backend that has no current
+account leaves the field out: Kerdr then shows nothing about it and never sends `account-current`
+there, so a backend that has one always sends the field, `null` included. `status` and `until` are the account's as this feed's machine
 sees it (`ready`, `out`, `sign_in`, `missing`), so each machine's feed says its own: where it
 isn't `ready`, new sessions on that machine start on their lists, and Kerdr shows that machine
 in a warning colour with why. A session started on it has `how: "current"` in `agents`.
@@ -571,7 +572,8 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-current` | `to` (a code), or `clear: true` | makes it the current account for every machine, or clears it; answers `message` and `current` (the field above, as this machine sees it now, or null) |
 
 `c` on the accounts screen sends `account-current` with `to`, and `C` sends it with `clear`, to
-the machine being viewed; Kerdr shows the answer's `message`, and its `current` at once on that
+the machine being viewed, whatever its feed last said (the backend answers if it was already
+so); Kerdr shows the answer's `message`, and its `current` at once on that
 machine, while the other machines' feeds follow as their backends do.
 
 The `S` tick runs `account-move-waiting` on configured feed machines only after the list was

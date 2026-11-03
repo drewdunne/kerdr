@@ -795,8 +795,16 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
     } else {
         usage.iter().map(|s| width(&s.content)).sum::<usize>() + 9
     };
+    // When usage won't fit, room is kept for the current account's code, so the tabs shown
+    // around the selected one leave it space (intent 0455).
+    let short: Vec<Span<'static>> = usage_machine
+        .map(|mi| account_ui::current_short(app, mi))
+        .unwrap_or_default();
+    let short_w: usize = short.iter().map(|s| width(&s.content)).sum();
     let reserve = if rect.width as usize > fixed + usage_w + 18 {
         usage_w
+    } else if short_w > 0 {
+        short_w + 2
     } else {
         0
     };
@@ -842,9 +850,9 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
         put_lr(buf, rect, rect.y, left, right);
     } else if cw > 0 && lw + cw + 2 <= rect.width as usize {
         put_lr(buf, rect, rect.y, left, current);
-    } else if cw > 0 {
-        let room = (rect.width as usize).saturating_sub(cw + 2);
-        put_lr(buf, rect, rect.y, fit(left, room), current);
+    } else if short_w > 0 {
+        // The code alone, at any width; the tabs were laid out leaving room for it.
+        put_lr(buf, rect, rect.y, left, short);
     } else {
         put(
             buf,
@@ -5828,19 +5836,22 @@ mod tests {
             let Some(feed) = m.feed.as_mut() else {
                 continue;
             };
-            feed.current = Some(crate::accounts::Current {
+            feed.current = Some(Some(crate::accounts::Current {
                 account: "KBZ_X".into(),
                 name: "Personal Codex".into(),
                 since: Some("2026-10-21T16:00:00-05:00".into()),
                 status: "ready".into(),
                 until: None,
                 machine: Some(name),
-            });
+            }));
         }
         let board = rendered(&a, 176, 44);
         assert!(board.contains("★ current KBZ_X"), "{board}");
         let narrow = rendered(&a, 80, 24);
-        assert!(narrow.contains("★ current KBZ_X"), "{narrow}");
+        assert!(
+            narrow.contains("★ KBZ_X") || narrow.contains("★ current KBZ_X"),
+            "{narrow}"
+        );
         a.open_accounts();
         let text = rendered(&a, 176, 44);
         assert!(text.contains("CURRENT ACCOUNT"), "{text}");
@@ -5858,6 +5869,8 @@ mod tests {
             .unwrap()
             .current
             .as_mut()
+            .unwrap()
+            .as_mut()
             .unwrap();
         c.status = "sign_in".into();
         let text = rendered(&a, 176, 44);
@@ -5871,16 +5884,133 @@ mod tests {
     #[test]
     fn a_feed_without_a_current_account_reads_as_none() {
         let old: crate::feed::Feed = serde_json::from_str(r#"{"kerdr_feed":1}"#).unwrap();
-        assert!(old.current.is_none());
+        assert!(old.current_account().is_none() && !old.knows_current());
+        // Written back (a cached feed), an older one stays older.
+        let again: crate::feed::Feed =
+            serde_json::from_str(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert!(!again.knows_current());
         let null: crate::feed::Feed =
             serde_json::from_str(r#"{"kerdr_feed":1,"current":null}"#).unwrap();
-        assert!(null.current.is_none());
+        assert!(null.current_account().is_none() && null.knows_current());
         let set: crate::feed::Feed = serde_json::from_str(
             r#"{"kerdr_feed":1,"current":{"account":"KBZ_C","name":null,"status":"out","until":null}}"#,
         )
         .unwrap();
-        let c = set.current.unwrap();
+        let c = set.current_account().unwrap();
         assert_eq!((c.account.as_str(), c.name.as_str()), ("KBZ_C", ""));
         assert_eq!(c.held_back("here").as_deref(), Some("out until reset"));
+    }
+
+    /// Sets the same current account on every machine's feed.
+    fn set_current(a: &mut App, code: &str, status: &str) {
+        for m in a.machines.iter_mut() {
+            let Some(feed) = m.feed.as_mut() else {
+                continue;
+            };
+            feed.current = Some(Some(crate::accounts::Current {
+                account: code.into(),
+                status: status.into(),
+                until: Some("2026-10-22T09:00:00-05:00".into()),
+                ..Default::default()
+            }));
+        }
+    }
+
+    /// One row of the screen, as text.
+    fn row(a: &App, w: u16, h: u16, y: usize) -> String {
+        rendered(a, w, h)
+            .chars()
+            .skip(y * w as usize)
+            .take(w as usize)
+            .collect()
+    }
+
+    /// Codex's review: an older feed shows the accounts screen as before, with no block or keys.
+    #[test]
+    fn an_older_feed_shows_the_accounts_screen_as_before() {
+        let mut a = demo(false);
+        a.open_accounts();
+        let text = rendered(&a, 176, 44);
+        assert!(!text.contains("CURRENT ACCOUNT"), "{text}");
+        assert!(!text.contains("make current"), "{text}");
+        assert!(!text.contains("make it current with c"), "{text}");
+        // A backend that has it, none set: the block says so, and c is offered.
+        for m in a.machines.iter_mut() {
+            if let Some(f) = m.feed.as_mut() {
+                f.current = Some(None);
+            }
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("CURRENT ACCOUNT"), "{text}");
+        assert!(text.contains("c make current"), "{text}");
+    }
+
+    /// Codex's review: the current account outlasts usage and the title at any width, and keeps
+    /// the selected session's tab in sight.
+    #[test]
+    fn the_current_account_stays_in_sight_on_narrow_screens() {
+        let mut a = demo(false);
+        set_current(&mut a, "KBZ_X", "out");
+        for w in [36, 60, 80] {
+            let top = row(&a, w, 24, 0);
+            assert!(top.contains("★") && top.contains("KBZ_X"), "{w}: {top}");
+        }
+        a.open_accounts();
+        for w in [50, 80, 120] {
+            let top = row(&a, w, 30, 1);
+            assert!(top.contains("★") && top.contains("KBZ_X"), "{w}: {top}");
+        }
+        let wide = row(&a, 176, 44, 1);
+        assert!(wide.contains("★ current KBZ_X · out until"), "{wide}");
+        a.mode = Mode::Board;
+        a.machine = Some(a.this_machine());
+        a.rebuild();
+        a.tab = a.tabs.len().saturating_sub(1);
+        let Some(Scope::Session(_, session)) = a.tabs.last().cloned() else {
+            panic!("the demo has session tabs")
+        };
+        for w in [44, 60, 80] {
+            let top = row(&a, w, 24, 0);
+            assert!(
+                top.contains(&session) && top.contains("KBZ_X"),
+                "{w}: {top}"
+            );
+        }
+    }
+
+    /// Codex's review: an account in no list that is current says new sessions start on it.
+    #[test]
+    fn the_current_account_in_no_list_says_it_still_runs() {
+        let mut a = demo(false);
+        for m in a.machines.iter_mut() {
+            for o in m.feed.iter_mut().flat_map(|f| f.owners.iter_mut()) {
+                o.models.retain(|c| c != "KBZ_X");
+            }
+        }
+        set_current(&mut a, "KBZ_X", "ready");
+        a.open_accounts();
+        let rows = match &a.mode {
+            Mode::Accounts {
+                screen: crate::app::account_controls::AccountScreen::List { rows, .. },
+                ..
+            } => rows.clone(),
+            _ => panic!("accounts list"),
+        };
+        let at = rows
+            .iter()
+            .position(|r| {
+                matches!(r, crate::app::account_controls::Row::Account(c)
+                    | crate::app::account_controls::Row::Copy(c, _) if c == "KBZ_X")
+            })
+            .unwrap();
+        if let Mode::Accounts {
+            screen: crate::app::account_controls::AccountScreen::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = at;
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(text.contains("In no list, but it's the current"), "{text}");
     }
 }
