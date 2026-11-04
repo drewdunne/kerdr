@@ -26,6 +26,7 @@ const CREDENTIAL_RUN: usize = 8;
 /// A run of letters and digits this long, with both in it, is taken for a token.
 const TOKEN_RUN: usize = 32;
 const TYPED: &str = "[typed]";
+#[cfg(unix)]
 const LOCK_TRIES: u32 = 5;
 /// How far past its limit the log may go while its lock can't be had.
 const UNLOCKED_SLACK: u64 = 256 * 1024;
