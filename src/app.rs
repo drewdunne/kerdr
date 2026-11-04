@@ -17,6 +17,8 @@ pub mod account_controls;
 mod controls;
 #[path = "edit_controls.rs"]
 pub mod edit_controls;
+#[path = "errors.rs"]
+pub(crate) mod errors;
 #[path = "inside.rs"]
 pub mod inside;
 #[path = "kickoff_controls.rs"]
@@ -551,6 +553,13 @@ pub struct App {
     /// failure is up, never long after you pressed e, and only while you're still there.
     pub edit_open: Option<String>,
     pub edit_open_when: Option<edit_controls::OpenWhen>,
+    /// Where every error shown is kept (`errors`), and what it needs to know.
+    pub error_log: crate::errlog::ErrorLog,
+    /// What the command behind the answer about to arrive printed on standard error.
+    pub answer_stderr: String,
+    pub(crate) answering: Option<errors::Answering>,
+    pub(crate) signin_kept: Option<String>,
+    pub(crate) machine_problems: std::collections::HashMap<(usize, String), String>,
     /// How many times the board has handed the terminal over (into herdr, to SSH, to an editor):
     /// an edit's answer opens the editor only while this is what it was at `e`.
     pub away: u64,
@@ -619,6 +628,11 @@ impl App {
             edit_flights: vec![],
             edit_open: None,
             edit_open_when: None,
+            error_log: crate::errlog::ErrorLog::on_this_machine(),
+            answer_stderr: String::new(),
+            answering: None,
+            signin_kept: None,
+            machine_problems: Default::default(),
             away: 0,
         };
         app.rebuild();
@@ -638,22 +652,33 @@ impl App {
     }
 
     pub fn say(&mut self, text: impl Into<String>, tone: Tone) {
+        let text = text.into();
+        match tone {
+            Tone::Warn => self.keep_error(&text, "warn"),
+            Tone::Fail => self.keep_error(&text, "fail"),
+            _ => {}
+        }
+        self.show(text, tone);
+    }
+
+    /// Puts something on the message line, the log having had it.
+    fn show(&mut self, text: String, tone: Tone) {
         // A failure stays up until it has been seen: the latest thing said meanwhile waits, and
         // shows once the failure is taken down.
         if tone != Tone::Fail && self.failing() {
-            let text = text.into();
             if !self.held.iter().any(|(t, _)| *t == text) {
                 self.held.push((text, tone));
             }
             return;
         }
-        self.message = Some((text.into(), tone, Instant::now()));
+        self.message = Some((text, tone, Instant::now()));
     }
 
     /// Says that a change didn't happen, where it can't be missed (intent 0416). Failures that
     /// come together stay together, the newest last.
     pub fn fail(&mut self, text: impl Into<String>) {
         let text = text.into();
+        self.keep_error(&text, "fail");
         // Every failure not yet seen stays, the newest last; the box shows as many as fit.
         let text = match &self.message {
             Some((old, Tone::Fail, _)) => format!("{old}\n{text}"),
@@ -694,7 +719,7 @@ impl App {
                     .find(|t| held.iter().any(|(_, h)| h == t))
                     .unwrap_or(Tone::Info);
                 let text: Vec<String> = held.into_iter().map(|(t, _)| t).collect();
-                self.say(text.join("  ·  "), tone);
+                self.show(text.join("  ·  "), tone);
             }
             return true;
         }
@@ -766,6 +791,7 @@ impl App {
             read = matches!(data.feed, Some(Ok(_)));
             m.take(data, ev.at);
         }
+        self.keep_machine_problems(ev.machine);
         // A change that succeeded shows from the feed itself once a read has it (intent 0416).
         if read {
             self.resolver
@@ -2494,7 +2520,7 @@ pub fn match_range(query: &str, text: &str) -> Option<(usize, usize)> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -2520,11 +2546,11 @@ mod tests {
         assert!(matches!(app.scope(), Scope::Session(m, _) if m == &machine));
     }
 
-    fn demo_app() -> App {
+    pub(crate) fn demo_app() -> App {
         App::new(Config::default(), crate::demo::machines(false))
     }
 
-    fn press(app: &mut App, c: char) -> Action {
+    pub(crate) fn press(app: &mut App, c: char) -> Action {
         app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 

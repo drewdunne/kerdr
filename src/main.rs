@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use kerdr::app::App;
 use kerdr::board::{self, MachineState, Scope};
 use kerdr::config::{self, Config};
+use kerdr::errlog::{Entry, ErrorLog};
 use kerdr::herdr_keys;
 use kerdr::poll::{self, Conn};
 use kerdr::report::{self, Report};
@@ -68,6 +69,7 @@ enum Cmd {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+    kerdr::errlog::keep_panics();
     let result = match cli.command {
         None => open_board(),
         Some(Cmd::Demo { away }) => open_demo(away),
@@ -96,6 +98,16 @@ fn main() -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
+            ErrorLog::on_this_machine().write(
+                &Entry {
+                    source: "kerdr",
+                    shown: "fail",
+                    message: e.to_string(),
+                    ..Default::default()
+                },
+                &[],
+                &[],
+            );
             eprintln!("kerdr: {e}");
             ExitCode::FAILURE
         }

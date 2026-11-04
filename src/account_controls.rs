@@ -2146,6 +2146,7 @@ impl App {
                     s.note = Some(response.message.clone());
                     s.editing = true;
                     s.poll_at = Instant::now() + Duration::from_secs(2);
+                    self.keep_error(&response.message, "warn");
                     return;
                 }
                 s.message = response.message.clone();
@@ -3171,6 +3172,48 @@ mod tests {
             .map(|c| c.symbol())
             .collect();
         assert!(text.contains(problem));
+    }
+
+    #[test]
+    fn a_failure_the_signin_box_says_itself_is_kept_once() {
+        let (_dir, log, path) = crate::errlog::tests::log();
+        let mut a = app();
+        a.demo = false;
+        a.error_log = log;
+        a.machines[0].conn = crate::poll::Conn::Connecting;
+        assert_eq!(token_signin(&mut a), Action::None);
+        assert_eq!(press(&mut a, 'r'), Action::None);
+        a.keep_box_errors();
+        a.keep_box_errors();
+        let got: Vec<_> = crate::errlog::tests::lines(&path)
+            .into_iter()
+            .filter(|l| l["action"] == "account-signin")
+            .collect();
+        assert_eq!(got.len(), 1, "{got:?}");
+        assert!(
+            got[0]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not answering")
+        );
+        assert_eq!(got[0]["machine"], a.machines[0].name().as_str());
+        // Another warning meanwhile, an answer about something else: still only the once, and that
+        // answer's stderr isn't put on it.
+        a.say("Something else went wrong.", Tone::Warn);
+        a.keep_box_errors();
+        a.answer_stderr = "another's stderr".into();
+        a.finish_action(
+            0,
+            serde_json::json!({"action":"dispatch","id":"0009"}),
+            Err("no".into()),
+        );
+        let lines = crate::errlog::tests::lines(&path);
+        let signins: Vec<_> = lines
+            .iter()
+            .filter(|l| l["action"] == "account-signin")
+            .collect();
+        assert_eq!(signins.len(), 1, "{lines:?}");
+        assert!(signins[0].get("stderr").is_none(), "{lines:?}");
     }
 
     #[test]

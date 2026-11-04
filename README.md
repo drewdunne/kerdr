@@ -486,6 +486,27 @@ stage, status, what it needs from you, done-when criteria, its log, dependencies
 backlog. The format is in [docs/feed.md](docs/feed.md). Kerdr runs the feed on each machine, so
 a feed can read that machine's own state.
 
+**Errors are kept.** Every error Kerdr shows, a warning on the message line or a failure in its box,
+goes to a log on the machine Kerdr runs on, with what the backend printed on standard error, so one
+can be looked up after it has left the screen: `~/.local/state/kerdr/errors.log`
+(`$XDG_STATE_HOME/kerdr/`, or on Windows `%LOCALAPPDATA%\kerdr\`). So does a machine or a feed
+that stops answering, once when it starts or changes, whichever machine it happened on, and a panic.
+Each line is a JSON object:
+
+```json
+{"time":"2026-11-03T17:37:35-06:00","kerdr":"0.26.0","source":"action","shown":"fail","machine":"build-box","card":"#41","action":"dispatch","message":"#41 didn't start: the store is locked","answer":"the store is locked","stderr":"the push failed: rejected"}
+```
+
+`source` is `action`, `machine` or `kerdr`; `shown` is `fail`, `warn`, `board`, or `quiet` for a
+failure nothing on screen said; `answer` is the backend's whole answer when the message shortened it.
+Only its owner can read it. What you type (a new intent's words, an edit, an answer) doesn't go in:
+a quote of it, whole or in part, is written `[typed]`, and so is every word of four letters or more of
+what you sent in the request a failure answers, even in a path made from them, which can leave `[typed]`
+in place of an ordinary word you happened to use. Anything that looks like a token is written
+`[redacted]`. Past 1 MiB it moves to `errors.log.1`, replacing the one before, so it stays near 2 MiB
+at most. A log that can't be written changes nothing else. On Windows its privacy is that of your
+`%LOCALAPPDATA%`, which only you and administrators can read unless you've changed it.
+
 ## Install
 
 You need [herdr](https://herdr.dev/docs/install/) 0.9.1 or newer on every machine you want on

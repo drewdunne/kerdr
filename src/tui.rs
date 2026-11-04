@@ -169,7 +169,7 @@ fn event_loop(
         theme.check(false);
         send_loaded_images(app, &bg, None);
         while let Ok(answer) = action_rx.try_recv() {
-            let (job, machine, request, result) = match answer {
+            let (job, machine, request, result, stderr) = match answer {
                 Answer::Started(n) => {
                     // A start that waited for its write-up shows from now.
                     app.job_started(n);
@@ -189,6 +189,8 @@ fn event_loop(
                 r.ok && !(request["action"] == "account-signin"
                     && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
             });
+            // For the error log, should it be a failure.
+            app.answer_stderr = stderr;
             match job {
                 Some(n) => {
                     app.finish_job(n, request, result);
@@ -285,6 +287,7 @@ fn event_loop(
             );
         }
         app.width = terminal.size()?.width;
+        app.keep_box_errors();
         terminal.draw(|f| crate::ui::draw(f, app))?;
         if !event::poll(Duration::from_millis(250))? {
             continue;
@@ -533,12 +536,14 @@ fn event_loop(
 }
 
 /// An answer: its change in the action resolution tool (None for an account action), its machine,
-/// the request without credentials, and what came back.
+/// the request without credentials, what came back, and what its command printed on standard
+/// error, for the error log.
 type ActionResult = (
     Option<u64>,
     usize,
     serde_json::Value,
     Result<crate::actions::Response, String>,
+    String,
 );
 
 /// What comes back to the board's thread: a change's command has started, its command has the
@@ -646,6 +651,7 @@ impl Runner {
                             machine,
                             metadata,
                             Err(crate::resolve::NOT_WRITTEN_UP.into()),
+                            String::new(),
                         ))));
                     }
                 }
@@ -658,7 +664,7 @@ impl Runner {
                     std::thread::spawn(move || {
                         // Its command having the whole request lets Kerdr quit (intent 0445).
                         let handed = answers.clone();
-                        let result = crate::actions::run_handing(
+                        let answered = crate::actions::run_handing(
                             &target,
                             &command,
                             &request,
@@ -670,14 +676,16 @@ impl Runner {
                         drop(request);
                         // A refusal naming another home holds its record's place until the board
                         // has sent it on there, or not (intent 0416).
-                        let held = result
+                        let held = answered
+                            .result
                             .as_ref()
                             .is_ok_and(crate::actions::Response::sends_on);
                         let _ = answers.send(Answer::Done(Box::new((
                             Some(n),
                             machine,
                             metadata,
-                            result,
+                            answered.result,
+                            answered.stderr,
                         ))));
                         if !held {
                             let _ = back.send(ToRunner::Done(n));
@@ -765,10 +773,16 @@ fn start_action(
         app.say(app.busy_label.clone(), Tone::Info);
     }
     std::thread::spawn(move || {
-        let result = crate::actions::run(&target, &command, &request);
+        let answered = crate::actions::run_keeping_stderr(&target, &command, &request);
         let metadata = crate::actions::request_metadata(&request);
         drop(request);
-        let _ = tx.send(Answer::Done(Box::new((None, machine, metadata, result))));
+        let _ = tx.send(Answer::Done(Box::new((
+            None,
+            machine,
+            metadata,
+            answered.result,
+            answered.stderr,
+        ))));
     });
 }
 

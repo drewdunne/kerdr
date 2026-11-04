@@ -2277,6 +2277,12 @@ impl App {
         request: Value,
         result: Result<Response, String>,
     ) {
+        self.answer_arrives(machine, &request, &result);
+        self.take_answer(machine, request, result);
+        self.answer_done();
+    }
+
+    fn take_answer(&mut self, machine: usize, request: Value, result: Result<Response, String>) {
         if request["action"]
             .as_str()
             .is_some_and(|a| a.starts_with("account-"))
