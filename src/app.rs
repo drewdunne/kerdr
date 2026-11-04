@@ -5527,6 +5527,8 @@ pub(crate) mod tests {
             card.detail.as_ref().unwrap().status.as_deref(),
             Some("Reopening…")
         );
+        let line = app.starting_line(&card.clone()).unwrap();
+        assert!(line.contains("Asking first"), "{line}");
         // Enter again takes no second one, and doesn't claim anything either.
         assert_eq!(enter(&mut app), Action::None);
         let said = app.message().unwrap().0.to_string();

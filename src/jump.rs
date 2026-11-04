@@ -1005,6 +1005,51 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_key_closes_the_window_at_once_whatever_herdr_is_slow_at() {
+        // Neither what Kerdr says on arrival nor clearing the token holds up seeing the key, or
+        // closing the window (intent 0491). A stand-in herdr and a stand-in window.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bin = dir.path().join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"notification show"*) echo said >>"{log}"; exec sleep 5;;
+  *"workspace list"*) echo '{{"id":"cli","result":{{"type":"workspace_list","workspaces":[{{"workspace_id":"w-keyed","tokens":{{"kerdr_jump":"next:{now}"}}}}]}}}}';;
+  *"report-metadata w-keyed"*) echo clearing >>"{log}"; sleep 5; echo cleared >>"{log}";;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut watched = jump(None);
+        watched.machine.herdr = bin.display().to_string();
+        let mut window = Command::new("sleep");
+        window.arg("60");
+        let t = std::time::Instant::now();
+        let attached = attach(&mut window, &Target::Local, &watched, &mut || {}).unwrap();
+        assert_eq!(attached.request, Some(Request::Next));
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        let by = std::time::Instant::now() + Duration::from_secs(4);
+        let said = || std::fs::read_to_string(&log).unwrap_or_default();
+        while !said().contains("clearing") && std::time::Instant::now() < by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(said().contains("clearing"), "{}", said());
+        assert!(!said().contains("cleared"), "{}", said());
+    }
+
     #[test]
     fn a_held_connection_needs_the_same_herdr_at_both_ends_on_another_machine() {
         let remote = machine(Some("server"));

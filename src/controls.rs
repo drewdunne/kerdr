@@ -2349,6 +2349,15 @@ impl App {
             return None;
         }
         let secs = job.asked.elapsed().as_secs();
+        // Nothing has started: its line says so, as the board does (intent 0491).
+        if job.asking {
+            let what = if job.request["queue"] == true {
+                "Queuing it"
+            } else {
+                "Asking first"
+            };
+            return Some(format!("◐ {what}… {secs} s"));
+        }
         let what = match &job.effect {
             Some(crate::resolve::Effect::StartingOn(m)) => format!("Starting up on {m}"),
             _ if job.request["action"] == "reopen" => "Reopening".to_string(),
