@@ -316,6 +316,9 @@ pub struct Job {
     /// A start waiting for its write-up that Esc dropped: gone once the runner says it never
     /// started, or shown again if it already had (review of intent 0445).
     pub dropping: bool,
+    /// A start or reopen that can only come back as a question, or wait in a queue: nothing has
+    /// started, so it shows nothing on its card and says so in words (intent 0491).
+    pub asking: bool,
 }
 
 impl Job {
@@ -588,8 +591,16 @@ impl Resolver {
             entered: false,
             handed: false,
             dropping: false,
+            asking: false,
         });
         self.next
+    }
+
+    /// This change shows nothing on its card because nothing has started (Job::asking).
+    pub fn mark_asking(&mut self, n: u64) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.n == n) {
+            job.asking = true;
+        }
     }
 
     /// Takes a start d asked for while its intent is still being written up: it shows nothing,

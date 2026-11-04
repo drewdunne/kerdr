@@ -1735,7 +1735,12 @@ impl App {
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         let shows = effect.is_some();
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
+        let asking = (!shows).then(|| self.asking_line(&request)).flatten();
         let n = self.resolver.add(machine, request, from, key, effect);
+        if let Some(line) = asking {
+            self.resolver.mark_asking(n);
+            self.say(line, Tone::Info);
+        }
         if starts {
             self.note_workspaces(n, machine);
         }
@@ -1801,12 +1806,65 @@ impl App {
         }
     }
 
+    /// What a start or reopen that shows nothing on its card says instead until it's answered.
+    fn asking_line(&self, request: &Value) -> Option<String> {
+        if !matches!(request["action"].as_str(), Some("dispatch" | "reopen")) {
+            return None;
+        }
+        let reference = self.reference_for(request["id"].as_str()?);
+        Some(if request["queue"] == true {
+            format!("Queuing {reference}…")
+        } else {
+            format!("Asking about {reference}…")
+        })
+    }
+
+    /// Whether a start or reopen can only come back as a question: done work always asks, and so
+    /// does work for a session the feed says is at its limit, unless it goes to the background
+    /// lane, which has none. Until it does, the card mustn't claim it's starting (intent 0491).
+    fn asks_first(&self, key: &str, request: &Value) -> bool {
+        if request.get("override").is_some() {
+            return false;
+        }
+        let Some(card) = self.card(key) else {
+            return false;
+        };
+        if request["action"] == "reopen" {
+            return card.done();
+        }
+        let Some(detail) = card.detail.as_ref() else {
+            return false;
+        };
+        if detail.lane.as_deref() == Some("background") {
+            return false;
+        }
+        let home = detail.home.as_ref();
+        let machine = home
+            .and_then(|h| h.machine.as_deref())
+            .map_or(Some(card.machine_index), |name| self.machine_index(name));
+        let session = request["session"]
+            .as_str()
+            .or(home.and_then(|h| h.session.as_deref()));
+        let (Some(machine), Some(session)) = (machine, session) else {
+            return false;
+        };
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .and_then(|f| f.sessions.get(session))
+            .is_some_and(|s| s.limit.is_some_and(|limit| s.used >= limit))
+    }
+
     /// What the board shows for a change while it's on its way: what the backend will make of the
-    /// record, as far as Kerdr can tell. A request that waits in a queue shows nothing.
+    /// record, as far as Kerdr can tell. A request that waits in a queue shows nothing, nor one
+    /// that can only come back as a question (intent 0491).
     pub(super) fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
         Some(match request["action"].as_str()? {
-            "dispatch" if request["queue"] != true => Effect::Starting,
-            "reopen" if request["queue"] != true => Effect::Reopening,
+            "dispatch" | "reopen" if request["queue"] == true || self.asks_first(key, request) => {
+                return None;
+            }
+            "dispatch" => Effect::Starting,
+            "reopen" => Effect::Reopening,
             "close" => Effect::Close,
             "dismiss" | "cancel" => Effect::SetAside,
             "restore" => Effect::Restore,
@@ -1872,11 +1930,26 @@ impl App {
         let machine = job.machine;
         self.action_from = job.from.clone();
         self.answer_went_in = job.entered;
+        if job.asking
+            && let Some(line) = self.asking_line(&job.request)
+        {
+            self.unsay(&line);
+        }
         let mut refused = None;
         if let Ok(response) = &result
             && response.ok
             && !response.confirmation
         {
+            // It asked nothing after all (a slot came free since the feed was read): from here it
+            // shows as any start or reopen does.
+            let guessed_wrong = job.asking && job.key.is_some() && job.request["queue"] != true;
+            if guessed_wrong {
+                job.effect = Some(if job.request["action"] == "reopen" {
+                    Effect::Reopening
+                } else {
+                    Effect::Starting
+                });
+            }
             match job.effect.as_mut() {
                 // Its card stays until the feed has the record it made; nothing made, it goes.
                 Some(Effect::Saving(p)) => {
@@ -1902,7 +1975,8 @@ impl App {
                 _ => {}
             }
             // It stays as shown until the feed has it; a start answered yes moves on now.
-            let changes = matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
+            let changes = guessed_wrong
+                || matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
             self.resolver.settle(job);
             if changes {
                 self.rebuild();
@@ -1975,6 +2049,19 @@ impl App {
         };
         let secs = job.asked.elapsed().as_secs();
         let reference = &card.reference;
+        // Nothing has started: a question or a place in a queue is all that can come (intent 0491).
+        if job.asking {
+            let what = if job.request["queue"] == true {
+                "queuing"
+            } else {
+                "asking about"
+            };
+            self.say(
+                format!("Kerdr is still {what} {reference} ({secs} s so far)."),
+                Tone::Info,
+            );
+            return true;
+        }
         let text = if open {
             format!(
                 "{reference}'s workspace is open and its agent is still taking its brief ({secs} s so far): ⏎ goes in, and X stops it."

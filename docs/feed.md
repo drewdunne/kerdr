@@ -258,6 +258,9 @@ requests for different records safe. The one exception is an `edit` without a `t
 changes nothing: it waits for the requests made before it for its record, but nothing waits for
 it, so a later change to that record may run while it does, and `q` neither waits for it nor
 counts it as still running.
+A `dispatch` to a session your feed says is at its `limit` (unless its card's `lane` is `background`),
+or a `reopen` of done work, shows nothing on the card until your backend's answer: it can only come back
+as a question, so Kerdr says it's asking instead; if it comes back started after all, it shows from then.
 A success shows from the feed itself once a read has it (or
 after two reads, or a minute). Anything else (`ok: false`, a confirmation, a timeout, an invalid
 response) takes the change off the board at once, so the card is as the feed last said, and Kerdr

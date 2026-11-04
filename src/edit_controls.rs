@@ -1715,6 +1715,7 @@ mod tests {
         );
         // A start on its way: as d and ⏎, e waits for it.
         let mut app = self::app();
+        crate::app::tests::room_in_every_session(&mut app);
         let (key, id, _) = waiting(&mut app);
         let machine = app.card(&key).unwrap().machine_index;
         app.queue_action(machine, json!({"action":"dispatch","id":id}));

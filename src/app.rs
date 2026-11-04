@@ -5501,6 +5501,158 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn enter_on_a_done_card_says_it_is_asking_and_claims_no_reopening_until_the_yes() {
+        // The backend always asks about done work, so "Reopening…" before that is false (intent
+        // 0491).
+        let mut app = demo_app();
+        let (key, id) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("Enter on a done card didn't ask to reopen it")
+        };
+        app.queue_action(machine, request.clone());
+        let asking = format!("Asking about {reference}…");
+        assert_eq!(app.message().unwrap().0, asking);
+        let card = app.card(&key).unwrap();
+        assert!(card.done(), "it still reads done");
+        assert_ne!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("Reopening…")
+        );
+        // Enter again takes no second one, and doesn't claim anything either.
+        assert_eq!(enter(&mut app), Action::None);
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("still asking about"), "{said}");
+        assert_eq!(app.resolver.on_its_way().count(), 1);
+        // The question comes: what it said goes, and a yes shows as it always has.
+        app.unsay(&said);
+        app.say(asking.clone(), Tone::Info);
+        reply_to(
+            &mut app,
+            machine,
+            request,
+            done_question(&reference, "0123456789ab0008"),
+        );
+        assert_ne!(app.message().map(|m| m.0), Some(asking.as_str()));
+        settle(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request["override"], true);
+        assert_eq!(request["id"], id.as_str());
+        app.queue_action(machine, request);
+        let card = app.card(&key).unwrap();
+        assert_eq!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("Reopening…")
+        );
+    }
+
+    #[test]
+    fn a_start_on_a_full_session_says_it_is_asking_and_one_with_room_says_starting() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        let session = app
+            .card(&key)
+            .unwrap()
+            .detail
+            .as_ref()
+            .unwrap()
+            .home
+            .clone()
+            .unwrap()
+            .session;
+        assert_eq!(
+            session.as_deref(),
+            Some("web"),
+            "a full session in the demo"
+        );
+        let reference = app.card(&key).unwrap().reference.clone();
+        let start = serde_json::json!({"action": "dispatch", "id": id, "session": "web"});
+        // Full: a question is all that can come.
+        assert_eq!(app.effect_for(&key, &start), None);
+        // The yes, or a session with room, or the background lane, starts it for real.
+        let mut yes = start.clone();
+        yes["override"] = serde_json::json!(true);
+        assert_eq!(
+            app.effect_for(&key, &yes),
+            Some(crate::resolve::Effect::Starting)
+        );
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().lane = Some("background".into());
+        assert_eq!(
+            app.effect_for(&key, &start),
+            Some(crate::resolve::Effect::Starting)
+        );
+        app.board.cards[i].detail.as_mut().unwrap().lane = None;
+        assert_eq!(app.effect_for(&key, &start), None);
+        let mut demo = demo_app();
+        room_in_every_session(&mut demo);
+        assert_eq!(
+            demo.effect_for(&key, &start),
+            Some(crate::resolve::Effect::Starting)
+        );
+        // As it goes: words on the board, and nothing on the card.
+        app.queue_action(machine, start.clone());
+        assert_eq!(
+            app.message().unwrap().0,
+            format!("Asking about {reference}…")
+        );
+        assert_ne!(
+            app.card(&key)
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Starting…")
+        );
+        // A slot came free since the feed was read: it started after all, and shows it.
+        let started = crate::actions::Response {
+            ok: true,
+            message: "Started.".into(),
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, start, Ok(started));
+        assert_eq!(app.message().map(|m| m.0), None);
+        assert_eq!(
+            app.card(&key)
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Starting…")
+        );
+        assert_eq!(app.card(&key).unwrap().state.as_deref(), Some("active"));
+    }
+
+    #[test]
+    fn w_says_it_is_queuing_until_the_answer_comes() {
+        let mut app = demo_app();
+        let (key, id) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let request = serde_json::json!({"action": "reopen", "id": id, "queue": true});
+        app.queue_action(0, request.clone());
+        assert_eq!(app.message().unwrap().0, format!("Queuing {reference}…"));
+        reply_to(
+            &mut app,
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: "Queued in web.".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(app.message().unwrap().0, "Queued in web.");
+    }
+
+    #[test]
     fn enter_on_a_done_card_asks_first_then_reopens_it_on_a_yes() {
         let mut app = demo_app();
         let (key, id) = done_card(&mut app);
@@ -6903,6 +7055,16 @@ pub(crate) mod tests {
     }
 
     /// A backlog card with an intent record in the demo, and its machine.
+    /// The demo's sessions are at their limits, where a start only asks (intent 0491).
+    pub(crate) fn room_in_every_session(app: &mut App) {
+        for m in &mut app.machines {
+            for slots in m.feed.iter_mut().flat_map(|f| f.sessions.values_mut()) {
+                slots.limit = None;
+            }
+        }
+        app.rebuild();
+    }
+
     fn waiting_card(app: &App) -> (String, String, usize) {
         let c = app
             .board
@@ -6992,6 +7154,7 @@ pub(crate) mod tests {
     #[test]
     fn a_start_shows_starting_and_a_question_still_asks() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         select_key(&mut app, &key);
@@ -7147,6 +7310,7 @@ pub(crate) mod tests {
     #[test]
     fn a_started_card_moves_on_and_takes_no_second_start_until_the_feed_has_it() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         let request = serde_json::json!({"action": "dispatch", "id": id});
@@ -7258,6 +7422,7 @@ pub(crate) mod tests {
         // Intent 0445: ark-dispatch opens the workspace before its agent takes its brief, and
         // answers only then. ⏎ goes in as soon as one shows, and says it's starting up till then.
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         select_key(&mut app, &key);
@@ -7416,6 +7581,7 @@ pub(crate) mod tests {
     #[test]
     fn d_on_work_being_written_up_starts_it_once_that_s_done() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         let set_intake = |app: &mut App, intake: Option<&str>| {
@@ -7651,6 +7817,7 @@ pub(crate) mod tests {
     #[test]
     fn d_in_the_backlog_view_keeps_the_starting_card_selected_and_takes_no_second_start() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _, _) = waiting_card(&app);
         app.enter_backlog(false);
