@@ -30,25 +30,25 @@ const FRESH_WAIT: Duration = Duration::from_millis(250);
 /// How long after coming back to the board its turn stays quick for the read asked for then.
 const READ_LANDS: Duration = Duration::from_secs(1);
 
-/// How often a machine with a start running has its feed read again, which is the only way the
+/// How often the machine of a start a ⏎ waits on has its feed read again, which is the only way the
 /// board learns its workspace has opened. No faster: a feed read costs that machine seconds of
 /// work (intent 0491).
 const START_READ_EVERY: Duration = Duration::from_secs(5);
 
-/// When each machine with a start running was last asked for its feed for that.
+/// When each machine of a start a ⏎ waits on was last asked for its feed for that.
 #[derive(Default)]
 struct StartReads(std::collections::HashMap<usize, Instant>);
 
 impl StartReads {
-    /// Of the machines running a start now, those whose feed is due again. Counted from when each
-    /// was first seen, since the start's own feed read has only just gone.
+    /// Of the machines a ⏎ waits on now, those whose feed is due. At once for a machine just
+    /// added: the ⏎ asks for the first read, so the wait doesn't grow by a whole gap.
     fn due(&mut self, running: &[usize], now: Instant) -> Vec<usize> {
         self.0.retain(|machine, _| running.contains(machine));
         let mut due = vec![];
         for &machine in running {
-            let last = self.0.entry(machine).or_insert(now);
-            if now.duration_since(*last) >= START_READ_EVERY {
-                *last = now;
+            let waited = self.0.get(&machine).map(|last| now.duration_since(*last));
+            if waited.is_none_or(|w| w >= START_READ_EVERY) {
+                self.0.insert(machine, now);
                 due.push(machine);
             }
         }
@@ -258,7 +258,7 @@ fn event_loop(
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
         run_ready(app, &runner);
         if let Some(l) = live.as_deref() {
-            for machine in start_reads.due(&app.starts_running_on(), Instant::now()) {
+            for machine in start_reads.due(&app.start_awaited_on(), Instant::now()) {
                 l.wake_feed(machine);
             }
         }
@@ -519,35 +519,13 @@ fn event_loop(
                         // Machines not answering are tried again; the rest are read now, feeds
                         // and all, so R brings the board up to date (intent 0445), and the board
                         // says when they have (intent 0491).
-                        let mut n = 0;
-                        let since = Instant::now();
-                        let mut waiting = vec![];
-                        for i in 0..app.machines.len() {
-                            if !app.machines[i].is_shown() {
-                                continue;
-                            }
-                            if app.machines[i].conn.is_live() {
-                                l.wake_feed(i);
-                                if app.machines[i].machine.feed.is_some() {
-                                    waiting.push(i);
-                                }
-                            } else {
-                                l.wake(i);
-                                n += 1;
-                            }
+                        let (reading, trying) = app.ask_refresh(Instant::now());
+                        for i in reading {
+                            l.wake_feed(i);
                         }
-                        let text = if n == 0 {
-                            "Reading every machine now.".to_string()
-                        } else {
-                            format!("Reading every machine now, and trying {n} again.")
-                        };
-                        app.say(text.clone(), Tone::Info);
-                        app.refresh = (!waiting.is_empty()).then_some(crate::app::Refresh {
-                            since,
-                            waiting,
-                            missed: vec![],
-                            said: text,
-                        });
+                        for i in trying {
+                            l.wake(i);
+                        }
                     }
                 }
             }
@@ -1016,6 +994,10 @@ fn jump_workspace(
                 .map(|w| w.label.clone())
         })
         .unwrap_or_else(|| id.clone());
+    if let Some(said) = app.stuck_refusal(mi, &session, &label) {
+        app.say(said, Tone::Warn);
+        return None;
+    }
     // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
     app.went_into_workspace(mi, &session, &id);
     let via = via_for(app, mi, &session);
@@ -1057,7 +1039,7 @@ fn workspace_jump(
         strict: tab.is_some(),
         tab,
         label,
-        others: app.needs_you_order().len(),
+        others: app.others_needing_you(None),
         via,
         prefix: app.prefix.clone(),
         keys: keys_on(app, mi),
@@ -1185,13 +1167,17 @@ fn jump_cards(
             }
             return;
         }
+        if let Some(said) = app.stuck_refusal(mi, &session, &card.reference) {
+            app.say(said, Tone::Warn);
+            return;
+        }
         app.sel = Selection {
             col: card.stage.index(),
             key: Some(key.clone()),
         };
         // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
         app.went_into(&key);
-        let others = app.needs_you_order().iter().filter(|k| **k != key).count();
+        let others = app.others_needing_you(Some(&key));
         let via = via_for(app, mi, &session);
         // Its own tab, never another's: a child's, or the card's own agent's (intent 0349).
         let (tab, strict) = app.jump_tab(&card);
@@ -1370,19 +1356,20 @@ mod tests {
     }
 
     #[test]
-    fn a_running_start_has_its_machines_feed_read_every_five_seconds_no_faster() {
+    fn a_start_a_key_waits_on_has_its_machines_feed_read_at_once_then_every_five_seconds() {
         let mut reads = StartReads::default();
         let t = Instant::now();
         let at = |secs: u64| t + Duration::from_secs(secs);
-        assert!(reads.due(&[1], at(0)).is_empty(), "it has only just gone");
+        assert_eq!(reads.due(&[1], at(0)), [1], "the key asks for the first");
         assert!(reads.due(&[1], at(4)).is_empty());
         assert_eq!(reads.due(&[1], at(5)), [1]);
         assert!(reads.due(&[1], at(9)).is_empty());
-        // Another machine counts from when it started; one with nothing running is forgotten.
-        assert!(reads.due(&[1, 2], at(9)).is_empty());
+        // Another machine counts from its own key; one nothing waits on is forgotten.
+        assert_eq!(reads.due(&[1, 2], at(9)), [2]);
         assert_eq!(reads.due(&[1, 2], at(10)), [1]);
         assert_eq!(reads.due(&[2], at(14)), [2]);
-        assert!(reads.due(&[1], at(100)).is_empty());
+        assert!(reads.due(&[], at(15)).is_empty());
+        assert_eq!(reads.due(&[1], at(100)), [1], "a new key, a new first read");
     }
 
     /// What the runner says, in words: "started 1", "handed 1", "dropped 1 yes", "done 1 ok".

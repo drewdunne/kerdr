@@ -319,6 +319,8 @@ pub struct Job {
     /// A start or reopen that can only come back as a question, or wait in a queue: nothing has
     /// started, so it shows nothing on its card and says so in words (intent 0491).
     pub asking: bool,
+    /// What a second key last said about it while it asks, which its answer takes down.
+    pub said: Option<String>,
 }
 
 impl Job {
@@ -592,6 +594,7 @@ impl Resolver {
             handed: false,
             dropping: false,
             asking: false,
+            said: None,
         });
         self.next
     }
@@ -600,6 +603,13 @@ impl Resolver {
     pub fn mark_asking(&mut self, n: u64) {
         if let Some(job) = self.jobs.iter_mut().find(|j| j.n == n) {
             job.asking = true;
+        }
+    }
+
+    /// Notes what a key has just said about this job, for its answer to take down.
+    pub fn note_said(&mut self, n: u64, line: String) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.n == n) {
+            job.said = Some(line);
         }
     }
 

@@ -1935,6 +1935,10 @@ impl App {
         {
             self.unsay(&line);
         }
+        // A second key while it asked said it in other words (intent 0491).
+        if let Some(said) = job.said.take() {
+            self.unsay(&said);
+        }
         let mut refused = None;
         if let Ok(response) = &result
             && response.ok
@@ -1944,6 +1948,9 @@ impl App {
             // shows as any start or reopen does.
             let guessed_wrong = job.asking && job.key.is_some() && job.request["queue"] != true;
             if guessed_wrong {
+                // It stays in the resolver until the feed has it, no longer asking anything: its
+                // line says it's starting, and a ⏎ on it is remembered (intent 0491).
+                job.asking = false;
                 job.effect = Some(if job.request["action"] == "reopen" {
                     Effect::Reopening
                 } else {
@@ -1996,7 +2003,7 @@ impl App {
                 .as_ref()
                 .is_some_and(|j| j.starts() && j.key.is_some() && j.key == self.enter_when_open)
             {
-                self.enter_when_open = None;
+                self.forget_enter();
             }
             if moved_on {
                 self.resolver.forget_moves_after(machine, n);
@@ -2054,6 +2061,7 @@ impl App {
         } else {
             "starting up"
         };
+        let n = job.n;
         let secs = job.asked.elapsed().as_secs();
         let reference = &card.reference;
         // Nothing has started: a question or a place in a queue is all that can come (intent 0491).
@@ -2063,10 +2071,9 @@ impl App {
             } else {
                 "asking about"
             };
-            self.say(
-                format!("Kerdr is still {what} {reference} ({secs} s so far)."),
-                Tone::Info,
-            );
+            let line = format!("Kerdr is still {what} {reference} ({secs} s so far).");
+            self.resolver.note_said(n, line.clone());
+            self.say(line, Tone::Info);
             return true;
         }
         let text = if open {
@@ -2121,7 +2128,7 @@ impl App {
         // Remembered: the workspace opens without another key from you (intent 0491). Not when
         // nothing has started, where only a question can come.
         if !asking {
-            self.enter_when_open = Some(card.key.clone());
+            self.remember_enter(&card.key);
         }
         Some(Action::None)
     }
@@ -2172,8 +2179,40 @@ impl App {
         };
         // In by his own ⏎: its answer takes him nowhere later.
         self.resolver.went_in(&id);
-        self.enter_when_open = None;
+        self.forget_enter();
         Some(action)
+    }
+
+    /// Remembers a ⏎ on a card just started, with the words on screen that promise it, so they go
+    /// when it does (intent 0491).
+    pub(crate) fn remember_enter(&mut self, key: &str) {
+        self.enter_when_open = Some(key.to_string());
+        self.enter_said = self
+            .message
+            .as_ref()
+            .filter(|(_, tone, _)| *tone != Tone::Fail)
+            .map(|(text, _, _)| text.clone());
+    }
+
+    /// Forgets the remembered ⏎, and takes down any words still promising it.
+    pub(crate) fn forget_enter(&mut self) {
+        self.enter_when_open = None;
+        if let Some(said) = self.enter_said.take() {
+            self.unsay(&said);
+        }
+    }
+
+    /// Whether going in can't take keys meant for something else here, so a remembered ⏎ counts.
+    pub(crate) fn enter_can_land_here(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Board
+                | Mode::Peek { .. }
+                | Mode::Backlog { .. }
+                | Mode::Misc { .. }
+                | Mode::Done { .. }
+                | Mode::Card { .. }
+        ) && !self.typing_view_search()
     }
 
     /// The ⏎ remembered on a card just started, once its workspace is open: how to go in. Only where
@@ -2182,18 +2221,7 @@ impl App {
     /// it (intent 0491).
     pub fn enter_when_open_due(&mut self) -> Option<Action> {
         let key = self.enter_when_open.clone()?;
-        if self.failing()
-            || !matches!(
-                self.mode,
-                Mode::Board
-                    | Mode::Peek { .. }
-                    | Mode::Backlog { .. }
-                    | Mode::Misc { .. }
-                    | Mode::Done { .. }
-                    | Mode::Card { .. }
-            )
-            || self.typing_view_search()
-        {
+        if self.failing() || !self.enter_can_land_here() {
             return None;
         }
         let Some(card) = self
@@ -2201,11 +2229,11 @@ impl App {
             .filter(|c| c.key == key)
             .cloned()
         else {
-            self.enter_when_open = None;
+            self.forget_enter();
             return None;
         };
         if card.is_open_workspace() {
-            self.enter_when_open = None;
+            self.forget_enter();
             return Some(self.jump_action(key));
         }
         let id = card.detail.as_ref()?.id.clone();
@@ -2215,7 +2243,7 @@ impl App {
         if self.started_lately(&id) {
             return None;
         }
-        self.enter_when_open = None;
+        self.forget_enter();
         self.say(
             format!(
                 "{} has no workspace to show for its start yet, so Kerdr stopped waiting; ⏎ tries again.",
@@ -2233,15 +2261,23 @@ impl App {
             .is_some_and(|(s, at)| s == id && at.elapsed() < Duration::from_secs(120))
     }
 
-    /// The machines with a start or reopen actually running: reading their feeds shows its
-    /// workspace, which opens well before the command answers (intent 0491).
-    pub fn starts_running_on(&self) -> Vec<usize> {
+    /// The machine to read often for the start a ⏎ is waiting on: reading its feed shows the
+    /// workspace, which opens well before the command answers. Only for a remembered ⏎, since each
+    /// read costs that machine seconds of work and the timed feed covers every other start, and
+    /// only one that's answering: a feed can't show anything from one that isn't, and these wakes
+    /// would override its wait between tries (intent 0491).
+    pub fn start_awaited_on(&self) -> Vec<usize> {
+        let Some(key) = self.enter_when_open.as_deref() else {
+            return vec![];
+        };
         let mut machines: Vec<usize> = self
             .resolver
             .on_its_way()
+            .filter(|j| j.key.as_deref() == Some(key))
             .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
             .filter(|j| j.request["queue"] != true)
             .map(|j| j.machine)
+            .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live()))
             .collect();
         machines.sort_unstable();
         machines.dedup();
@@ -2251,7 +2287,7 @@ impl App {
     /// Going into a card's workspace yourself: a start or reopen still on its way for it neither
     /// asks nor takes you in when it answers, since you're already there (intent 0445).
     pub fn went_into(&mut self, key: &str) {
-        self.enter_when_open = None;
+        self.forget_enter();
         if let Some(id) = self
             .card(key)
             .and_then(|c| c.detail.as_ref())
@@ -2263,7 +2299,7 @@ impl App {
 
     /// The same, going into a workspace by its id: the card it's for, if any.
     pub fn went_into_workspace(&mut self, machine: usize, session: &str, id: &str) {
-        self.enter_when_open = None;
+        self.forget_enter();
         let Some(name) = self.machines.get(machine).map(|m| m.name()) else {
             return;
         };
@@ -2363,9 +2399,13 @@ impl App {
             _ if job.request["action"] == "reopen" => "Reopening".to_string(),
             _ => "Starting up".to_string(),
         };
-        Some(format!(
-            "◐ {what} · {secs} s so far · ⏎ goes in as soon as its workspace opens"
-        ))
+        // A ⏎ already remembered needs no second one: Kerdr will take the screen by itself.
+        let then = if self.enter_when_open.as_deref() == Some(card.key.as_str()) {
+            "Kerdr goes in when its workspace opens · Esc stops waiting"
+        } else {
+            "⏎ goes in as soon as its workspace opens"
+        };
+        Some(format!("◐ {what} · {secs} s so far · {then}"))
     }
 
     /// What holds Kerdr open on q, said: a change not yet sent, which would never be, or a new

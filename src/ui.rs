@@ -530,6 +530,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let banner = banner(app);
     let pending = pending_line(app);
     let message = app.message();
+    // What was said takes the line first; this lasts as long as the ⏎ does (intent 0491).
+    let remembered = remembered_line(app);
     let filter_line = filtered(app);
     let accounts = app
         .machines
@@ -540,7 +542,9 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(u16::from(banner.is_some())),
         Constraint::Length(if accounts { 1 } else { 3 }),
         Constraint::Min(4),
-        Constraint::Length(u16::from(pending.is_some() || message.is_some())),
+        Constraint::Length(u16::from(
+            pending.is_some() || message.is_some() || remembered.is_some(),
+        )),
         Constraint::Length(1),
     ])
     .split(inner);
@@ -630,6 +634,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             rows[4].width,
             vec![Span::styled(text.to_string(), fg(color))],
         );
+    } else if let Some(line) = remembered {
+        put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
     }
     let backlog_hints = card_hints(app);
     let card_moves = matches!(app.mode, Mode::Board)
@@ -1110,6 +1116,20 @@ fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
         Span::styled(format!("is on {}, which is {conn}. ", card.machine), fg(FG)),
         Span::styled(
             "Kerdr jumps in when it answers · esc stops waiting",
+            fg(DIM),
+        ),
+    ])
+}
+
+/// What a remembered ⏎ on a starting card says for as long as it lasts: messages go after 8 s, and a
+/// start can run for minutes before herdr takes the screen (intent 0491).
+fn remembered_line(app: &App) -> Option<Vec<Span<'static>>> {
+    let card = app.card(app.enter_when_open.as_deref()?)?;
+    Some(vec![
+        Span::styled(format!("{} ", card.reference), bold(CYAN)),
+        Span::styled("is starting. ", fg(FG)),
+        Span::styled(
+            "Kerdr goes in when its workspace opens · esc stops waiting",
             fg(DIM),
         ),
     ])
@@ -5074,6 +5094,25 @@ mod tests {
         assert!(text.contains("The Tenants copy is signed in."), "{text}");
         assert!(text.contains("Signed in.    esc accounts"));
         assert!(!text.contains("leaves this one as it was"));
+    }
+
+    #[test]
+    fn a_remembered_enter_keeps_saying_so_after_the_words_have_gone() {
+        // Messages go after 8 s, and herdr can take the screen minutes later (intent 0491).
+        let mut a = crate::app::tests::demo_app();
+        let key = a.board.cards[0].key.clone();
+        let reference = a.board.cards[0].reference.clone();
+        let line = "Kerdr goes in when its workspace opens";
+        assert!(!rendered(&a, 160, 40).contains(line));
+        a.enter_when_open = Some(key);
+        let screen = rendered(&a, 160, 40);
+        assert!(screen.contains(line), "{screen}");
+        assert!(screen.contains(&reference), "{screen}");
+        // Anything said meanwhile comes first.
+        a.say("Something else", Tone::Info);
+        let screen = rendered(&a, 160, 40);
+        assert!(screen.contains("Something else"), "{screen}");
+        assert!(!screen.contains(line), "{screen}");
     }
 
     fn rendered(a: &App, w: u16, h: u16) -> String {
