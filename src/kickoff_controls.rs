@@ -327,9 +327,9 @@ impl App {
                 return self.leave_kickoff(form, target, Leaving::Along);
             }
             KeyCode::Up if form.at > 0 => {
+                // No guard to wait out: you've read this one already (intent 0491).
                 form.at -= 1;
                 form.scroll.set(0);
-                form.ready_at = Instant::now() + READY_AFTER;
             }
             KeyCode::PageDown => {
                 form.scroll
@@ -706,6 +706,26 @@ mod tests {
             panic!()
         };
         assert_eq!(form.at, 0, "there's nothing before the first");
+    }
+
+    #[test]
+    fn going_back_to_a_question_needs_no_wait_before_enter_takes_it() {
+        // Already read, unlike one that has just appeared (intent 0491).
+        let mut app = open(&answer());
+        typed(&mut app, "mine");
+        key(&mut app, KeyCode::Enter);
+        let Mode::Kickoff { form, .. } = &mut app.mode else {
+            panic!()
+        };
+        assert_eq!(form.at, 1);
+        form.ready_at = Instant::now();
+        key(&mut app, KeyCode::Up);
+        key(&mut app, KeyCode::Enter);
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!()
+        };
+        assert_eq!(form.at, 1, "the Enter counted");
+        assert_eq!(form.drafts[0], "mine");
     }
 
     #[test]
