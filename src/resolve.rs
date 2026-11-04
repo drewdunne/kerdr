@@ -222,6 +222,9 @@ impl Effect {
             Effect::Text(text) => {
                 fc.words = Some(text.clone());
                 fc.intake = Some("pending".into());
+                // What the feed read ahead is the text this replaces.
+                fc.item_text = None;
+                fc.item_was = None;
             }
         }
     }

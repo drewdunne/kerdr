@@ -148,6 +148,12 @@ pub struct FeedCard {
     /// The questions `d` would ask it first, read ahead so the box opens at once (intent 0491).
     #[serde(default)]
     pub kickoff: Option<Preloaded>,
+    /// A backlog item's whole text and its fingerprint, read ahead so `e` opens it at once and the
+    /// save checks it (intent 0491). Both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_was: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
     #[serde(default)]
