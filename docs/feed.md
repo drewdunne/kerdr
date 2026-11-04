@@ -611,6 +611,12 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
 }
 ```
 
+`agents` lists the agents this machine started, newest first. A card shows the account of the
+record whose `conversation` is the one herdr sees in the card's pane, and shows none when no record
+has it; until herdr knows the pane's conversation, it takes the first record on that pane. A
+backend should leave out records of agents that no longer run, but one left in can't change a card
+whose conversation herdr knows.
+
 `current` is the **current account**: the one new sessions start on ahead of every owner's
 list, set for every machine at once. It's `null` when none is set. A backend that has no current
 account leaves the field out: Kerdr then shows nothing about it and never sends `account-current`

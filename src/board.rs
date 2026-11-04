@@ -432,24 +432,32 @@ pub fn attention(s: &Signals) -> (Attention, String) {
     }
 }
 
-fn usage_waiting(machine: &MachineState, workspace: &WsRef) -> bool {
-    machine.feed.as_ref().is_some_and(|feed| {
-        workspace.agents.iter().any(|agent| {
-            feed.agents.iter().any(|a| {
-                a.pane == agent.pane_id && a.session == workspace.session && a.waiting_for_usage()
-            })
-        })
+/// The feed's records of the agents in this workspace: each pane's by the conversation herdr sees
+/// there (`Feed::agent_on_pane`), so a record left on a pane says nothing about its card.
+fn workspace_records<'a>(
+    machine: &'a MachineState,
+    workspace: &'a WsRef,
+) -> impl Iterator<Item = &'a crate::accounts::AccountAgent> {
+    let feed = machine.feed.as_ref();
+    workspace.agents.iter().filter_map(move |agent| {
+        feed?.agent_on_pane(
+            &workspace.session,
+            &agent.pane_id,
+            agent
+                .agent_session
+                .as_ref()
+                .and_then(|s| s.value.as_deref()),
+        )
     })
 }
 
-fn account_problem<'a>(machine: &'a MachineState, workspace: &WsRef) -> Option<&'a str> {
-    machine.feed.as_ref()?.agents.iter().find_map(|a| {
-        (a.session == workspace.session
-            && workspace.agents.iter().any(|agent| a.pane == agent.pane_id))
-        .then_some(a.problem.as_deref())
-        .flatten()
-        .filter(|p| !p.trim().is_empty())
-    })
+fn usage_waiting(machine: &MachineState, workspace: &WsRef) -> bool {
+    workspace_records(machine, workspace).any(|a| a.waiting_for_usage())
+}
+
+fn account_problem<'a>(machine: &'a MachineState, workspace: &'a WsRef) -> Option<&'a str> {
+    workspace_records(machine, workspace)
+        .find_map(|a| a.problem.as_deref().filter(|p| !p.trim().is_empty()))
 }
 
 fn parse_time(s: &str) -> Option<DateTime<Local>> {
@@ -1362,6 +1370,68 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn a_record_left_on_a_pane_says_nothing_about_its_card() {
+        use crate::accounts::{AccountAgent, Waiting};
+        let on_card = |real: AccountAgent| {
+            let left_behind = AccountAgent {
+                pane: "w5:p1".into(),
+                session: "default".into(),
+                conversation: "c-left-behind".into(),
+                problem: Some("Something about an agent long gone".into()),
+                waiting: Some(Waiting {
+                    why: "usage".into(),
+                    until: None,
+                }),
+                ..Default::default()
+            };
+            let board = build(
+                &[live(
+                    machine("build-box", true),
+                    vec![(
+                        "default",
+                        Snapshot {
+                            workspaces: vec![ws("w5", "69-mine")],
+                            agents: vec![Agent {
+                                agent_session: Some(crate::herdr::AgentSession {
+                                    value: Some("c-real".into()),
+                                }),
+                                ..agent("w5", "idle")
+                            }],
+                            ..Default::default()
+                        },
+                    )],
+                    Some(Feed {
+                        kerdr_feed: 1,
+                        cards: vec![feed_card("0169", "build", "active")],
+                        agents: vec![left_behind, real],
+                        ..Default::default()
+                    }),
+                )],
+                &Config::default(),
+            );
+            let c = board.cards.iter().find(|c| c.reference == "#169").unwrap();
+            (c.attention, c.why.clone())
+        };
+        let real = AccountAgent {
+            pane: "w5:p1".into(),
+            session: "default".into(),
+            conversation: "c-real".into(),
+            ..Default::default()
+        };
+        let (attention, status) = on_card(real.clone());
+        // Neither its problem nor its wait for usage: only what herdr says of the real agent.
+        assert_eq!(attention, Attention::NeedsYou);
+        assert_eq!(status, "its turn ended; nothing says what it's waiting on");
+        // The conversation really in the pane still speaks for its card.
+        let (attention, status) = on_card(AccountAgent {
+            problem: Some("Not saving its conversation".into()),
+            ..real
+        });
+        assert_eq!(attention, Attention::NeedsYou);
+        assert_eq!(status, "Not saving its conversation");
     }
 
     #[test]

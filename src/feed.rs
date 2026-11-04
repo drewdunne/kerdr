@@ -72,6 +72,26 @@ where
 }
 
 impl Feed {
+    /// The record of the agent in a pane: of the conversation herdr sees there, and none when no
+    /// record has it. Where herdr doesn't know the conversation yet, the newest record on the pane,
+    /// which is the first, since a feed lists `agents` newest first. A pane can hold records left
+    /// behind by agents that no longer run there, so the pane alone never decides.
+    pub fn agent_on_pane(
+        &self,
+        session: &str,
+        pane: &str,
+        conversation: Option<&str>,
+    ) -> Option<&crate::accounts::AccountAgent> {
+        let mut on_pane = self
+            .agents
+            .iter()
+            .filter(|a| a.pane == pane && a.session == session);
+        match conversation.filter(|c| !c.is_empty()) {
+            Some(conversation) => on_pane.find(|a| a.conversation == conversation),
+            None => on_pane.next(),
+        }
+    }
+
     /// The current account, when one is set.
     pub fn current_account(&self) -> Option<&crate::accounts::Current> {
         self.current.as_ref().and_then(Option::as_ref)
