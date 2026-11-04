@@ -924,6 +924,8 @@ fn jump_workspace(
     let j = workspace_jump(app, mi, session, id, label, tab, via);
     let outcome = run_jump(terminal, flags, app, mi, &j, client_config, bg);
     if let Some(l) = live.as_deref() {
+        // What herdr shows first, then the feed, as in read_again (intent 0491).
+        l.wake(mi);
         l.wake_feed(mi);
     }
     match &outcome {
@@ -1185,10 +1187,9 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
         let since = Instant::now();
         for &i in &machines {
             if i == mi {
-                // What herdr shows comes first and fast; the feed follows on its own (intent 0445).
-                if choosing_next {
-                    l.wake(i);
-                }
+                // What herdr shows comes first and fast, so the card you just answered stops
+                // saying it needs you; the feed follows on its own (intents 0445 and 0491).
+                l.wake(i);
                 l.wake_feed(i);
             } else {
                 l.wake(i);

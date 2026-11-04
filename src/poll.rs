@@ -3,7 +3,7 @@
 //! card feed. Failures move the machine through the connection states the board shows.
 
 use std::collections::BTreeMap;
-use std::sync::mpsc::{self, RecvTimeoutError, Sender};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -278,6 +278,32 @@ pub enum Wake {
     Stop,
 }
 
+/// What the wakes waiting ask of the reader, all taken at once: after every change that succeeds
+/// each machine gets a feed wake, and read one per read they'd queue into feed reads back to back
+/// (intent 0491).
+#[derive(Debug, Default, PartialEq)]
+struct Asked {
+    /// What herdr shows now, which takes tens of milliseconds.
+    now: bool,
+    /// The feed too, which takes seconds.
+    feed: bool,
+    stop: bool,
+}
+
+impl Asked {
+    fn gather(first: Wake, rest: &Receiver<Wake>) -> Asked {
+        let mut asked = Asked::default();
+        for wake in std::iter::once(first).chain(rest.try_iter()) {
+            match wake {
+                Wake::Now => asked.now = true,
+                Wake::Feed => asked.feed = true,
+                Wake::Stop => asked.stop = true,
+            }
+        }
+        asked
+    }
+}
+
 pub struct Poller {
     pub wake: Sender<Wake>,
 }
@@ -317,9 +343,15 @@ pub fn spawn(
         let mut first_failure: Option<DateTime<Local>> = None;
         let mut ever_live = false;
         let mut last_feed: Option<std::time::Instant> = None;
+        let mut fed_once = false;
+        // A wake that wants what herdr shows now: that first, with any feed owed straight after,
+        // rather than making it wait seconds behind the feed. Never a machine's first read, or
+        // an empty board would say there are no cards before its feed has come (intent 0491).
+        let mut quick_first = false;
         loop {
-            let feed_due = machine.feed.is_some()
+            let feed_owed = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
+            let feed_due = feed_owed && !quick_first;
             if feed_due {
                 inbox.reading_feed(index, reader);
             }
@@ -334,8 +366,14 @@ pub fn spawn(
                     // The inbox keeps this feed even if a newer read takes this one's place.
                     if feed_due {
                         last_feed = Some(Instant::now());
+                        fed_once = true;
                     }
-                    (Conn::Live { latency: out.took }, Some(data), timing.every)
+                    let wait = if feed_owed && !feed_due {
+                        Duration::ZERO
+                    } else {
+                        timing.every
+                    };
+                    (Conn::Live { latency: out.took }, Some(data), wait)
                 }
                 Err(Failure::Herdr(conn)) => (conn, None, RETRY_CAP),
                 Err(Failure::Ssh(problem)) => {
@@ -382,14 +420,18 @@ pub fn spawn(
                 started,
                 reader,
             );
-            match wake_rx.recv_timeout(wait) {
-                Ok(Wake::Feed) => {
-                    last_feed = None;
-                    continue;
-                }
-                Ok(Wake::Now) | Err(RecvTimeoutError::Timeout) => continue,
-                Ok(Wake::Stop) | Err(RecvTimeoutError::Disconnected) => return,
+            let asked = match wake_rx.recv_timeout(wait) {
+                Ok(first) => Asked::gather(first, &wake_rx),
+                Err(RecvTimeoutError::Timeout) => Asked::default(),
+                Err(RecvTimeoutError::Disconnected) => return,
+            };
+            if asked.stop {
+                return;
             }
+            if asked.feed {
+                last_feed = None;
+            }
+            quick_first = asked.now && fed_once;
         }
     });
     Poller { wake: wake_tx }
@@ -797,6 +839,99 @@ mod tests {
         assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
         inbox.reading_feed(0, 0);
         assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn wakes_waiting_are_taken_together() {
+        let (tx, rx) = mpsc::channel();
+        for wake in [Wake::Feed, Wake::Feed, Wake::Now] {
+            tx.send(wake).unwrap();
+        }
+        let first = rx.recv().unwrap();
+        let asked = Asked::gather(first, &rx);
+        assert_eq!(
+            asked,
+            Asked {
+                now: true,
+                feed: true,
+                stop: false
+            }
+        );
+        assert!(rx.try_recv().is_err(), "none left for the next read");
+        tx.send(Wake::Stop).unwrap();
+        tx.send(Wake::Feed).unwrap();
+        let first = rx.recv().unwrap();
+        assert!(Asked::gather(first, &rx).stop);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_wake_for_now_reads_without_the_feed_first_and_feed_wakes_make_one_feed_read() {
+        // Back from a card: what herdr shows comes in tens of milliseconds, and only then the
+        // feed, which takes seconds, however many changes asked for one (intent 0491).
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let bin = dir.path().join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  --version) echo read >>"{log}"; echo "herdr 0.9.1";;
+  "session list --json") echo '{{"sessions":[]}}';;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: bin.display().to_string(),
+            feed: Some(format!(
+                r#"echo feed >>"{}"; sleep 0.5; echo '{{"kerdr_feed":1}}'"#,
+                log.display()
+            )),
+            hidden: false,
+        };
+        let lines = || -> Vec<String> {
+            std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let until = |n: usize| {
+            let by = Instant::now() + Duration::from_secs(20);
+            while lines().len() < n && Instant::now() < by {
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let inbox = Arc::new(Inbox::default());
+        let timing = Timing {
+            every: Duration::from_secs(600),
+            feed_every: Duration::from_secs(3600),
+        };
+        let poller = spawn(0, machine, timing, inbox.clone(), 0);
+        // In the middle of its first read, which is always a feed read.
+        until(2);
+        assert_eq!(lines(), ["read", "feed"]);
+        for wake in [Wake::Now, Wake::Feed, Wake::Feed, Wake::Feed] {
+            poller.wake.send(wake).unwrap();
+        }
+        until(5);
+        thread::sleep(Duration::from_millis(800));
+        assert_eq!(lines(), ["read", "feed", "read", "read", "feed"]);
+        // On its own, a wake for now reads what herdr shows and owes nothing.
+        poller.wake.send(Wake::Now).unwrap();
+        until(6);
+        thread::sleep(Duration::from_millis(300));
+        assert_eq!(lines().len(), 6);
+        assert_eq!(lines()[5], "read");
+        let _ = poller.wake.send(Wake::Stop);
     }
 
     #[test]
