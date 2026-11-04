@@ -157,6 +157,14 @@ pub fn choose_via(machine: &Machine, server: Option<&str>, here: Option<&str>) -
     if server < here { Via::Ssh } else { Via::Remote }
 }
 
+/// Whether a session can be reached by a held connection: another machine, whose herdr is the very
+/// same version as this one's. Anything else goes through `herdr --remote` or SSH, which handle a
+/// difference between them.
+pub fn same_herdr(machine: &Machine, server: Option<&str>, here: Option<&str>) -> bool {
+    choose_via(machine, server, here) == Via::Remote
+        && server.and_then(herdr::parse_version) == here.and_then(herdr::parse_version)
+}
+
 /// The herdr config a window run over SSH uses there: that machine's own, with the sidebar
 /// hidden. Written into its cache, so Kerdr needs nothing installed there.
 const REMOTE_CLIENT_CONFIG: &str = r#"C="${HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}"
@@ -421,105 +429,63 @@ pub fn enter(terminal: &mut DefaultTerminal, flags: &TerminalFlags) {
     drop_pending_keys();
 }
 
-pub fn run(
-    terminal: &mut DefaultTerminal,
-    flags: &TerminalFlags,
+/// How herdr's window reaches a session through a connection Kerdr holds: this machine's herdr
+/// client, connected to the session's forwarded socket, as `herdr --remote` runs it behind its own
+/// bridge.
+fn held_client(host: &str, session: &str, socket: &Path) -> Command {
+    let mut c = Command::new("herdr");
+    c.arg("client")
+        .env("HERDR_CLIENT_SOCKET_PATH", socket)
+        .env("HERDR_REMOTE_KEYBINDINGS", "server")
+        .env(
+            "HERDR_REATTACH_COMMAND",
+            format!("herdr --remote {host} --session {session}"),
+        );
+    c
+}
+
+/// A window that closed with an error this soon never really opened: a held connection that had
+/// just gone, say. Going in the usual way is what to try before saying anything.
+const FAILED_AT_ONCE: Duration = Duration::from_secs(3);
+
+/// How a herdr window ended.
+struct Attached {
+    status: Option<std::process::ExitStatus>,
+    request: Option<Request>,
+    took: Duration,
+}
+
+impl Attached {
+    fn failed_at_once(&self) -> bool {
+        self.request.is_none()
+            && self.took < FAILED_AT_ONCE
+            && self.status.is_some_and(|s| !s.success())
+    }
+}
+
+/// While you're in herdr: every this often, `tick` lets the board keep up.
+const TICK_EVERY: Duration = Duration::from_secs(1);
+
+/// Runs one herdr window until it closes, watching for Kerdr's keys.
+fn attach(
+    cmd: &mut Command,
+    t: &Target,
     jump: &Jump,
-    client_config: &Path,
-) -> Outcome {
-    let t = target(&jump.machine);
-    let herdr_bin = jump.machine.herdr.clone();
-
-    // A newly attached herdr window opens on the session's focused workspace, on its active tab.
-    let focused = focus(&t, jump, |args| {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
-    });
-    if let Some(outcome) = focused {
-        // Keys pressed while herdr didn't answer (another ⏎) mustn't start a second try before
-        // the reason is read.
-        drop_pending_keys();
-        return outcome;
-    }
-
-    let session_args: Vec<&str> = if jump.session == "default" {
-        vec![]
-    } else {
-        vec!["--session", &jump.session]
-    };
-    let mut cmd = match (&jump.machine.ssh, jump.via) {
-        (Some(host), Via::Ssh) => {
-            let out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
-            if !out.ok() {
-                drop_pending_keys();
-                return Outcome::Failed(format!(
-                    "Couldn't prepare herdr's window on {}: {}",
-                    jump.machine.name,
-                    first_line(&out)
-                ));
-            }
-            let words: Vec<String> = session_args.iter().map(|a| transport::quote(a)).collect();
-            let script = format!(
-                "{}; unset {}; HERDR_CONFIG_PATH=\"${{XDG_CACHE_HOME:-$HOME/.cache}}/kerdr/herdr-client.toml\" KERDR=1 exec {} {}",
-                transport::PATH_PREFIX,
-                HERDR_VARS.join(" "),
-                transport::herdr_word(&herdr_bin),
-                words.join(" ")
-            );
-            let mut c = Command::new("ssh");
-            c.args(transport::ssh_args().iter().filter(|a| *a != "-T"))
-                .arg("-t")
-                .arg("--")
-                .arg(host)
-                .arg(format!("sh -c {}", transport::quote(&script)));
-            c
-        }
-        (Some(host), _) => {
-            let mut c = Command::new("herdr");
-            c.args(["--remote", host, "--remote-keybindings", "server"]);
-            c.args(&session_args);
-            c
-        }
-        (None, _) => {
-            let mut c = Command::new(expand_home(&herdr_bin));
-            c.args(&session_args);
-            c
-        }
-    };
-    for var in HERDR_VARS {
-        cmd.env_remove(var);
-    }
-    if !client_config.as_os_str().is_empty() {
-        cmd.env("HERDR_CONFIG_PATH", client_config);
-    }
-    cmd.env("KERDR", "1");
-
+    tick: &mut dyn FnMut(),
+) -> std::io::Result<Attached> {
+    let begun = std::time::Instant::now();
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let ctrl_c = CtrlCToHerdr::new();
-    drop_pending_keys();
-    leave(flags);
-    let tty = TtyModes::capture();
-    #[cfg(windows)]
-    let console_modes = crate::windows::ConsoleModes::capture();
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(e) => {
-            #[cfg(windows)]
-            drop(console_modes);
-            enter(terminal, flags);
-            return Outcome::Failed(format!("Couldn't start herdr: {e}"));
-        }
-    };
+    let mut child = cmd.spawn()?;
 
     // Watch for Kerdr's keys: a kerdr_jump token on any of the session's workspaces.
     let stop = Arc::new(AtomicBool::new(false));
     let request: Arc<Mutex<Option<Request>>> = Arc::new(Mutex::new(None));
     {
         let (stop, request) = (stop.clone(), request.clone());
-        let (t, herdr_bin, session) = (t.clone(), herdr_bin.clone(), jump.session.clone());
+        let (t, herdr_bin, session) = (t.clone(), jump.machine.herdr.clone(), jump.session.clone());
         let body = if jump.keys && jump.others > 0 {
             format!(
                 "{p} q: back to the board · {p} space: next that needs you ({n} more)",
@@ -595,6 +561,7 @@ pub fn run(
         });
     }
     let mut asked_to_close = false;
+    let mut ticked = std::time::Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -603,16 +570,156 @@ pub fn run(
                     close_client(&mut child);
                     asked_to_close = true;
                 }
+                if ticked.elapsed() >= TICK_EVERY {
+                    tick();
+                    ticked = std::time::Instant::now();
+                }
                 thread::sleep(Duration::from_millis(30));
             }
             Err(_) => break None,
         }
     };
     stop.store(true, Ordering::Relaxed);
+    let request = *request.lock().unwrap();
+    Ok(Attached {
+        status,
+        request,
+        took: begun.elapsed(),
+    })
+}
+
+/// Goes into herdr on the card's workspace. `held` is the socket of a connection Kerdr holds for
+/// this session, when it has one; `tick` runs now and then while you're in there. `opened` says
+/// whether a window really opened, whatever way it ended.
+#[allow(clippy::too_many_arguments)]
+pub fn run(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    jump: &Jump,
+    client_config: &Path,
+    held: Option<&crate::hold::HeldWay>,
+    tick: &mut dyn FnMut(),
+    opened: &mut bool,
+) -> Outcome {
+    let t = target(&jump.machine);
+    let herdr_bin = jump.machine.herdr.clone();
+
+    // A newly attached herdr window opens on the session's focused workspace, on its active tab.
+    let focused = focus(&t, jump, |args| {
+        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
+    });
+    if let Some(outcome) = focused {
+        // Keys pressed while herdr didn't answer (another ⏎) mustn't start a second try before
+        // the reason is read.
+        drop_pending_keys();
+        return outcome;
+    }
+
+    let session_args: Vec<&str> = if jump.session == "default" {
+        vec![]
+    } else {
+        vec!["--session", &jump.session]
+    };
+    let mut cmd = match (&jump.machine.ssh, jump.via) {
+        (Some(host), Via::Ssh) => {
+            let out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
+            if !out.ok() {
+                drop_pending_keys();
+                return Outcome::Failed(format!(
+                    "Couldn't prepare herdr's window on {}: {}",
+                    jump.machine.name,
+                    first_line(&out)
+                ));
+            }
+            let words: Vec<String> = session_args.iter().map(|a| transport::quote(a)).collect();
+            let script = format!(
+                "{}; unset {}; HERDR_CONFIG_PATH=\"${{XDG_CACHE_HOME:-$HOME/.cache}}/kerdr/herdr-client.toml\" KERDR=1 exec {} {}",
+                transport::PATH_PREFIX,
+                HERDR_VARS.join(" "),
+                transport::herdr_word(&herdr_bin),
+                words.join(" ")
+            );
+            let mut c = Command::new("ssh");
+            c.args(transport::ssh_args().iter().filter(|a| *a != "-T"))
+                .arg("-t")
+                .arg("--")
+                .arg(host)
+                .arg(format!("sh -c {}", transport::quote(&script)));
+            c
+        }
+        (Some(host), _) => {
+            let mut c = Command::new("herdr");
+            c.args(["--remote", host, "--remote-keybindings", "server"]);
+            c.args(&session_args);
+            c
+        }
+        (None, _) => {
+            let mut c = Command::new(expand_home(&herdr_bin));
+            c.args(&session_args);
+            c
+        }
+    };
+    for var in HERDR_VARS {
+        cmd.env_remove(var);
+    }
+    if !client_config.as_os_str().is_empty() {
+        cmd.env("HERDR_CONFIG_PATH", client_config);
+    }
+    cmd.env("KERDR", "1");
+
+    // A held connection first, if its machine answers through it; when that window never really
+    // opens, the usual way.
+    let held = held.filter(|h| h.answers(crate::hold::ANSWER_WITHIN));
+    let mut through_held = match (&jump.machine.ssh, jump.via, held) {
+        (Some(host), Via::Remote, Some(way)) => {
+            let mut c = held_client(host, &jump.session, &way.socket);
+            for var in HERDR_VARS {
+                c.env_remove(var);
+            }
+            if !client_config.as_os_str().is_empty() {
+                c.env("HERDR_CONFIG_PATH", client_config);
+            }
+            c.env("KERDR", "1");
+            Some(c)
+        }
+        _ => None,
+    };
+    let ctrl_c = CtrlCToHerdr::new();
+    drop_pending_keys();
+    leave(flags);
+    let tty = TtyModes::capture();
+    #[cfg(windows)]
+    let console_modes = crate::windows::ConsoleModes::capture();
+    let first = through_held
+        .as_mut()
+        .and_then(|c| attach(c, &t, jump, tick).ok())
+        .filter(|a| !a.failed_at_once());
+    tty.restore();
+    let attached = match first {
+        Some(a) => a,
+        None => {
+            if through_held.is_some() {
+                // A client stopped short may have left its modes on, which aren't line settings.
+                leave(flags);
+                let _ = execute!(stdout(), DisableFocusChange);
+            }
+            match attach(&mut cmd, &t, jump, tick) {
+                Ok(a) => a,
+                Err(e) => {
+                    #[cfg(windows)]
+                    drop(console_modes);
+                    enter(terminal, flags);
+                    return Outcome::Failed(format!("Couldn't start herdr: {e}"));
+                }
+            }
+        }
+    };
     #[cfg(windows)]
     drop(console_modes);
     tty.restore();
-    let result = *request.lock().unwrap();
+    *opened = !attached.failed_at_once();
+    let (status, result) = (attached.status, attached.request);
     // herdr's own words on why its window closed (SSH failing, an update under way, versions
     // that don't match) are on the plain screen: they stay there until you've read them, since
     // the board would cover them (intent 0411).
@@ -757,6 +864,55 @@ mod tests {
             feed: None,
             hidden: false,
         }
+    }
+
+    #[test]
+    fn a_held_connection_needs_the_same_herdr_at_both_ends_on_another_machine() {
+        let remote = machine(Some("server"));
+        assert!(same_herdr(&remote, Some("0.9.1"), Some("0.9.1")));
+        assert!(!same_herdr(&remote, Some("0.9.1"), Some("0.9.3")));
+        assert!(!same_herdr(&remote, Some("0.9.3"), Some("0.9.1")));
+        assert!(!same_herdr(&remote, None, Some("0.9.1")));
+        assert!(!same_herdr(&machine(None), Some("0.9.1"), Some("0.9.1")));
+    }
+
+    #[test]
+    fn a_held_window_is_herdrs_client_on_the_forwarded_socket() {
+        let c = held_client("server", "ARK", Path::new("/run/h1-2.sock"));
+        assert_eq!(c.get_program(), "herdr");
+        assert_eq!(c.get_args().collect::<Vec<_>>(), ["client"]);
+        let envs: Vec<_> = c
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_str().unwrap().to_string(),
+                    v.unwrap().to_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        assert!(envs.contains(&("HERDR_CLIENT_SOCKET_PATH".into(), "/run/h1-2.sock".into())));
+        assert!(envs.contains(&("HERDR_REMOTE_KEYBINDINGS".into(), "server".into())));
+        assert!(envs.contains(&(
+            "HERDR_REATTACH_COMMAND".into(),
+            "herdr --remote server --session ARK".into()
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn only_a_quick_failure_goes_in_the_usual_way_instead() {
+        use std::os::unix::process::ExitStatusExt;
+        let failed = std::process::ExitStatus::from_raw(1 << 8);
+        let clean = std::process::ExitStatus::from_raw(0);
+        let ended = |status, request, secs| Attached {
+            status: Some(status),
+            request,
+            took: Duration::from_secs(secs),
+        };
+        assert!(ended(failed, None, 0).failed_at_once());
+        assert!(!ended(clean, None, 0).failed_at_once(), "prefix q");
+        assert!(!ended(failed, None, 3).failed_at_once(), "it was open");
+        assert!(!ended(failed, Some(Request::Board), 0).failed_at_once());
     }
 
     #[test]

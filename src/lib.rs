@@ -12,6 +12,7 @@ pub mod family;
 pub mod feed;
 pub mod herdr;
 pub mod herdr_keys;
+pub mod hold;
 pub mod images;
 pub mod jump;
 pub mod model;

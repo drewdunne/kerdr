@@ -793,6 +793,7 @@ mod tests {
                 name: session.into(),
                 running: true,
                 default: false,
+                socket_path: None,
             }],
             snapshots: [(session.to_string(), Ok(snap))].into_iter().collect(),
             keys: true,

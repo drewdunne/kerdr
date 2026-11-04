@@ -51,6 +51,30 @@ assert card["why"] == "live check", card
 PY
 herdr --session "$S" workspace list | grep -q '"kerdr_jump":"next:1"' || fail "workspace tokens aren't listed"
 
+# What a held connection counts on (src/hold.rs), which a change in herdr would quietly turn back into
+# the slow way in: the client socket's name beside the API socket's, and `herdr client` drawing on it.
+A=$(herdr session list --json | tr '{' '\n' | grep "\"name\":\"$S\"" | sed -n 's/.*"socket_path":"\([^"]*\)".*/\1/p')
+[ -n "$A" ] || fail "herdr's session list doesn't give the socket's path"
+C="${A%.sock}-client.sock"
+[ -S "$C" ] || fail "no client socket at $C"
+HERDR_CLIENT_SOCKET_PATH="$C" HERDR_REMOTE_KEYBINDINGS=server python3 - <<'PY' || fail "herdr client didn't draw on the client socket"
+import os, pty, select, signal, struct, fcntl, termios, time
+pid, fd = pty.fork()
+if pid == 0:
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp("herdr", ["herdr", "client"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 100, 0, 0))
+seen, end = 0, time.time() + 8
+while seen < 1500 and time.time() < end:
+    if select.select([fd], [], [], 0.1)[0]:
+        try:
+            seen += len(os.read(fd, 65536))
+        except OSError:
+            break
+os.kill(pid, signal.SIGTERM)
+raise SystemExit(0 if seen >= 1500 else 1)
+PY
+
 # Enter on a card whose work runs in a tab focuses that tab after its workspace: herdr's answer
 # names the tab's workspace, and a tab that has closed answers tab_not_found.
 T=$(herdr --session "$S" tab create --workspace "$W" --label child --no-focus |

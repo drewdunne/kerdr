@@ -1181,6 +1181,7 @@ mod tests {
                     name: n.to_string(),
                     running: true,
                     default: false,
+                    socket_path: None,
                 })
                 .collect(),
             snapshots: sessions

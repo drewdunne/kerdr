@@ -1,5 +1,6 @@
 //! The running board: draws, reads keys, and listens to every machine's reader.
 
+use std::cell::RefCell;
 use std::io::stdout;
 use std::path::PathBuf;
 use std::process::Command;
@@ -16,6 +17,7 @@ use ratatui::crossterm::terminal::supports_keyboard_enhancement;
 use crate::app::{Action, App, Selection, Tone};
 use crate::config::Machine;
 use crate::herdr_keys;
+use crate::hold::{Holds, Place, Spot};
 use crate::jump::{self, Jump, Outcome, TerminalFlags};
 use crate::poll::{self, Conn, Inbox, Poller, Timing, Wake};
 use crate::state::State;
@@ -155,10 +157,17 @@ fn event_loop(
         let _ = feeds.send(ToRunner::Feed { machine, intakes });
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
+    let holds = RefCell::new(if live.is_some() && !app.demo {
+        Holds::on()
+    } else {
+        Holds::off()
+    });
     let bg = Bg {
         images: &image_rx,
         answers: &action_tx,
         runner: &runner,
+        inbox,
+        holds: &holds,
     };
     // When q last said what still runs: a second q soon after quits (intent 0445).
     let mut quit_asked: Option<Instant> = None;
@@ -273,6 +282,7 @@ fn event_loop(
         for ev in inbox.take() {
             app.apply(ev);
         }
+        holds.borrow_mut().sync(app);
         if let Some(key) = app.pending_jump_ready() {
             jump_cards(
                 terminal,
@@ -703,6 +713,8 @@ struct Bg<'a> {
     images: &'a mpsc::Receiver<(u64, crate::images::Loading)>,
     answers: &'a mpsc::Sender<Answer>,
     runner: &'a Runner,
+    inbox: &'a Inbox,
+    holds: &'a RefCell<Holds>,
 }
 
 /// The longest a jump into herdr waits for the image a sent new intent waits for: a clipboard read
@@ -909,7 +921,7 @@ fn jump_workspace(
     app.went_into_workspace(mi, &session, &id);
     let via = via_for(app, mi, &session);
     let j = workspace_jump(app, mi, session, id, label, tab, via);
-    let outcome = run_jump(terminal, flags, app, &j, client_config, bg);
+    let outcome = run_jump(terminal, flags, app, mi, &j, client_config, bg);
     if let Some(l) = live.as_deref() {
         l.wake_feed(mi);
     }
@@ -957,6 +969,7 @@ fn run_jump(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
     app: &mut App,
+    mi: usize,
     j: &Jump,
     client_config: Option<&PathBuf>,
     bg: &Bg,
@@ -971,6 +984,25 @@ fn run_jump(
     app.away += 1;
     app.say(opening.clone(), Tone::Info);
     let _ = terminal.draw(|f| crate::ui::draw(f, app));
+    let held = bg.holds.borrow_mut().entering(
+        app,
+        Spot {
+            place: Place {
+                machine: mi,
+                session: j.session.clone(),
+            },
+            workspace: j.workspace.clone(),
+        },
+    );
+    // While you're in there the board keeps up, unseen, so what's held follows what waits on you
+    // and the minute after you left another session still ends on time.
+    let mut keep_up = || {
+        for ev in bg.inbox.take() {
+            app.apply(ev);
+        }
+        bg.holds.borrow_mut().sync(app);
+    };
+    let mut opened = false;
     let outcome = jump::run(
         terminal,
         flags,
@@ -978,7 +1010,11 @@ fn run_jump(
         client_config
             .map(|p| p.as_path())
             .unwrap_or(std::path::Path::new("")),
+        held.as_ref(),
+        &mut keep_up,
+        &mut opened,
     );
+    bg.holds.borrow_mut().left(app, opened);
     app.unsay(&opening);
     outcome
 }
@@ -1073,7 +1109,7 @@ fn jump_cards(
             prefix: app.prefix.clone(),
             keys: keys_on(app, mi),
         };
-        let outcome = run_jump(terminal, flags, app, &j, client_config, bg);
+        let outcome = run_jump(terminal, flags, app, mi, &j, client_config, bg);
         // The next card is chosen only on ctrl+space space, or when one Kerdr picked has gone.
         let choosing_next = matches!(outcome, Outcome::Next)
             || (!yours && matches!(outcome, Outcome::Closed | Outcome::Stopped));
@@ -1408,10 +1444,14 @@ mod tests {
         let (answers, rx) = mpsc::channel();
         let runner = Runner::spawn(answers.clone());
         let (image_tx, image_rx) = mpsc::channel();
+        let inbox = Inbox::default();
+        let holds = RefCell::new(Holds::off());
         let bg = Bg {
             images: &image_rx,
             answers: &answers,
             runner: &runner,
+            inbox: &inbox,
+            holds: &holds,
         };
         app.image_load = Some(7);
         app.send_after_load = Some((
