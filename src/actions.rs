@@ -2,7 +2,7 @@
 
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::Machine;
@@ -11,7 +11,7 @@ use crate::transport::{self, Target};
 const MAX_JSON_BYTES: usize = 64 * 1024;
 
 /// One of your open questions on background work, for the Kickoff Questions box (intent 0409).
-#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Question {
     pub num: String,
     pub question: String,

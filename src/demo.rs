@@ -163,6 +163,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         keys: true,
         feed: None,
         feed_failed_after: None,
+        kept_snapshots: Default::default(),
     });
 
     // The build box: the API and the background lane.
@@ -226,6 +227,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         keys: true,
         feed: None,
         feed_failed_after: None,
+        kept_snapshots: Default::default(),
     });
 
     gpu.conn = Conn::HostKey {

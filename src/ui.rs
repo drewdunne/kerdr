@@ -1,6 +1,8 @@
 //! Drawing every screen: the board, and over or instead of it the peek, search, keys menu,
 //! machines and backlog. Layout follows the design canvas.
 
+use std::time::Instant;
+
 use ratatui::Frame;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -65,11 +67,17 @@ fn failure(f: &mut Frame, area: Rect, app: &App) {
         lines.extend(wrapped(line, inner, fg(FG), Some(("✗ ", RED))));
     }
     let more = all.len().saturating_sub(crate::app::FAIL_PAGE);
+    // Only once a key can: until then a key on its way mustn't take it down, and nothing should
+    // promise otherwise (intent 0491).
+    let closes = !matches!(&app.message, Some((_, _, at)) if at.elapsed() < crate::app::FAIL_SEEN);
     lines.push(Line::from(Span::styled(
-        if more > 0 {
-            format!("The board shows them as they really are. Any key shows {more} more.")
-        } else {
-            "The board shows it as it really is. Any key closes this.".to_string()
+        match (more > 0, closes) {
+            (true, true) => {
+                format!("The board shows them as they really are. Any key shows {more} more.")
+            }
+            (true, false) => "The board shows them as they really are.".to_string(),
+            (false, true) => "The board shows it as it really is. Any key closes this.".to_string(),
+            (false, false) => "The board shows it as it really is.".to_string(),
         },
         fg(DIM),
     )));
@@ -172,11 +180,20 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             back,
             request,
             queue,
+            ready_at,
             ..
         } => {
             draw_mode(f, area, app, back);
             dim_behind(f);
-            confirm(f, area, title, message, request["action"].as_str(), *queue);
+            confirm(
+                f,
+                area,
+                title,
+                message,
+                request["action"].as_str(),
+                *queue,
+                ready_at.is_some_and(|at| Instant::now() < at),
+            );
         }
         Mode::Kickoff { form, back, .. } => {
             draw_mode(f, area, app, back);
@@ -256,13 +273,24 @@ fn fit(spans: Vec<Span<'static>>, max: usize) -> Vec<Span<'static>> {
 }
 
 fn key_hints(hints: &[(&str, &str)]) -> Vec<Span<'static>> {
+    key_hints_held(hints, &[])
+}
+
+/// The same, with the keys in `held` drawn faint: a guard won't let them answer yet, so a key
+/// pressed now is seen to do nothing, rather than looking like a hang (intent 0491).
+fn key_hints_held(hints: &[(&str, &str)], held: &[&str]) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
     for (i, (k, what)) in hints.iter().enumerate() {
         if i > 0 {
             spans.push(Span::raw("   "));
         }
-        spans.push(Span::styled(k.to_string(), bold(FG)));
-        spans.push(Span::styled(format!(" {what}"), fg(DIM)));
+        if held.contains(k) {
+            spans.push(Span::styled(k.to_string(), fg(FAINT)));
+            spans.push(Span::styled(format!(" {what}"), fg(FAINT)));
+        } else {
+            spans.push(Span::styled(k.to_string(), bold(FG)));
+            spans.push(Span::styled(format!(" {what}"), fg(DIM)));
+        }
     }
     spans
 }
@@ -502,6 +530,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let banner = banner(app);
     let pending = pending_line(app);
     let message = app.message();
+    // What was said takes the line first; this lasts as long as the ⏎ does (intent 0491).
+    let remembered = remembered_line(app);
     let filter_line = filtered(app);
     let accounts = app
         .machines
@@ -512,7 +542,9 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(u16::from(banner.is_some())),
         Constraint::Length(if accounts { 1 } else { 3 }),
         Constraint::Min(4),
-        Constraint::Length(u16::from(pending.is_some() || message.is_some())),
+        Constraint::Length(u16::from(
+            pending.is_some() || message.is_some() || remembered.is_some(),
+        )),
         Constraint::Length(1),
     ])
     .split(inner);
@@ -602,6 +634,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             rows[4].width,
             vec![Span::styled(text.to_string(), fg(color))],
         );
+    } else if let Some(line) = remembered {
+        put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
     }
     let backlog_hints = card_hints(app);
     let card_moves = matches!(app.mode, Mode::Board)
@@ -1082,6 +1116,20 @@ fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
         Span::styled(format!("is on {}, which is {conn}. ", card.machine), fg(FG)),
         Span::styled(
             "Kerdr jumps in when it answers · esc stops waiting",
+            fg(DIM),
+        ),
+    ])
+}
+
+/// What a remembered ⏎ on a starting card says for as long as it lasts: messages go after 8 s, and a
+/// start can run for minutes before herdr takes the screen (intent 0491).
+fn remembered_line(app: &App) -> Option<Vec<Span<'static>>> {
+    let card = app.card(app.enter_when_open.as_deref()?)?;
+    Some(vec![
+        Span::styled(format!("{} ", card.reference), bold(CYAN)),
+        Span::styled("is starting. ", fg(FG)),
+        Span::styled(
+            "Kerdr goes in when its workspace opens · esc stops waiting",
             fg(DIM),
         ),
     ])
@@ -2681,6 +2729,7 @@ fn confirm(
     message: &str,
     action: Option<&str>,
     queue: bool,
+    too_soon: bool,
 ) {
     let rect = centered(area, 86, 16, None);
     dialog(f, rect, YELLOW);
@@ -2709,7 +2758,7 @@ fn confirm(
         inner.bottom().saturating_sub(1),
         inner.width,
         fit(
-            key_hints(
+            key_hints_held(
                 &[
                     (
                         "Enter / y",
@@ -2735,6 +2784,7 @@ fn confirm(
                     .filter(|(k, _)| queue || *k != "w")
                     .copied()
                     .collect::<Vec<_>>(),
+                if too_soon { &["Enter / y", "w"] } else { &[] },
             ),
             w,
         ),
@@ -2904,13 +2954,18 @@ fn kickoff(f: &mut Frame, area: Rect, form: &Kickoff) {
             "leave it for later"
         },
     ));
+    let too_soon: &[&str] = if Instant::now() < form.ready_at {
+        &["⏎"]
+    } else {
+        &[]
+    };
     let buf = f.buffer_mut();
     put(
         buf,
         inner.x,
         inner.bottom().saturating_sub(2),
         inner.width,
-        fit(key_hints(&first), w),
+        fit(key_hints_held(&first, too_soon), w),
     );
     put(
         buf,
@@ -5041,6 +5096,25 @@ mod tests {
         assert!(!text.contains("leaves this one as it was"));
     }
 
+    #[test]
+    fn a_remembered_enter_keeps_saying_so_after_the_words_have_gone() {
+        // Messages go after 8 s, and herdr can take the screen minutes later (intent 0491).
+        let mut a = crate::app::tests::demo_app();
+        let key = a.board.cards[0].key.clone();
+        let reference = a.board.cards[0].reference.clone();
+        let line = "Kerdr goes in when its workspace opens";
+        assert!(!rendered(&a, 160, 40).contains(line));
+        a.enter_when_open = Some(key);
+        let screen = rendered(&a, 160, 40);
+        assert!(screen.contains(line), "{screen}");
+        assert!(screen.contains(&reference), "{screen}");
+        // Anything said meanwhile comes first.
+        a.say("Something else", Tone::Info);
+        let screen = rendered(&a, 160, 40);
+        assert!(screen.contains("Something else"), "{screen}");
+        assert!(!screen.contains(line), "{screen}");
+    }
+
     fn rendered(a: &App, w: u16, h: u16) -> String {
         let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
         t.draw(|f| draw(f, a)).unwrap();
@@ -5574,6 +5648,91 @@ mod tests {
             &[],
         )
         .unwrap()
+    }
+
+    /// The colour `text` is drawn in, wherever it first shows on the screen.
+    fn colour_of(a: &App, w: u16, h: u16, text: &str) -> ratatui::style::Color {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, a)).unwrap();
+        let buf = t.backend().buffer();
+        let cells: Vec<&str> = buf.content.iter().map(|c| c.symbol()).collect();
+        let needle: Vec<String> = text.chars().map(|c| c.to_string()).collect();
+        let at = cells
+            .windows(needle.len())
+            .position(|run| run.iter().zip(&needle).all(|(a, b)| *a == b))
+            .unwrap_or_else(|| panic!("{text} isn't on screen"));
+        buf.content[at].fg
+    }
+
+    #[test]
+    fn a_questions_keys_are_faint_until_they_can_answer_it() {
+        // A guard that swallows a key looks like a hang unless it shows (intent 0491).
+        use std::time::Duration;
+        let mut a = App::new(Config::default(), crate::demo::machines(false));
+        a.mode = Mode::Confirm {
+            machine: 0,
+            request: serde_json::json!({"action": "reopen", "id": "1"}),
+            title: "Reopen #1 in web?".into(),
+            message: "It's done.".into(),
+            back: Box::new(Mode::Board),
+            target: None,
+            queue: true,
+            ready_at: Some(Instant::now() + Duration::from_secs(60)),
+            plain: false,
+        };
+        assert_eq!(colour_of(&a, 120, 40, "Enter / y"), FAINT);
+        assert_eq!(colour_of(&a, 120, 40, "w queue"), FAINT);
+        // What never needs the guard reads as usual meanwhile.
+        assert_eq!(colour_of(&a, 120, 40, "Esc / n"), FG);
+        if let Mode::Confirm { ready_at, .. } = &mut a.mode {
+            *ready_at = Some(Instant::now());
+        }
+        assert_eq!(colour_of(&a, 120, 40, "Enter / y"), FG);
+        assert_eq!(colour_of(&a, 120, 40, "w queue"), FG);
+    }
+
+    #[test]
+    fn a_kickoff_questions_enter_is_faint_until_it_can_take_it() {
+        use std::time::Duration;
+        let mut a = App::new(Config::default(), crate::demo::machines(false));
+        let mut form = kickoff_form();
+        form.ready_at = Instant::now() + Duration::from_secs(60);
+        a.mode = Mode::Kickoff {
+            form: form.clone(),
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        assert_eq!(colour_of(&a, 120, 50, "⏎ take"), FAINT);
+        assert_eq!(colour_of(&a, 120, 50, "esc leave"), FG);
+        form.ready_at = Instant::now();
+        a.mode = Mode::Kickoff {
+            form,
+            back: Box::new(Mode::Board),
+            target: None,
+        };
+        assert_eq!(colour_of(&a, 120, 50, "⏎ take"), FG);
+    }
+
+    #[test]
+    fn a_failure_box_says_a_key_closes_it_only_once_one_can() {
+        let mut a = App::new(Config::default(), crate::demo::machines(false));
+        a.fail("It didn't work.");
+        let early = rendered(&a, 120, 40);
+        assert!(early.contains("as it really is"), "{early}");
+        assert!(!early.contains("Any key"), "{early}");
+        let back = |a: &mut App| {
+            if let Some((_, _, at)) = &mut a.message {
+                *at -= crate::app::FAIL_SEEN;
+            }
+        };
+        back(&mut a);
+        assert!(rendered(&a, 120, 40).contains("Any key closes this."));
+        // With more behind it, the same.
+        a.message = None;
+        a.fail("One\nTwo\nThree\nFour");
+        assert!(!rendered(&a, 120, 40).contains("Any key"));
+        back(&mut a);
+        assert!(rendered(&a, 120, 40).contains("Any key shows 1 more."));
     }
 
     #[test]

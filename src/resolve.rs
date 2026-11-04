@@ -222,6 +222,9 @@ impl Effect {
             Effect::Text(text) => {
                 fc.words = Some(text.clone());
                 fc.intake = Some("pending".into());
+                // What the feed read ahead is the text this replaces.
+                fc.item_text = None;
+                fc.item_was = None;
             }
         }
     }
@@ -313,6 +316,11 @@ pub struct Job {
     /// A start waiting for its write-up that Esc dropped: gone once the runner says it never
     /// started, or shown again if it already had (review of intent 0445).
     pub dropping: bool,
+    /// A start or reopen that can only come back as a question, or wait in a queue: nothing has
+    /// started, so it shows nothing on its card and says so in words (intent 0491).
+    pub asking: bool,
+    /// What a second key last said about it while it asks, which its answer takes down.
+    pub said: Option<String>,
 }
 
 impl Job {
@@ -331,8 +339,8 @@ impl Job {
         self.request["action"] == "move"
     }
 
-    /// Whether it only reads: `edit` without a text, for the editor `e` opens (intent 0414). It
-    /// waits for the changes to its record made before it, but it isn't a change: nothing waits
+    /// Whether it only reads: `edit` without a text, for the editor `e` opens (intent 0414), or
+    /// `kickoff`, checking a box already open (intent 0491). It waits for the changes to its record made before it, but it isn't a change: nothing waits
     /// for it, and q neither waits for it nor counts it as running.
     pub fn reads(&self) -> bool {
         reads(&self.request)
@@ -384,9 +392,10 @@ pub struct Queue {
     rewritten: Vec<(Queued, u8)>,
 }
 
-/// Whether a request only reads: `edit` without a text (intent 0414).
+/// Whether a request only reads: `edit` without a text (intent 0414), or the check behind a Kickoff
+/// Questions box already open (intent 0491).
 fn reads(request: &Value) -> bool {
-    request["action"] == "edit" && request.get("text").is_none()
+    request["action"] == "kickoff" || (request["action"] == "edit" && request.get("text").is_none())
 }
 
 #[derive(Debug)]
@@ -584,8 +593,24 @@ impl Resolver {
             entered: false,
             handed: false,
             dropping: false,
+            asking: false,
+            said: None,
         });
         self.next
+    }
+
+    /// This change shows nothing on its card because nothing has started (Job::asking).
+    pub fn mark_asking(&mut self, n: u64) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.n == n) {
+            job.asking = true;
+        }
+    }
+
+    /// Notes what a key has just said about this job, for its answer to take down.
+    pub fn note_said(&mut self, n: u64, line: String) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.n == n) {
+            job.said = Some(line);
+        }
     }
 
     /// Takes a start d asked for while its intent is still being written up: it shows nothing,

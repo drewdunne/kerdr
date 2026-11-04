@@ -750,6 +750,9 @@ impl App {
         } else if request["action"] == "dispatch" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Starting {}…", self.reference_for(id))
+        } else if request["action"] == "kickoff" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Checking {}'s questions…", self.reference_for(id))
         } else if request["action"] == "cancel" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Cancelling {}: stopping its agent…", self.reference_for(id))
@@ -925,6 +928,10 @@ impl App {
             };
             Action::None
         } else {
+            // Its questions are read ahead: the box opens now, and the start waits for his answers.
+            if let Some(check) = self.open_preloaded_kickoff(&card, machine, &request) {
+                return check;
+            }
             self.action_from = Some(CardSnapshot::of(&card));
             Action::Mutate { machine, request }
         }
@@ -1728,7 +1735,12 @@ impl App {
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         let shows = effect.is_some();
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
+        let asking = (!shows).then(|| self.asking_line(&request)).flatten();
         let n = self.resolver.add(machine, request, from, key, effect);
+        if let Some(line) = asking {
+            self.resolver.mark_asking(n);
+            self.say(line, Tone::Info);
+        }
         if starts {
             self.note_workspaces(n, machine);
         }
@@ -1794,12 +1806,65 @@ impl App {
         }
     }
 
+    /// What a start or reopen that shows nothing on its card says instead until it's answered.
+    fn asking_line(&self, request: &Value) -> Option<String> {
+        if !matches!(request["action"].as_str(), Some("dispatch" | "reopen")) {
+            return None;
+        }
+        let reference = self.reference_for(request["id"].as_str()?);
+        Some(if request["queue"] == true {
+            format!("Queuing {reference}…")
+        } else {
+            format!("Asking about {reference}…")
+        })
+    }
+
+    /// Whether a start or reopen can only come back as a question: done work always asks, and so
+    /// does work for a session the feed says is at its limit, unless it goes to the background
+    /// lane, which has none. Until it does, the card mustn't claim it's starting (intent 0491).
+    fn asks_first(&self, key: &str, request: &Value) -> bool {
+        if request.get("override").is_some() {
+            return false;
+        }
+        let Some(card) = self.card(key) else {
+            return false;
+        };
+        if request["action"] == "reopen" {
+            return card.done();
+        }
+        let Some(detail) = card.detail.as_ref() else {
+            return false;
+        };
+        if detail.lane.as_deref() == Some("background") {
+            return false;
+        }
+        let home = detail.home.as_ref();
+        let machine = home
+            .and_then(|h| h.machine.as_deref())
+            .map_or(Some(card.machine_index), |name| self.machine_index(name));
+        let session = request["session"]
+            .as_str()
+            .or(home.and_then(|h| h.session.as_deref()));
+        let (Some(machine), Some(session)) = (machine, session) else {
+            return false;
+        };
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .and_then(|f| f.sessions.get(session))
+            .is_some_and(|s| s.limit.is_some_and(|limit| s.used >= limit))
+    }
+
     /// What the board shows for a change while it's on its way: what the backend will make of the
-    /// record, as far as Kerdr can tell. A request that waits in a queue shows nothing.
-    fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
+    /// record, as far as Kerdr can tell. A request that waits in a queue shows nothing, nor one
+    /// that can only come back as a question (intent 0491).
+    pub(super) fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
         Some(match request["action"].as_str()? {
-            "dispatch" if request["queue"] != true => Effect::Starting,
-            "reopen" if request["queue"] != true => Effect::Reopening,
+            "dispatch" | "reopen" if request["queue"] == true || self.asks_first(key, request) => {
+                return None;
+            }
+            "dispatch" => Effect::Starting,
+            "reopen" => Effect::Reopening,
             "close" => Effect::Close,
             "dismiss" | "cancel" => Effect::SetAside,
             "restore" => Effect::Restore,
@@ -1865,11 +1930,33 @@ impl App {
         let machine = job.machine;
         self.action_from = job.from.clone();
         self.answer_went_in = job.entered;
+        if job.asking
+            && let Some(line) = self.asking_line(&job.request)
+        {
+            self.unsay(&line);
+        }
+        // A second key while it asked said it in other words (intent 0491).
+        if let Some(said) = job.said.take() {
+            self.unsay(&said);
+        }
         let mut refused = None;
         if let Ok(response) = &result
             && response.ok
             && !response.confirmation
         {
+            // It asked nothing after all (a slot came free since the feed was read): from here it
+            // shows as any start or reopen does.
+            let guessed_wrong = job.asking && job.key.is_some() && job.request["queue"] != true;
+            if guessed_wrong {
+                // It stays in the resolver until the feed has it, no longer asking anything: its
+                // line says it's starting, and a ⏎ on it is remembered (intent 0491).
+                job.asking = false;
+                job.effect = Some(if job.request["action"] == "reopen" {
+                    Effect::Reopening
+                } else {
+                    Effect::Starting
+                });
+            }
             match job.effect.as_mut() {
                 // Its card stays until the feed has the record it made; nothing made, it goes.
                 Some(Effect::Saving(p)) => {
@@ -1895,7 +1982,8 @@ impl App {
                 _ => {}
             }
             // It stays as shown until the feed has it; a start answered yes moves on now.
-            let changes = matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
+            let changes = guessed_wrong
+                || matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
             self.resolver.settle(job);
             if changes {
                 self.rebuild();
@@ -1910,6 +1998,13 @@ impl App {
         let shown = refused.as_ref().is_some_and(|j| j.effect.is_some());
         let redirected = result.as_ref().is_ok_and(Response::sends_on);
         if !redirected {
+            // It failed, or asks first: no workspace is coming for a ⏎ to wait for.
+            if refused
+                .as_ref()
+                .is_some_and(|j| j.starts() && j.key.is_some() && j.key == self.enter_when_open)
+            {
+                self.forget_enter();
+            }
             if moved_on {
                 self.resolver.forget_moves_after(machine, n);
             }
@@ -1966,13 +2061,30 @@ impl App {
         } else {
             "starting up"
         };
+        let n = job.n;
         let secs = job.asked.elapsed().as_secs();
         let reference = &card.reference;
+        // Nothing has started: a question or a place in a queue is all that can come (intent 0491).
+        if job.asking {
+            let what = if job.request["queue"] == true {
+                "queuing"
+            } else {
+                "asking about"
+            };
+            let line = format!("Kerdr is still {what} {reference} ({secs} s so far).");
+            self.resolver.note_said(n, line.clone());
+            self.say(line, Tone::Info);
+            return true;
+        }
         let text = if open {
             format!(
                 "{reference}'s workspace is open and its agent is still taking its brief ({secs} s so far): ⏎ goes in, and X stops it."
             )
-        } else if matches!(action, "enter" | "dispatch" | "reopen") {
+        } else if action == "enter" {
+            format!(
+                "{reference} is {verb} ({secs} s so far). Kerdr goes in when its workspace opens; Esc stops waiting."
+            )
+        } else if matches!(action, "dispatch" | "reopen") {
             format!(
                 "{reference} is {verb} ({secs} s so far); ⏎ goes in as soon as its workspace opens."
             )
@@ -2008,6 +2120,23 @@ impl App {
         if card.is_open_workspace() {
             return None;
         }
+        let asking = self.resolver.starting(&id)?.asking;
+        if let Some(action) = self.go_into_opened(card) {
+            return Some(action);
+        }
+        self.still_changing(card, "enter");
+        // Remembered: the workspace opens without another key from you (intent 0491). Not when
+        // nothing has started, where only a question can come.
+        if !asking {
+            self.remember_enter(&card.key);
+        }
+        Some(Action::None)
+    }
+
+    /// Into the workspace a feed names for this card's record, opened since its start or reopen was
+    /// asked for. None until one has.
+    fn go_into_opened(&mut self, card: &Card) -> Option<Action> {
+        let id = card.detail.as_ref()?.id.clone();
         let job = self.resolver.starting(&id)?;
         // Where it asked, and where a start that ran on another machine runs (intent 0445).
         let mut machines = vec![self.machines.get(job.machine).map(|m| m.name())?];
@@ -2042,24 +2171,123 @@ impl App {
                     .before
                     .iter()
                     .any(|(s, i)| *s == w.session && *i == w.id)
-        });
-        if let Some(w) = opened {
-            let action = Action::JumpWorkspace {
-                machine: w.machine.clone(),
-                session: w.session.clone(),
-                id: w.id.clone(),
-            };
-            // In by his own ⏎: its answer takes him nowhere later.
-            self.resolver.went_in(&id);
-            return Some(action);
+        })?;
+        let action = Action::JumpWorkspace {
+            machine: opened.machine.clone(),
+            session: opened.session.clone(),
+            id: opened.id.clone(),
+        };
+        // In by his own ⏎: its answer takes him nowhere later.
+        self.resolver.went_in(&id);
+        self.forget_enter();
+        Some(action)
+    }
+
+    /// Remembers a ⏎ on a card just started, with the words on screen that promise it, so they go
+    /// when it does (intent 0491).
+    pub(crate) fn remember_enter(&mut self, key: &str) {
+        self.enter_when_open = Some(key.to_string());
+        self.enter_said = self
+            .message
+            .as_ref()
+            .filter(|(_, tone, _)| *tone != Tone::Fail)
+            .map(|(text, _, _)| text.clone());
+    }
+
+    /// Forgets the remembered ⏎, and takes down any words still promising it.
+    pub(crate) fn forget_enter(&mut self) {
+        self.enter_when_open = None;
+        if let Some(said) = self.enter_said.take() {
+            self.unsay(&said);
         }
-        self.still_changing(card, "enter");
-        Some(Action::None)
+    }
+
+    /// Whether going in can't take keys meant for something else here, so a remembered ⏎ counts.
+    pub(crate) fn enter_can_land_here(&self) -> bool {
+        matches!(
+            self.mode,
+            Mode::Board
+                | Mode::Peek { .. }
+                | Mode::Backlog { .. }
+                | Mode::Misc { .. }
+                | Mode::Done { .. }
+                | Mode::Card { .. }
+        ) && !self.typing_view_search()
+    }
+
+    /// The ⏎ remembered on a card just started, once its workspace is open: how to go in. Only where
+    /// going in can't take keys meant for something else, and not while a failure is up. Forgotten
+    /// when you've moved off the card, and when the start has gone with no workspace to show for
+    /// it (intent 0491).
+    pub fn enter_when_open_due(&mut self) -> Option<Action> {
+        let key = self.enter_when_open.clone()?;
+        if self.failing() || !self.enter_can_land_here() {
+            return None;
+        }
+        let Some(card) = self
+            .selected_for_control()
+            .filter(|c| c.key == key)
+            .cloned()
+        else {
+            self.forget_enter();
+            return None;
+        };
+        if card.is_open_workspace() {
+            self.forget_enter();
+            return Some(self.jump_action(key));
+        }
+        let id = card.detail.as_ref()?.id.clone();
+        if self.resolver.starting(&id).is_some() {
+            return self.go_into_opened(&card);
+        }
+        if self.started_lately(&id) {
+            return None;
+        }
+        self.forget_enter();
+        self.say(
+            format!(
+                "{} has no workspace to show for its start yet, so Kerdr stopped waiting; ⏎ tries again.",
+                card.reference
+            ),
+            Tone::Info,
+        );
+        None
+    }
+
+    /// Whether this record's start was answered yes lately: its workspace may yet come.
+    pub(super) fn started_lately(&self, id: &str) -> bool {
+        self.started
+            .as_ref()
+            .is_some_and(|(s, at)| s == id && at.elapsed() < Duration::from_secs(120))
+    }
+
+    /// The machine to read often for the start a ⏎ is waiting on: reading its feed shows the
+    /// workspace, which opens well before the command answers. Only for a remembered ⏎, since each
+    /// read costs that machine seconds of work and the timed feed covers every other start, and
+    /// only one that's answering: a feed can't show anything from one that isn't, and these wakes
+    /// would override its wait between tries (intent 0491).
+    pub fn start_awaited_on(&self) -> Vec<usize> {
+        let Some(key) = self.enter_when_open.as_deref() else {
+            return vec![];
+        };
+        let mut machines: Vec<usize> = self
+            .resolver
+            .on_its_way()
+            .filter(|j| j.key.as_deref() == Some(key))
+            .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
+            .filter(|j| j.request["queue"] != true)
+            .map(|j| j.machine)
+            .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live()))
+            .collect();
+        machines.sort_unstable();
+        machines.dedup();
+        machines
     }
 
     /// Going into a card's workspace yourself: a start or reopen still on its way for it neither
     /// asks nor takes you in when it answers, since you're already there (intent 0445).
     pub fn went_into(&mut self, key: &str) {
+        self.forget_enter();
         if let Some(id) = self
             .card(key)
             .and_then(|c| c.detail.as_ref())
@@ -2071,6 +2299,7 @@ impl App {
 
     /// The same, going into a workspace by its id: the card it's for, if any.
     pub fn went_into_workspace(&mut self, machine: usize, session: &str, id: &str) {
+        self.forget_enter();
         let Some(name) = self.machines.get(machine).map(|m| m.name()) else {
             return;
         };
@@ -2156,14 +2385,27 @@ impl App {
             return None;
         }
         let secs = job.asked.elapsed().as_secs();
+        // Nothing has started: its line says so, as the board does (intent 0491).
+        if job.asking {
+            let what = if job.request["queue"] == true {
+                "Queuing it"
+            } else {
+                "Asking first"
+            };
+            return Some(format!("◐ {what}… {secs} s"));
+        }
         let what = match &job.effect {
             Some(crate::resolve::Effect::StartingOn(m)) => format!("Starting up on {m}"),
             _ if job.request["action"] == "reopen" => "Reopening".to_string(),
             _ => "Starting up".to_string(),
         };
-        Some(format!(
-            "◐ {what} · {secs} s so far · ⏎ goes in as soon as its workspace opens"
-        ))
+        // A ⏎ already remembered needs no second one: Kerdr will take the screen by itself.
+        let then = if self.enter_when_open.as_deref() == Some(card.key.as_str()) {
+            "Kerdr goes in when its workspace opens · Esc stops waiting"
+        } else {
+            "⏎ goes in as soon as its workspace opens"
+        };
+        Some(format!("◐ {what} · {secs} s so far · {then}"))
     }
 
     /// What holds Kerdr open on q, said: a change not yet sent, which would never be, or a new
@@ -2381,6 +2623,9 @@ impl App {
         }
         if request["action"] == "edit" {
             return self.finish_edit(machine, request, result, from);
+        }
+        if request["action"] == "kickoff" {
+            return self.finish_kickoff_check(machine, &request, result);
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {

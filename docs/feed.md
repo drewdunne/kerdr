@@ -92,6 +92,7 @@ know rather than guessing.
 | `backlog_rank` | An optional signed integer ordering the backlog, lower numbers first. The action backend writes the canonical order. |
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
 | `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
+| `item_text`, `item_was` | Optional, together. A backlog item's whole text as an `edit` read answers it, and the `was` that read would give, so `e` opens your editor at once with no read. Kerdr then sends no read at all, and the save's `was` is what checks it. Leave them out for a record whose text you wouldn't hand over, and for a copy from a machine that isn't the record's home, since a save goes there. Without them `e` reads first, as below. |
 | `submission` | The `submission` a `create` request carried, for a record it made. Kerdr's card for new words, shown while they're saved, gives way to the card carrying it as soon as any machine's feed shows one, even before the request answers. Optional. |
 | `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
@@ -227,6 +228,16 @@ you along instead: `override: true` and its `confirm`, with `asked` and `answers
 When the questions have changed since `asked`, save nothing, and answer with them as they are now. A
 start with answers that fails keeps what you typed: `d` opens the box again with your words in it.
 Kerdr asks it for `dispatch` and `reopen`.
+
+Preloading them: a card can carry those questions in the feed, so `d` opens the box at once rather than
+after a start is refused, `"kickoff":{"asked":"opaque","questions":[…]}`. Behind the open box Kerdr
+sends `{"action":"kickoff","id":"0041"}`, which must start nothing: answer it as you'd answer the start,
+with the questions as they are now, or with `ok` and no questions when none are left, and the box closes
+saying your `message`. A question that changed shows as it is now, and the box says so; one that didn't
+keeps its place and what's typed. Tab is offered only once that answer has come. With no answer, the box
+stays up and says it couldn't check, and your check of `asked` still decides. Leave `kickoff` out where
+`d` wouldn't ask them.
+
 Actions have a 120-second deadline, and `dispatch` and `reopen` five minutes, since a start on
 another machine can wait minutes for it there; keep your own limits under those, so your answer
 comes first. A timeout or an invalid response does not prove the mutation failed: its result is
@@ -247,6 +258,9 @@ requests for different records safe. The one exception is an `edit` without a `t
 changes nothing: it waits for the requests made before it for its record, but nothing waits for
 it, so a later change to that record may run while it does, and `q` neither waits for it nor
 counts it as still running.
+A `dispatch` to a session your feed says is at its `limit` (unless its card's `lane` is `background`),
+or a `reopen` of done work, shows nothing on the card until your backend's answer: it can only come back
+as a question, so Kerdr says it's asking instead; if it comes back started after all, it shows from then.
 A success shows from the feed itself once a read has it (or
 after two reads, or a minute). Anything else (`ok: false`, a confirmation, a timeout, an invalid
 response) takes the change off the board at once, so the card is as the feed last said, and Kerdr
@@ -289,8 +303,10 @@ item's text, the words that started it, full screen in your own editor. Kerdr re
 that isn't waiting in the backlog (started, done or in won't do) itself, and one still being written
 up (`intake: "pending"`) with "#416 is still being written up; edit it once that's done.", without
 asking the backend; so too a new intent's card while its words are still being saved, a card whose
-start or reopen is on its way, and one `d` asked to start once it's written up. Otherwise it reads
-the text:
+start or reopen is on its way, and one `d` asked to start once it's written up. A card whose feed
+carries `item_text` and `item_was`, read within the last five minutes, opens from those with no read,
+and only its save asks the backend anything; so whatever a read would refuse that the feed can't show,
+the save must refuse. Otherwise Kerdr says it's reading, and reads the text:
 
 ```json
 {"action":"edit","id":"0414","from":"amd-lzm4"}

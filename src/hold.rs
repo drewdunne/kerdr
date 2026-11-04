@@ -1000,6 +1000,7 @@ mod tests {
                 keys: true,
                 feed: None,
                 feed_failed_after: None,
+                kept_snapshots: Default::default(),
             });
             m
         }
@@ -1199,7 +1200,7 @@ esac
             h.want(wanted("server", &[("P4M", "/r/p4m-client.sock")]));
             wait_for("ARK released", || ready(&h, "server", "ARK").is_none());
             assert!(dir.path().join("up").exists());
-            assert!(log(dir.path()).contains("cancel "));
+            wait_for("the cancel", || log(dir.path()).contains("cancel "));
 
             // The last one: the connection goes too.
             h.want(BTreeMap::new());

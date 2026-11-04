@@ -5,6 +5,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// A card's open questions as its feed read them, and a token of what was asked, for the Kickoff
+/// Questions box (intent 0491).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Preloaded {
+    pub asked: String,
+    #[serde(default)]
+    pub questions: Vec<crate::actions::Question>,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct Feed {
     pub kerdr_feed: u32,
@@ -136,6 +145,15 @@ pub struct FeedCard {
     pub message: Option<String>,
     #[serde(default)]
     pub needs: Option<String>,
+    /// The questions `d` would ask it first, read ahead so the box opens at once (intent 0491).
+    #[serde(default)]
+    pub kickoff: Option<Preloaded>,
+    /// A backlog item's whole text and its fingerprint, read ahead so `e` opens it at once and the
+    /// save checks it (intent 0491). Both or neither.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_was: Option<String>,
     #[serde(default)]
     pub blockers: Vec<String>,
     #[serde(default)]
@@ -415,6 +433,23 @@ mod tests {
         assert_eq!(card["refreshed_at"], "2026-10-22");
         assert_eq!(card["backlog_rank"], -2);
         assert_eq!(card["disposition"], "kept");
+    }
+
+    #[test]
+    fn reads_the_questions_a_start_would_ask() {
+        let feed: Feed = serde_json::from_value(serde_json::json!({
+            "kerdr_feed": 1,
+            "cards": [{"id": "1", "title": "t", "kickoff": {"asked": "abc", "questions": [
+                {"num": "1", "question": "Whose is it?", "pick": "Mine"}
+            ]}}, {"id": "2", "title": "u"}],
+        }))
+        .unwrap();
+        let k = feed.cards[0].kickoff.as_ref().unwrap();
+        assert_eq!(
+            (k.asked.as_str(), k.questions[0].pick.as_str()),
+            ("abc", "Mine")
+        );
+        assert!(feed.cards[1].kickoff.is_none());
     }
 
     #[test]

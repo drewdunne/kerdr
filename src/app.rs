@@ -95,6 +95,27 @@ pub enum Tone {
 /// appeared mustn't.
 pub const FAIL_SEEN: Duration = Duration::from_millis(1500);
 
+/// How long the board's turn waits for a key with nothing on its way. Answers from the background
+/// threads are only taken when the turn comes round, and a key is what brings it round sooner.
+pub const KEY_WAIT: Duration = Duration::from_millis(250);
+/// The same while something is coming, so it shows when it comes, not up to a quarter of a second
+/// later (intent 0491).
+pub const KEY_WAIT_COMING: Duration = Duration::from_millis(50);
+
+/// `R`, until every machine it asked has read its feed since: nothing on the board need change, so
+/// the board says when it's done (intent 0491).
+#[derive(Clone, Debug)]
+pub struct Refresh {
+    pub since: Instant,
+    pub waiting: Vec<usize>,
+    /// Those that stopped answering, or whose feed failed, meanwhile.
+    pub missed: Vec<String>,
+    /// What `R` said, which this replaces.
+    pub said: String,
+    /// `App::away` when it was pressed: its answer means nothing once he's been off the board.
+    pub away: u64,
+}
+
 /// How many failures one box shows: a key takes those down, and the rest come up next, so none
 /// goes unseen.
 pub const FAIL_PAGE: usize = 3;
@@ -526,6 +547,11 @@ pub struct App {
     pub moved_home: Vec<(String, usize, Option<String>)>,
     /// What's typed in a Kickoff Questions box and not saved yet, by its record's number.
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
+    /// The tokens of questions answered from the box, whose copy in the feed is out of date until
+    /// its next read: d doesn't open them again from there (intent 0491).
+    pub kickoff_sent: std::collections::HashSet<String>,
+    /// The last check sent behind a Kickoff Questions box, so a late answer can't touch a newer box.
+    pub kickoff_checks: u64,
     /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
@@ -563,6 +589,13 @@ pub struct App {
     /// How many times the board has handed the terminal over (into herdr, to SSH, to an editor):
     /// an edit's answer opens the editor only while this is what it was at `e`.
     pub away: u64,
+    /// `R`, until it's up to date.
+    pub refresh: Option<Refresh>,
+    /// A card ⏎ was pressed on while its start ran: Kerdr goes in when its workspace opens. Not
+    /// `pending_jump`, which takes a card that isn't open to have closed (intent 0491).
+    pub enter_when_open: Option<String>,
+    /// The words on screen that promise it, which go when it does (intent 0491).
+    pub enter_said: Option<String>,
 }
 
 impl App {
@@ -613,6 +646,8 @@ impl App {
             outside_warned: None,
             moved_home: vec![],
             kickoff_kept: Default::default(),
+            kickoff_sent: Default::default(),
+            kickoff_checks: 0,
             answered_at: None,
             width: 200,
             demo: false,
@@ -634,6 +669,9 @@ impl App {
             signin_kept: None,
             machine_problems: Default::default(),
             away: 0,
+            refresh: None,
+            enter_when_open: None,
+            enter_said: None,
         };
         app.rebuild();
         app
@@ -690,6 +728,31 @@ impl App {
     /// Whether a failure is up.
     pub fn failing(&self) -> bool {
         matches!(self.message, Some((_, Tone::Fail, _)))
+    }
+
+    /// How long this turn of the board waits for a key: less while an answer, an image or a jump is
+    /// on its way, or a guard's hint is about to light up (intent 0491). Not for a start waiting
+    /// for its write-up, which can take minutes; the runner hears of that itself.
+    pub fn key_wait(&self) -> Duration {
+        let answer_coming = self.busy
+            || self.refresh.is_some()
+            || self.enter_when_open.is_some()
+            || self
+                .resolver
+                .on_its_way()
+                .any(|job| !job.waits_for_write_up());
+        let guard_up = match &self.mode {
+            Mode::Confirm {
+                ready_at: Some(at), ..
+            } => Instant::now() < *at,
+            Mode::Kickoff { form, .. } => Instant::now() < form.ready_at,
+            _ => false,
+        } || matches!(&self.message, Some((_, Tone::Fail, at)) if at.elapsed() < FAIL_SEEN);
+        if answer_coming || guard_up || self.image_load.is_some() || self.pending_jump.is_some() {
+            KEY_WAIT_COMING
+        } else {
+            KEY_WAIT
+        }
     }
 
     /// A key was pressed while a failure is up: once it has been up long enough to be seen, the
@@ -776,6 +839,96 @@ impl App {
             .as_ref()
             .filter(|(_, tone, at)| *tone == Tone::Fail || at.elapsed() < Duration::from_secs(8))
             .map(|(t, tone, _)| (t.as_str(), *tone))
+    }
+
+    /// `R`: says what it's about to read, and remembers what it waits on. A machine it can only try
+    /// again goes down as missed from the start: its cards stay as they were, so `R` can't call it
+    /// up to date (intent 0491). The machines to read, feeds and all, and those to try again.
+    pub fn ask_refresh(&mut self, since: Instant) -> (Vec<usize>, Vec<usize>) {
+        let shown = || (0..self.machines.len()).filter(|&i| self.machines[i].is_shown());
+        let (reading, trying): (Vec<usize>, Vec<usize>) =
+            shown().partition(|&i| self.machines[i].conn.is_live());
+        let waiting: Vec<usize> = reading
+            .iter()
+            .copied()
+            .filter(|&i| self.machines[i].machine.feed.is_some())
+            .collect();
+        let said = if trying.is_empty() {
+            "Reading every machine now.".to_string()
+        } else {
+            format!(
+                "Reading every machine now, and trying {} again.",
+                trying.len()
+            )
+        };
+        self.say(said.clone(), Tone::Info);
+        self.refresh = (!waiting.is_empty()).then(|| Refresh {
+            since,
+            waiting,
+            missed: trying.iter().map(|&i| self.machines[i].name()).collect(),
+            said,
+            away: self.away,
+        });
+        (reading, trying)
+    }
+
+    /// Which machines `R` waits on have read their feed since it. Asked before the reads waiting are
+    /// taken, so what this finds has been applied by the time `settle_refresh` speaks.
+    pub fn refreshed(&self, inbox: &crate::poll::Inbox) -> Vec<usize> {
+        self.refresh.as_ref().map_or_else(Vec::new, |r| {
+            r.waiting
+                .iter()
+                .copied()
+                .filter(|&i| inbox.feed_read_since(i, r.since))
+                .collect()
+        })
+    }
+
+    /// Says `R` is done once every machine it asked has read its feed, or dropped out of the
+    /// reckoning. Only in place of its own words: something else said since matters more.
+    pub fn settle_refresh(&mut self, fed: &[usize]) {
+        let Some(mut r) = self.refresh.take() else {
+            return;
+        };
+        // He went into a card meanwhile: only a key on the board this moment wants this answer, and
+        // the read asked for on his return hasn't landed yet (intent 0491).
+        if r.away != self.away {
+            return;
+        }
+        let machines = &self.machines;
+        let missed = &mut r.missed;
+        r.waiting.retain(|&i| {
+            let Some(m) = machines.get(i) else {
+                return false;
+            };
+            if matches!(m.conn, Conn::Hidden) {
+                return false;
+            }
+            let failed = !m.conn.is_live() || (fed.contains(&i) && m.feed_error.is_some());
+            if failed {
+                missed.push(m.name());
+            } else if fed.contains(&i) && !m.snapshot_errors.is_empty() {
+                // Its cards are new, but a stuck session's workspaces are as they last were.
+                let mut sessions: Vec<&str> =
+                    m.snapshot_errors.keys().map(String::as_str).collect();
+                sessions.sort_unstable();
+                missed.push(format!("{}'s {}", m.name(), sessions.join(", ")));
+            }
+            !failed && !fed.contains(&i)
+        });
+        if !r.waiting.is_empty() {
+            self.refresh = Some(r);
+            return;
+        }
+        if self.message().is_some_and(|(said, _)| said != r.said) {
+            return;
+        }
+        if r.missed.is_empty() {
+            self.say("Up to date.", Tone::Good);
+        } else {
+            let names = r.missed.join(", ");
+            self.say(format!("Up to date, except {names}."), Tone::Info);
+        }
     }
 
     pub fn apply(&mut self, ev: Event) {
@@ -1142,8 +1295,41 @@ impl App {
         candidates
             .into_iter()
             .filter(|k| !skip.contains(k))
-            .find(|k| self.card(k).is_some_and(|c| c.is_open_workspace()))
+            .find(|k| {
+                self.card(k)
+                    .is_some_and(|c| c.is_open_workspace() && self.stuck_session(c).is_none())
+            })
             .cloned()
+    }
+
+    /// How many others the next-card key could go on to from `key`.
+    pub fn others_needing_you(&self, key: Option<&str>) -> usize {
+        self.needs_you_order()
+            .iter()
+            .filter(|k| Some(k.as_str()) != key)
+            .filter(|k| self.card(k).is_none_or(|c| self.stuck_session(c).is_none()))
+            .count()
+    }
+
+    /// Why this card's herdr session is shown from its last good read, when it is. Kerdr can't go in
+    /// till it answers, and trying would hold the board for the jump's whole limit (intent 0491).
+    fn stuck_session(&self, card: &Card) -> Option<&str> {
+        self.session_stuck(card.machine_index, card.session.as_deref()?)
+    }
+
+    /// The same, by machine and session.
+    fn session_stuck(&self, machine: usize, session: &str) -> Option<&str> {
+        let m = self.machines.get(machine)?;
+        m.snapshot_errors.get(session).map(String::as_str)
+    }
+
+    /// What to say instead of going into this session, when it isn't answering. None when it is.
+    pub fn stuck_refusal(&self, machine: usize, session: &str, what: &str) -> Option<String> {
+        let why = self.session_stuck(machine, session)?;
+        let name = self.machines[machine].name();
+        Some(format!(
+            "Kerdr can't go into {what} yet: {session} on {name} is stuck ({why}). R reads it again."
+        ))
     }
 
     /// herdr has just said the workspace you went into, `tried`, has closed: work still under way,
@@ -1173,18 +1359,19 @@ impl App {
         if self.still_changing(card, "enter") {
             return true;
         }
-        let id = card.detail.as_ref().map(|d| d.id.as_str());
-        let starting = self.started.as_ref().is_some_and(|(s, at)| {
-            Some(s.as_str()) == id && at.elapsed() < Duration::from_secs(120)
-        });
+        let starting = card
+            .detail
+            .as_ref()
+            .is_some_and(|d| self.started_lately(&d.id));
         if starting {
             self.say(
                 format!(
-                    "{} is starting; ⏎ goes in once its workspace shows.",
+                    "{} is starting. Kerdr goes in when its workspace opens; Esc stops waiting.",
                     card.reference
                 ),
                 Tone::Info,
             );
+            self.remember_enter(&card.key);
         }
         starting
     }
@@ -1469,15 +1656,23 @@ impl App {
         }
         // Esc on the board lets a running action's answer go: it still finishes, but neither asks
         // nor takes you anywhere, and a reopen or ⏎ waiting its turn is dropped. Anywhere else Esc
-        // has its own job (no to a question, back from a peek), so waiting work keeps waiting.
+        // has its own job (no to a question, back from a peek), so waiting work keeps waiting,
+        // except a remembered ⏎: Kerdr said Esc stops that wherever he pressed it, so it does,
+        // and then the key does its usual job too (intent 0491).
         let mut stopped = vec![];
-        if key.code == KeyCode::Esc && matches!(self.mode, Mode::Board) {
+        let on_board = matches!(self.mode, Mode::Board);
+        let stops_enter = self.enter_when_open.is_some() && self.enter_can_land_here();
+        if key.code == KeyCode::Esc && (on_board || stops_enter) {
             let let_go = self.resolver.let_go();
-            if (self.busy && self.action_from.take().is_some()) || let_go {
+            let was_waiting = self.enter_when_open.is_some();
+            self.forget_enter();
+            if (self.busy && self.action_from.take().is_some()) || let_go || was_waiting {
                 stopped.push(
                     "Stopped waiting: it still finishes, and won't take you anywhere.".to_string(),
                 );
             }
+        }
+        if key.code == KeyCode::Esc && on_board {
             let reopen = self.pending_reopen.take().map(|k| (k, "reopen"));
             let written: Vec<(String, &str)> = self
                 .resolver
@@ -2603,6 +2798,212 @@ pub(crate) mod tests {
         if let Mode::Confirm { ready_at, .. } = &mut app.mode {
             *ready_at = None;
         }
+    }
+
+    fn asked_to_refresh(app: &mut App, waiting: Vec<usize>) {
+        let said = "Reading every machine now.".to_string();
+        app.say(said.clone(), Tone::Info);
+        app.refresh = Some(Refresh {
+            since: Instant::now(),
+            waiting,
+            missed: vec![],
+            said,
+            away: app.away,
+        });
+    }
+
+    #[test]
+    fn r_with_a_machine_down_never_calls_it_up_to_date() {
+        // Down when he pressed it, not only one that drops after (intent 0491).
+        let mut app = demo_app();
+        app.machines.truncate(2);
+        app.machines[0].conn = Conn::Live {
+            latency: Duration::from_millis(1),
+        };
+        app.machines[0].machine.feed = Some("a-feed".into());
+        let down = app.machines[1].name();
+        app.machines[1].conn = reconnecting();
+        let (reading, trying) = app.ask_refresh(Instant::now());
+        assert_eq!((reading, trying), (vec![0], vec![1]));
+        assert_eq!(
+            app.message().unwrap().0,
+            "Reading every machine now, and trying 1 again."
+        );
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {down}.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_with_every_machine_down_says_only_that_it_is_trying() {
+        let mut app = demo_app();
+        for m in &mut app.machines {
+            m.conn = reconnecting();
+        }
+        let n = app.machines.len();
+        let (reading, trying) = app.ask_refresh(Instant::now());
+        assert!(reading.is_empty());
+        assert_eq!(trying.len(), n);
+        assert!(app.refresh.is_none(), "nothing to wait for");
+        let said = format!("Reading every machine now, and trying {n} again.");
+        app.settle_refresh(&[]);
+        assert_eq!(app.message().unwrap().0, said);
+    }
+
+    #[test]
+    fn r_says_nothing_about_a_read_that_lands_while_he_is_in_a_card() {
+        // The first turn back: nothing says up to date when the read asked on return hasn't come.
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        app.away += 1;
+        let inside = "Opening it…";
+        app.say(inside, Tone::Info);
+        app.unsay(inside);
+        app.settle_refresh(&[0]);
+        assert!(app.refresh.is_none());
+        assert_eq!(app.message(), None);
+    }
+
+    fn reconnecting() -> Conn {
+        Conn::Reconnecting {
+            since: Local::now(),
+            attempt: 1,
+            retry_at: Local::now(),
+            detail: "no answer".into(),
+        }
+    }
+
+    #[test]
+    fn r_says_up_to_date_once_every_machine_it_asked_has_read_its_feed() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0, 1]);
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        app.settle_refresh(&[]);
+        assert!(app.refresh.is_some(), "still reading both");
+        app.settle_refresh(&[0]);
+        assert_eq!(app.refresh.as_ref().unwrap().waiting, [1]);
+        assert_eq!(app.message().unwrap().0, "Reading every machine now.");
+        app.settle_refresh(&[1]);
+        assert!(app.refresh.is_none());
+        assert_eq!(app.message(), Some(("Up to date.", Tone::Good)));
+    }
+
+    #[test]
+    fn r_reads_the_inbox_for_feeds_that_began_after_it() {
+        let mut app = demo_app();
+        let inbox = crate::poll::Inbox::default();
+        let event = |feed: bool| Event {
+            machine: 0,
+            conn: Conn::Live {
+                latency: Duration::from_millis(1),
+            },
+            data: Some(crate::poll::MachineData {
+                feed: feed.then(|| Ok(crate::feed::Feed::default())),
+                ..Default::default()
+            }),
+            at: Local::now(),
+        };
+        asked_to_refresh(&mut app, vec![0]);
+        let since = app.refresh.as_ref().unwrap().since;
+        inbox.put(event(true), since - Duration::from_millis(1), 0);
+        assert!(app.refreshed(&inbox).is_empty(), "began before R");
+        inbox.put(event(false), since, 0);
+        assert!(app.refreshed(&inbox).is_empty(), "no feed in it");
+        inbox.put(event(true), since, 0);
+        assert_eq!(app.refreshed(&inbox), [0]);
+    }
+
+    #[test]
+    fn r_says_which_machines_it_could_not_bring_up_to_date() {
+        // Stopped answering while it waited, or read but its feed failed: not up to date, and a
+        // hidden one isn't worth a word.
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0, 1]);
+        let gone = app.machines[1].name();
+        app.machines[1].conn = Conn::Connecting;
+        app.settle_refresh(&[]);
+        assert_eq!(app.refresh.as_ref().unwrap().waiting, [0]);
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {gone}.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0, 1]);
+        let failed = app.machines[0].name();
+        app.machines[0].feed_error = Some("timed out".into());
+        app.machines[1].conn = Conn::Hidden;
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {failed}.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_names_a_stuck_session_it_could_not_bring_up_to_date() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        let name = app.machines[0].name();
+        app.machines[0]
+            .snapshot_errors
+            .insert("web".into(), crate::poll::SESSION_SILENT.into());
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {name}'s web.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_finishing_never_talks_over_something_said_since() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        app.say("Select an intent first.", Tone::Info);
+        app.settle_refresh(&[0]);
+        assert!(app.refresh.is_none());
+        assert_eq!(app.message().unwrap().0, "Select an intent first.");
+    }
+
+    #[test]
+    fn the_board_turns_faster_only_while_something_is_coming() {
+        let mut app = demo_app();
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        // An image being read.
+        app.image_load = Some(1);
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        app.image_load = None;
+        // An answer on its way, until it comes.
+        let (key, id) = waiting_backlog_card(&app);
+        let request = serde_json::json!({"action": "move", "id": id, "delta": 1});
+        app.resolver.add(0, request, None, Some(key.clone()), None);
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        let n = app.resolver.on_its_way().next().unwrap().n;
+        app.resolver.take(n);
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        // A start that waits for its write-up, which can take minutes, isn't an answer coming.
+        let request = serde_json::json!({"action": "dispatch", "id": id});
+        app.resolver.add_gated(0, request, None, Some(key), None);
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        let n = app.resolver.on_its_way().next().unwrap().n;
+        app.resolver.take(n);
+        // A failure until a key can take it down, then not.
+        app.fail("Not this time");
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        if let Some((_, _, at)) = &mut app.message {
+            *at -= FAIL_SEEN;
+        }
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        // A question's guard, until it has passed.
+        app.mode = Mode::Confirm {
+            machine: 0,
+            request: serde_json::json!({}),
+            title: "Sure?".into(),
+            message: String::new(),
+            back: Box::new(Mode::Board),
+            target: None,
+            queue: false,
+            ready_at: Some(Instant::now() + Duration::from_secs(60)),
+            plain: false,
+        };
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        settle(&mut app);
+        assert_eq!(app.key_wait(), KEY_WAIT);
     }
 
     #[test]
@@ -5272,6 +5673,169 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn enter_on_a_done_card_says_it_is_asking_and_claims_no_reopening_until_the_yes() {
+        // The backend always asks about done work, so "Reopening…" before that is false (intent
+        // 0491).
+        let mut app = demo_app();
+        let (key, id) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("Enter on a done card didn't ask to reopen it")
+        };
+        app.queue_action(machine, request.clone());
+        let asking = format!("Asking about {reference}…");
+        assert_eq!(app.message().unwrap().0, asking);
+        let card = app.card(&key).unwrap();
+        assert!(card.done(), "it still reads done");
+        assert_ne!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("Reopening…")
+        );
+        let line = app.starting_line(&card.clone()).unwrap();
+        assert!(line.contains("Asking first"), "{line}");
+        // Enter again takes no second one, and doesn't claim anything either.
+        assert_eq!(enter(&mut app), Action::None);
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("still asking about"), "{said}");
+        assert_eq!(app.resolver.on_its_way().count(), 1);
+        // The question comes: what it said goes, in either wording, and a yes shows as it always
+        // has.
+        reply_to(
+            &mut app,
+            machine,
+            request,
+            done_question(&reference, "0123456789ab0008"),
+        );
+        assert_ne!(app.message().map(|m| m.0), Some(said.as_str()));
+        assert_ne!(app.message().map(|m| m.0), Some(asking.as_str()));
+        settle(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request["override"], true);
+        assert_eq!(request["id"], id.as_str());
+        app.queue_action(machine, request);
+        let card = app.card(&key).unwrap();
+        assert_eq!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("Reopening…")
+        );
+    }
+
+    #[test]
+    fn a_start_on_a_full_session_says_it_is_asking_and_one_with_room_says_starting() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        let session = app
+            .card(&key)
+            .unwrap()
+            .detail
+            .as_ref()
+            .unwrap()
+            .home
+            .clone()
+            .unwrap()
+            .session;
+        assert_eq!(
+            session.as_deref(),
+            Some("web"),
+            "a full session in the demo"
+        );
+        let reference = app.card(&key).unwrap().reference.clone();
+        let start = serde_json::json!({"action": "dispatch", "id": id, "session": "web"});
+        // Full: a question is all that can come.
+        assert_eq!(app.effect_for(&key, &start), None);
+        // The yes, or a session with room, or the background lane, starts it for real.
+        let mut yes = start.clone();
+        yes["override"] = serde_json::json!(true);
+        assert_eq!(
+            app.effect_for(&key, &yes),
+            Some(crate::resolve::Effect::Starting)
+        );
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().lane = Some("background".into());
+        assert_eq!(
+            app.effect_for(&key, &start),
+            Some(crate::resolve::Effect::Starting)
+        );
+        app.board.cards[i].detail.as_mut().unwrap().lane = None;
+        assert_eq!(app.effect_for(&key, &start), None);
+        let mut demo = demo_app();
+        room_in_every_session(&mut demo);
+        assert_eq!(
+            demo.effect_for(&key, &start),
+            Some(crate::resolve::Effect::Starting)
+        );
+        // As it goes: words on the board, and nothing on the card.
+        app.queue_action(machine, start.clone());
+        assert_eq!(
+            app.message().unwrap().0,
+            format!("Asking about {reference}…")
+        );
+        assert_ne!(
+            app.card(&key)
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Starting…")
+        );
+        // A slot came free since the feed was read: it started after all, and shows it.
+        let started = crate::actions::Response {
+            ok: true,
+            message: "Started.".into(),
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, start, Ok(started));
+        assert_eq!(app.message().map(|m| m.0), None);
+        assert_eq!(
+            app.card(&key)
+                .unwrap()
+                .detail
+                .as_ref()
+                .unwrap()
+                .status
+                .as_deref(),
+            Some("Starting…")
+        );
+        assert_eq!(app.card(&key).unwrap().state.as_deref(), Some("active"));
+        // Its line and ⏎ agree with that, not with what it was guessed it would do.
+        let card = app.card(&key).cloned().unwrap();
+        let line = app.starting_line(&card).unwrap();
+        assert!(line.contains("Starting up"), "{line}");
+        select_key(&mut app, &key);
+        assert_eq!(enter(&mut app), Action::None);
+        let said = app.message().unwrap().0;
+        assert!(!said.contains("asking"), "{said}");
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn w_says_it_is_queuing_until_the_answer_comes() {
+        let mut app = demo_app();
+        let (key, id) = done_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let request = serde_json::json!({"action": "reopen", "id": id, "queue": true});
+        app.queue_action(0, request.clone());
+        assert_eq!(app.message().unwrap().0, format!("Queuing {reference}…"));
+        reply_to(
+            &mut app,
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: "Queued in web.".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(app.message().unwrap().0, "Queued in web.");
+    }
+
+    #[test]
     fn enter_on_a_done_card_asks_first_then_reopens_it_on_a_yes() {
         let mut app = demo_app();
         let (key, id) = done_card(&mut app);
@@ -6674,6 +7238,16 @@ pub(crate) mod tests {
     }
 
     /// A backlog card with an intent record in the demo, and its machine.
+    /// The demo's sessions are at their limits, where a start only asks (intent 0491).
+    pub(crate) fn room_in_every_session(app: &mut App) {
+        for m in &mut app.machines {
+            for slots in m.feed.iter_mut().flat_map(|f| f.sessions.values_mut()) {
+                slots.limit = None;
+            }
+        }
+        app.rebuild();
+    }
+
     fn waiting_card(app: &App) -> (String, String, usize) {
         let c = app
             .board
@@ -6763,6 +7337,7 @@ pub(crate) mod tests {
     #[test]
     fn a_start_shows_starting_and_a_question_still_asks() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         select_key(&mut app, &key);
@@ -6918,6 +7493,7 @@ pub(crate) mod tests {
     #[test]
     fn a_started_card_moves_on_and_takes_no_second_start_until_the_feed_has_it() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         let request = serde_json::json!({"action": "dispatch", "id": id});
@@ -7024,11 +7600,329 @@ pub(crate) mod tests {
         );
     }
 
+    /// A card just started with d, ⏎ pressed on it: the board, and its id and machine.
+    fn entered_while_starting() -> (App, String, String, usize) {
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        select_key(&mut app, &key);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        select_key(&mut app, &key);
+        assert_eq!(enter(&mut app), Action::None);
+        (app, key, id, machine)
+    }
+
+    /// The feed names a workspace for this record, opened since the start, on the board.
+    fn its_workspace_opens(app: &mut App, id: &str, machine: usize, ws: &str) {
+        let name = app.machines[machine].name();
+        let two = &id[id.len() - 2..];
+        for c in app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+            .filter(|c| c.id == id)
+        {
+            c.workspace = Some(crate::feed::FeedWorkspace {
+                session: Some("web".into()),
+                id: Some(ws.into()),
+                ..Default::default()
+            });
+        }
+        app.board.workspaces.push(crate::board::WorkspaceRow {
+            machine: name,
+            session: "web".into(),
+            id: ws.into(),
+            label: format!("{two}-the-work"),
+            status: "working".into(),
+            card: None,
+            note: None,
+            cached: false,
+        });
+    }
+
+    #[test]
+    fn enter_on_a_starting_card_goes_in_by_itself_when_its_workspace_opens() {
+        let (mut app, key, id, machine) = entered_while_starting();
+        let (said, _) = app.message().unwrap();
+        assert!(
+            said.contains("Kerdr goes in when its workspace opens"),
+            "{said}"
+        );
+        assert!(said.contains("Esc stops waiting"), "{said}");
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        // Waits, with no key from you, as long as nothing has opened.
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        its_workspace_opens(&mut app, &id, machine, "w-new");
+        let name = app.machines[machine].name();
+        assert_eq!(
+            app.enter_when_open_due(),
+            Some(Action::JumpWorkspace {
+                machine: name,
+                session: "web".into(),
+                id: "w-new".into()
+            })
+        );
+        assert_eq!(app.enter_when_open, None, "once");
+        assert_eq!(app.enter_when_open_due(), None);
+    }
+
+    #[test]
+    fn enter_remembered_goes_in_once_the_card_itself_shows_open() {
+        let (mut app, key, _, _) = entered_while_starting();
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        let card = &mut app.board.cards[i];
+        card.session = Some("web".into());
+        card.workspace_id = Some("w-new".into());
+        assert!(app.card(&key).unwrap().is_open_workspace());
+        assert_eq!(app.enter_when_open_due(), Some(Action::Jump(key)));
+        assert_eq!(app.enter_when_open, None);
+    }
+
+    #[test]
+    fn enter_remembered_is_dropped_by_esc_and_by_moving_off_the_card() {
+        let (mut app, _, _, _) = entered_while_starting();
+        esc(&mut app);
+        assert_eq!(app.enter_when_open, None);
+        assert!(app.message().unwrap().0.contains("Stopped waiting"));
+        let (mut app, key, _, _) = entered_while_starting();
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key)
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open, None, "gone, even if you come back");
+        select_key(&mut app, &key);
+        assert_eq!(app.enter_when_open_due(), None);
+    }
+
+    #[test]
+    fn enter_remembered_is_dropped_by_esc_from_a_peek_and_a_cards_screen() {
+        // "Esc stops waiting" holds wherever ⏎ was pressed: the key also does its usual job, and
+        // herdr doesn't take the screen later (intent 0491).
+        for card_screen in [false, true] {
+            let (mut app, key, id, machine) = entered_while_starting();
+            app.mode = if card_screen {
+                Mode::Card {
+                    card: key.clone(),
+                    focus: key.clone(),
+                    opened: vec![],
+                    back: Box::new(Mode::Board),
+                }
+            } else {
+                Mode::Peek {
+                    scroll: 0,
+                    back: Box::new(Mode::Board),
+                }
+            };
+            app.sel.key = Some(key);
+            esc(&mut app);
+            assert_eq!(app.enter_when_open, None, "{card_screen}");
+            assert!(matches!(app.mode, Mode::Board), "{card_screen}");
+            assert!(app.message().unwrap().0.contains("Stopped waiting"));
+            its_workspace_opens(&mut app, &id, machine, "w-new");
+            assert_eq!(app.enter_when_open_due(), None, "{card_screen}");
+        }
+    }
+
+    #[test]
+    fn enter_remembered_stays_through_esc_where_going_in_could_not_land_anyway() {
+        // A help screen's Esc only closes it.
+        let (mut app, key, _, _) = entered_while_starting();
+        app.mode = Mode::Keys {
+            filter: String::new(),
+            typing: false,
+            scroll: 0,
+        };
+        esc(&mut app);
+        assert_eq!(app.enter_when_open, Some(key));
+    }
+
+    #[test]
+    fn enter_remembered_takes_its_words_with_it_and_keeps_saying_so_after_they_expire() {
+        let (mut app, key, _, _) = entered_while_starting();
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("Esc stops waiting"), "{said}");
+        // The card's own line says Kerdr will go in, not that he has to press it.
+        let card = app.card(&key).cloned().unwrap();
+        let line = app.starting_line(&card).unwrap();
+        assert!(line.contains("Kerdr goes in when"), "{line}");
+        assert!(line.contains("Esc stops waiting"), "{line}");
+        assert!(!line.contains("⏎"), "{line}");
+        // Moved off the card, forgotten: nothing still promises it.
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key)
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.message(), None);
+        // Not remembered: back to the card's plain line.
+        let line = app.starting_line(&card).unwrap();
+        assert!(line.contains("⏎ goes in"), "{line}");
+    }
+
+    #[test]
+    fn enter_remembered_doesnt_take_down_something_said_since() {
+        let (mut app, key, _, _) = entered_while_starting();
+        app.say("Something else", Tone::Info);
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key)
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.message().unwrap().0, "Something else");
+    }
+
+    #[test]
+    fn enter_remembered_is_dropped_when_the_start_fails_or_asks_first() {
+        let (mut app, key, id, machine) = entered_while_starting();
+        let start = serde_json::json!({"action": "dispatch", "id": id});
+        reply_to(&mut app, machine, start, Err("no answer".into()));
+        assert_eq!(app.enter_when_open, None);
+        assert!(app.failing());
+        let (mut app, _, id, machine) = entered_while_starting();
+        let start = serde_json::json!({"action": "dispatch", "id": id});
+        reply_to(&mut app, machine, start, Ok(over_limit(&id)));
+        assert_eq!(app.enter_when_open, None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{key}");
+    }
+
+    #[test]
+    fn enter_remembered_waits_out_a_failure_and_a_box_and_ends_when_no_workspace_comes() {
+        let (mut app, key, id, machine) = entered_while_starting();
+        // Never over a failure, which going in would hide, nor while typing.
+        its_workspace_opens(&mut app, &id, machine, "w-new");
+        app.fail("Something else");
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        app.message = None;
+        let board = std::mem::replace(
+            &mut app.mode,
+            Mode::Keys {
+                filter: String::new(),
+                typing: false,
+                scroll: 0,
+            },
+        );
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        app.mode = board;
+        assert!(matches!(
+            app.enter_when_open_due(),
+            Some(Action::JumpWorkspace { .. })
+        ));
+        // Answered yes, gone from the resolver, and still no workspace: says so and stops.
+        let (mut app, key, id, machine) = entered_while_starting();
+        let n = app
+            .resolver
+            .unanswered_where(|r| r["action"] == "dispatch")
+            .unwrap();
+        app.resolver.take(n);
+        app.started = Some((id, Instant::now()));
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()), "lately");
+        app.started = None;
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open, None);
+        assert!(app.message().unwrap().0.contains("stopped waiting"));
+        assert!(machine < app.machines.len());
+    }
+
+    #[test]
+    fn enter_on_work_it_is_still_asking_about_remembers_nothing() {
+        // A question is all that can come, so nothing would ever go in.
+        let mut app = demo_app();
+        let (key, _) = done_card(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("Enter on a done card didn't ask to reopen it")
+        };
+        app.queue_action(machine, request);
+        assert_eq!(enter(&mut app), Action::None);
+        assert_eq!(app.enter_when_open, None, "{key}");
+        assert!(app.start_awaited_on().is_empty());
+    }
+
+    #[test]
+    fn only_a_start_actually_running_has_its_machine_read_again() {
+        let (mut app, key, _, machine) = entered_while_starting();
+        assert_eq!(app.start_awaited_on(), [machine]);
+        // Forgotten: the timed feed will do, without the cost of reading it every few seconds.
+        app.forget_enter();
+        assert!(app.start_awaited_on().is_empty());
+        // A ⏎ waiting on another card's start doesn't pay for this one.
+        app.enter_when_open = Some("someone-else".into());
+        assert!(app.start_awaited_on().is_empty());
+        // A machine that isn't answering keeps its wait between tries: a feed can show nothing
+        // from it, and one waiting on a person must not be tried every 5 s.
+        app.enter_when_open = Some(key);
+        assert_eq!(app.start_awaited_on(), [machine]);
+        app.machines[machine].conn = reconnecting();
+        assert!(app.start_awaited_on().is_empty());
+    }
+
+    #[test]
+    fn a_stuck_sessions_cards_are_passed_over_and_refused_at_once() {
+        // Its last good read keeps them on the board, but going in would hold the board for the
+        // jump's whole limit (intent 0491).
+        let mut app = demo_app();
+        let open: Vec<String> = app
+            .needs_you_order()
+            .into_iter()
+            .filter(|k| app.card(k).is_some_and(|c| c.is_open_workspace()))
+            .collect();
+        assert_eq!(open.len(), 2, "{open:?}");
+        assert_eq!(
+            app.others_needing_you(Some(&open[0])),
+            app.needs_you_order().len() - 1
+        );
+        let card = app.card(&open[1]).cloned().unwrap();
+        let session = card.session.clone().unwrap();
+        let why = crate::poll::SESSION_SILENT.to_string();
+        assert_eq!(app.stuck_refusal(card.machine_index, &session, "it"), None);
+        assert!(app.next_needs_you_after(&open[0], &[]).is_some());
+        app.machines[card.machine_index]
+            .snapshot_errors
+            .insert(session.clone(), why.clone());
+        // Everything in that session stuck, the next one past it comes up, or none.
+        let next = app.next_needs_you_after(&open[0], &[]);
+        assert_ne!(next, Some(open[1].clone()));
+        let said = app
+            .stuck_refusal(card.machine_index, &session, &card.reference)
+            .unwrap();
+        assert!(said.contains(&card.reference), "{said}");
+        assert!(said.contains(&why), "{said}");
+        assert!(said.contains("R reads it again"), "{said}");
+    }
+
     #[test]
     fn enter_on_a_starting_card_goes_into_the_workspace_it_opened() {
         // Intent 0445: ark-dispatch opens the workspace before its agent takes its brief, and
         // answers only then. ⏎ goes in as soon as one shows, and says it's starting up till then.
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         select_key(&mut app, &key);
@@ -7040,7 +7934,7 @@ pub(crate) mod tests {
         assert_eq!(enter(&mut app), Action::None);
         let (said, _) = app.message().unwrap();
         assert!(said.contains("is starting up"), "{said}");
-        assert!(said.contains("as soon as its workspace opens"), "{said}");
+        assert!(said.contains("when its workspace opens"), "{said}");
         // Its card says so too, wherever it's looked at.
         let card = app.card(&key).cloned().unwrap();
         assert!(app.starting_line(&card).unwrap().contains("Starting up"));
@@ -7187,6 +8081,7 @@ pub(crate) mod tests {
     #[test]
     fn d_on_work_being_written_up_starts_it_once_that_s_done() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id, machine) = waiting_card(&app);
         let set_intake = |app: &mut App, intake: Option<&str>| {
@@ -7422,6 +8317,7 @@ pub(crate) mod tests {
     #[test]
     fn d_in_the_backlog_view_keeps_the_starting_card_selected_and_takes_no_second_start() {
         let mut app = demo_app();
+        room_in_every_session(&mut app);
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _, _) = waiting_card(&app);
         app.enter_backlog(false);

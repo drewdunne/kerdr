@@ -4,8 +4,11 @@
 //!
 //! Both requests go through the action resolution tool (intent 0416). The save is a change like
 //! any other: the card shows the new words and ✎ the moment the editor closes, its command runs
-//! in the background, and when it lands nothing more is said. The read before the editor isn't a
-//! change: it shows nothing, and nothing waits for it. Kerdr keeps your version until a save of it
+//! in the background, and when it lands nothing more is said. A feed that carries the item's text
+//! opens the editor at once (intent 0491), and the save checks everything. Otherwise a read comes
+//! first, which isn't a change: it says only that it's reading, and nothing waits for it. Unlike a
+//! read, a text from the feed isn't refused for an agent the feed doesn't show yet: the save still
+//! is, with what you wrote kept. Kerdr keeps your version until a save of it
 //! succeeds, so a refusal, a change underneath or a lost answer never loses what you typed, and
 //! says so in the red box that stays until it's read: a save that works says nothing, so one that
 //! doesn't can't be missed.
@@ -60,6 +63,8 @@ pub struct EditFlight {
     pub key: String,
     pub at: Instant,
     pub away: u64,
+    /// What it said when it was sent, taken back when the answer comes.
+    pub said: String,
 }
 
 /// When and where the editor was asked for: the `e` press it answers, the trips away from the board
@@ -264,6 +269,24 @@ impl App {
         if !self.can_write(machine) {
             return Action::None;
         }
+        // Its feed holds the text: it opens now, as `d` opens a card's questions (intent 0491).
+        if let Some((text, was)) = self.text_from_feed(&card, machine) {
+            self.edits.insert(
+                card.key.clone(),
+                Held {
+                    id: detail.id.clone(),
+                    machine,
+                    current: edit::normalise(&text),
+                    was,
+                    read_at: Instant::now(),
+                    mine: None,
+                    check_first: false,
+                    read_only: None,
+                },
+            );
+            self.open_now(&card);
+            return Action::None;
+        }
         // Read moments ago: it opens as it was read, with no read.
         if let Some(held) = self.edits.get_mut(&card.key).filter(|h| {
             h.id == detail.id
@@ -281,16 +304,43 @@ impl App {
         self.action_from = Some(CardSnapshot::of(&card));
         self.edit_flights
             .retain(|f| f.key != card.key && f.at.elapsed() < 4 * OPEN_WITHIN);
+        // This can take a second or two, and the card shows nothing: say so at once (intent 0491).
+        let said = format!("Reading {reference}'s text…");
+        self.say(said.clone(), Tone::Info);
         self.edit_flights.push(EditFlight {
             id: detail.id.clone(),
             key: card.key.clone(),
             at: Instant::now(),
             away: self.away,
+            said,
         });
         Action::Mutate {
             machine,
             request: json!({"action":"edit","id":detail.id,"from":crate::config::hostname()}),
         }
+    }
+
+    /// The item's text and fingerprint as the card's feed read them, when `e` can open from those:
+    /// Kerdr holds nothing of yours to check first, the feed is from the machine a save goes to,
+    /// and it's been read lately. Otherwise `e` reads it, as it does from a feed without them.
+    fn text_from_feed(&self, card: &Card, machine: usize) -> Option<(String, String)> {
+        if card.machine_index != machine {
+            return None;
+        }
+        if self
+            .edits
+            .get(&card.key)
+            .is_some_and(|h| h.mine.is_some() || h.check_first)
+        {
+            return None;
+        }
+        let taken = self.machines.get(machine)?.feed_taken?;
+        let age = (self.now() - taken).to_std().unwrap_or_default();
+        if age >= READY_FOR {
+            return None;
+        }
+        let detail = card.detail.as_ref()?;
+        Some((detail.item_text.clone()?, detail.item_was.clone()?))
     }
 
     /// The machine an item's save goes to, without saying anything: where a refusal said it lives
@@ -785,6 +835,9 @@ impl App {
         } else {
             None
         };
+        if let Some(flight) = &flight {
+            self.unsay(&flight.said);
+        }
         let Some(key) = self.edit_key(&id, flight.as_ref()) else {
             // Its card is gone from the board, and Kerdr holds nothing of it: only a problem is
             // worth saying.
@@ -1318,6 +1371,191 @@ mod tests {
         }
     }
 
+    /// Gives a card's copy in its feed the fields `e` opens from, as a read of that feed brings
+    /// them, and says when the feed was taken in.
+    fn feed_holds_text(app: &mut App, key: &str, text: &str, was: &str) -> usize {
+        let i = app.card(key).unwrap().machine_index;
+        let id = key.rsplit_once(':').unwrap().1.to_string();
+        let m = &mut app.machines[i];
+        let feed = m.feed.as_mut().unwrap();
+        let fc = feed.cards.iter_mut().find(|c| c.id == id).unwrap();
+        fc.item_text = Some(text.into());
+        fc.item_was = Some(was.into());
+        m.feed_taken = Some(chrono::Local::now());
+        app.rebuild();
+        i
+    }
+
+    #[test]
+    fn e_opens_at_once_from_the_feed_and_the_save_checks_what_it_read() {
+        let mut app = app();
+        let (key, id, _) = waiting(&mut app);
+        let machine = feed_holds_text(
+            &mut app,
+            &key,
+            "The first words.\r\nAnd more.\n",
+            "sha256:a",
+        );
+        // No read is sent, nothing has to answer, and the editor is due this very turn.
+        assert!(matches!(press(&mut app, 'e'), Action::None));
+        assert_eq!(app.resolver.on_its_way().count(), 0);
+        assert_eq!(app.editor_due(), Some(key.clone()));
+        let (_, file, ..) = app.edit_file(&key).unwrap();
+        assert!(file.contains("The first words.\nAnd more."), "{file}");
+        // What's saved says what it was read as, to the machine it was read from.
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = app.edit_ended(&key, wrote("New words."))
+        else {
+            panic!("a changed text is sent");
+        };
+        assert_eq!(to, machine);
+        assert_eq!(request["was"], "sha256:a");
+        assert_eq!(request["id"], id);
+        // Changed underneath: refused by the save, with his words kept, as after any read.
+        let sent = send(&mut app, to, request);
+        app.finish_job(
+            sent.n,
+            sent.request,
+            Ok(Response {
+                ok: false,
+                status: Some("stale".into()),
+                message: "It changed.".into(),
+                text: Some("Someone else's words.".into()),
+                was: Some("sha256:b".into()),
+                ..Default::default()
+            }),
+        );
+        let held = app.edits.get(&key).unwrap();
+        assert_eq!(held.mine.as_ref().unwrap().text, "New words.");
+        assert_eq!(held.was, "sha256:b");
+    }
+
+    #[test]
+    fn e_reads_first_where_the_feed_cant_be_trusted_with_it() {
+        // No fields at all: read, saying so at once, and unsaid when it answers.
+        let mut plain = app();
+        let (key, id, reference) = waiting(&mut plain);
+        let (machine, request) = e_reads(&mut plain, &id);
+        assert_eq!(
+            plain.message().map(|(t, _)| t.to_string()),
+            Some(format!("Reading {reference}'s text…"))
+        );
+        let sent = send(&mut plain, machine, request);
+        plain.finish_job(sent.n, sent.request, text_answer("Words.", "sha256:a"));
+        assert_eq!(plain.message(), None);
+        assert_eq!(plain.editor_due(), Some(key));
+
+        let reads = |setup: &dyn Fn(&mut App, &str)| {
+            let mut app = app();
+            let (key, id, _) = waiting(&mut app);
+            feed_holds_text(&mut app, &key, "From the feed.", "sha256:feed");
+            setup(&mut app, &key);
+            e_reads(&mut app, &id);
+        };
+        // A feed that has stopped coming is too old to open from.
+        reads(&|app, key| {
+            let i = app.card(key).unwrap().machine_index;
+            app.machines[i].feed_taken = Some(chrono::Local::now() - chrono::Duration::hours(1));
+        });
+        // A save that got no clear answer is checked first, by a read.
+        reads(&|app, key| {
+            let (id, machine) = {
+                let c = app.card(key).unwrap();
+                (c.detail.as_ref().unwrap().id.clone(), c.machine_index)
+            };
+            app.edits.insert(
+                key.to_string(),
+                Held {
+                    id,
+                    machine,
+                    current: "As it was.".into(),
+                    was: "sha256:old".into(),
+                    read_at: Instant::now(),
+                    mine: Some(Mine {
+                        text: "Mine.".into(),
+                        from: "As it was.".into(),
+                    }),
+                    check_first: true,
+                    read_only: None,
+                },
+            );
+        });
+    }
+
+    #[test]
+    fn e_from_the_feed_is_refused_as_any_other_and_your_version_comes_first() {
+        // Being written up: refused, with no text opened.
+        let mut a = app();
+        let (key, id, _) = waiting(&mut a);
+        let machine = feed_holds_text(&mut a, &key, "From the feed.", "sha256:feed");
+        let m = &mut a.machines[machine];
+        let fc = m
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+            .find(|c| c.id == id)
+            .unwrap();
+        fc.intake = Some("pending".into());
+        a.rebuild();
+        assert!(matches!(press(&mut a, 'e'), Action::None));
+        assert!(a.message().unwrap().0.contains("still being written up"));
+        assert_eq!(a.editor_due(), None);
+        // Your unsaved version wins over what the feed reads.
+        let mut b = app();
+        let (key, id, _) = waiting(&mut b);
+        let machine = feed_holds_text(&mut b, &key, "From the feed.", "sha256:feed");
+        b.edits.insert(
+            key.clone(),
+            Held {
+                id,
+                machine,
+                current: "As it was.".into(),
+                was: "sha256:old".into(),
+                read_at: Instant::now(),
+                mine: Some(Mine {
+                    text: "Mine, unsaved.".into(),
+                    from: "As it was.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        assert!(matches!(press(&mut b, 'e'), Action::None));
+        assert_eq!(b.editor_due(), Some(key.clone()));
+        assert_eq!(b.edits[&key].was, "sha256:old");
+        assert!(b.edit_file(&key).unwrap().1.contains("Mine, unsaved."));
+    }
+
+    #[test]
+    fn a_save_on_its_way_hides_the_text_the_feed_read_before_it() {
+        // Effect::Text: the card shows the new words as being written up, so nothing opens the
+        // words they replace, even once its answer has come and the feed hasn't caught up.
+        let mut app = app();
+        let (key, _, _) = waiting(&mut app);
+        let machine = feed_holds_text(&mut app, &key, "Old words.", "sha256:old");
+        assert!(matches!(press(&mut app, 'e'), Action::None));
+        assert_eq!(app.editor_due(), Some(key.clone()));
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = app.edit_ended(&key, wrote("New words."))
+        else {
+            panic!("a changed text is sent");
+        };
+        let sent = send(&mut app, to, request);
+        assert_eq!(to, machine);
+        app.finish_job(sent.n, sent.request, saved());
+        let detail = app.card(&key).unwrap().detail.clone().unwrap();
+        assert_eq!(detail.item_text, None);
+        assert_eq!(detail.item_was, None);
+        assert!(matches!(press(&mut app, 'e'), Action::None));
+        assert_eq!(app.editor_due(), None);
+    }
+
     #[test]
     fn e_works_in_the_backlog_list_and_in_a_peek_of_a_backlog_card() {
         let mut app = app();
@@ -1477,6 +1715,7 @@ mod tests {
         );
         // A start on its way: as d and ⏎, e waits for it.
         let mut app = self::app();
+        crate::app::tests::room_in_every_session(&mut app);
         let (key, id, _) = waiting(&mut app);
         let machine = app.card(&key).unwrap().machine_index;
         app.queue_action(machine, json!({"action":"dispatch","id":id}));

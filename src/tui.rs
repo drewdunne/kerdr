@@ -23,8 +23,38 @@ use crate::poll::{self, Conn, Inbox, Poller, Timing, Wake};
 use crate::state::State;
 
 /// How long the board waits, on the way to the next card that needs you, for the live machines
-/// to say what's there now.
-const FRESH_WAIT: Duration = Duration::from_millis(1500);
+/// to say what's there now. It takes no keys meanwhile, so it's short: a read without the feed
+/// lands well inside it, and giving up only chooses from a read a few seconds old (intent 0491).
+const FRESH_WAIT: Duration = Duration::from_millis(250);
+
+/// How long after coming back to the board its turn stays quick for the read asked for then.
+const READ_LANDS: Duration = Duration::from_secs(1);
+
+/// How often the machine of a start a ⏎ waits on has its feed read again, which is the only way the
+/// board learns its workspace has opened. No faster: a feed read costs that machine seconds of
+/// work (intent 0491).
+const START_READ_EVERY: Duration = Duration::from_secs(5);
+
+/// When each machine of a start a ⏎ waits on was last asked for its feed for that.
+#[derive(Default)]
+struct StartReads(std::collections::HashMap<usize, Instant>);
+
+impl StartReads {
+    /// Of the machines a ⏎ waits on now, those whose feed is due. At once for a machine just
+    /// added: the ⏎ asks for the first read, so the wait doesn't grow by a whole gap.
+    fn due(&mut self, running: &[usize], now: Instant) -> Vec<usize> {
+        self.0.retain(|machine, _| running.contains(machine));
+        let mut due = vec![];
+        for &machine in running {
+            let waited = self.0.get(&machine).map(|last| now.duration_since(*last));
+            if waited.is_none_or(|w| w >= START_READ_EVERY) {
+                self.0.insert(machine, now);
+                due.push(machine);
+            }
+        }
+        due
+    }
+}
 
 struct Live {
     pollers: Vec<Option<Poller>>,
@@ -174,7 +204,15 @@ fn event_loop(
     // Colours from the desktop theme, read again when it changes (palette.rs).
     let mut theme = crate::palette::ThemeWatch::new(app.cfg.theme.colors.as_deref());
     theme.check(true);
+    // Back from herdr or your editor: the read that was asked for lands in moments, and the board
+    // should show it as it lands (intent 0491).
+    let (mut away_seen, mut back_at) = (app.away, None::<Instant>);
+    let mut start_reads = StartReads::default();
     loop {
+        if app.away != away_seen {
+            away_seen = app.away;
+            back_at = Some(Instant::now());
+        }
         theme.check(false);
         send_loaded_images(app, &bg, None);
         while let Ok(answer) = action_rx.try_recv() {
@@ -219,6 +257,11 @@ fn event_loop(
         }
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
         run_ready(app, &runner);
+        if let Some(l) = live.as_deref() {
+            for machine in start_reads.due(&app.start_awaited_on(), Instant::now()) {
+                l.wake_feed(machine);
+            }
+        }
         if app.resolver.expire() {
             app.rebuild();
         }
@@ -250,22 +293,17 @@ fn event_loop(
                 open.tab,
             );
             if outcome == Some(Outcome::Next) {
-                // Choose from the board as it is now, as jump_cards does, not as it was on the way in.
-                read_again(app, live.as_deref(), inbox, open.machine, true);
-                match app.next_needs_you_after(&open.from, &[]) {
-                    Some(next) => jump_cards(
-                        terminal,
-                        flags,
-                        app,
-                        live.as_deref_mut(),
-                        inbox,
-                        client_config.as_ref(),
-                        &bg,
-                        next,
-                        false,
-                    ),
-                    None => app.say("Nothing else needs you right now.", Tone::Good),
-                }
+                go_on_to_next(
+                    terminal,
+                    flags,
+                    app,
+                    live.as_deref_mut(),
+                    inbox,
+                    client_config.as_ref(),
+                    &bg,
+                    open.machine,
+                    &open.from,
+                );
             }
         }
         // A backlog item's text you just asked for with e: your editor, full screen (intent 0414).
@@ -279,9 +317,12 @@ fn event_loop(
         {
             start_action(app, &action_tx, &runner, machine, request);
         }
+        // `R`'s feeds, looked for first: what's found here is applied by the time it says so.
+        let fed = app.refreshed(inbox);
         for ev in inbox.take() {
             app.apply(ev);
         }
+        app.settle_refresh(&fed);
         holds.borrow_mut().sync(app);
         if let Some(key) = app.pending_jump_ready() {
             jump_cards(
@@ -296,10 +337,67 @@ fn event_loop(
                 true,
             );
         }
+        // ⏎ on a card whose start was running: its workspace has opened (intent 0491).
+        let remembered = app.enter_when_open.clone();
+        match app.enter_when_open_due() {
+            Some(Action::Jump(key)) => jump_cards(
+                terminal,
+                flags,
+                app,
+                live.as_deref_mut(),
+                inbox,
+                client_config.as_ref(),
+                &bg,
+                key,
+                true,
+            ),
+            Some(Action::JumpWorkspace {
+                machine,
+                session,
+                id,
+            }) => {
+                if let Some(mi) = app.machine_index(&machine) {
+                    let outcome = jump_workspace(
+                        terminal,
+                        flags,
+                        app,
+                        live.as_deref_mut(),
+                        client_config.as_ref(),
+                        &bg,
+                        mi,
+                        session,
+                        id,
+                        None,
+                        None,
+                    );
+                    if outcome == Some(Outcome::Next)
+                        && let Some(from) = remembered
+                    {
+                        go_on_to_next(
+                            terminal,
+                            flags,
+                            app,
+                            live.as_deref_mut(),
+                            inbox,
+                            client_config.as_ref(),
+                            &bg,
+                            mi,
+                            &from,
+                        );
+                    }
+                }
+            }
+            _ => {}
+        }
         app.width = terminal.size()?.width;
         app.keep_box_errors();
         terminal.draw(|f| crate::ui::draw(f, app))?;
-        if !event::poll(Duration::from_millis(250))? {
+        let wait = if back_at.is_some_and(|at| at.elapsed() < READ_LANDS) {
+            crate::app::KEY_WAIT_COMING
+        } else {
+            app.key_wait()
+        };
+        if !event::poll(wait)? {
             continue;
         }
         let action = match event::read()? {
@@ -430,25 +528,15 @@ fn event_loop(
                     }
                     None => {
                         // Machines not answering are tried again; the rest are read now, feeds
-                        // and all, so R brings the board up to date (intent 0445).
-                        let mut n = 0;
-                        for i in 0..app.machines.len() {
-                            if !app.machines[i].is_shown() {
-                                continue;
-                            }
-                            if app.machines[i].conn.is_live() {
-                                l.wake_feed(i);
-                            } else {
-                                l.wake(i);
-                                n += 1;
-                            }
+                        // and all, so R brings the board up to date (intent 0445), and the board
+                        // says when they have (intent 0491).
+                        let (reading, trying) = app.ask_refresh(Instant::now());
+                        for i in reading {
+                            l.wake_feed(i);
                         }
-                        let text = if n == 0 {
-                            "Reading every machine now.".to_string()
-                        } else {
-                            format!("Reading every machine now, and trying {n} again.")
-                        };
-                        app.say(text, Tone::Info);
+                        for i in trying {
+                            l.wake(i);
+                        }
                     }
                 }
             }
@@ -917,12 +1005,18 @@ fn jump_workspace(
                 .map(|w| w.label.clone())
         })
         .unwrap_or_else(|| id.clone());
+    if let Some(said) = app.stuck_refusal(mi, &session, &label) {
+        app.say(said, Tone::Warn);
+        return None;
+    }
     // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
     app.went_into_workspace(mi, &session, &id);
     let via = via_for(app, mi, &session);
     let j = workspace_jump(app, mi, session, id, label, tab, via);
     let outcome = run_jump(terminal, flags, app, mi, &j, client_config, bg);
     if let Some(l) = live.as_deref() {
+        // What herdr shows first, then the feed, as in read_again (intent 0491).
+        l.wake(mi);
         l.wake_feed(mi);
     }
     match &outcome {
@@ -956,7 +1050,7 @@ fn workspace_jump(
         strict: tab.is_some(),
         tab,
         label,
-        others: app.needs_you_order().len(),
+        others: app.others_needing_you(None),
         via,
         prefix: app.prefix.clone(),
         keys: keys_on(app, mi),
@@ -1036,6 +1130,37 @@ fn via_for(app: &App, mi: usize, session: &str) -> jump::Via {
     jump::choose_via(&m.machine, server.as_deref(), here.as_deref())
 }
 
+/// Ctrl+Space Space from a workspace Kerdr went into by itself: on to the next card that needs you.
+/// Chosen from the board as it is now, as jump_cards does, not as it was on the way in.
+#[allow(clippy::too_many_arguments)]
+fn go_on_to_next(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    live: Option<&mut Live>,
+    inbox: &Inbox,
+    client_config: Option<&PathBuf>,
+    bg: &Bg,
+    machine: usize,
+    from: &str,
+) {
+    read_again(app, live.as_deref(), inbox, machine, true);
+    match app.next_needs_you_after(from, &[]) {
+        Some(next) => jump_cards(
+            terminal,
+            flags,
+            app,
+            live,
+            inbox,
+            client_config,
+            bg,
+            next,
+            false,
+        ),
+        None => app.say("Nothing else needs you right now.", Tone::Good),
+    }
+}
+
 /// Jumps into a card, and on ctrl+space space keeps going to the next one that needs you. `yours`
 /// is whether you picked the first card yourself.
 #[allow(clippy::too_many_arguments)]
@@ -1084,13 +1209,17 @@ fn jump_cards(
             }
             return;
         }
+        if let Some(said) = app.stuck_refusal(mi, &session, &card.reference) {
+            app.say(said, Tone::Warn);
+            return;
+        }
         app.sel = Selection {
             col: card.stage.index(),
             key: Some(key.clone()),
         };
         // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
         app.went_into(&key);
-        let others = app.needs_you_order().iter().filter(|k| **k != key).count();
+        let others = app.others_needing_you(Some(&key));
         let via = via_for(app, mi, &session);
         // Its own tab, never another's: a child's, or the card's own agent's (intent 0349).
         let (tab, strict) = app.jump_tab(&card);
@@ -1169,7 +1298,8 @@ fn jump_cards(
 
 /// Reads the card's machine again and applies what's waiting. Choosing the next card, it reads
 /// every live machine and waits a moment (FRESH_WAIT at most) for what they say, so the choice is
-/// made from the board as it is now, not as it was when you went into herdr.
+/// made from the board as it is now, not as it was when you went into herdr. A machine in the
+/// middle of a feed read can't say anything new that soon, so it isn't waited for (intent 0491).
 fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choosing_next: bool) {
     if let Some(l) = live {
         let mut machines = vec![mi];
@@ -1183,11 +1313,9 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
         let since = Instant::now();
         for &i in &machines {
             if i == mi {
-                // What herdr shows comes first and fast; the feed follows on its own, so the
-                // wait below never waits out a feed read (intent 0445).
-                if choosing_next {
-                    l.wake(i);
-                }
+                // What herdr shows comes first and fast, so the card you just answered stops
+                // saying it needs you; the feed follows on its own (intents 0445 and 0491).
+                l.wake(i);
                 l.wake_feed(i);
             } else {
                 l.wake(i);
@@ -1267,6 +1395,23 @@ mod tests {
             jump::Via::Local,
         );
         assert_eq!((j.tab, j.strict), (None, false));
+    }
+
+    #[test]
+    fn a_start_a_key_waits_on_has_its_machines_feed_read_at_once_then_every_five_seconds() {
+        let mut reads = StartReads::default();
+        let t = Instant::now();
+        let at = |secs: u64| t + Duration::from_secs(secs);
+        assert_eq!(reads.due(&[1], at(0)), [1], "the key asks for the first");
+        assert!(reads.due(&[1], at(4)).is_empty());
+        assert_eq!(reads.due(&[1], at(5)), [1]);
+        assert!(reads.due(&[1], at(9)).is_empty());
+        // Another machine counts from its own key; one nothing waits on is forgotten.
+        assert_eq!(reads.due(&[1, 2], at(9)), [2]);
+        assert_eq!(reads.due(&[1, 2], at(10)), [1]);
+        assert_eq!(reads.due(&[2], at(14)), [2]);
+        assert!(reads.due(&[], at(15)).is_empty());
+        assert_eq!(reads.due(&[1], at(100)), [1], "a new key, a new first read");
     }
 
     /// What the runner says, in words: "started 1", "handed 1", "dropped 1 yes", "done 1 ok".

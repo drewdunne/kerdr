@@ -8,7 +8,7 @@ use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{
@@ -463,6 +463,97 @@ impl Attached {
     }
 }
 
+/// How often a herdr window's watcher looks for Kerdr's keys. Pressing one shows nothing until
+/// it's seen, so this is most of how long the key feels; each look is one short herdr call
+/// (intent 0491). Windows has no shared ssh connection, so there each look at another machine is a
+/// whole new sign-in: that keeps the slower pace it always had.
+fn look_every(signs_in_each_time: bool) -> Duration {
+    Duration::from_millis(if signs_in_each_time { 700 } else { 200 })
+}
+
+/// Kerdr's keys acted on lately, kept from one herdr window to the next: a token is cleared on a
+/// thread nothing waits for, so later windows can open while it's still there, and he can have
+/// hopped through several cards by then (intent 0491).
+static RECENT_KEYS: Mutex<Vec<(String, Instant)>> = Mutex::new(Vec::new());
+
+/// How long a key stays in `RECENT_KEYS`. Longer than a clearing can take (6 s) plus the second
+/// before a window opened that still counts as fresh, after which a leftover token is old news.
+const KEY_REMEMBERED: Duration = Duration::from_secs(10);
+
+/// One herdr call in a session, for a window's watcher and the threads it starts.
+fn on_herdr(
+    t: &Target,
+    herdr_bin: &str,
+    session: &str,
+    rest: &[&str],
+    secs: u64,
+) -> transport::Output {
+    let args = herdr_args(session, rest);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    transport::run_herdr(t, herdr_bin, &refs, Duration::from_secs(secs))
+}
+
+/// What one herdr window's watcher knows between looks.
+struct KeyWatch {
+    /// The machine and session it watches: a workspace's id and a token's value mean nothing
+    /// without them.
+    place: String,
+    /// When the window opened, in seconds.
+    started: u64,
+    /// Tokens this window has seen, and sent to be cleared, so a slow connection doesn't get one
+    /// call for each look and one whose clearing failed never counts as a new key here.
+    clearing: Vec<String>,
+}
+
+impl KeyWatch {
+    fn new(place: String, started: u64) -> KeyWatch {
+        KeyWatch {
+            place,
+            started,
+            clearing: Vec::new(),
+        }
+    }
+
+    /// One look at the session's workspaces: the key pressed, if any, and the workspaces whose
+    /// tokens to clear. A token counts once: its key must be new, or one uncleared token would jump
+    /// a second time, since a window takes a token from up to a second before it opened. A key
+    /// pressed on another workspace in the same second as the last one is a new key.
+    fn look(
+        &mut self,
+        list: &[herdr::Workspace],
+        recent: &Mutex<Vec<(String, Instant)>>,
+    ) -> (Option<Request>, Vec<String>) {
+        let mut heard = None;
+        let mut to_clear = Vec::new();
+        let mut recent = recent.lock().unwrap_or_else(|e| e.into_inner());
+        recent.retain(|(_, at)| at.elapsed() < KEY_REMEMBERED);
+        for w in list {
+            let Some(value) = w.tokens.get(herdr_keys::TOKEN) else {
+                continue;
+            };
+            let name = format!("{}/{}/{value}", self.place, w.workspace_id);
+            let new_here = !self.clearing.contains(&name);
+            if new_here {
+                self.clearing.push(name.clone());
+                to_clear.push(w.workspace_id.clone());
+            }
+            // A key pressed before this visit began is old news.
+            let fresh = value
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .is_none_or(|at| at + 1 >= self.started);
+            if heard.is_none() && fresh && new_here && !recent.iter().any(|(n, _)| *n == name) {
+                heard = herdr_keys::parse_request(value);
+                if heard.is_some() {
+                    recent.push((name, Instant::now()));
+                }
+            }
+        }
+        (heard, to_clear)
+    }
+}
+
 /// While you're in herdr: every this often, `tick` lets the board keep up.
 const TICK_EVERY: Duration = Duration::from_secs(1);
 
@@ -473,7 +564,7 @@ fn attach(
     jump: &Jump,
     tick: &mut dyn FnMut(),
 ) -> std::io::Result<Attached> {
-    let begun = std::time::Instant::now();
+    let begun = Instant::now();
     let started = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -495,32 +586,17 @@ fn attach(
         } else {
             format!("{} q: back to the board", jump.prefix)
         };
-        thread::spawn(move || {
-            let run = |rest: &[&str], secs: u64| {
-                let args = herdr_args(&session, rest);
-                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(secs))
-            };
-            let clear = |wid: &str| {
-                run(
-                    &[
-                        "workspace",
-                        "report-metadata",
-                        wid,
-                        "--source",
-                        "kerdr",
-                        "--clear-token",
-                        herdr_keys::TOKEN,
-                    ],
-                    6,
-                )
-            };
-            thread::sleep(Duration::from_millis(600));
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            run(
-                &[
+        // What Kerdr says on arrival goes on a thread of its own: herdr's window takes a moment to
+        // come up, and looking for a key mustn't wait for that or for its answer (intent 0491).
+        {
+            let (stop, t, herdr_bin, session) =
+                (stop.clone(), t.clone(), herdr_bin.clone(), session.clone());
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(600));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let rest = [
                     "notification",
                     "show",
                     "kerdr",
@@ -528,40 +604,53 @@ fn attach(
                     &body,
                     "--position",
                     "top-right",
-                ],
-                6,
-            );
+                ];
+                on_herdr(&t, &herdr_bin, &session, &rest, 6);
+            });
+        }
+        let place = format!("{}/{session}", jump.machine.name);
+        let look_gap = look_every(cfg!(windows) && jump.machine.ssh.is_some());
+        thread::spawn(move || {
+            let mut watch = KeyWatch::new(place, started);
             while !stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(700));
+                let out = on_herdr(&t, &herdr_bin, &session, &["workspace", "list"], 6);
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let out = run(&["workspace", "list"], 6);
-                let Ok(list) = herdr::parse_workspace_list(&out.stdout) else {
-                    continue;
-                };
-                let Some((wid, value)) = crate::board::jump_request(&list) else {
-                    continue;
-                };
-                if stop.load(Ordering::Relaxed) {
-                    break;
+                if let Ok(list) = herdr::parse_workspace_list(&out.stdout) {
+                    let (heard, to_clear) = watch.look(&list, &RECENT_KEYS);
+                    // The request first: only it takes the window down, and clearing the token
+                    // can take a slow connection seconds. Nothing waits for the clearing, which is
+                    // why `RECENT_KEYS` is kept.
+                    if let Some(r) = heard {
+                        *request.lock().unwrap() = Some(r);
+                    }
+                    for wid in to_clear {
+                        let (t, herdr_bin, session) =
+                            (t.clone(), herdr_bin.clone(), session.clone());
+                        thread::spawn(move || {
+                            let rest = [
+                                "workspace",
+                                "report-metadata",
+                                wid.as_str(),
+                                "--source",
+                                "kerdr",
+                                "--clear-token",
+                                herdr_keys::TOKEN,
+                            ];
+                            on_herdr(&t, &herdr_bin, &session, &rest, 6);
+                        });
+                    }
+                    if heard.is_some() {
+                        break;
+                    }
                 }
-                clear(&wid);
-                // A key pressed before this visit began is old news.
-                let fresh = value
-                    .split(':')
-                    .nth(1)
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .is_none_or(|at| at + 1 >= started);
-                if let (true, Some(r)) = (fresh, herdr_keys::parse_request(&value)) {
-                    *request.lock().unwrap() = Some(r);
-                    break;
-                }
+                thread::sleep(look_gap);
             }
         });
     }
     let mut asked_to_close = false;
-    let mut ticked = std::time::Instant::now();
+    let mut ticked = Instant::now();
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break Some(status),
@@ -572,7 +661,7 @@ fn attach(
                 }
                 if ticked.elapsed() >= TICK_EVERY {
                     tick();
-                    ticked = std::time::Instant::now();
+                    ticked = Instant::now();
                 }
                 thread::sleep(Duration::from_millis(30));
             }
@@ -864,6 +953,164 @@ mod tests {
             feed: None,
             hidden: false,
         }
+    }
+
+    fn with_key(id: &str, value: &str) -> herdr::Workspace {
+        herdr::Workspace {
+            workspace_id: id.into(),
+            tokens: [(herdr_keys::TOKEN.to_string(), value.to_string())].into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_key_jumps_once_though_its_token_is_still_there_when_the_next_window_opens() {
+        // Its token is cleared on a thread nothing waits for, and a window takes a token from up
+        // to a second before it opened (intent 0491).
+        let last = Mutex::new(Vec::new());
+        let mut first = KeyWatch::new("m/web".into(), 100);
+        let token = [with_key("w1", "next:100")];
+        assert_eq!(
+            first.look(&token, &last),
+            (Some(Request::Next), vec!["w1".to_string()])
+        );
+        let mut next = KeyWatch::new("m/web".into(), 101);
+        let (heard, clear) = next.look(&token, &last);
+        assert_eq!(heard, None, "the same key, still there");
+        assert_eq!(
+            clear,
+            ["w1"],
+            "asked again, in case the first clearing failed"
+        );
+        // Asked once a window: looks come five times a second, whatever a connection is doing.
+        assert_eq!(next.look(&token, &last), (None, vec![]));
+        // A key pressed on the card it went on to is a new key, even in the same second.
+        assert_eq!(
+            next.look(
+                &[with_key("w1", "next:100"), with_key("w2", "next:101")],
+                &last
+            ),
+            (Some(Request::Next), vec!["w2".to_string()])
+        );
+        let same_second = next.look(&[with_key("w3", "board:101")], &last);
+        assert_eq!(same_second, (Some(Request::Board), vec!["w3".to_string()]));
+    }
+
+    #[test]
+    fn hopping_through_two_cards_never_makes_the_first_key_jump_again() {
+        // Next on w1, Next on w2 within a second or two, and w1's clearing still running or failed:
+        // the third window never closes on a card he hasn't seen.
+        let last = Mutex::new(Vec::new());
+        let w1 = with_key("w1", "next:100");
+        let w2 = with_key("w2", "next:101");
+        let mut first = KeyWatch::new("m/web".into(), 100);
+        assert_eq!(
+            first.look(std::slice::from_ref(&w1), &last).0,
+            Some(Request::Next)
+        );
+        let mut second = KeyWatch::new("m/web".into(), 101);
+        assert_eq!(
+            second.look(&[w1.clone(), w2.clone()], &last).0,
+            Some(Request::Next)
+        );
+        let mut third = KeyWatch::new("m/web".into(), 101);
+        assert_eq!(third.look(&[w1, w2], &last).0, None);
+    }
+
+    #[test]
+    fn a_token_is_forgotten_only_once_it_is_too_old_to_count() {
+        let key = with_key("w1", "next:100");
+        let name = "m/web/w1/next:100".to_string();
+        let Some(long_ago) = Instant::now().checked_sub(KEY_REMEMBERED) else {
+            return;
+        };
+        let last = Mutex::new(vec![(name.clone(), long_ago)]);
+        // Nothing keeps a key for ever, however many go by.
+        let mut watch = KeyWatch::new("m/web".into(), 200);
+        assert_eq!(watch.look(std::slice::from_ref(&key), &last).0, None);
+        assert!(last.lock().unwrap().is_empty());
+        // A window still open past that never takes a token it has already seen for a new key.
+        let mut watch = KeyWatch::new("m/web".into(), 100);
+        last.lock().unwrap().push((name, long_ago));
+        assert_eq!(
+            watch.look(std::slice::from_ref(&key), &last).0,
+            Some(Request::Next)
+        );
+        last.lock().unwrap().clear();
+        assert_eq!(watch.look(std::slice::from_ref(&key), &last).0, None);
+    }
+
+    #[test]
+    fn a_look_on_windows_at_another_machine_keeps_the_slower_pace() {
+        // A whole ssh sign-in for each look there, with no shared connection (intent 0491).
+        assert_eq!(look_every(true), Duration::from_millis(700));
+        assert_eq!(look_every(false), Duration::from_millis(200));
+    }
+
+    #[test]
+    fn a_key_from_before_the_window_opened_is_cleared_and_ignored() {
+        let last = Mutex::new(Vec::new());
+        let mut watch = KeyWatch::new("m/web".into(), 100);
+        assert_eq!(
+            watch.look(&[with_key("w1", "next:98")], &last),
+            (None, vec!["w1".to_string()])
+        );
+        // What it can't read is cleared and ignored too.
+        assert_eq!(
+            watch.look(&[with_key("w2", "dance")], &last),
+            (None, vec!["w2".to_string()])
+        );
+        assert!(last.lock().unwrap().is_empty());
+        // The second before it opened still counts: the two clocks may differ a little.
+        assert_eq!(
+            watch.look(&[with_key("w3", "board:99")], &last).0,
+            Some(Request::Board)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_key_closes_the_window_at_once_whatever_herdr_is_slow_at() {
+        // Neither what Kerdr says on arrival nor clearing the token holds up seeing the key, or
+        // closing the window (intent 0491). A stand-in herdr and a stand-in window.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let bin = dir.path().join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  *"notification show"*) echo said >>"{log}"; exec sleep 5;;
+  *"workspace list"*) echo '{{"id":"cli","result":{{"type":"workspace_list","workspaces":[{{"workspace_id":"w-keyed","tokens":{{"kerdr_jump":"next:{now}"}}}}]}}}}';;
+  *"report-metadata w-keyed"*) echo clearing >>"{log}"; sleep 5; echo cleared >>"{log}";;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut watched = jump(None);
+        watched.machine.herdr = bin.display().to_string();
+        let mut window = Command::new("sleep");
+        window.arg("60");
+        let t = std::time::Instant::now();
+        let attached = attach(&mut window, &Target::Local, &watched, &mut || {}).unwrap();
+        assert_eq!(attached.request, Some(Request::Next));
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        let by = std::time::Instant::now() + Duration::from_secs(4);
+        let said = || std::fs::read_to_string(&log).unwrap_or_default();
+        while !said().contains("clearing") && std::time::Instant::now() < by {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(said().contains("clearing"), "{}", said());
+        assert!(!said().contains("cleared"), "{}", said());
     }
 
     #[test]

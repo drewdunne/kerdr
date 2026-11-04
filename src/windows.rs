@@ -143,8 +143,8 @@ pub fn poll(machine: &Machine, feed_due: bool) -> Output {
 
 fn poll_with_deadline(machine: &Machine, feed_due: bool, deadline: Duration) -> Output {
     let started = Instant::now();
-    let run = |args: &[&str]| {
-        let remaining = deadline.saturating_sub(started.elapsed());
+    let run_within = |args: &[&str], most: Duration| {
+        let remaining = deadline.saturating_sub(started.elapsed()).min(most);
         if remaining.is_zero() {
             return Output {
                 timed_out: true,
@@ -153,7 +153,7 @@ fn poll_with_deadline(machine: &Machine, feed_due: bool, deadline: Duration) -> 
         }
         transport::run_herdr(&Target::Local, &machine.herdr, args, remaining)
     };
-    let version = run(&["--version"]);
+    let version = run_within(&["--version"], deadline);
     if version.status == Some(127) {
         return Output {
             status: Some(0),
@@ -165,7 +165,8 @@ fn poll_with_deadline(machine: &Machine, feed_due: bool, deadline: Duration) -> 
     if !version.ok() {
         return version;
     }
-    let sessions = run(&["session", "list", "--json"]);
+    // One stuck session costs its own snapshot, not the whole read (intent 0491).
+    let sessions = run_within(&["session", "list", "--json"], crate::poll::SESSION_MOST);
     if !sessions.ok() {
         return sessions;
     }
@@ -180,12 +181,17 @@ fn poll_with_deadline(machine: &Machine, feed_due: bool, deadline: Duration) -> 
     );
     if let Ok(list) = crate::herdr::parse_sessions(&sessions.stdout) {
         for session in list.into_iter().filter(|s| s.running) {
-            let snapshot = run(&["--session", &session.name, "api", "snapshot"]);
-            if snapshot.timed_out {
+            let snapshot = run_within(
+                &["--session", &session.name, "api", "snapshot"],
+                crate::poll::SESSION_MOST,
+            );
+            if snapshot.timed_out && started.elapsed() >= deadline {
                 return snapshot;
             }
             let body = if snapshot.ok() {
                 snapshot.stdout
+            } else if snapshot.timed_out {
+                crate::poll::SESSION_SILENT.to_string()
             } else {
                 format!(
                     "snapshot failed (exit {:?}): {}",
