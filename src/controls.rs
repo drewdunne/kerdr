@@ -2114,7 +2114,7 @@ impl App {
             return None;
         }
         let asking = self.resolver.starting(&id)?.asking;
-        if let Some(action) = self.into_opened(card) {
+        if let Some(action) = self.go_into_opened(card) {
             return Some(action);
         }
         self.still_changing(card, "enter");
@@ -2128,7 +2128,7 @@ impl App {
 
     /// Into the workspace a feed names for this card's record, opened since its start or reopen was
     /// asked for. None until one has.
-    fn into_opened(&mut self, card: &Card) -> Option<Action> {
+    fn go_into_opened(&mut self, card: &Card) -> Option<Action> {
         let id = card.detail.as_ref()?.id.clone();
         let job = self.resolver.starting(&id)?;
         // Where it asked, and where a start that ran on another machine runs (intent 0445).
@@ -2210,7 +2210,7 @@ impl App {
         }
         let id = card.detail.as_ref()?.id.clone();
         if self.resolver.starting(&id).is_some() {
-            return self.into_opened(&card);
+            return self.go_into_opened(&card);
         }
         if self.started_lately(&id) {
             return None;
