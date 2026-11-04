@@ -114,11 +114,18 @@ impl MachineState {
         let last = self.data.take();
         let last = last.as_ref().map(|d| &d.snapshots);
         self.snapshot_errors.clear();
+        let mut kept = std::mem::take(&mut data.kept_snapshots);
         for (session, snap) in &mut data.snapshots {
-            if snap.is_err()
-                && let Some(Ok(good)) = last.and_then(|l| l.get(session))
-            {
-                let Err(why) = std::mem::replace(snap, Ok(good.clone())) else {
+            if !snap.is_err() {
+                continue;
+            }
+            // Newest first: a good read merged into this one, else the one the board has.
+            let good = kept.remove(session).or_else(|| {
+                last.and_then(|l| l.get(session))
+                    .and_then(|s| s.as_ref().ok().cloned())
+            });
+            if let Some(good) = good {
+                let Err(why) = std::mem::replace(snap, Ok(good)) else {
                     continue;
                 };
                 self.snapshot_errors.insert(session.clone(), why);
@@ -1234,6 +1241,59 @@ mod tests {
         let next = live(machine, after, None).data.unwrap();
         m.take(next, t0 + chrono::Duration::seconds(2));
         m
+    }
+
+    #[test]
+    fn a_session_failing_after_a_read_the_board_hadnt_shown_keeps_that_read() {
+        // Read while the board was away: w1 closed, and then the session stopped answering. Merged,
+        // the board mustn't bring w1 back from what it last showed.
+        let machine = Machine {
+            name: "m".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let mut m = live(
+            machine.clone(),
+            vec![(
+                "web",
+                Snapshot {
+                    workspaces: vec![ws("w1", "1-open")],
+                    ..Default::default()
+                },
+            )],
+            None,
+        );
+        let event = |snap: Result<Snapshot, String>| {
+            let mut data = live(machine.clone(), vec![], None).data.unwrap();
+            data.snapshots.insert("web".into(), snap);
+            crate::poll::Event {
+                machine: 0,
+                conn: m.conn.clone(),
+                data: Some(data),
+                at: Local::now(),
+            }
+        };
+        let inbox = crate::poll::Inbox::default();
+        let reader = inbox.next_reader(0);
+        let now = std::time::Instant::now();
+        inbox.put(event(Ok(Snapshot::default())), now, reader);
+        inbox.put(event(Err(crate::poll::SESSION_SILENT.into())), now, reader);
+        let mut merged = inbox.take();
+        assert_eq!(merged.len(), 1);
+        m.take(merged.remove(0).data.unwrap(), Local::now());
+        assert!(
+            m.data.as_ref().unwrap().snapshots["web"]
+                .as_ref()
+                .unwrap()
+                .workspaces
+                .is_empty()
+        );
+        assert_eq!(
+            m.snapshot_errors.get("web").map(String::as_str),
+            Some(crate::poll::SESSION_SILENT)
+        );
     }
 
     #[test]

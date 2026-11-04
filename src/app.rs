@@ -550,6 +550,8 @@ pub struct App {
     /// The tokens of questions answered from the box, whose copy in the feed is out of date until
     /// its next read: d doesn't open them again from there (intent 0491).
     pub kickoff_sent: std::collections::HashSet<String>,
+    /// The last check sent behind a Kickoff Questions box, so a late answer can't touch a newer box.
+    pub kickoff_checks: u64,
     /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
@@ -645,6 +647,7 @@ impl App {
             moved_home: vec![],
             kickoff_kept: Default::default(),
             kickoff_sent: Default::default(),
+            kickoff_checks: 0,
             answered_at: None,
             width: 200,
             demo: false,
@@ -904,6 +907,12 @@ impl App {
             let failed = !m.conn.is_live() || (fed.contains(&i) && m.feed_error.is_some());
             if failed {
                 missed.push(m.name());
+            } else if fed.contains(&i) && !m.snapshot_errors.is_empty() {
+                // Its cards are new, but a stuck session's workspaces are as they last were.
+                let mut sessions: Vec<&str> =
+                    m.snapshot_errors.keys().map(String::as_str).collect();
+                sessions.sort_unstable();
+                missed.push(format!("{}'s {}", m.name(), sessions.join(", ")));
             }
             !failed && !fed.contains(&i)
         });
@@ -2925,6 +2934,19 @@ pub(crate) mod tests {
         app.machines[1].conn = Conn::Hidden;
         app.settle_refresh(&[0]);
         let said = format!("Up to date, except {failed}.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_names_a_stuck_session_it_could_not_bring_up_to_date() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        let name = app.machines[0].name();
+        app.machines[0]
+            .snapshot_errors
+            .insert("web".into(), crate::poll::SESSION_SILENT.into());
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {name}'s web.");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
     }
 

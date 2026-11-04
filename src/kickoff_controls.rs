@@ -62,6 +62,15 @@ fn drafts_for(questions: &[Question], kept: &[KeptAnswer]) -> Vec<String> {
         .collect()
 }
 
+/// A note with any words typed against an old wording after it.
+fn with_orphaned(note: Option<String>, orphaned: &[String]) -> Option<String> {
+    if orphaned.is_empty() {
+        return note;
+    }
+    let words = format!("{CHANGED_KEPT} {}", orphaned.join(" / "));
+    Some(note.map_or_else(|| words.clone(), |note| format!("{note} {words}")))
+}
+
 /// What's on screen in the box.
 #[derive(Clone, Debug)]
 pub struct Kickoff {
@@ -83,6 +92,11 @@ pub struct Kickoff {
     pub along: Option<String>,
     /// Something the backend wants said in the box.
     pub note: Option<String>,
+    /// Which check of the questions this box waits on; 0 when none was sent behind it.
+    pub check: u64,
+    /// Words typed for a question the check found changed: they're no answer to the new one, so
+    /// they stay in the note, and go with the rest of what's kept if he leaves (intent 0491).
+    pub orphaned: Vec<String>,
     pub ready_at: Instant,
     /// How far the question's text is scrolled, on a screen too small for it, and how far it can
     /// be, which only drawing it can tell.
@@ -118,6 +132,11 @@ impl Kickoff {
         }
         let questions = cleaned(&response.questions);
         let drafts = drafts_for(&questions, kept);
+        let orphaned: Vec<String> = kept
+            .iter()
+            .filter(|(num, ..)| num.is_empty())
+            .map(|(.., words)| words.clone())
+            .collect();
         Some(Kickoff {
             machine,
             request,
@@ -133,7 +152,9 @@ impl Kickoff {
             } else {
                 None
             },
-            note: response.note.as_deref().map(clean),
+            note: with_orphaned(response.note.as_deref().map(clean), &orphaned),
+            check: 0,
+            orphaned,
             ready_at: Instant::now() + READY_AFTER,
             scroll: Cell::new(0),
             scroll_most: Cell::new(0),
@@ -154,28 +175,24 @@ impl Kickoff {
             None
         };
         self.asked = response.asked.clone().unwrap_or_default();
-        self.note = response.note.as_deref().map(clean);
+        self.note = with_orphaned(response.note.as_deref().map(clean), &self.orphaned);
         let now = cleaned(&response.questions);
         if now != self.questions {
             let kept = self.kept();
             self.drafts = drafts_for(&now, &kept);
             // Words typed against the old wording can't be answers to the new one, but they were
             // typed while this box was up, so they stay on screen rather than vanish (intent 0491).
-            let orphans: Vec<String> = kept
-                .iter()
-                .filter(|(num, question, _)| {
-                    !now.iter().any(|q| q.num == *num && q.question == *question)
-                })
-                .map(|(.., words)| clean(words))
-                .collect();
+            self.orphaned.extend(
+                kept.iter()
+                    .filter(|(num, question, _)| {
+                        !now.iter().any(|q| q.num == *num && q.question == *question)
+                    })
+                    .map(|(.., words)| clean(words)),
+            );
             self.questions = now;
             self.at = 0;
             self.reached = 0;
-            self.note = Some(if orphans.is_empty() {
-                CHANGED.into()
-            } else {
-                format!("{CHANGED} {CHANGED_KEPT} {}", orphans.join(" / "))
-            });
+            self.note = with_orphaned(Some(CHANGED.into()), &self.orphaned);
             self.ready_at = Instant::now() + READY_AFTER;
             self.scroll.set(0);
         }
@@ -263,7 +280,7 @@ impl App {
             .get(&detail.id)
             .cloned()
             .unwrap_or_default();
-        let form = Kickoff::from_answer(
+        let mut form = Kickoff::from_answer(
             machine,
             request,
             &response,
@@ -271,6 +288,9 @@ impl App {
             card.title.clone(),
             &kept,
         )?;
+        self.kickoff_checks += 1;
+        form.check = self.kickoff_checks;
+        let check = form.check;
         let id = detail.id.clone();
         self.mode = Mode::Kickoff {
             form,
@@ -279,12 +299,13 @@ impl App {
         };
         Some(Action::Mutate {
             machine,
-            request: json!({"action": "kickoff", "id": id}),
+            request: json!({"action": "kickoff", "id": id, "check": check}),
         })
     }
 
-    /// The check's answer, while its box is still up; once it's gone, nothing it says matters: his
-    /// answers went with their token, and the backend checks that itself.
+    /// The check's answer, while the box it was sent behind is still up; once that's gone, nothing
+    /// it says matters: his answers went with their token, and the backend checks that itself. A
+    /// token the check disproves is done with, so a feed still holding it can't open the box again.
     pub(super) fn finish_kickoff_check(
         &mut self,
         machine: usize,
@@ -294,11 +315,14 @@ impl App {
         let Mode::Kickoff { form, back, .. } = &mut self.mode else {
             return;
         };
-        if form.request["id"] != request["id"] {
+        if form.request["id"] != request["id"] || request["check"] != json!(form.check) {
             return;
         }
         match result {
             Ok(response) if !response.questions.is_empty() && response.asked.is_some() => {
+                if response.asked.as_ref() != Some(&form.asked) {
+                    self.kickoff_sent.insert(form.asked.clone());
+                }
                 form.checked(machine, &response);
             }
             Err(_) => form.note = Some(UNCHECKED.into()),
@@ -309,6 +333,7 @@ impl App {
             // None left to ask, or it can't be answered now: the box goes, keeping what's typed.
             Ok(response) => {
                 let (form, back) = (form.clone(), back.clone());
+                self.kickoff_sent.insert(form.asked.clone());
                 self.keep_kickoff(&form);
                 self.mode = *back;
                 if response.ok {
@@ -418,7 +443,13 @@ impl App {
         let Some(id) = form.request["id"].as_str() else {
             return;
         };
-        let kept = form.kept();
+        let mut kept = form.kept();
+        // No question of their own: an empty number marks them for the next box's note.
+        kept.extend(
+            form.orphaned
+                .iter()
+                .map(|words| (String::new(), String::new(), words.clone())),
+        );
         if kept.is_empty() {
             self.kickoff_kept.remove(id);
         } else {
@@ -884,6 +915,69 @@ mod tests {
         now.questions = vec![question("1", "The question now?", "No")];
         app.finish_kickoff_check(0, &request, Ok(now));
         assert_eq!(showing(&app).note.as_deref(), Some(CHANGED));
+    }
+
+    #[test]
+    fn a_late_check_cant_touch_a_newer_box() {
+        let (mut app, card) = preloaded(answer().questions);
+        let first = sent(d(&mut app, &card));
+        key(&mut app, KeyCode::Esc);
+        let second = sent(d(&mut app, &card));
+        assert_ne!(first["check"], second["check"]);
+        // The newer check answers first; the older one, from a box he's left, changes nothing.
+        app.finish_kickoff_check(0, &second, Ok(answer()));
+        let mut old = answer();
+        old.questions = vec![question("1", "What the older check read?", "No")];
+        old.asked = Some("older".into());
+        app.finish_kickoff_check(0, &first, Ok(old));
+        let form = showing(&app);
+        assert_eq!(form.questions.len(), 2);
+        assert_eq!(form.asked, "fedcba9876543210");
+    }
+
+    #[test]
+    fn a_token_the_check_disproves_cant_open_the_box_again() {
+        // None left: d means start now, though the feed still has the questions.
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        let done = Response {
+            ok: true,
+            message: "#41 has no questions for you now; d starts it.".into(),
+            ..Default::default()
+        };
+        app.finish_kickoff_check(0, &request, Ok(done));
+        assert!(!matches!(app.mode, Mode::Kickoff { .. }));
+        assert_eq!(sent(d(&mut app, &card))["action"], "dispatch");
+        assert!(!matches!(app.mode, Mode::Kickoff { .. }));
+
+        // A new token: answering it leaves the feed's old one no way back in either.
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        app.finish_kickoff_check(0, &request, Ok(answer()));
+        assert_eq!(showing(&app).asked, "fedcba9876543210");
+        key(&mut app, KeyCode::Esc);
+        assert_eq!(sent(d(&mut app, &card))["action"], "dispatch");
+    }
+
+    #[test]
+    fn words_for_a_changed_question_are_there_again_after_esc() {
+        let (mut app, card) = preloaded(vec![question("1", "An old question?", "Yes")]);
+        let request = sent(d(&mut app, &card));
+        typed(&mut app, "words for the old one");
+        let mut now = answer();
+        now.questions = vec![question("1", "The question now?", "No")];
+        app.finish_kickoff_check(0, &request, Ok(now.clone()));
+        key(&mut app, KeyCode::Esc);
+        assert!(!matches!(app.mode, Mode::Kickoff { .. }));
+        // Reopened from the feed, once it has caught up: the words are in the note, no answer.
+        let id = card.detail.as_ref().unwrap().id.clone();
+        let kept = app.kickoff_kept[&id].clone();
+        let form =
+            Kickoff::from_answer(0, &json!({"id": id}), &now, "#41".into(), "t".into(), &kept)
+                .unwrap();
+        assert_eq!(form.drafts, [""]);
+        assert!(form.note.unwrap().ends_with("words for the old one"));
+        assert_eq!(form.orphaned, ["words for the old one"]);
     }
 
     #[test]

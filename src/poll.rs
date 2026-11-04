@@ -109,6 +109,8 @@ pub struct MachineData {
     pub feed: Option<Result<Feed, String>>,
     /// A feed read that failed after the good one above, when two reads were merged into one.
     pub feed_failed_after: Option<String>,
+    /// The same for a session: its last good snapshot, where a later read in the merge failed.
+    pub kept_snapshots: BTreeMap<String, Snapshot>,
 }
 
 #[derive(Debug)]
@@ -125,20 +127,38 @@ pub struct Event {
 /// so the board ends up where applying both in turn would have left it.
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
-        (Some(data), Some(old_data)) => match (data.feed.take(), old_data.feed) {
-            // No feed this time: the older read's stands, with any failure that followed it.
-            (None, old_feed) => {
-                data.feed = old_feed;
-                data.feed_failed_after = old_data.feed_failed_after;
+        (Some(data), Some(old_data)) => {
+            // A session that failed after a good read stays as that read left it, not as the
+            // board last showed it (intent 0491).
+            let failed = |data: &MachineData, session: &str| {
+                matches!(data.snapshots.get(session), Some(Err(_)))
+            };
+            let good = old_data.kept_snapshots.into_iter().chain(
+                old_data
+                    .snapshots
+                    .into_iter()
+                    .filter_map(|(s, snap)| Some((s, snap.ok()?))),
+            );
+            for (session, snap) in good {
+                if failed(data, &session) {
+                    data.kept_snapshots.insert(session, snap);
+                }
             }
-            // A failure after good cards keeps the cards and says it failed, as applying the
-            // two reads in turn would have.
-            (Some(Err(e)), Some(Ok(feed))) => {
-                data.feed = Some(Ok(feed));
-                data.feed_failed_after = Some(e);
+            match (data.feed.take(), old_data.feed) {
+                // No feed this time: the older read's stands, with any failure that followed it.
+                (None, old_feed) => {
+                    data.feed = old_feed;
+                    data.feed_failed_after = old_data.feed_failed_after;
+                }
+                // A failure after good cards keeps the cards and says it failed, as applying the
+                // two reads in turn would have.
+                (Some(Err(e)), Some(Ok(feed))) => {
+                    data.feed = Some(Ok(feed));
+                    data.feed_failed_after = Some(e);
+                }
+                (new_feed, _) => data.feed = new_feed,
             }
-            (new_feed, _) => data.feed = new_feed,
-        },
+        }
         (None, Some(old_data)) => {
             new.data = Some(old_data);
             new.at = old.at;
@@ -622,6 +642,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         keys: sections.keys.unwrap_or(false),
         feed,
         feed_failed_after: None,
+        kept_snapshots: Default::default(),
     })
 }
 

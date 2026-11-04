@@ -293,22 +293,17 @@ fn event_loop(
                 open.tab,
             );
             if outcome == Some(Outcome::Next) {
-                // Choose from the board as it is now, as jump_cards does, not as it was on the way in.
-                read_again(app, live.as_deref(), inbox, open.machine, true);
-                match app.next_needs_you_after(&open.from, &[]) {
-                    Some(next) => jump_cards(
-                        terminal,
-                        flags,
-                        app,
-                        live.as_deref_mut(),
-                        inbox,
-                        client_config.as_ref(),
-                        &bg,
-                        next,
-                        false,
-                    ),
-                    None => app.say("Nothing else needs you right now.", Tone::Good),
-                }
+                go_on_to_next(
+                    terminal,
+                    flags,
+                    app,
+                    live.as_deref_mut(),
+                    inbox,
+                    client_config.as_ref(),
+                    &bg,
+                    open.machine,
+                    &open.from,
+                );
             }
         }
         // A backlog item's text you just asked for with e: your editor, full screen (intent 0414).
@@ -343,6 +338,7 @@ fn event_loop(
             );
         }
         // ⏎ on a card whose start was running: its workspace has opened (intent 0491).
+        let remembered = app.enter_when_open.clone();
         match app.enter_when_open_due() {
             Some(Action::Jump(key)) => jump_cards(
                 terminal,
@@ -361,7 +357,7 @@ fn event_loop(
                 id,
             }) => {
                 if let Some(mi) = app.machine_index(&machine) {
-                    jump_workspace(
+                    let outcome = jump_workspace(
                         terminal,
                         flags,
                         app,
@@ -374,6 +370,21 @@ fn event_loop(
                         None,
                         None,
                     );
+                    if outcome == Some(Outcome::Next)
+                        && let Some(from) = remembered
+                    {
+                        go_on_to_next(
+                            terminal,
+                            flags,
+                            app,
+                            live.as_deref_mut(),
+                            inbox,
+                            client_config.as_ref(),
+                            &bg,
+                            mi,
+                            &from,
+                        );
+                    }
                 }
             }
             _ => {}
@@ -1122,6 +1133,37 @@ fn via_for(app: &App, mi: usize, session: &str) -> jump::Via {
 /// Jumps into a card, and on ctrl+space space keeps going to the next one that needs you. `yours`
 /// is whether you picked the first card yourself.
 #[allow(clippy::too_many_arguments)]
+/// Ctrl+Space Space from a workspace Kerdr went into by itself: on to the next card that needs you.
+/// Chosen from the board as it is now, as jump_cards does, not as it was on the way in.
+#[allow(clippy::too_many_arguments)]
+fn go_on_to_next(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    mut live: Option<&mut Live>,
+    inbox: &Inbox,
+    client_config: Option<&PathBuf>,
+    bg: &Bg,
+    machine: usize,
+    from: &str,
+) {
+    read_again(app, live.as_deref(), inbox, machine, true);
+    match app.next_needs_you_after(from, &[]) {
+        Some(next) => jump_cards(
+            terminal,
+            flags,
+            app,
+            live.as_deref_mut(),
+            inbox,
+            client_config,
+            bg,
+            next,
+            false,
+        ),
+        None => app.say("Nothing else needs you right now.", Tone::Good),
+    }
+}
+
 fn jump_cards(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,

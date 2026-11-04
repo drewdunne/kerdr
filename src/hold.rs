@@ -1000,6 +1000,7 @@ mod tests {
                 keys: true,
                 feed: None,
                 feed_failed_after: None,
+                kept_snapshots: Default::default(),
             });
             m
         }
