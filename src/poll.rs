@@ -462,6 +462,24 @@ pub const SESSION_MOST: Duration = Duration::from_secs(5);
 /// What a session that ran out of that time shows in its row.
 pub const SESSION_SILENT: &str = "this herdr session didn't answer in 5 s";
 
+/// What the machine shows when herdr's list of sessions ran out of that time: no list, no read.
+pub const SESSIONS_SILENT: &str = "herdr didn't list its sessions in 5 s";
+
+/// That limit, for machines with no `timeout` command, macOS among them: the command in the
+/// background and a watchdog that stops it, with `timeout`'s exit status. The watchdog's output
+/// goes nowhere, or it would hold the read open, and what the shell says of a job it lost isn't let
+/// into the answer.
+const WATCHDOG: &str = r#"limited() {
+  "$@" & p=$!
+  ( sleep "$M" & z=$!; trap 'kill $z 2>/dev/null; exit 0' TERM; wait $z; kill $p ) >/dev/null 2>&1 &
+  w=$!
+  { wait $p; } 2>/dev/null; r=$?
+  { kill $w; wait $w; } 2>/dev/null
+  [ $r = 143 ] && return 124
+  return $r
+}
+"#;
+
 /// The script one read runs on the machine.
 pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
     let mut s = String::new();
@@ -469,10 +487,9 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
     s.push('\n');
     s.push_str(&format!("unset {}\n", HERDR_VARS.join(" ")));
     s.push_str(&format!("H={}\n", transport::herdr_word(herdr)));
-    s.push_str(&format!(
-        "T=; command -v timeout >/dev/null 2>&1 && T='timeout {}'\n",
-        SESSION_MOST.as_secs()
-    ));
+    s.push_str(&format!("M={}\n", SESSION_MOST.as_secs()));
+    s.push_str(WATCHDOG);
+    s.push_str("T=limited; command -v timeout >/dev/null 2>&1 && T=\"timeout $M\"\n");
     s.push_str(&format!("echo '{MARK}host'; uname -n\n"));
     s.push_str(&format!(
         "if ! command -v \"$H\" >/dev/null 2>&1; then echo '{MARK}missing'; exit 0; fi\n"
@@ -482,7 +499,8 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
         "echo '{MARK}keys'; grep -q kerdr_jump \"${{HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}}\" 2>/dev/null && echo yes || echo no\n"
     ));
     s.push_str(&format!(
-        "S=$($T \"$H\" session list --json 2>&1); echo '{MARK}sessions'; printf '%s\\n' \"$S\"\n"
+        "S=$($T \"$H\" session list --json 2>&1) || {{ [ $? = 124 ] && S={}; }}; echo '{MARK}sessions'; printf '%s\\n' \"$S\"\n",
+        transport::quote(SESSIONS_SILENT)
     ));
     // Session names only split into words here; never expanded as file patterns.
     s.push_str("set -f\n");
@@ -1023,13 +1041,26 @@ esac
         assert_eq!(data.version.as_deref(), Some("0.9.1"));
     }
 
+    /// The script for a stand-in herdr, with a limit of a second, and either with or without a
+    /// `timeout` command to hold it to that.
     #[cfg(unix)]
-    #[test]
-    fn a_stuck_session_costs_a_read_only_its_own_snapshot() {
-        // Not the whole read and with it the machine, as when the snapshots had no limit (intent
-        // 0491). `exec`: a child left running would hold the read open.
+    fn limited_script(dir: &std::path::Path, fake: &str, has_timeout: bool) -> String {
         use std::os::unix::fs::PermissionsExt;
-        let fake = r#"#!/bin/sh
+        let bin = dir.join("herdr");
+        std::fs::write(&bin, fake).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = build_script("herdr", None)
+            .replace("H=herdr", &format!("H={}", bin.display()))
+            .replace("M=5\n", "M=1\n");
+        if has_timeout {
+            script
+        } else {
+            script.replace("command -v timeout", "command -v no-such-timeout-here")
+        }
+    }
+
+    #[cfg(unix)]
+    const ONE_STUCK: &str = r#"#!/bin/sh
 case "$*" in
   --version) echo "herdr 0.9.1";;
   "session list --json") echo '{"sessions":[{"name":"stuck","running":true},{"name":"web","running":true}]}';;
@@ -1037,22 +1068,92 @@ case "$*" in
   *"api snapshot") echo "{\"result\":{\"snapshot\":{\"workspaces\":[]}}}";;
 esac
 "#;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_session_costs_a_read_only_its_own_snapshot() {
+        // Not the whole read and with it the machine, as when the snapshots had no limit (intent
+        // 0491), and also where there's no `timeout` command, as on a Mac. `exec`: a child left
+        // running would hold the read open.
         let dir = tempfile::tempdir().unwrap();
-        let bin = dir.path().join("herdr");
-        std::fs::write(&bin, fake).unwrap();
-        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let script = build_script("herdr", None)
-            .replace("H=herdr", &format!("H={}", bin.display()))
-            .replace("'timeout 5'", "'timeout 1'");
-        let t = Instant::now();
-        let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
-        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        for has_timeout in [true, false] {
+            if has_timeout && !timeout_here() {
+                continue;
+            }
+            let script = limited_script(dir.path(), ONE_STUCK, has_timeout);
+            let t = Instant::now();
+            let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
+            assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+            let data = read(&Target::Local, &out, false).ok().expect("read works");
+            assert!(data.snapshots["web"].is_ok());
+            assert_eq!(
+                data.snapshots["stuck"].as_ref().err().unwrap(),
+                SESSION_SILENT
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_limit_without_a_timeout_command_works_where_sh_is_bash() {
+        // macOS's sh is bash, which says more about a job it lost than Linux's dash does.
+        let bash = std::path::Path::new("/bin/bash");
+        if !bash.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let script = limited_script(dir.path(), ONE_STUCK, false);
+        let out = std::process::Command::new(bash)
+            .args(["--posix", "-c", &script])
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let out = transport::Output {
+            status: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            ..Default::default()
+        };
         let data = read(&Target::Local, &out, false).ok().expect("read works");
-        assert!(data.snapshots["web"].is_ok());
         assert_eq!(
             data.snapshots["stuck"].as_ref().err().unwrap(),
             SESSION_SILENT
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_session_list_past_the_limit_says_so_in_plain_words() {
+        // The machine still counts as not answering, but says why: an empty list used to read
+        // "herdr printed nothing" (intent 0491).
+        let fake = r#"#!/bin/sh
+case "$*" in
+  --version) echo "herdr 0.9.1";;
+  "session list --json") exec sleep 60;;
+esac
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        for has_timeout in [true, false] {
+            if has_timeout && !timeout_here() {
+                continue;
+            }
+            let script = limited_script(dir.path(), fake, has_timeout);
+            let t = Instant::now();
+            let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
+            assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+            match read(&Target::Local, &out, false) {
+                Err(Failure::Ssh(Problem::Other(why))) => assert_eq!(why, SESSIONS_SILENT),
+                _ => panic!("expected it to say why: {}", out.stdout),
+            }
+        }
+    }
+
+    /// Whether this machine has a `timeout` command to test.
+    #[cfg(unix)]
+    fn timeout_here() -> bool {
+        std::process::Command::new("sh")
+            .args(["-c", "command -v timeout"])
+            .output()
+            .is_ok_and(|o| o.status.success())
     }
 
     #[cfg(unix)]
@@ -1077,6 +1178,29 @@ esac
         let out = transport::run_script(&Target::Local, &script, Duration::from_secs(5));
         let data = read(&Target::Local, &out, false).ok().expect("read works");
         assert!(data.snapshots["web"].is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_of_its_own_is_passed_on_and_nothing_is_left_behind() {
+        // The stand-in for `timeout` keeps herdr's own exit, and its watchdog ends with it. A
+        // leftover would hold a remote read open till the connection's limit.
+        let dir = tempfile::tempdir().unwrap();
+        let script = limited_script(dir.path(), "#!/bin/sh\nexit 3\n", false);
+        let script = script
+            .split("echo '@@KERDR host'")
+            .next()
+            .unwrap()
+            .to_string()
+            + "$T \"$H\" anything; echo \"status $?\"\n";
+        let t = Instant::now();
+        let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
+        assert_eq!(out.stdout.trim(), "status 3");
+        assert!(
+            t.elapsed() < Duration::from_millis(900),
+            "{:?}",
+            t.elapsed()
+        );
     }
 
     #[cfg(windows)]
