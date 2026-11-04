@@ -3,6 +3,11 @@
 //! takes them one at a time, whole: ⏎ takes the recommendation or sends what you typed. The answers
 //! go back with the start itself, so nothing is saved until the last one, and then it runs on its
 //! own. Esc keeps the answers already given, and leaves the rest for the next `d`.
+//!
+//! When the card's feed read its questions ahead (intent 0491), `d` opens the box at once from those,
+//! and a `kickoff` request, which starts nothing, checks them behind it: the box takes what's true
+//! now from its answer without losing what's typed, and says so if the questions changed. Answers
+//! carry the token of what they answered, so the backend still refuses any it wasn't asking.
 
 use super::*;
 use crate::actions::{Question, Response};
@@ -14,10 +19,46 @@ use std::cell::Cell;
 const READY_AFTER: Duration = Duration::from_millis(500);
 /// As long as the backend takes an answer.
 const ANSWER_MOST: usize = 2000;
+/// When the questions read ahead turned out not to be the ones it asks now.
+const CHANGED: &str =
+    "These questions changed since the board last read them. These are the current ones.";
+/// When the check behind a box opened from the feed gets no answer.
+const UNCHECKED: &str =
+    "Kerdr couldn't check these are still current. Your answers are checked when they're sent.";
 
 /// Words typed for a question, kept until they're saved: its number, its text, and the words. They
 /// fill the box again only for that same question (a question reworded since isn't the same one).
 pub type KeptAnswer = (String, String, String);
+
+/// Text from a record never reaches the terminal as anything but text.
+fn clean(text: &str) -> String {
+    text.chars().filter(|c| !c.is_control()).collect()
+}
+
+fn cleaned(questions: &[Question]) -> Vec<Question> {
+    questions
+        .iter()
+        .map(|q| Question {
+            num: q.num.clone(),
+            question: clean(&q.question),
+            background: clean(&q.background),
+            pick: clean(&q.pick),
+            why: clean(&q.why),
+        })
+        .collect()
+}
+
+/// What was typed for each of these questions: only for that same question, not one reworded since.
+fn drafts_for(questions: &[Question], kept: &[KeptAnswer]) -> Vec<String> {
+    questions
+        .iter()
+        .map(|q| {
+            kept.iter()
+                .find(|(num, question, _)| *num == q.num && *question == q.question)
+                .map_or_else(String::new, |(.., words)| words.clone())
+        })
+        .collect()
+}
 
 /// What's on screen in the box.
 #[derive(Clone, Debug)]
@@ -73,27 +114,8 @@ impl Kickoff {
         if let Some(session) = &response.session {
             request["session"] = json!(session);
         }
-        // Text from a record never reaches the terminal as anything but text.
-        let clean = |text: &str| -> String { text.chars().filter(|c| !c.is_control()).collect() };
-        let questions: Vec<Question> = response
-            .questions
-            .iter()
-            .map(|q| Question {
-                num: q.num.clone(),
-                question: clean(&q.question),
-                background: clean(&q.background),
-                pick: clean(&q.pick),
-                why: clean(&q.why),
-            })
-            .collect();
-        let drafts = questions
-            .iter()
-            .map(|q| {
-                kept.iter()
-                    .find(|(num, question, _)| *num == q.num && *question == q.question)
-                    .map_or_else(String::new, |(.., words)| words.clone())
-            })
-            .collect();
+        let questions = cleaned(&response.questions);
+        let drafts = drafts_for(&questions, kept);
         Some(Kickoff {
             machine,
             request,
@@ -114,6 +136,34 @@ impl Kickoff {
             scroll: Cell::new(0),
             scroll_most: Cell::new(0),
         })
+    }
+
+    /// What the check behind a box opened from the feed answered: the questions as they are now,
+    /// and what only the backend can say (the session, Tab's token, a note). Questions that didn't
+    /// change stay exactly where they are, with what's typed in them.
+    fn checked(&mut self, machine: usize, response: &Response) {
+        self.machine = machine;
+        if let Some(session) = &response.session {
+            self.request["session"] = json!(session);
+        }
+        self.along = if response.confirmation {
+            response.confirm.clone()
+        } else {
+            None
+        };
+        self.asked = response.asked.clone().unwrap_or_default();
+        self.note = response.note.as_deref().map(clean);
+        let now = cleaned(&response.questions);
+        if now != self.questions {
+            let kept = self.kept();
+            self.drafts = drafts_for(&now, &kept);
+            self.questions = now;
+            self.at = 0;
+            self.reached = 0;
+            self.note = Some(CHANGED.into());
+            self.ready_at = Instant::now() + READY_AFTER;
+            self.scroll.set(0);
+        }
     }
 
     /// What's typed so far, to keep until it's saved.
@@ -172,6 +222,89 @@ enum Leaving {
 }
 
 impl App {
+    /// `d` on work whose questions its feed read ahead: the box opens now, and this is the check
+    /// to send behind it. None when there's nothing to open from, so the start goes as it would.
+    pub(super) fn open_preloaded_kickoff(
+        &mut self,
+        card: &Card,
+        machine: usize,
+        request: &Value,
+    ) -> Option<Action> {
+        if request["action"] != "dispatch" || request.get("override").is_some() {
+            return None;
+        }
+        let detail = card.detail.as_ref()?;
+        let preloaded = detail.kickoff.as_ref()?;
+        if self.kickoff_sent.contains(&preloaded.asked) {
+            return None;
+        }
+        let response = Response {
+            asked: Some(preloaded.asked.clone()),
+            questions: preloaded.questions.clone(),
+            ..Default::default()
+        };
+        let kept = self
+            .kickoff_kept
+            .get(&detail.id)
+            .cloned()
+            .unwrap_or_default();
+        let form = Kickoff::from_answer(
+            machine,
+            request,
+            &response,
+            card.reference.clone(),
+            card.title.clone(),
+            &kept,
+        )?;
+        let id = detail.id.clone();
+        self.mode = Mode::Kickoff {
+            form,
+            back: Box::new(self.mode.clone()),
+            target: Some(Box::new(CardSnapshot::of(card))),
+        };
+        Some(Action::Mutate {
+            machine,
+            request: json!({"action": "kickoff", "id": id}),
+        })
+    }
+
+    /// The check's answer, while its box is still up; once it's gone, nothing it says matters: his
+    /// answers went with their token, and the backend checks that itself.
+    pub(super) fn finish_kickoff_check(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        result: Result<Response, String>,
+    ) {
+        let Mode::Kickoff { form, back, .. } = &mut self.mode else {
+            return;
+        };
+        if form.request["id"] != request["id"] {
+            return;
+        }
+        match result {
+            Ok(response) if !response.questions.is_empty() && response.asked.is_some() => {
+                form.checked(machine, &response);
+            }
+            Err(_) => form.note = Some(UNCHECKED.into()),
+            // A backend older than this request: as good as no answer.
+            Ok(response) if !response.ok && response.message == "unknown action" => {
+                form.note = Some(UNCHECKED.into());
+            }
+            // None left to ask, or it can't be answered now: the box goes, keeping what's typed.
+            Ok(response) => {
+                let (form, back) = (form.clone(), back.clone());
+                self.keep_kickoff(&form);
+                self.mode = *back;
+                if response.ok {
+                    self.say(response.message, Tone::Info);
+                } else {
+                    self.fail(response.message);
+                }
+            }
+        }
+    }
+
     pub(super) fn kickoff_key(
         &mut self,
         key: KeyEvent,
@@ -343,6 +476,10 @@ impl App {
         } else {
             form.reached
         };
+        // The feed still has these until its next read: d goes by the backend's answer till then.
+        if answered > 0 {
+            self.kickoff_sent.insert(form.asked.clone());
+        }
         let answers = form.answers(answered);
         let request = match how {
             Leaving::Keep => json!({
@@ -604,6 +741,171 @@ mod tests {
         let request = sent(key(&mut app, KeyCode::Tab));
         assert_eq!(request["answers"], json!([{"num": "1", "take": true}]));
         assert_eq!(request["override"], json!(true));
+    }
+
+    /// A demo backlog card whose feed read these questions ahead, and the app it's in.
+    fn preloaded(questions: Vec<Question>) -> (App, Card) {
+        let (mut app, id) = open_on(&answer());
+        app.mode = Mode::Board;
+        let card = app
+            .board
+            .cards
+            .iter_mut()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .unwrap();
+        card.detail.as_mut().unwrap().kickoff = Some(crate::feed::Preloaded {
+            asked: "feedread".into(),
+            questions,
+        });
+        let card = card.clone();
+        (app, card)
+    }
+
+    fn d(app: &mut App, card: &Card) -> Action {
+        app.intent_action_on(card.clone(), "dispatch", json!({}))
+    }
+
+    fn showing(app: &App) -> &Kickoff {
+        let Mode::Kickoff { form, .. } = &app.mode else {
+            panic!("the box is shut: {:?}", app.mode)
+        };
+        form
+    }
+
+    #[test]
+    fn d_opens_questions_read_ahead_at_once_and_only_checks_them_behind_the_box() {
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        // Nothing starts: it's the check, and the card shows no change.
+        assert_eq!(request["action"], "kickoff");
+        assert_eq!(request["id"], json!(card.detail.as_ref().unwrap().id));
+        assert!(app.effect_for(&card.key, &request).is_none());
+        let form = showing(&app);
+        assert_eq!(form.questions.len(), 2);
+        assert_eq!(form.asked, "feedread");
+        // Tab isn't offered until the backend says it can be.
+        assert!(form.along.is_none());
+        // The answers go with the token of what he was shown, as a start.
+        let start = sent({
+            key(&mut app, KeyCode::Enter);
+            key(&mut app, KeyCode::Enter)
+        });
+        assert_eq!(start["action"], "dispatch");
+        assert_eq!(start["asked"], "feedread");
+        assert_eq!(start["answers"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn the_check_keeps_his_place_and_words_when_the_questions_are_the_same() {
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        key(&mut app, KeyCode::Enter);
+        typed(&mut app, "half a thought");
+        app.finish_kickoff_check(3, &request, Ok(answer()));
+        let form = showing(&app);
+        assert_eq!((form.at, form.reached, form.machine), (1, 1, 3));
+        assert_eq!(form.drafts[1], "half a thought");
+        assert_eq!(form.asked, "fedcba9876543210");
+        assert_eq!(form.along.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(form.request["session"], "web");
+        assert!(form.note.is_none());
+    }
+
+    #[test]
+    fn the_check_shows_changed_questions_as_they_are_now_and_says_so() {
+        let (mut app, card) = preloaded(vec![
+            question("1", "Whose is it?", "Kibbelz"),
+            question("2", "An old question?", "Yes"),
+        ]);
+        let request = sent(d(&mut app, &card));
+        typed(&mut app, "Mine");
+        key(&mut app, KeyCode::Enter);
+        typed(&mut app, "words for the old one");
+        let mut now = answer();
+        now.questions = vec![
+            question("1", "Whose is it?", "Kibbelz"),
+            question("2", "The question now?", "No"),
+        ];
+        app.finish_kickoff_check(0, &request, Ok(now));
+        let form = showing(&app);
+        assert_eq!(form.questions[1].question, "The question now?");
+        assert_eq!((form.at, form.reached), (0, 0));
+        assert_eq!(form.drafts[0], "Mine");
+        assert_eq!(form.drafts[1], "");
+        assert_eq!(form.note.as_deref(), Some(CHANGED));
+    }
+
+    #[test]
+    fn the_box_goes_when_nothing_is_left_to_ask_or_it_cannot_be_answered() {
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        typed(&mut app, "kept");
+        let done = Response {
+            ok: true,
+            message: "#41 has no questions for you now; d starts it.".into(),
+            ..Default::default()
+        };
+        app.finish_kickoff_check(0, &request, Ok(done));
+        assert!(matches!(app.mode, Mode::Board));
+        assert!(app.message().unwrap().0.contains("d starts it"));
+        assert_eq!(
+            app.kickoff_kept[&request["id"].as_str().unwrap().to_string()][0].2,
+            "kept"
+        );
+        // A refusal, in red: it started elsewhere, say.
+        let request = sent(d(&mut app, &card));
+        let refused = Response {
+            message: "only an open backlog intent can start".into(),
+            ..Default::default()
+        };
+        app.finish_kickoff_check(0, &request, Ok(refused));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn a_check_with_no_answer_leaves_the_box_up_and_says_so() {
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        app.finish_kickoff_check(0, &request, Err("its machine isn't answering".into()));
+        assert_eq!(showing(&app).note.as_deref(), Some(UNCHECKED));
+        assert_eq!(showing(&app).asked, "feedread");
+        // Nor does a backend that doesn't know the request shut it.
+        let old = Response {
+            message: "unknown action".into(),
+            ..Default::default()
+        };
+        app.finish_kickoff_check(0, &request, Ok(old));
+        assert!(matches!(app.mode, Mode::Kickoff { .. }));
+    }
+
+    #[test]
+    fn a_check_answered_after_he_left_changes_nothing() {
+        let (mut app, card) = preloaded(answer().questions);
+        let request = sent(d(&mut app, &card));
+        key(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Board));
+        app.finish_kickoff_check(0, &request, Ok(answer()));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn questions_he_answered_are_not_opened_from_the_feed_again() {
+        let (mut app, card) = preloaded(answer().questions);
+        sent(d(&mut app, &card));
+        key(&mut app, KeyCode::Enter);
+        sent(key(&mut app, KeyCode::Esc));
+        // The feed still shows them until its next read: the start goes, and the backend says.
+        let request = sent(d(&mut app, &card));
+        assert_eq!(request["action"], "dispatch");
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn with_nothing_read_ahead_d_asks_the_backend_as_it_did() {
+        let (mut app, mut card) = preloaded(answer().questions);
+        card.detail.as_mut().unwrap().kickoff = None;
+        assert_eq!(sent(d(&mut app, &card))["action"], "dispatch");
+        assert!(matches!(app.mode, Mode::Board));
     }
 
     #[test]

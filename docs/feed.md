@@ -227,6 +227,16 @@ you along instead: `override: true` and its `confirm`, with `asked` and `answers
 When the questions have changed since `asked`, save nothing, and answer with them as they are now. A
 start with answers that fails keeps what you typed: `d` opens the box again with your words in it.
 Kerdr asks it for `dispatch` and `reopen`.
+
+Preloading them: a card can carry those questions in the feed, so `d` opens the box at once rather than
+after a start is refused, `"kickoff":{"asked":"opaque","questions":[…]}`. Behind the open box Kerdr
+sends `{"action":"kickoff","id":"0041"}`, which must start nothing: answer it as you'd answer the start,
+with the questions as they are now, or with `ok` and no questions when none are left, and the box closes
+saying your `message`. A question that changed shows as it is now, and the box says so; one that didn't
+keeps its place and what's typed. Tab is offered only once that answer has come. With no answer, the box
+stays up and says it couldn't check, and your check of `asked` still decides. Leave `kickoff` out where
+`d` wouldn't ask them.
+
 Actions have a 120-second deadline, and `dispatch` and `reopen` five minutes, since a start on
 another machine can wait minutes for it there; keep your own limits under those, so your answer
 comes first. A timeout or an invalid response does not prove the mutation failed: its result is

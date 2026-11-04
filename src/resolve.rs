@@ -331,8 +331,8 @@ impl Job {
         self.request["action"] == "move"
     }
 
-    /// Whether it only reads: `edit` without a text, for the editor `e` opens (intent 0414). It
-    /// waits for the changes to its record made before it, but it isn't a change: nothing waits
+    /// Whether it only reads: `edit` without a text, for the editor `e` opens (intent 0414), or
+    /// `kickoff`, checking a box already open (intent 0491). It waits for the changes to its record made before it, but it isn't a change: nothing waits
     /// for it, and q neither waits for it nor counts it as running.
     pub fn reads(&self) -> bool {
         reads(&self.request)
@@ -384,9 +384,10 @@ pub struct Queue {
     rewritten: Vec<(Queued, u8)>,
 }
 
-/// Whether a request only reads: `edit` without a text (intent 0414).
+/// Whether a request only reads: `edit` without a text (intent 0414), or the check behind a Kickoff
+/// Questions box already open (intent 0491).
 fn reads(request: &Value) -> bool {
-    request["action"] == "edit" && request.get("text").is_none()
+    request["action"] == "kickoff" || (request["action"] == "edit" && request.get("text").is_none())
 }
 
 #[derive(Debug)]

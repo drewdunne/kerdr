@@ -750,6 +750,9 @@ impl App {
         } else if request["action"] == "dispatch" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Starting {}…", self.reference_for(id))
+        } else if request["action"] == "kickoff" {
+            let id = request["id"].as_str().unwrap_or_default();
+            format!("Checking {}'s questions…", self.reference_for(id))
         } else if request["action"] == "cancel" {
             let id = request["id"].as_str().unwrap_or_default();
             format!("Cancelling {}: stopping its agent…", self.reference_for(id))
@@ -925,6 +928,10 @@ impl App {
             };
             Action::None
         } else {
+            // Its questions are read ahead: the box opens now, and the start waits for his answers.
+            if let Some(check) = self.open_preloaded_kickoff(&card, machine, &request) {
+                return check;
+            }
             self.action_from = Some(CardSnapshot::of(&card));
             Action::Mutate { machine, request }
         }
@@ -1796,7 +1803,7 @@ impl App {
 
     /// What the board shows for a change while it's on its way: what the backend will make of the
     /// record, as far as Kerdr can tell. A request that waits in a queue shows nothing.
-    fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
+    pub(super) fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
         Some(match request["action"].as_str()? {
             "dispatch" if request["queue"] != true => Effect::Starting,
             "reopen" if request["queue"] != true => Effect::Reopening,
@@ -2381,6 +2388,9 @@ impl App {
         }
         if request["action"] == "edit" {
             return self.finish_edit(machine, request, result, from);
+        }
+        if request["action"] == "kickoff" {
+            return self.finish_kickoff_check(machine, &request, result);
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {

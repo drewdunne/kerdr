@@ -526,6 +526,9 @@ pub struct App {
     pub moved_home: Vec<(String, usize, Option<String>)>,
     /// What's typed in a Kickoff Questions box and not saved yet, by its record's number.
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
+    /// The tokens of questions answered from the box, whose copy in the feed is out of date until
+    /// its next read: d doesn't open them again from there (intent 0491).
+    pub kickoff_sent: std::collections::HashSet<String>,
     /// When the last action answered: what it said stays on screen a moment before a waiting ⏎
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
@@ -613,6 +616,7 @@ impl App {
             outside_warned: None,
             moved_home: vec![],
             kickoff_kept: Default::default(),
+            kickoff_sent: Default::default(),
             answered_at: None,
             width: 200,
             demo: false,
