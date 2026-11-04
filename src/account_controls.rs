@@ -3128,10 +3128,10 @@ mod tests {
             .position(|f| f.session == "api" && f.pane == "w1:p1")
             .unwrap();
         feed.agents[real].conversation = "c-real".into();
-        feed.agents[real].account = "ARK_C".into();
+        feed.agents[real].account = "REAL_C".into();
         let mut stale = feed.agents[real].clone();
         stale.conversation = "c-left-behind".into();
-        stale.account = "KBZ_C".into();
+        stale.account = "OLD_C".into();
         feed.agents.insert(0, stale);
     }
     #[test]
@@ -3141,7 +3141,7 @@ mod tests {
         stale_record_first(&mut a);
         set_conversation(&mut a, "c-real");
         let card = a.selected().unwrap();
-        assert_eq!(a.account_agent(card).unwrap().account, "ARK_C");
+        assert_eq!(a.account_agent(card).unwrap().account, "REAL_C");
     }
     #[test]
     fn a_conversation_with_no_record_shows_no_account_rather_than_a_stale_one() {
@@ -3160,7 +3160,7 @@ mod tests {
         // A feed lists its agents newest first.
         let card = a.selected().unwrap();
         assert!(card.agents.iter().all(|g| g.conversation.is_none()));
-        assert_eq!(a.account_agent(card).unwrap().account, "KBZ_C");
+        assert_eq!(a.account_agent(card).unwrap().account, "OLD_C");
     }
     #[test]
     fn s_moves_the_agent_really_in_the_pane() {
