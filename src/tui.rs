@@ -1130,9 +1130,6 @@ fn via_for(app: &App, mi: usize, session: &str) -> jump::Via {
     jump::choose_via(&m.machine, server.as_deref(), here.as_deref())
 }
 
-/// Jumps into a card, and on ctrl+space space keeps going to the next one that needs you. `yours`
-/// is whether you picked the first card yourself.
-#[allow(clippy::too_many_arguments)]
 /// Ctrl+Space Space from a workspace Kerdr went into by itself: on to the next card that needs you.
 /// Chosen from the board as it is now, as jump_cards does, not as it was on the way in.
 #[allow(clippy::too_many_arguments)]
@@ -1140,7 +1137,7 @@ fn go_on_to_next(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
     app: &mut App,
-    mut live: Option<&mut Live>,
+    live: Option<&mut Live>,
     inbox: &Inbox,
     client_config: Option<&PathBuf>,
     bg: &Bg,
@@ -1153,7 +1150,7 @@ fn go_on_to_next(
             terminal,
             flags,
             app,
-            live.as_deref_mut(),
+            live,
             inbox,
             client_config,
             bg,
@@ -1164,6 +1161,9 @@ fn go_on_to_next(
     }
 }
 
+/// Jumps into a card, and on ctrl+space space keeps going to the next one that needs you. `yours`
+/// is whether you picked the first card yourself.
+#[allow(clippy::too_many_arguments)]
 fn jump_cards(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
