@@ -23,8 +23,9 @@ use crate::poll::{self, Conn, Inbox, Poller, Timing, Wake};
 use crate::state::State;
 
 /// How long the board waits, on the way to the next card that needs you, for the live machines
-/// to say what's there now.
-const FRESH_WAIT: Duration = Duration::from_millis(1500);
+/// to say what's there now. It takes no keys meanwhile, so it's short: a read without the feed
+/// lands well inside it, and giving up only chooses from a read a few seconds old (intent 0491).
+const FRESH_WAIT: Duration = Duration::from_millis(250);
 
 struct Live {
     pollers: Vec<Option<Poller>>,
@@ -1169,7 +1170,8 @@ fn jump_cards(
 
 /// Reads the card's machine again and applies what's waiting. Choosing the next card, it reads
 /// every live machine and waits a moment (FRESH_WAIT at most) for what they say, so the choice is
-/// made from the board as it is now, not as it was when you went into herdr.
+/// made from the board as it is now, not as it was when you went into herdr. A machine in the
+/// middle of a feed read can't say anything new that soon, so it isn't waited for (intent 0491).
 fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choosing_next: bool) {
     if let Some(l) = live {
         let mut machines = vec![mi];
@@ -1183,8 +1185,7 @@ fn read_again(app: &mut App, live: Option<&Live>, inbox: &Inbox, mi: usize, choo
         let since = Instant::now();
         for &i in &machines {
             if i == mi {
-                // What herdr shows comes first and fast; the feed follows on its own, so the
-                // wait below never waits out a feed read (intent 0445).
+                // What herdr shows comes first and fast; the feed follows on its own (intent 0445).
                 if choosing_next {
                     l.wake(i);
                 }

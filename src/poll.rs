@@ -172,6 +172,9 @@ struct Slot {
     reader: u64,
     /// The read, and when it began.
     read: Option<(Event, Instant)>,
+    /// A read with the feed in it is running: nothing it finds lands for seconds, so nothing
+    /// waiting on this machine's next read gains from waiting (intent 0491).
+    reading_feed: bool,
 }
 
 impl Inbox {
@@ -191,7 +194,17 @@ impl Inbox {
         let mut slots = self.slots(i);
         slots[i].reader += 1;
         slots[i].read = None;
+        slots[i].reading_feed = false;
         slots[i].reader
+    }
+
+    /// Reader `reader` is about to read machine `i`'s feed. `put` ends it, whatever the read found.
+    pub fn reading_feed(&self, i: usize, reader: u64) {
+        let mut slots = self.slots(i);
+        if slots[i].reader == reader {
+            slots[i].reading_feed = true;
+            self.arrived.notify_all();
+        }
     }
 
     /// A read that began at `started`, from reader `reader` (see `next_reader`).
@@ -201,6 +214,7 @@ impl Inbox {
         if slots[i].reader != reader {
             return;
         }
+        slots[i].reading_feed = false;
         if let Some(Some(Ok(feed))) = ev.data.as_ref().map(|d| d.feed.as_ref())
             && let Some(watch) = self
                 .watch
@@ -231,14 +245,19 @@ impl Inbox {
             .collect()
     }
 
-    /// Waits until each of `machines` has a read waiting that began at `since` or later, or
-    /// `timeout` passes. Says whether they all came.
+    /// Waits until each of `machines` has a read waiting that began at `since` or later, or is in
+    /// the middle of a feed read, which takes seconds and so can't bring anything fresher in time;
+    /// or until `timeout` passes. Says whether it ended before `timeout`. Going on while a feed
+    /// runs chooses from what that machine last said, at most a few seconds old (intent 0491).
+    /// Only for machines already read once: the callers' are all live.
     pub fn wait_since(&self, machines: &[usize], since: Instant, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
         let mut slots = self.slots(0);
         loop {
             let fresh = machines.iter().all(|&i| {
-                matches!(slots.get(i).and_then(|s| s.read.as_ref()), Some((_, started)) if *started >= since)
+                slots.get(i).is_some_and(|s| {
+                    s.reading_feed || matches!(&s.read, Some((_, started)) if *started >= since)
+                })
             });
             let left = deadline.saturating_duration_since(Instant::now());
             if fresh || left.is_zero() {
@@ -301,6 +320,9 @@ pub fn spawn(
         loop {
             let feed_due = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
+            if feed_due {
+                inbox.reading_feed(index, reader);
+            }
             let started = Instant::now();
             let out = collect(&machine, feed_due);
             let now = Local::now();
@@ -737,6 +759,44 @@ mod tests {
         assert!(inbox.wait_since(&[0], since, Duration::from_secs(5)));
         reader.join().unwrap();
         assert_eq!(host(&inbox.take()[0]), Some("fresh"));
+    }
+
+    #[test]
+    fn waiting_for_fresh_reads_never_waits_out_a_feed_read() {
+        // A feed read takes seconds, so a key that meets one goes on from what's known (intent
+        // 0491): the wait costs nothing, and a machine that can still answer is still waited for.
+        let inbox = Arc::new(Inbox::default());
+        let since = Instant::now();
+        inbox.reading_feed(0, 0);
+        let long = Duration::from_secs(30);
+        let t = Instant::now();
+        assert!(inbox.wait_since(&[0], since, long));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        assert!(!inbox.wait_since(&[0, 1], since, Duration::from_millis(30)));
+        // Whatever the read found ends it.
+        inbox.put(
+            read_of(0, live(), None, false),
+            since - Duration::from_millis(1),
+            0,
+        );
+        assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
+        // One that begins during the wait ends the wait: a woken read that's due a feed is one.
+        let begins = {
+            let inbox = inbox.clone();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(20));
+                inbox.reading_feed(0, 0);
+            })
+        };
+        let t = Instant::now();
+        assert!(inbox.wait_since(&[0], since, long));
+        assert!(t.elapsed() < Duration::from_secs(5));
+        begins.join().unwrap();
+        // A retired reader's says nothing, and a new reader starts with none running.
+        inbox.next_reader(0);
+        assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
+        inbox.reading_feed(0, 0);
+        assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
     }
 
     #[test]
