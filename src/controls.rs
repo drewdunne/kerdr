@@ -1991,6 +1991,13 @@ impl App {
         let shown = refused.as_ref().is_some_and(|j| j.effect.is_some());
         let redirected = result.as_ref().is_ok_and(Response::sends_on);
         if !redirected {
+            // It failed, or asks first: no workspace is coming for a ⏎ to wait for.
+            if refused
+                .as_ref()
+                .is_some_and(|j| j.starts() && j.key.is_some() && j.key == self.enter_when_open)
+            {
+                self.enter_when_open = None;
+            }
             if moved_on {
                 self.resolver.forget_moves_after(machine, n);
             }
@@ -2066,7 +2073,11 @@ impl App {
             format!(
                 "{reference}'s workspace is open and its agent is still taking its brief ({secs} s so far): ⏎ goes in, and X stops it."
             )
-        } else if matches!(action, "enter" | "dispatch" | "reopen") {
+        } else if action == "enter" {
+            format!(
+                "{reference} is {verb} ({secs} s so far). Kerdr goes in when its workspace opens; Esc stops waiting."
+            )
+        } else if matches!(action, "dispatch" | "reopen") {
             format!(
                 "{reference} is {verb} ({secs} s so far); ⏎ goes in as soon as its workspace opens."
             )
@@ -2102,6 +2113,23 @@ impl App {
         if card.is_open_workspace() {
             return None;
         }
+        let asking = self.resolver.starting(&id)?.asking;
+        if let Some(action) = self.into_opened(card) {
+            return Some(action);
+        }
+        self.still_changing(card, "enter");
+        // Remembered: the workspace opens without another key from you (intent 0491). Not when
+        // nothing has started, where only a question can come.
+        if !asking {
+            self.enter_when_open = Some(card.key.clone());
+        }
+        Some(Action::None)
+    }
+
+    /// Into the workspace a feed names for this card's record, opened since its start or reopen was
+    /// asked for. None until one has.
+    fn into_opened(&mut self, card: &Card) -> Option<Action> {
+        let id = card.detail.as_ref()?.id.clone();
         let job = self.resolver.starting(&id)?;
         // Where it asked, and where a start that ran on another machine runs (intent 0445).
         let mut machines = vec![self.machines.get(job.machine).map(|m| m.name())?];
@@ -2136,24 +2164,94 @@ impl App {
                     .before
                     .iter()
                     .any(|(s, i)| *s == w.session && *i == w.id)
-        });
-        if let Some(w) = opened {
-            let action = Action::JumpWorkspace {
-                machine: w.machine.clone(),
-                session: w.session.clone(),
-                id: w.id.clone(),
-            };
-            // In by his own ⏎: its answer takes him nowhere later.
-            self.resolver.went_in(&id);
-            return Some(action);
+        })?;
+        let action = Action::JumpWorkspace {
+            machine: opened.machine.clone(),
+            session: opened.session.clone(),
+            id: opened.id.clone(),
+        };
+        // In by his own ⏎: its answer takes him nowhere later.
+        self.resolver.went_in(&id);
+        self.enter_when_open = None;
+        Some(action)
+    }
+
+    /// The ⏎ remembered on a card just started, once its workspace is open: how to go in. Only where
+    /// going in can't take keys meant for something else, and not while a failure is up. Forgotten
+    /// when you've moved off the card, and when the start has gone with no workspace to show for
+    /// it (intent 0491).
+    pub fn enter_when_open_due(&mut self) -> Option<Action> {
+        let key = self.enter_when_open.clone()?;
+        if self.failing()
+            || !matches!(
+                self.mode,
+                Mode::Board
+                    | Mode::Peek { .. }
+                    | Mode::Backlog { .. }
+                    | Mode::Misc { .. }
+                    | Mode::Done { .. }
+                    | Mode::Card { .. }
+            )
+            || self.typing_view_search()
+        {
+            return None;
         }
-        self.still_changing(card, "enter");
-        Some(Action::None)
+        let Some(card) = self
+            .selected_for_control()
+            .filter(|c| c.key == key)
+            .cloned()
+        else {
+            self.enter_when_open = None;
+            return None;
+        };
+        if card.is_open_workspace() {
+            self.enter_when_open = None;
+            return Some(self.jump_action(key));
+        }
+        let id = card.detail.as_ref()?.id.clone();
+        if self.resolver.starting(&id).is_some() {
+            return self.into_opened(&card);
+        }
+        if self.started_lately(&id) {
+            return None;
+        }
+        self.enter_when_open = None;
+        self.say(
+            format!(
+                "{} has no workspace to show for its start yet, so Kerdr stopped waiting; ⏎ tries again.",
+                card.reference
+            ),
+            Tone::Info,
+        );
+        None
+    }
+
+    /// Whether this record's start was answered yes lately: its workspace may yet come.
+    pub(super) fn started_lately(&self, id: &str) -> bool {
+        self.started
+            .as_ref()
+            .is_some_and(|(s, at)| s == id && at.elapsed() < Duration::from_secs(120))
+    }
+
+    /// The machines with a start or reopen actually running: reading their feeds shows its
+    /// workspace, which opens well before the command answers (intent 0491).
+    pub fn starts_running_on(&self) -> Vec<usize> {
+        let mut machines: Vec<usize> = self
+            .resolver
+            .on_its_way()
+            .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
+            .filter(|j| j.request["queue"] != true)
+            .map(|j| j.machine)
+            .collect();
+        machines.sort_unstable();
+        machines.dedup();
+        machines
     }
 
     /// Going into a card's workspace yourself: a start or reopen still on its way for it neither
     /// asks nor takes you in when it answers, since you're already there (intent 0445).
     pub fn went_into(&mut self, key: &str) {
+        self.enter_when_open = None;
         if let Some(id) = self
             .card(key)
             .and_then(|c| c.detail.as_ref())
@@ -2165,6 +2263,7 @@ impl App {
 
     /// The same, going into a workspace by its id: the card it's for, if any.
     pub fn went_into_workspace(&mut self, machine: usize, session: &str, id: &str) {
+        self.enter_when_open = None;
         let Some(name) = self.machines.get(machine).map(|m| m.name()) else {
             return;
         };

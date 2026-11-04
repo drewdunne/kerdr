@@ -30,6 +30,32 @@ const FRESH_WAIT: Duration = Duration::from_millis(250);
 /// How long after coming back to the board its turn stays quick for the read asked for then.
 const READ_LANDS: Duration = Duration::from_secs(1);
 
+/// How often a machine with a start running has its feed read again, which is the only way the
+/// board learns its workspace has opened. No faster: a feed read costs that machine seconds of
+/// work (intent 0491).
+const START_READ_EVERY: Duration = Duration::from_secs(5);
+
+/// When each machine with a start running was last asked for its feed for that.
+#[derive(Default)]
+struct StartReads(std::collections::HashMap<usize, Instant>);
+
+impl StartReads {
+    /// Of the machines running a start now, those whose feed is due again. Counted from when each
+    /// was first seen, since the start's own feed read has only just gone.
+    fn due(&mut self, running: &[usize], now: Instant) -> Vec<usize> {
+        self.0.retain(|machine, _| running.contains(machine));
+        let mut due = vec![];
+        for &machine in running {
+            let last = self.0.entry(machine).or_insert(now);
+            if now.duration_since(*last) >= START_READ_EVERY {
+                *last = now;
+                due.push(machine);
+            }
+        }
+        due
+    }
+}
+
 struct Live {
     pollers: Vec<Option<Poller>>,
     inbox: Arc<Inbox>,
@@ -181,6 +207,7 @@ fn event_loop(
     // Back from herdr or your editor: the read that was asked for lands in moments, and the board
     // should show it as it lands (intent 0491).
     let (mut away_seen, mut back_at) = (app.away, None::<Instant>);
+    let mut start_reads = StartReads::default();
     loop {
         if app.away != away_seen {
             away_seen = app.away;
@@ -230,6 +257,11 @@ fn event_loop(
         }
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
         run_ready(app, &runner);
+        if let Some(l) = live.as_deref() {
+            for machine in start_reads.due(&app.starts_running_on(), Instant::now()) {
+                l.wake_feed(machine);
+            }
+        }
         if app.resolver.expire() {
             app.rebuild();
         }
@@ -309,6 +341,42 @@ fn event_loop(
                 key,
                 true,
             );
+        }
+        // ⏎ on a card whose start was running: its workspace has opened (intent 0491).
+        match app.enter_when_open_due() {
+            Some(Action::Jump(key)) => jump_cards(
+                terminal,
+                flags,
+                app,
+                live.as_deref_mut(),
+                inbox,
+                client_config.as_ref(),
+                &bg,
+                key,
+                true,
+            ),
+            Some(Action::JumpWorkspace {
+                machine,
+                session,
+                id,
+            }) => {
+                if let Some(mi) = app.machine_index(&machine) {
+                    jump_workspace(
+                        terminal,
+                        flags,
+                        app,
+                        live.as_deref_mut(),
+                        client_config.as_ref(),
+                        &bg,
+                        mi,
+                        session,
+                        id,
+                        None,
+                        None,
+                    );
+                }
+            }
+            _ => {}
         }
         app.width = terminal.size()?.width;
         app.keep_box_errors();
@@ -1299,6 +1367,22 @@ mod tests {
             jump::Via::Local,
         );
         assert_eq!((j.tab, j.strict), (None, false));
+    }
+
+    #[test]
+    fn a_running_start_has_its_machines_feed_read_every_five_seconds_no_faster() {
+        let mut reads = StartReads::default();
+        let t = Instant::now();
+        let at = |secs: u64| t + Duration::from_secs(secs);
+        assert!(reads.due(&[1], at(0)).is_empty(), "it has only just gone");
+        assert!(reads.due(&[1], at(4)).is_empty());
+        assert_eq!(reads.due(&[1], at(5)), [1]);
+        assert!(reads.due(&[1], at(9)).is_empty());
+        // Another machine counts from when it started; one with nothing running is forgotten.
+        assert!(reads.due(&[1, 2], at(9)).is_empty());
+        assert_eq!(reads.due(&[1, 2], at(10)), [1]);
+        assert_eq!(reads.due(&[2], at(14)), [2]);
+        assert!(reads.due(&[1], at(100)).is_empty());
     }
 
     /// What the runner says, in words: "started 1", "handed 1", "dropped 1 yes", "done 1 ok".
