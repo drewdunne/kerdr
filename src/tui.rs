@@ -290,9 +290,12 @@ fn event_loop(
         {
             start_action(app, &action_tx, &runner, machine, request);
         }
+        // `R`'s feeds, looked for first: what's found here is applied by the time it says so.
+        let fed = app.refreshed(inbox);
         for ev in inbox.take() {
             app.apply(ev);
         }
+        app.settle_refresh(&fed);
         holds.borrow_mut().sync(app);
         if let Some(key) = app.pending_jump_ready() {
             jump_cards(
@@ -446,14 +449,20 @@ fn event_loop(
                     }
                     None => {
                         // Machines not answering are tried again; the rest are read now, feeds
-                        // and all, so R brings the board up to date (intent 0445).
+                        // and all, so R brings the board up to date (intent 0445), and the board
+                        // says when they have (intent 0491).
                         let mut n = 0;
+                        let since = Instant::now();
+                        let mut waiting = vec![];
                         for i in 0..app.machines.len() {
                             if !app.machines[i].is_shown() {
                                 continue;
                             }
                             if app.machines[i].conn.is_live() {
                                 l.wake_feed(i);
+                                if app.machines[i].machine.feed.is_some() {
+                                    waiting.push(i);
+                                }
                             } else {
                                 l.wake(i);
                                 n += 1;
@@ -464,7 +473,13 @@ fn event_loop(
                         } else {
                             format!("Reading every machine now, and trying {n} again.")
                         };
-                        app.say(text, Tone::Info);
+                        app.say(text.clone(), Tone::Info);
+                        app.refresh = (!waiting.is_empty()).then_some(crate::app::Refresh {
+                            since,
+                            waiting,
+                            missed: vec![],
+                            said: text,
+                        });
                     }
                 }
             }

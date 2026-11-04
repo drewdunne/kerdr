@@ -102,6 +102,18 @@ pub const KEY_WAIT: Duration = Duration::from_millis(250);
 /// later (intent 0491).
 pub const KEY_WAIT_COMING: Duration = Duration::from_millis(50);
 
+/// `R`, until every machine it asked has read its feed since: nothing on the board need change, so
+/// the board says when it's done (intent 0491).
+#[derive(Clone, Debug)]
+pub struct Refresh {
+    pub since: Instant,
+    pub waiting: Vec<usize>,
+    /// Those that stopped answering, or whose feed failed, meanwhile.
+    pub missed: Vec<String>,
+    /// What `R` said, which this replaces.
+    pub said: String,
+}
+
 /// How many failures one box shows: a key takes those down, and the rest come up next, so none
 /// goes unseen.
 pub const FAIL_PAGE: usize = 3;
@@ -573,6 +585,8 @@ pub struct App {
     /// How many times the board has handed the terminal over (into herdr, to SSH, to an editor):
     /// an edit's answer opens the editor only while this is what it was at `e`.
     pub away: u64,
+    /// `R`, until it's up to date.
+    pub refresh: Option<Refresh>,
 }
 
 impl App {
@@ -645,6 +659,7 @@ impl App {
             signin_kept: None,
             machine_problems: Default::default(),
             away: 0,
+            refresh: None,
         };
         app.rebuild();
         app
@@ -708,6 +723,7 @@ impl App {
     /// for its write-up, which can take minutes; the runner hears of that itself.
     pub fn key_wait(&self) -> Duration {
         let answer_coming = self.busy
+            || self.refresh.is_some()
             || self
                 .resolver
                 .on_its_way()
@@ -810,6 +826,54 @@ impl App {
             .as_ref()
             .filter(|(_, tone, at)| *tone == Tone::Fail || at.elapsed() < Duration::from_secs(8))
             .map(|(t, tone, _)| (t.as_str(), *tone))
+    }
+
+    /// Which machines `R` waits on have read their feed since it. Asked before the reads waiting are
+    /// taken, so what this finds has been applied by the time `settle_refresh` speaks.
+    pub fn refreshed(&self, inbox: &crate::poll::Inbox) -> Vec<usize> {
+        self.refresh.as_ref().map_or_else(Vec::new, |r| {
+            r.waiting
+                .iter()
+                .copied()
+                .filter(|&i| inbox.feed_read_since(i, r.since))
+                .collect()
+        })
+    }
+
+    /// Says `R` is done once every machine it asked has read its feed, or dropped out of the
+    /// reckoning. Only in place of its own words: something else said since matters more.
+    pub fn settle_refresh(&mut self, fed: &[usize]) {
+        let Some(mut r) = self.refresh.take() else {
+            return;
+        };
+        let machines = &self.machines;
+        let missed = &mut r.missed;
+        r.waiting.retain(|&i| {
+            let Some(m) = machines.get(i) else {
+                return false;
+            };
+            if matches!(m.conn, Conn::Hidden) {
+                return false;
+            }
+            let failed = !m.conn.is_live() || (fed.contains(&i) && m.feed_error.is_some());
+            if failed {
+                missed.push(m.name());
+            }
+            !failed && !fed.contains(&i)
+        });
+        if !r.waiting.is_empty() {
+            self.refresh = Some(r);
+            return;
+        }
+        if self.message().is_some_and(|(said, _)| said != r.said) {
+            return;
+        }
+        if r.missed.is_empty() {
+            self.say("Up to date.", Tone::Good);
+        } else {
+            let names = r.missed.join(", ");
+            self.say(format!("Up to date, except {names}."), Tone::Info);
+        }
     }
 
     pub fn apply(&mut self, ev: Event) {
@@ -2637,6 +2701,91 @@ pub(crate) mod tests {
         if let Mode::Confirm { ready_at, .. } = &mut app.mode {
             *ready_at = None;
         }
+    }
+
+    fn asked_to_refresh(app: &mut App, waiting: Vec<usize>) {
+        let said = "Reading every machine now.".to_string();
+        app.say(said.clone(), Tone::Info);
+        app.refresh = Some(Refresh {
+            since: Instant::now(),
+            waiting,
+            missed: vec![],
+            said,
+        });
+    }
+
+    #[test]
+    fn r_says_up_to_date_once_every_machine_it_asked_has_read_its_feed() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0, 1]);
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        app.settle_refresh(&[]);
+        assert!(app.refresh.is_some(), "still reading both");
+        app.settle_refresh(&[0]);
+        assert_eq!(app.refresh.as_ref().unwrap().waiting, [1]);
+        assert_eq!(app.message().unwrap().0, "Reading every machine now.");
+        app.settle_refresh(&[1]);
+        assert!(app.refresh.is_none());
+        assert_eq!(app.message(), Some(("Up to date.", Tone::Good)));
+    }
+
+    #[test]
+    fn r_reads_the_inbox_for_feeds_that_began_after_it() {
+        let mut app = demo_app();
+        let inbox = crate::poll::Inbox::default();
+        let event = |feed: bool| Event {
+            machine: 0,
+            conn: Conn::Live {
+                latency: Duration::from_millis(1),
+            },
+            data: Some(crate::poll::MachineData {
+                feed: feed.then(|| Ok(crate::feed::Feed::default())),
+                ..Default::default()
+            }),
+            at: Local::now(),
+        };
+        asked_to_refresh(&mut app, vec![0]);
+        let since = app.refresh.as_ref().unwrap().since;
+        inbox.put(event(true), since - Duration::from_millis(1), 0);
+        assert!(app.refreshed(&inbox).is_empty(), "began before R");
+        inbox.put(event(false), since, 0);
+        assert!(app.refreshed(&inbox).is_empty(), "no feed in it");
+        inbox.put(event(true), since, 0);
+        assert_eq!(app.refreshed(&inbox), [0]);
+    }
+
+    #[test]
+    fn r_says_which_machines_it_could_not_bring_up_to_date() {
+        // Stopped answering while it waited, or read but its feed failed: not up to date, and a
+        // hidden one isn't worth a word.
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0, 1]);
+        let gone = app.machines[1].name();
+        app.machines[1].conn = Conn::Connecting;
+        app.settle_refresh(&[]);
+        assert_eq!(app.refresh.as_ref().unwrap().waiting, [0]);
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {gone}.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0, 1]);
+        let failed = app.machines[0].name();
+        app.machines[0].feed_error = Some("timed out".into());
+        app.machines[1].conn = Conn::Hidden;
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {failed}.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_finishing_never_talks_over_something_said_since() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        app.say("Select an intent first.", Tone::Info);
+        app.settle_refresh(&[0]);
+        assert!(app.refresh.is_none());
+        assert_eq!(app.message().unwrap().0, "Select an intent first.");
     }
 
     #[test]

@@ -446,7 +446,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `i` | Misc: workspaces with no record |
 | `Ctrl+Space` | a menu of the work and view keys, with the same letters |
 | `M` | machines |
-| `r` / `R` | retry a machine that isn't answering / read every machine now, trying again any that aren't |
+| `r` / `R` | retry a machine that isn't answering / read every machine now, trying again any that aren't, and say when it's up to date |
 | `?` | keys |
 | `q` | quit (every session keeps running; with a start still running, a start waiting for its write-up, or words for a new intent or your version of an item's text only Kerdr holds, it says so and a second `q` quits) |
 

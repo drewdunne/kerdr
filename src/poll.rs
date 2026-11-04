@@ -175,6 +175,8 @@ struct Slot {
     /// A read with the feed in it is running: nothing it finds lands for seconds, so nothing
     /// waiting on this machine's next read gains from waiting (intent 0491).
     reading_feed: bool,
+    /// When the newest read that brought the feed began, even one a newer read has merged into.
+    feed_started: Option<Instant>,
 }
 
 impl Inbox {
@@ -195,6 +197,7 @@ impl Inbox {
         slots[i].reader += 1;
         slots[i].read = None;
         slots[i].reading_feed = false;
+        slots[i].feed_started = None;
         slots[i].reader
     }
 
@@ -215,6 +218,9 @@ impl Inbox {
             return;
         }
         slots[i].reading_feed = false;
+        if ev.data.as_ref().is_some_and(|d| d.feed.is_some()) {
+            slots[i].feed_started = Some(started);
+        }
         if let Some(Some(Ok(feed))) = ev.data.as_ref().map(|d| d.feed.as_ref())
             && let Some(watch) = self
                 .watch
@@ -230,6 +236,11 @@ impl Inbox {
         };
         slots[i].read = Some((ev, started));
         self.arrived.notify_all();
+    }
+
+    /// Whether a read of machine `i`'s feed that began at `since` or later has landed, good or not.
+    pub fn feed_read_since(&self, i: usize, since: Instant) -> bool {
+        self.slots(i)[i].feed_started.is_some_and(|t| t >= since)
     }
 
     /// Has `watch` told of each machine's feed as its reader brings it, from the reader's thread.
@@ -851,6 +862,31 @@ mod tests {
         assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
         inbox.reading_feed(0, 0);
         assert!(!inbox.wait_since(&[0], since, Duration::from_millis(30)));
+    }
+
+    #[test]
+    fn a_feed_read_counts_only_from_when_it_began_and_only_with_its_feed() {
+        let inbox = Inbox::default();
+        let before = Instant::now();
+        let since = before + Duration::from_millis(5);
+        let after = since + Duration::from_millis(5);
+        assert!(!inbox.feed_read_since(0, since));
+        // Already running when R came: what it says may be from before.
+        inbox.put(read_of(0, live(), Some("old feed"), true), before, 0);
+        assert!(!inbox.feed_read_since(0, since));
+        // A later read without the feed says nothing about it.
+        inbox.put(read_of(0, live(), Some("no feed"), false), after, 0);
+        assert!(!inbox.feed_read_since(0, since));
+        inbox.put(read_of(0, live(), Some("new feed"), true), after, 0);
+        assert!(inbox.feed_read_since(0, since));
+        // Still so once the board has taken it, or a newer read without one has merged with it.
+        inbox.put(read_of(0, live(), Some("no feed"), false), after, 0);
+        inbox.take();
+        assert!(inbox.feed_read_since(0, since));
+        // Not for a reader since retired, nor another machine.
+        assert!(!inbox.feed_read_since(1, since));
+        inbox.next_reader(0);
+        assert!(!inbox.feed_read_since(0, since));
     }
 
     #[test]
