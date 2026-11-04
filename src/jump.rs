@@ -463,6 +463,86 @@ impl Attached {
     }
 }
 
+/// How often a herdr window's watcher looks for Kerdr's keys. Pressing one shows nothing until
+/// it's seen, so this is most of how long the key feels; each look is one short herdr call
+/// (intent 0491).
+const LOOK_EVERY: Duration = Duration::from_millis(200);
+
+/// The last of Kerdr's keys acted on, kept from one herdr window to the next: its token is cleared
+/// on a thread nothing waits for, so the next window can open while it's still there.
+static LAST_KEY: Mutex<Option<String>> = Mutex::new(None);
+
+/// One herdr call in a session, for a window's watcher and the threads it starts.
+fn on_herdr(
+    t: &Target,
+    herdr_bin: &str,
+    session: &str,
+    rest: &[&str],
+    secs: u64,
+) -> transport::Output {
+    let args = herdr_args(session, rest);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    transport::run_herdr(t, herdr_bin, &refs, Duration::from_secs(secs))
+}
+
+/// What one herdr window's watcher knows between looks.
+struct KeyWatch {
+    /// The machine and session it watches: a workspace's id and a token's value mean nothing
+    /// without them.
+    place: String,
+    /// When the window opened, in seconds.
+    started: u64,
+    /// Tokens already sent to be cleared, so a slow connection doesn't get one call for each look.
+    clearing: Vec<String>,
+}
+
+impl KeyWatch {
+    fn new(place: String, started: u64) -> KeyWatch {
+        KeyWatch {
+            place,
+            started,
+            clearing: Vec::new(),
+        }
+    }
+
+    /// One look at the session's workspaces: the key pressed, if any, and the workspaces whose
+    /// tokens to clear. A token counts once: its key must be new, or one uncleared token would jump
+    /// a second time, since a window takes a token from up to a second before it opened. A key
+    /// pressed on another workspace in the same second as the last one is a new key.
+    fn look(
+        &mut self,
+        list: &[herdr::Workspace],
+        last: &Mutex<Option<String>>,
+    ) -> (Option<Request>, Vec<String>) {
+        let mut heard = None;
+        let mut to_clear = Vec::new();
+        for w in list {
+            let Some(value) = w.tokens.get(herdr_keys::TOKEN) else {
+                continue;
+            };
+            let name = format!("{}/{}/{value}", self.place, w.workspace_id);
+            if !self.clearing.contains(&name) {
+                self.clearing.push(name.clone());
+                to_clear.push(w.workspace_id.clone());
+            }
+            // A key pressed before this visit began is old news.
+            let fresh = value
+                .split(':')
+                .nth(1)
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .is_none_or(|at| at + 1 >= self.started);
+            let mut last = last.lock().unwrap_or_else(|e| e.into_inner());
+            if heard.is_none() && fresh && last.as_deref() != Some(name.as_str()) {
+                heard = herdr_keys::parse_request(value);
+                if heard.is_some() {
+                    *last = Some(name);
+                }
+            }
+        }
+        (heard, to_clear)
+    }
+}
+
 /// While you're in herdr: every this often, `tick` lets the board keep up.
 const TICK_EVERY: Duration = Duration::from_secs(1);
 
@@ -495,32 +575,17 @@ fn attach(
         } else {
             format!("{} q: back to the board", jump.prefix)
         };
-        thread::spawn(move || {
-            let run = |rest: &[&str], secs: u64| {
-                let args = herdr_args(&session, rest);
-                let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-                transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(secs))
-            };
-            let clear = |wid: &str| {
-                run(
-                    &[
-                        "workspace",
-                        "report-metadata",
-                        wid,
-                        "--source",
-                        "kerdr",
-                        "--clear-token",
-                        herdr_keys::TOKEN,
-                    ],
-                    6,
-                )
-            };
-            thread::sleep(Duration::from_millis(600));
-            if stop.load(Ordering::Relaxed) {
-                return;
-            }
-            run(
-                &[
+        // What Kerdr says on arrival goes on a thread of its own: herdr's window takes a moment to
+        // come up, and looking for a key mustn't wait for that or for its answer (intent 0491).
+        {
+            let (stop, t, herdr_bin, session) =
+                (stop.clone(), t.clone(), herdr_bin.clone(), session.clone());
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(600));
+                if stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let rest = [
                     "notification",
                     "show",
                     "kerdr",
@@ -528,35 +593,47 @@ fn attach(
                     &body,
                     "--position",
                     "top-right",
-                ],
-                6,
-            );
+                ];
+                on_herdr(&t, &herdr_bin, &session, &rest, 6);
+            });
+        }
+        let place = format!("{}/{session}", jump.machine.name);
+        thread::spawn(move || {
+            let mut watch = KeyWatch::new(place, started);
             while !stop.load(Ordering::Relaxed) {
-                thread::sleep(Duration::from_millis(700));
+                let out = on_herdr(&t, &herdr_bin, &session, &["workspace", "list"], 6);
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let out = run(&["workspace", "list"], 6);
-                let Ok(list) = herdr::parse_workspace_list(&out.stdout) else {
-                    continue;
-                };
-                let Some((wid, value)) = crate::board::jump_request(&list) else {
-                    continue;
-                };
-                if stop.load(Ordering::Relaxed) {
-                    break;
+                if let Ok(list) = herdr::parse_workspace_list(&out.stdout) {
+                    let (heard, to_clear) = watch.look(&list, &LAST_KEY);
+                    // The request first: only it takes the window down, and clearing the token
+                    // can take a slow connection seconds. Nothing waits for the clearing, which is
+                    // why `LAST_KEY` is kept.
+                    if let Some(r) = heard {
+                        *request.lock().unwrap() = Some(r);
+                    }
+                    for wid in to_clear {
+                        let (t, herdr_bin, session) =
+                            (t.clone(), herdr_bin.clone(), session.clone());
+                        thread::spawn(move || {
+                            let rest = [
+                                "workspace",
+                                "report-metadata",
+                                wid.as_str(),
+                                "--source",
+                                "kerdr",
+                                "--clear-token",
+                                herdr_keys::TOKEN,
+                            ];
+                            on_herdr(&t, &herdr_bin, &session, &rest, 6);
+                        });
+                    }
+                    if heard.is_some() {
+                        break;
+                    }
                 }
-                clear(&wid);
-                // A key pressed before this visit began is old news.
-                let fresh = value
-                    .split(':')
-                    .nth(1)
-                    .and_then(|s| s.trim().parse::<u64>().ok())
-                    .is_none_or(|at| at + 1 >= started);
-                if let (true, Some(r)) = (fresh, herdr_keys::parse_request(&value)) {
-                    *request.lock().unwrap() = Some(r);
-                    break;
-                }
+                thread::sleep(LOOK_EVERY);
             }
         });
     }
@@ -864,6 +941,68 @@ mod tests {
             feed: None,
             hidden: false,
         }
+    }
+
+    fn with_key(id: &str, value: &str) -> herdr::Workspace {
+        herdr::Workspace {
+            workspace_id: id.into(),
+            tokens: [(herdr_keys::TOKEN.to_string(), value.to_string())].into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_key_jumps_once_though_its_token_is_still_there_when_the_next_window_opens() {
+        // Its token is cleared on a thread nothing waits for, and a window takes a token from up
+        // to a second before it opened (intent 0491).
+        let last = Mutex::new(None);
+        let mut first = KeyWatch::new("m/web".into(), 100);
+        let token = [with_key("w1", "next:100")];
+        assert_eq!(
+            first.look(&token, &last),
+            (Some(Request::Next), vec!["w1".to_string()])
+        );
+        let mut next = KeyWatch::new("m/web".into(), 101);
+        let (heard, clear) = next.look(&token, &last);
+        assert_eq!(heard, None, "the same key, still there");
+        assert_eq!(
+            clear,
+            ["w1"],
+            "asked again, in case the first clearing failed"
+        );
+        // Asked once a window: looks come five times a second, whatever a connection is doing.
+        assert_eq!(next.look(&token, &last), (None, vec![]));
+        // A key pressed on the card it went on to is a new key, even in the same second.
+        assert_eq!(
+            next.look(
+                &[with_key("w1", "next:100"), with_key("w2", "next:101")],
+                &last
+            ),
+            (Some(Request::Next), vec!["w2".to_string()])
+        );
+        let same_second = next.look(&[with_key("w3", "board:101")], &last);
+        assert_eq!(same_second, (Some(Request::Board), vec!["w3".to_string()]));
+    }
+
+    #[test]
+    fn a_key_from_before_the_window_opened_is_cleared_and_ignored() {
+        let last = Mutex::new(None);
+        let mut watch = KeyWatch::new("m/web".into(), 100);
+        assert_eq!(
+            watch.look(&[with_key("w1", "next:98")], &last),
+            (None, vec!["w1".to_string()])
+        );
+        // What it can't read is cleared and ignored too.
+        assert_eq!(
+            watch.look(&[with_key("w2", "dance")], &last),
+            (None, vec!["w2".to_string()])
+        );
+        assert_eq!(*last.lock().unwrap(), None);
+        // The second before it opened still counts: the two clocks may differ a little.
+        assert_eq!(
+            watch.look(&[with_key("w3", "board:99")], &last).0,
+            Some(Request::Board)
+        );
     }
 
     #[test]
