@@ -862,11 +862,20 @@ pub mod tests {
         let mut name = path.as_os_str().to_owned();
         name.push(".lock");
         let holder = fs::File::open(&name).unwrap();
-        // SAFETY: flock only reads the descriptor `holder` keeps open.
-        assert_eq!(
-            unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        // A child another test is starting can hold it for a moment on a busy machine: keep trying.
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            // SAFETY: flock only reads the descriptor `holder` keeps open.
+            let got = unsafe { libc::flock(holder.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if got == 0 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "the lock never came free"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         let long = "word ".repeat(1500);
         for _ in 0..200 {
             log.write(&entry(&long), &[], &[]);
