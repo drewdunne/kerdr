@@ -29,6 +29,9 @@ pub struct MachineState {
     pub stopped: HashMap<(String, String), DateTime<Local>>,
     /// By (session, workspace): the `kerdr_status` an agent reported, and when Kerdr first saw it.
     pub reported: HashMap<(String, String), (String, DateTime<Local>)>,
+    /// By session: why its snapshot in `data` is the last good one, when its newest failed. It
+    /// stays on the board, and its row says this (intent 0491).
+    pub snapshot_errors: HashMap<String, String>,
 }
 
 impl MachineState {
@@ -48,6 +51,7 @@ impl MachineState {
             feed_taken: None,
             stopped: HashMap::new(),
             reported: HashMap::new(),
+            snapshot_errors: HashMap::new(),
         }
     }
 
@@ -105,6 +109,21 @@ impl MachineState {
         }
         self.stopped = stopped;
         self.reported = reported;
+        // A session that didn't answer stays on the board as it last was, and only its row says
+        // so: its workspaces would otherwise go, as if they'd closed (intent 0491).
+        let last = self.data.take();
+        let last = last.as_ref().map(|d| &d.snapshots);
+        self.snapshot_errors.clear();
+        for (session, snap) in &mut data.snapshots {
+            if snap.is_err()
+                && let Some(Ok(good)) = last.and_then(|l| l.get(session))
+            {
+                let Err(why) = std::mem::replace(snap, Ok(good.clone())) else {
+                    continue;
+                };
+                self.snapshot_errors.insert(session.clone(), why);
+            }
+        }
         self.data = Some(data);
         self.last_ok = Some(at);
     }
@@ -877,6 +896,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                     .snapshots
                     .get(&info.name)
                     .and_then(|s| s.as_ref().err().cloned())
+                    .or_else(|| m.snapshot_errors.get(&info.name).cloned())
                     .or_else(|| m.feed_error.clone()),
             });
         }
@@ -1214,6 +1234,60 @@ mod tests {
         let next = live(machine, after, None).data.unwrap();
         m.take(next, t0 + chrono::Duration::seconds(2));
         m
+    }
+
+    #[test]
+    fn a_session_that_stops_answering_keeps_its_workspaces_and_its_row_says_why() {
+        // One stuck session, not its machine: only a row says so (intent 0491).
+        let machine = Machine {
+            name: "m".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let snapshot = Snapshot {
+            workspaces: vec![ws("w1", "1-open")],
+            ..Default::default()
+        };
+        let mut m = live(machine.clone(), vec![("web", snapshot)], None);
+        let sessions = m.data.as_ref().unwrap().sessions.clone();
+        let silent = |why: &str| {
+            let mut next = live(machine.clone(), vec![], None).data.unwrap();
+            next.sessions = sessions.clone();
+            next.snapshots.insert("web".into(), Err(why.to_string()));
+            next
+        };
+        m.take(silent(crate::poll::SESSION_SILENT), Local::now());
+        let data = m.data.as_ref().unwrap();
+        assert_eq!(data.snapshots["web"].as_ref().unwrap().workspaces.len(), 1);
+        let cfg = Config::default();
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert!(board.workspaces.iter().any(|w| w.id == "w1"));
+        let row = board.sessions.iter().find(|s| s.session == "web").unwrap();
+        assert_eq!(row.error.as_deref(), Some(crate::poll::SESSION_SILENT));
+        // Again and again: the same, and the latest reason.
+        m.take(silent("still nothing"), Local::now());
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert!(board.workspaces.iter().any(|w| w.id == "w1"));
+        let row = board.sessions.iter().find(|s| s.session == "web").unwrap();
+        assert_eq!(row.error.as_deref(), Some("still nothing"));
+        // A session never read has nothing to keep: its failure stands.
+        let mut never = live(machine.clone(), vec![], None);
+        let mut first = live(machine.clone(), vec![], None).data.unwrap();
+        first.snapshots.insert("web".into(), Err("no".into()));
+        never.take(first, Local::now());
+        assert!(never.data.unwrap().snapshots["web"].is_err());
+        // It answers again: all as it says, and the row clears.
+        let answered = Snapshot::default();
+        let mut next = live(machine.clone(), vec![("web", answered)], None)
+            .data
+            .unwrap();
+        next.sessions = sessions.clone();
+        m.take(next, Local::now());
+        assert!(m.snapshot_errors.is_empty());
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert!(!board.workspaces.iter().any(|w| w.id == "w1"));
     }
 
     fn feed_card(id: &str, stage: &str, state: &str) -> FeedCard {

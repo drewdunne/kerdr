@@ -444,6 +444,13 @@ enum Failure {
 
 const MARK: &str = "@@KERDR ";
 
+/// The longest one herdr session has to answer: one that's stuck must not take the whole read, and
+/// with it its machine, off the board (intent 0491). Generous, since LAB-Server's load spikes.
+pub const SESSION_MOST: Duration = Duration::from_secs(5);
+
+/// What a session that ran out of that time shows in its row.
+pub const SESSION_SILENT: &str = "this herdr session didn't answer in 5 s";
+
 /// The script one read runs on the machine.
 pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
     let mut s = String::new();
@@ -451,6 +458,10 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
     s.push('\n');
     s.push_str(&format!("unset {}\n", HERDR_VARS.join(" ")));
     s.push_str(&format!("H={}\n", transport::herdr_word(herdr)));
+    s.push_str(&format!(
+        "T=; command -v timeout >/dev/null 2>&1 && T='timeout {}'\n",
+        SESSION_MOST.as_secs()
+    ));
     s.push_str(&format!("echo '{MARK}host'; uname -n\n"));
     s.push_str(&format!(
         "if ! command -v \"$H\" >/dev/null 2>&1; then echo '{MARK}missing'; exit 0; fi\n"
@@ -460,7 +471,7 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
         "echo '{MARK}keys'; grep -q kerdr_jump \"${{HERDR_CONFIG_PATH:-$HOME/.config/herdr/config.toml}}\" 2>/dev/null && echo yes || echo no\n"
     ));
     s.push_str(&format!(
-        "S=$(\"$H\" session list --json 2>&1); echo '{MARK}sessions'; printf '%s\\n' \"$S\"\n"
+        "S=$($T \"$H\" session list --json 2>&1); echo '{MARK}sessions'; printf '%s\\n' \"$S\"\n"
     ));
     // Session names only split into words here; never expanded as file patterns.
     s.push_str("set -f\n");
@@ -468,7 +479,8 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
         "for s in $(printf '%s' \"$S\" | tr '{' '\\n' | grep '\"running\":true' | sed -n 's/.*\"name\":\"\\([^\"]*\\)\".*/\\1/p'); do\n",
     );
     s.push_str(&format!(
-        "  echo \"{MARK}snapshot $s\"; \"$H\" --session \"$s\" api snapshot 2>&1\ndone\n"
+        "  echo \"{MARK}snapshot $s\"; $T \"$H\" --session \"$s\" api snapshot 2>&1 || {{ [ $? = 124 ] && echo {}; }}\ndone\n",
+        transport::quote(SESSION_SILENT)
     ));
     if let Some(cmd) = feed {
         s.push_str(&format!("KERDR_FEED={}\n", transport::quote(cmd)));
@@ -973,6 +985,62 @@ esac
         let names: Vec<_> = data.snapshots.keys().cloned().collect();
         assert_eq!(names, ["default", "web"]);
         assert_eq!(data.version.as_deref(), Some("0.9.1"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stuck_session_costs_a_read_only_its_own_snapshot() {
+        // Not the whole read and with it the machine, as when the snapshots had no limit (intent
+        // 0491). `exec`: a child left running would hold the read open.
+        use std::os::unix::fs::PermissionsExt;
+        let fake = r#"#!/bin/sh
+case "$*" in
+  --version) echo "herdr 0.9.1";;
+  "session list --json") echo '{"sessions":[{"name":"stuck","running":true},{"name":"web","running":true}]}';;
+  *"stuck api snapshot") exec sleep 60;;
+  *"api snapshot") echo "{\"result\":{\"snapshot\":{\"workspaces\":[]}}}";;
+esac
+"#;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("herdr");
+        std::fs::write(&bin, fake).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = build_script("herdr", None)
+            .replace("H=herdr", &format!("H={}", bin.display()))
+            .replace("'timeout 5'", "'timeout 1'");
+        let t = Instant::now();
+        let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
+        assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+        let data = read(&Target::Local, &out, false).ok().expect("read works");
+        assert!(data.snapshots["web"].is_ok());
+        assert_eq!(
+            data.snapshots["stuck"].as_ref().err().unwrap(),
+            SESSION_SILENT
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_read_works_where_there_is_no_timeout_command() {
+        let script = build_script("herdr", None);
+        let fake = r#"#!/bin/sh
+case "$*" in
+  --version) echo "herdr 0.9.1";;
+  "session list --json") echo '{"sessions":[{"name":"web","running":true}]}';;
+  *"api snapshot") echo "{\"result\":{\"snapshot\":{\"workspaces\":[]}}}";;
+esac
+"#;
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("herdr");
+        std::fs::write(&bin, fake).unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let script = script
+            .replace("H=herdr", &format!("H={}", bin.display()))
+            .replace("command -v timeout", "command -v no-such-timeout-here");
+        let out = transport::run_script(&Target::Local, &script, Duration::from_secs(5));
+        let data = read(&Target::Local, &out, false).ok().expect("read works");
+        assert!(data.snapshots["web"].is_ok());
     }
 
     #[cfg(windows)]
