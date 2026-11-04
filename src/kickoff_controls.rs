@@ -22,6 +22,8 @@ const ANSWER_MOST: usize = 2000;
 /// When the questions read ahead turned out not to be the ones it asks now.
 const CHANGED: &str =
     "These questions changed since the board last read them. These are the current ones.";
+/// What it adds when it has words typed for a question that has gone or been reworded.
+const CHANGED_KEPT: &str = "What you typed for the old wording:";
 /// When the check behind a box opened from the feed gets no answer.
 const UNCHECKED: &str =
     "Kerdr couldn't check these are still current. Your answers are checked when they're sent.";
@@ -157,10 +159,23 @@ impl Kickoff {
         if now != self.questions {
             let kept = self.kept();
             self.drafts = drafts_for(&now, &kept);
+            // Words typed against the old wording can't be answers to the new one, but they were
+            // typed while this box was up, so they stay on screen rather than vanish (intent 0491).
+            let orphans: Vec<String> = kept
+                .iter()
+                .filter(|(num, question, _)| {
+                    !now.iter().any(|q| q.num == *num && q.question == *question)
+                })
+                .map(|(.., words)| clean(words))
+                .collect();
             self.questions = now;
             self.at = 0;
             self.reached = 0;
-            self.note = Some(CHANGED.into());
+            self.note = Some(if orphans.is_empty() {
+                CHANGED.into()
+            } else {
+                format!("{CHANGED} {CHANGED_KEPT} {}", orphans.join(" / "))
+            });
             self.ready_at = Instant::now() + READY_AFTER;
             self.scroll.set(0);
         }
@@ -851,8 +866,24 @@ mod tests {
         assert_eq!(form.questions[1].question, "The question now?");
         assert_eq!((form.at, form.reached), (0, 0));
         assert_eq!(form.drafts[0], "Mine");
-        assert_eq!(form.drafts[1], "");
-        assert_eq!(form.note.as_deref(), Some(CHANGED));
+        assert_eq!(
+            form.drafts[1], "",
+            "never an answer to a question it wasn't for"
+        );
+        let note = form.note.as_deref().unwrap();
+        assert!(note.starts_with(CHANGED), "{note}");
+        assert!(note.ends_with("words for the old one"), "{note}");
+        assert!(!note.contains("Mine"), "{note}");
+    }
+
+    #[test]
+    fn the_check_says_only_that_they_changed_when_no_words_were_lost() {
+        let (mut app, card) = preloaded(vec![question("1", "An old question?", "Yes")]);
+        let request = sent(d(&mut app, &card));
+        let mut now = answer();
+        now.questions = vec![question("1", "The question now?", "No")];
+        app.finish_kickoff_check(0, &request, Ok(now));
+        assert_eq!(showing(&app).note.as_deref(), Some(CHANGED));
     }
 
     #[test]
