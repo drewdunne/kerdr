@@ -27,6 +27,9 @@ use crate::state::State;
 /// lands well inside it, and giving up only chooses from a read a few seconds old (intent 0491).
 const FRESH_WAIT: Duration = Duration::from_millis(250);
 
+/// How long after coming back to the board its turn stays quick for the read asked for then.
+const READ_LANDS: Duration = Duration::from_secs(1);
+
 struct Live {
     pollers: Vec<Option<Poller>>,
     inbox: Arc<Inbox>,
@@ -175,7 +178,14 @@ fn event_loop(
     // Colours from the desktop theme, read again when it changes (palette.rs).
     let mut theme = crate::palette::ThemeWatch::new(app.cfg.theme.colors.as_deref());
     theme.check(true);
+    // Back from herdr or your editor: the read that was asked for lands in moments, and the board
+    // should show it as it lands (intent 0491).
+    let (mut away_seen, mut back_at) = (app.away, None::<Instant>);
     loop {
+        if app.away != away_seen {
+            away_seen = app.away;
+            back_at = Some(Instant::now());
+        }
         theme.check(false);
         send_loaded_images(app, &bg, None);
         while let Ok(answer) = action_rx.try_recv() {
@@ -300,7 +310,12 @@ fn event_loop(
         app.width = terminal.size()?.width;
         app.keep_box_errors();
         terminal.draw(|f| crate::ui::draw(f, app))?;
-        if !event::poll(Duration::from_millis(250))? {
+        let wait = if back_at.is_some_and(|at| at.elapsed() < READ_LANDS) {
+            crate::app::KEY_WAIT_COMING
+        } else {
+            app.key_wait()
+        };
+        if !event::poll(wait)? {
             continue;
         }
         let action = match event::read()? {

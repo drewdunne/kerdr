@@ -95,6 +95,13 @@ pub enum Tone {
 /// appeared mustn't.
 pub const FAIL_SEEN: Duration = Duration::from_millis(1500);
 
+/// How long the board's turn waits for a key with nothing on its way. Answers from the background
+/// threads are only taken when the turn comes round, and a key is what brings it round sooner.
+pub const KEY_WAIT: Duration = Duration::from_millis(250);
+/// The same while something is coming, so it shows when it comes, not up to a quarter of a second
+/// later (intent 0491).
+pub const KEY_WAIT_COMING: Duration = Duration::from_millis(50);
+
 /// How many failures one box shows: a key takes those down, and the rest come up next, so none
 /// goes unseen.
 pub const FAIL_PAGE: usize = 3;
@@ -694,6 +701,29 @@ impl App {
     /// Whether a failure is up.
     pub fn failing(&self) -> bool {
         matches!(self.message, Some((_, Tone::Fail, _)))
+    }
+
+    /// How long this turn of the board waits for a key: less while an answer, an image or a jump is
+    /// on its way, or a guard's hint is about to light up (intent 0491). Not for a start waiting
+    /// for its write-up, which can take minutes; the runner hears of that itself.
+    pub fn key_wait(&self) -> Duration {
+        let answer_coming = self.busy
+            || self
+                .resolver
+                .on_its_way()
+                .any(|job| !job.waits_for_write_up());
+        let guard_up = match &self.mode {
+            Mode::Confirm {
+                ready_at: Some(at), ..
+            } => Instant::now() < *at,
+            Mode::Kickoff { form, .. } => Instant::now() < form.ready_at,
+            _ => false,
+        } || matches!(&self.message, Some((_, Tone::Fail, at)) if at.elapsed() < FAIL_SEEN);
+        if answer_coming || guard_up || self.image_load.is_some() || self.pending_jump.is_some() {
+            KEY_WAIT_COMING
+        } else {
+            KEY_WAIT
+        }
     }
 
     /// A key was pressed while a failure is up: once it has been up long enough to be seen, the
@@ -2607,6 +2637,52 @@ pub(crate) mod tests {
         if let Mode::Confirm { ready_at, .. } = &mut app.mode {
             *ready_at = None;
         }
+    }
+
+    #[test]
+    fn the_board_turns_faster_only_while_something_is_coming() {
+        let mut app = demo_app();
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        // An image being read.
+        app.image_load = Some(1);
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        app.image_load = None;
+        // An answer on its way, until it comes.
+        let (key, id) = waiting_backlog_card(&app);
+        let request = serde_json::json!({"action": "move", "id": id, "delta": 1});
+        app.resolver.add(0, request, None, Some(key.clone()), None);
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        let n = app.resolver.on_its_way().next().unwrap().n;
+        app.resolver.take(n);
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        // A start that waits for its write-up, which can take minutes, isn't an answer coming.
+        let request = serde_json::json!({"action": "dispatch", "id": id});
+        app.resolver.add_gated(0, request, None, Some(key), None);
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        let n = app.resolver.on_its_way().next().unwrap().n;
+        app.resolver.take(n);
+        // A failure until a key can take it down, then not.
+        app.fail("Not this time");
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        if let Some((_, _, at)) = &mut app.message {
+            *at -= FAIL_SEEN;
+        }
+        assert_eq!(app.key_wait(), KEY_WAIT);
+        // A question's guard, until it has passed.
+        app.mode = Mode::Confirm {
+            machine: 0,
+            request: serde_json::json!({}),
+            title: "Sure?".into(),
+            message: String::new(),
+            back: Box::new(Mode::Board),
+            target: None,
+            queue: false,
+            ready_at: Some(Instant::now() + Duration::from_secs(60)),
+            plain: false,
+        };
+        assert_eq!(app.key_wait(), KEY_WAIT_COMING);
+        settle(&mut app);
+        assert_eq!(app.key_wait(), KEY_WAIT);
     }
 
     #[test]
