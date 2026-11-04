@@ -1002,6 +1002,7 @@ fn run_jump(
         }
         bg.holds.borrow_mut().sync(app);
     };
+    let mut opened = false;
     let outcome = jump::run(
         terminal,
         flags,
@@ -1011,9 +1012,9 @@ fn run_jump(
             .unwrap_or(std::path::Path::new("")),
         held.as_ref(),
         &mut keep_up,
+        &mut opened,
     );
-    let reached = matches!(outcome, Outcome::Board | Outcome::Next);
-    bg.holds.borrow_mut().left(app, reached);
+    bg.holds.borrow_mut().left(app, opened);
     app.unsay(&opening);
     outcome
 }

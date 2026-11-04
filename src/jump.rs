@@ -589,7 +589,9 @@ fn attach(
 }
 
 /// Goes into herdr on the card's workspace. `held` is the socket of a connection Kerdr holds for
-/// this session, when it has one; `tick` runs now and then while you're in there.
+/// this session, when it has one; `tick` runs now and then while you're in there. `opened` says
+/// whether a window really opened, whatever way it ended.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
@@ -597,6 +599,7 @@ pub fn run(
     client_config: &Path,
     held: Option<&crate::hold::HeldWay>,
     tick: &mut dyn FnMut(),
+    opened: &mut bool,
 ) -> Outcome {
     let t = target(&jump.machine);
     let herdr_bin = jump.machine.herdr.clone();
@@ -715,6 +718,7 @@ pub fn run(
     #[cfg(windows)]
     drop(console_modes);
     tty.restore();
+    *opened = !attached.failed_at_once();
     let (status, result) = (attached.status, attached.request);
     // herdr's own words on why its window closed (SSH failing, an update under way, versions
     // that don't match) are on the plain screen: they stay there until you've read them, since

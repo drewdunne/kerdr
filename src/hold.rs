@@ -52,9 +52,11 @@ pub struct Policy {
 }
 
 impl Policy {
-    /// What waits on you now, from the board.
-    pub fn saw(&mut self, waiting: BTreeSet<Spot>) {
-        self.been_into.retain(|s| waiting.contains(s));
+    /// What waits on you now, from the board. A place it couldn't read says nothing about a wait
+    /// there: only seeing it gone ends one you've been into, or a failed read would make it new.
+    pub fn saw(&mut self, waiting: BTreeSet<Spot>, unread: impl Fn(&Place) -> bool) {
+        self.been_into
+            .retain(|s| waiting.contains(s) || unread(&s.place));
         self.waiting = waiting;
     }
 
@@ -115,6 +117,17 @@ pub fn waiting_spots(app: &App) -> BTreeSet<Spot> {
             })
         })
         .collect()
+}
+
+/// Whether the board couldn't read this session just now: its machine isn't answering, or herdr's
+/// answer for that session failed. A session simply gone from the list has been read.
+pub fn unread(app: &App, place: &Place) -> bool {
+    let Some(m) = app.machines.get(place.machine) else {
+        return false;
+    };
+    let failed =
+        |d: &crate::poll::MachineData| matches!(d.snapshots.get(&place.session), Some(Err(_)));
+    !m.conn.is_live() || m.data.as_ref().is_none_or(failed)
 }
 
 /// The session's client socket from its API socket, as herdr names it: `herdr.sock` beside
@@ -183,7 +196,7 @@ impl Holds {
         let Some(holder) = self.holder.as_mut() else {
             return;
         };
-        self.policy.saw(waiting_spots(app));
+        self.policy.saw(waiting_spots(app), |p| unread(app, p));
         let mut wanted: Wanted = BTreeMap::new();
         for (place, until) in self.policy.wanted(Instant::now()) {
             let found = target(app, &place).or_else(|| {
@@ -218,6 +231,9 @@ impl Holds {
         self.policy.leave(Instant::now(), reached);
         self.inside = None;
         self.sync(app);
+        if let Some(holder) = &self.holder {
+            holder.free();
+        }
     }
 }
 
@@ -272,6 +288,7 @@ impl Holder {
     fn ready_soon(&self, _host: &str, _session: &str, _within: Duration) -> Option<HeldWay> {
         None
     }
+    fn free(&self) {}
 }
 
 #[cfg(unix)]
@@ -279,8 +296,11 @@ impl Holder {
 struct Shared {
     /// Machines whose connection is up, with its control socket.
     up: BTreeMap<String, PathBuf>,
-    /// Machines whose connection failed to answer: to be closed and opened anew.
-    suspect: BTreeSet<String>,
+    /// Connections, by control socket, that failed to answer: to be closed and opened anew.
+    suspect: BTreeSet<PathBuf>,
+    /// By (host, session), the way someone has gone in by: never let go until they're back, whatever
+    /// the time says, since the connection now carries their window.
+    in_use: BTreeSet<(String, String)>,
     /// By (host, session), the socket here that reaches that session.
     ready: BTreeMap<(String, String), PathBuf>,
 }
@@ -360,11 +380,12 @@ impl Holder {
         let deadline = Instant::now() + within;
         loop {
             let (socket, up) = {
-                let shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
-                (
-                    shared.ready.get(&key).cloned(),
-                    shared.up.get(host).cloned(),
-                )
+                let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+                let socket = shared.ready.get(&key).cloned();
+                if socket.is_some() {
+                    shared.in_use.insert(key.clone());
+                }
+                (socket, shared.up.get(host).cloned())
             };
             if let (Some(socket), Some(control)) = (socket, &up) {
                 // Refused when the connection behind it has just gone.
@@ -381,20 +402,29 @@ impl Holder {
         }
     }
 
+    /// Nobody's window runs through a held way now.
+    fn free(&self) {
+        let mut shared = self.shared.lock().unwrap_or_else(|e| e.into_inner());
+        shared.in_use.clear();
+    }
+
     /// Sends a question through the connection, away from the board's thread. No answer marks it
-    /// for closing, so the next go has a good one.
+    /// for closing, so the next go has a good one, unless it has been replaced since.
     fn ask(&self, host: &str, control: &Path) -> std::sync::mpsc::Receiver<bool> {
         let (tx, rx) = std::sync::mpsc::channel();
         let mut cmd = std::process::Command::new(&self.program);
         cmd.arg("-S").arg(control);
         cmd.args(["-o", "BatchMode=yes", "-o", "ControlMaster=no", "-T", "--"]);
         cmd.args([host, "true"]);
-        let (host, shared) = (host.to_string(), self.shared.clone());
+        let (host, control, shared) =
+            (host.to_string(), control.to_path_buf(), self.shared.clone());
         std::thread::spawn(move || {
             let ok = crate::transport::run_plain(&mut cmd, ANSWER_WITHIN).ok();
             if !ok {
                 let mut shared = shared.lock().unwrap_or_else(|e| e.into_inner());
-                shared.suspect.insert(host);
+                if shared.up.get(&host) == Some(&control) {
+                    shared.suspect.insert(control);
+                }
             }
             let _ = tx.send(ok);
         });
@@ -520,26 +550,42 @@ impl Connection {
     fn reconcile(&mut self, all: &BTreeMap<String, Hold>) {
         self.notice_lost();
         let now = Instant::now();
-        let wanted: BTreeMap<&String, &String> = all
-            .iter()
-            .filter(|(_, hold)| hold.until.is_none_or(|until| now < until))
-            .map(|(session, hold)| (session, &hold.socket))
-            .collect();
-        if wanted.is_empty() {
+        // Under one lock with taking what goes out of `ready`: going in either finds it gone, and
+        // goes the usual way, or has marked it in use first, and it stays.
+        let (wanted, stale) = {
+            let mut shared = self.lock();
+            let in_use = |session: &String| {
+                shared
+                    .in_use
+                    .contains(&(self.host.clone(), session.clone()))
+            };
+            let wanted: BTreeMap<&String, &String> = all
+                .iter()
+                .filter(|(session, hold)| {
+                    hold.until.is_none_or(|until| now < until) || in_use(session)
+                })
+                .map(|(session, hold)| (session, &hold.socket))
+                .collect();
+            let stale: Vec<String> = self
+                .forwards
+                .iter()
+                .filter(|(session, f)| wanted.get(*session) != Some(&&f.remote) && !in_use(session))
+                .map(|(session, _)| session.clone())
+                .collect();
+            for session in &stale {
+                shared.ready.remove(&(self.host.clone(), session.clone()));
+            }
+            (wanted, stale)
+        };
+        let all_stale = stale.len() == self.forwards.len();
+        for session in stale {
+            self.cancel(&session);
+        }
+        if wanted.is_empty() && all_stale {
             self.close();
             self.failures = 0;
             self.retry_at = None;
             return;
-        }
-        // A session gone from the list, or whose socket has moved.
-        let stale: Vec<String> = self
-            .forwards
-            .iter()
-            .filter(|(session, f)| wanted.get(*session) != Some(&&f.remote))
-            .map(|(session, _)| session.clone())
-            .collect();
-        for session in stale {
-            self.cancel(&session);
         }
         if self.master.is_none() && !self.open() {
             return;
@@ -558,7 +604,8 @@ impl Connection {
             .master
             .as_mut()
             .is_some_and(|m| !matches!(m.child.try_wait(), Ok(None)));
-        let suspect = self.lock().suspect.remove(&self.host);
+        let control = self.master.as_ref().map(|m| m.control.clone());
+        let suspect = control.is_some_and(|c| self.lock().suspect.remove(&c));
         if dropped || suspect || self.wedged.get() {
             self.close();
         }
@@ -732,6 +779,25 @@ mod tests {
         spots.iter().cloned().collect()
     }
 
+    impl Policy {
+        /// With every session read.
+        fn saw_all(&mut self, waiting: BTreeSet<Spot>) {
+            self.saw(waiting, |_| false);
+        }
+    }
+
+    #[test]
+    fn a_failed_read_doesnt_make_a_wait_youve_been_into_new() {
+        let mut p = Policy::default();
+        let t0 = Instant::now();
+        p.saw_all(set(&[spot("ARK", "w1")]));
+        p.enter(spot("ARK", "w1"));
+        p.leave(t0, true);
+        p.saw(set(&[]), |_| true);
+        p.saw_all(set(&[spot("ARK", "w1")]));
+        assert!(p.wanted(t0 + AFTER_LEAVING).is_empty());
+    }
+
     fn names(p: &mut Policy, now: Instant) -> BTreeSet<Place> {
         p.wanted(now).into_keys().collect()
     }
@@ -740,10 +806,10 @@ mod tests {
     fn a_try_that_never_got_in_leaves_the_wait_as_it_was() {
         let mut p = Policy::default();
         let t0 = Instant::now();
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         p.enter(spot("ARK", "w1"));
         p.leave(t0, false);
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         assert_eq!(
             names(&mut p, t0 + Duration::from_secs(600)),
             places(&["ARK"])
@@ -771,7 +837,7 @@ mod tests {
             Some(&Some(t0 + AFTER_LEAVING))
         );
         // Something new waits there: held for that, with no end.
-        p.saw(set(&[spot("ARK", "w2")]));
+        p.saw_all(set(&[spot("ARK", "w2")]));
         assert_eq!(p.wanted(t0).values().next(), Some(&None));
     }
 
@@ -780,10 +846,10 @@ mod tests {
         let mut p = Policy::default();
         let now = Instant::now();
         assert!(p.wanted(now).is_empty());
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         assert_eq!(names(&mut p, now), places(&["ARK"]));
         // It stopped waiting without your going in: nothing needs it now.
-        p.saw(set(&[]));
+        p.saw_all(set(&[]));
         assert!(p.wanted(now).is_empty());
     }
 
@@ -791,10 +857,10 @@ mod tests {
     fn the_minute_starts_when_you_leave_however_long_you_stayed() {
         let mut p = Policy::default();
         let t0 = Instant::now();
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         p.enter(spot("ARK", "w1"));
         // Half an hour in the card: still held, and the wait you're in doesn't end it.
-        p.saw(set(&[]));
+        p.saw_all(set(&[]));
         assert_eq!(
             names(&mut p, t0 + Duration::from_secs(1800)),
             places(&["ARK"])
@@ -812,18 +878,18 @@ mod tests {
     fn a_wait_you_have_been_into_is_released_after_the_minute_even_if_it_still_shows() {
         let mut p = Policy::default();
         let t0 = Instant::now();
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         p.enter(spot("ARK", "w1"));
         p.leave(t0, true);
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         assert_eq!(
             names(&mut p, t0 + Duration::from_secs(30)),
             places(&["ARK"])
         );
         assert!(p.wanted(t0 + Duration::from_secs(60)).is_empty());
         // It ended, and another began: that one counts.
-        p.saw(set(&[]));
-        p.saw(set(&[spot("ARK", "w1")]));
+        p.saw_all(set(&[]));
+        p.saw_all(set(&[spot("ARK", "w1")]));
         assert_eq!(
             names(&mut p, t0 + Duration::from_secs(61)),
             places(&["ARK"])
@@ -834,7 +900,7 @@ mod tests {
     fn another_workspace_waiting_keeps_the_session_held() {
         let mut p = Policy::default();
         let t0 = Instant::now();
-        p.saw(set(&[spot("ARK", "w1"), spot("ARK", "w2")]));
+        p.saw_all(set(&[spot("ARK", "w1"), spot("ARK", "w2")]));
         p.enter(spot("ARK", "w1"));
         p.leave(t0, true);
         assert_eq!(
@@ -995,6 +1061,28 @@ mod tests {
                 machine("server", true, "0.9.5", "blocked"),
             ]);
             assert_eq!(target(&newer, &ark()), None);
+        }
+
+        #[test]
+        fn a_session_is_unread_only_when_reading_it_failed() {
+            let mut failing = machine("server", true, "0.9.1", "blocked");
+            let data = failing.data.as_mut().unwrap();
+            data.snapshots.insert("broken".into(), Err("no".into()));
+            let mut away = machine("gone", true, "0.9.1", "blocked");
+            away.conn = Conn::Connecting;
+            let a = app(vec![
+                machine("here", false, "0.9.1", "blocked"),
+                failing,
+                away,
+            ]);
+            let at = |machine: usize, session: &str| Place {
+                machine,
+                session: session.into(),
+            };
+            assert!(unread(&a, &at(1, "broken")));
+            assert!(!unread(&a, &at(1, "ARK")));
+            assert!(!unread(&a, &at(1, "stopped")), "gone from the list");
+            assert!(unread(&a, &at(2, "ARK")));
         }
 
         #[test]
@@ -1205,6 +1293,56 @@ esac
             wait_for("connection closed", || {
                 !h.shared.lock().unwrap().up.contains_key("server")
             });
+        }
+
+        #[test]
+        fn a_way_in_use_outlasts_its_minute_until_youre_back() {
+            let dir = tempfile::tempdir().unwrap();
+            let ssh = fake_ssh(dir.path(), true);
+            let mut h = Holder::in_dir(&ssh, Duration::from_millis(20), dir.path().to_path_buf());
+            let mut w = wanted("server", &[("ARK", "/r/ark-client.sock")]);
+            let until = Instant::now() + Duration::from_millis(300);
+            w.get_mut("server").unwrap().get_mut("ARK").unwrap().until = Some(until);
+            h.want(w);
+            wait_for("held", || ready(&h, "server", "ARK").is_some());
+            h.shared
+                .lock()
+                .unwrap()
+                .in_use
+                .insert(("server".into(), "ARK".into()));
+            std::thread::sleep(Duration::from_millis(600));
+            assert!(
+                ready(&h, "server", "ARK").is_some(),
+                "it outlasted the time"
+            );
+            // Not even gone from the list lets it go.
+            h.want(BTreeMap::new());
+            std::thread::sleep(Duration::from_millis(200));
+            assert!(ready(&h, "server", "ARK").is_some());
+            assert!(h.shared.lock().unwrap().up.contains_key("server"));
+            h.free();
+            wait_for("let go", || ready(&h, "server", "ARK").is_none());
+            wait_for("connection closed", || {
+                !h.shared.lock().unwrap().up.contains_key("server")
+            });
+        }
+
+        #[test]
+        fn a_late_failure_from_a_replaced_connection_leaves_the_new_one_alone() {
+            let dir = tempfile::tempdir().unwrap();
+            let ssh = fake_ssh(dir.path(), true);
+            let mut h = Holder::in_dir(&ssh, Duration::from_millis(20), dir.path().to_path_buf());
+            h.want(wanted("server", &[("ARK", "/r/ark-client.sock")]));
+            wait_for("ready", || ready(&h, "server", "ARK").is_some());
+            std::fs::write(dir.path().join("silent"), "").unwrap();
+            assert!(
+                !h.ask("server", &dir.path().join("an-older.ctl"))
+                    .recv()
+                    .unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(150));
+            assert_eq!(log(dir.path()).matches("master ").count(), 1);
+            assert!(h.shared.lock().unwrap().suspect.is_empty());
         }
 
         #[test]
