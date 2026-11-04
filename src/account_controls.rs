@@ -607,11 +607,10 @@ impl App {
 
     pub fn account_agent(&self, card: &Card) -> Option<&AccountAgent> {
         let feed = self.account_feed(card.machine_index)?;
-        card.agents.iter().find_map(|a| {
-            feed.agents.iter().find(|f| {
-                f.pane == a.pane_id && Some(f.session.as_str()) == card.session.as_deref()
-            })
-        })
+        let session = card.session.as_deref()?;
+        card.agents
+            .iter()
+            .find_map(|a| feed.agent_on_pane(session, &a.pane_id, a.conversation.as_deref()))
     }
 
     /// The agent s moves: the one the feed records on this card, or else the card's agent with
@@ -3120,6 +3119,71 @@ mod tests {
         assert!(!card.needs_you());
     }
 
+    /// A feed where the pane's first record is one left behind by another conversation.
+    fn stale_record_first(a: &mut App) {
+        let feed = a.machines[1].feed.as_mut().unwrap();
+        let real = feed
+            .agents
+            .iter()
+            .position(|f| f.session == "api" && f.pane == "w1:p1")
+            .unwrap();
+        feed.agents[real].conversation = "c-real".into();
+        feed.agents[real].account = "REAL_C".into();
+        let mut stale = feed.agents[real].clone();
+        stale.conversation = "c-left-behind".into();
+        stale.account = "OLD_C".into();
+        feed.agents.insert(0, stale);
+    }
+    #[test]
+    fn a_card_shows_the_account_of_the_conversation_in_its_pane() {
+        let mut a = app();
+        pick(&mut a);
+        stale_record_first(&mut a);
+        set_conversation(&mut a, "c-real");
+        let card = a.selected().unwrap();
+        assert_eq!(a.account_agent(card).unwrap().account, "REAL_C");
+    }
+    #[test]
+    fn a_conversation_with_no_record_shows_no_account_rather_than_a_stale_one() {
+        let mut a = app();
+        pick(&mut a);
+        stale_record_first(&mut a);
+        set_conversation(&mut a, "c-started-by-hand");
+        let card = a.selected().unwrap();
+        assert!(a.account_agent(card).is_none());
+    }
+    #[test]
+    fn until_herdr_knows_the_conversation_the_newest_record_stands() {
+        let mut a = app();
+        pick(&mut a);
+        stale_record_first(&mut a);
+        // A feed lists its agents newest first.
+        let card = a.selected().unwrap();
+        assert!(card.agents.iter().all(|g| g.conversation.is_none()));
+        assert_eq!(a.account_agent(card).unwrap().account, "OLD_C");
+    }
+    #[test]
+    fn s_moves_the_agent_really_in_the_pane() {
+        let mut a = app();
+        pick(&mut a);
+        stale_record_first(&mut a);
+        set_conversation(&mut a, "c-real");
+        press(&mut a, 's');
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["action"], "account-move");
+        assert_eq!(r["conversation"], "c-real");
+        assert_eq!(r["pane"], "w1:p1");
+    }
+    #[test]
+    fn s_on_a_conversation_with_no_record_moves_it_and_not_a_stale_one() {
+        let mut a = app();
+        pick(&mut a);
+        stale_record_first(&mut a);
+        set_conversation(&mut a, "c-started-by-hand");
+        press(&mut a, 's');
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["conversation"], "c-started-by-hand");
+    }
     #[test]
     fn queued_and_stale_moves_leave_the_account_to_the_feed() {
         for (state, message) in [
