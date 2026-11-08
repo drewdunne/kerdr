@@ -2618,6 +2618,18 @@ impl App {
                         );
                         return;
                     }
+                    // s's account goes on only to a backend that starts on one: an older one would
+                    // start it on its owner's list without a word (intent 0580).
+                    if request.get("account").is_some()
+                        && !self
+                            .account_feed(to)
+                            .is_some_and(|f| f.starts_on(request["action"].as_str().unwrap_or("")))
+                    {
+                        self.fail(format!(
+                            "{reference} lives on {name} now, whose backend can't start work on a chosen account yet; nothing started. Update it, or ⏎ starts it on its owner's list there."
+                        ));
+                        return;
+                    }
                     let mut request = request;
                     if request["action"] == "reopen" && !session.is_empty() {
                         request["session"] = json!(session);
@@ -2778,9 +2790,17 @@ impl App {
                 if request["action"] == "reopen" && request["queue"] == true && response.ok {
                     note = Some(message.clone());
                 }
+                // The account s picked wasn't applied, since nothing restarted: that's said, and
+                // Kerdr doesn't take you in as if it had been (intent 0580).
+                let unchanged = response.ok && response.account_unchanged;
+                if unchanged {
+                    message.push_str(" ⏎ on its card goes in.");
+                    note = Some(message.clone());
+                }
                 // A reopen takes you in only while you're still on its card; otherwise it says so.
                 if request["action"] == "reopen"
                     && response.ok
+                    && !unchanged
                     && let (Some(session), Some(workspace)) =
                         (response.session.clone(), response.workspace.clone())
                 {

@@ -94,11 +94,6 @@ impl App {
                 "{reference} is in won't do; u brings it back, then s starts it on an account."
             ));
         }
-        if card.intake() == Some("failed") {
-            return RunState::Unavailable(format!(
-                "{reference} couldn't be written up from your words, so there's nothing to start yet."
-            ));
-        }
         if card.outside_herdr().is_some() {
             return RunState::Unavailable(format!(
                 "{reference}'s conversation runs in a terminal outside herdr: s would start a second copy. ⏎ says where it is."
@@ -122,14 +117,16 @@ impl App {
                 "{reference} has no agent running; with [actions] configured, s starts it on an account."
             ));
         }
-        // Where the start goes, as ⏎ and d send it: its home machine, else the card's own.
-        let machine = match card
+        // Where the start goes, as ⏎ and d send it (home_machine): where a refusal said it lives
+        // now, else its home machine, else the card's own.
+        let home = card
             .detail
             .as_ref()
             .and_then(|d| d.home.as_ref())
-            .and_then(|h| h.machine.as_deref())
-        {
-            Some(name) => match self.machine_index(name) {
+            .and_then(|h| h.machine.as_deref());
+        let machine = match (self.moved_target(card), home) {
+            (Some(to), _) => to,
+            (None, Some(name)) => match self.machine_index(name) {
                 Some(mi) => mi,
                 None => {
                     return RunState::Unavailable(format!(
@@ -137,7 +134,7 @@ impl App {
                     ));
                 }
             },
-            None => card.machine_index,
+            (None, None) => card.machine_index,
         };
         let Some(feed) = self.account_feed(machine) else {
             return RunState::Unavailable(format!(
@@ -151,9 +148,9 @@ impl App {
                 self.machines[machine].name()
             ));
         }
-        let program = (how == StartHow::Reopen)
-            .then(|| card.resume_agent().map(str::to_string))
-            .flatten();
+        // The program its conversation ran, for a reopen, and for a dispatch too: work queued to be
+        // reopened starts by d, and its backend resumes the conversation then.
+        let program = card.resume_agent().map(str::to_string);
         RunState::Stopped(Start {
             how,
             machine,
@@ -164,20 +161,33 @@ impl App {
     /// The accounts a stopped card's picker offers: those of the machine it starts on, of the
     /// program a reopen resumes with when that's known, then "list" (its owner's list, as ⏎ or d).
     pub fn start_choices(&self, start: &Start) -> Vec<String> {
-        let mut choices: Vec<String> = self
-            .account_feed(start.machine)
-            .into_iter()
-            .flat_map(|f| &f.accounts)
-            .filter(|a| {
-                start
-                    .program
-                    .as_deref()
-                    .is_none_or(|p| a.runs.is_empty() || a.runs == p)
-            })
-            .map(|a| a.code.clone())
-            .collect();
+        let mut choices: Vec<String> =
+            self.account_feed(start.machine)
+                .into_iter()
+                .flat_map(|f| &f.accounts)
+                .filter(|a| {
+                    start.program.as_deref().is_none_or(|p| {
+                        self.account_runs(start.machine, a).contains(&p.to_string())
+                    })
+                })
+                .map(|a| a.code.clone())
+                .collect();
         choices.push("list".into());
         choices
+    }
+
+    /// The programs an account runs: its own `runs`, else its provider's `programs`, as the
+    /// feed describes them.
+    fn account_runs(&self, machine: usize, a: &crate::accounts::Account) -> Vec<String> {
+        if !a.runs.is_empty() {
+            return vec![a.runs.clone()];
+        }
+        self.account_feed(machine)
+            .into_iter()
+            .flat_map(|f| &f.providers)
+            .filter(|p| p.id == a.provider)
+            .flat_map(|p| p.programs.clone())
+            .collect()
     }
 
     /// `s` on a card: the picker its state calls for, or why there's none.
@@ -535,5 +545,115 @@ mod tests {
             panic!("expected the model list, got {:?}", a.message())
         };
         assert_eq!(owner.id, "shop");
+    }
+
+    fn finish(a: &mut App, machine: usize, request: Value, reply: Value) {
+        a.finish_action(
+            machine,
+            request,
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+
+    #[test]
+    fn work_whose_write_up_failed_starts_as_d_would() {
+        let mut a = app();
+        let k = backlog_card(&a);
+        no_kickoff(&mut a, &k);
+        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+            c.detail.as_mut().unwrap().intake = Some("failed".into());
+        }
+        select(&mut a, &k);
+        press(&mut a, 's');
+        assert_eq!(start_screen(&a).0.how, StartHow::Dispatch);
+    }
+
+    #[test]
+    fn an_account_whose_program_only_its_provider_names_is_matched_by_it() {
+        let mut a = app();
+        let k = closed_card(&mut a);
+        let mi = a.card(&k).unwrap().machine_index;
+        for acc in &mut a.machines[mi].feed.as_mut().unwrap().accounts {
+            acc.runs.clear();
+        }
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let choices = start_screen(&a).1;
+        assert!(choices.contains(&"ARK_C".to_string()), "{choices:?}");
+        assert!(!choices.contains(&"KBZ_X".to_string()), "{choices:?}");
+    }
+
+    #[test]
+    fn a_move_to_a_machine_whose_backend_cant_take_an_account_starts_nothing() {
+        let mut a = app();
+        let k = backlog_card(&a);
+        no_kickoff(&mut a, &k);
+        let here = a.card(&k).unwrap().machine_index;
+        let other = (0..2).find(|&m| m != here).unwrap();
+        a.machines[other].feed.as_mut().unwrap().starts_on.clear();
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let (machine, request) = choose(&mut a, "ARK_C");
+        let home = format!("{}/web", a.machines[other].name());
+        finish(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"message":"lives elsewhere","home":home}),
+        );
+        assert!(a.resent.is_empty(), "the start went on to an older backend");
+        let said = a.message().unwrap().0;
+        assert!(
+            said.contains("can't start work on a chosen account"),
+            "{said}"
+        );
+        // And s on it now asks that machine, whose backend can't, so s offers nothing.
+        let card = a.card(&k).unwrap().clone();
+        assert!(
+            matches!(a.run_state(&card), RunState::Unavailable(ref why) if why.contains("update it")),
+            "{:?}",
+            a.run_state(&card)
+        );
+        assert_eq!(press(&mut a, 's'), Action::None);
+        assert!(!matches!(a.mode, Mode::Accounts { .. }));
+    }
+
+    #[test]
+    fn a_reopen_that_restarted_nothing_says_so_rather_than_go_in() {
+        let mut a = app();
+        let k = closed_card(&mut a);
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let (machine, request) = choose(&mut a, "ARK_C");
+        finish(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":true,"message":"#1 is open already, in web. Its agent was running already, so it stays on its own account, not ARK_C: s on its card moves it.","session":"web","workspace":"w9","account_unchanged":true}),
+        );
+        assert_eq!(a.open_after, None);
+        assert!(a.message().unwrap().0.contains("not ARK_C"));
+    }
+
+    #[test]
+    fn upper_s_never_takes_a_home_session_from_another_machine() {
+        let mut a = app();
+        let k = closed_card(&mut a);
+        let card = a.board.cards.iter_mut().find(|c| c.key == k).unwrap();
+        let d = card.detail.as_mut().unwrap();
+        // Its home is a machine this board doesn't have, whose session shares a name with one here.
+        d.home = serde_json::from_value(json!({"machine":"elsewhere","session":"web"})).ok();
+        d.tenant = None;
+        d.organization = Some("platform".into());
+        select(&mut a, &k);
+        press(&mut a, 'S');
+        let Mode::Accounts {
+            screen: AccountScreen::Models { owner, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("expected the model list, got {:?}", a.message())
+        };
+        assert_eq!(owner.id, "platform", "web's owner here isn't this card's");
     }
 }

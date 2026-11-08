@@ -881,19 +881,24 @@ impl App {
 
     fn card_owner(&self, card: &Card) -> Option<(usize, Owner)> {
         let home = card.detail.as_ref().and_then(|d| d.home.as_ref());
-        let machine = home
-            .and_then(|h| h.machine.as_deref())
-            .and_then(|m| self.machine_index(m))
-            .unwrap_or(card.machine_index);
+        // Its home session is looked up only on its own home machine: the same name on another
+        // machine can belong to someone else. A home machine Kerdr doesn't have gives no session.
+        let home_machine = match home.and_then(|h| h.machine.as_deref()) {
+            Some(name) => self.machine_index(name),
+            None => Some(card.machine_index),
+        };
         let sessions = [
-            (card.machine_index, card.session.as_deref()),
-            (machine, home.and_then(|h| h.session.as_deref())),
+            (Some(card.machine_index), card.session.as_deref()),
+            (home_machine, home.and_then(|h| h.session.as_deref())),
         ];
         for (mi, session) in sessions {
-            if let Some(owner) = session.and_then(|s| self.account_owner(mi, s)) {
+            if let (Some(mi), Some(session)) = (mi, session)
+                && let Some(owner) = self.account_owner(mi, session)
+            {
                 return Some((mi, owner.clone()));
             }
         }
+        let machine = home_machine.unwrap_or(card.machine_index);
         let d = card.detail.as_ref()?;
         let named = [d.tenant.as_deref(), d.organization.as_deref()];
         let feed = self.account_feed(machine)?;
