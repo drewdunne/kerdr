@@ -340,6 +340,9 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
     if card.reopenable() {
         hints.push(("⏎", "reopen it".into()));
     }
+    if let Some(m) = move_hint(app, card) {
+        hints.push(("s", m));
+    }
     hints.extend([("C", "done".into()), ("x", "won’t do".into())]);
     with_inside(app, card, &mut hints);
     spans.extend(owned_hints(&hints));
@@ -350,12 +353,19 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
 /// The account move s offers for a card, as its hint says it: the card's own agent, off the
 /// account it's on (intent 0321, F-0294). None when s has no agent there to move.
 fn move_hint(app: &App, card: &Card) -> Option<String> {
-    let agent = app.move_agent(card)?;
-    Some(if agent.account.is_empty() {
-        "move its agent to another account".into()
-    } else {
-        format!("move its agent off {}", agent.account)
-    })
+    use crate::app::run_state::{RunState, StartHow};
+    // What s does depends on where the card's agent stands (intent 0580).
+    match app.run_state(card) {
+        RunState::Running(agent) if agent.account.is_empty() => {
+            Some("move its agent to another account".into())
+        }
+        RunState::Running(agent) => Some(format!("move its agent off {}", agent.account)),
+        RunState::Stopped(start) if start.how == StartHow::Reopen => {
+            Some("resume it on an account".into())
+        }
+        RunState::Stopped(_) => Some("start it on an account".into()),
+        RunState::Unavailable(_) => None,
+    }
 }
 
 /// Work an agent is at, selected on the board: ⏎ goes in, s moves its agent to another account
@@ -393,6 +403,9 @@ fn done_hints(app: &App) -> Vec<Span<'static>> {
     };
     let mut spans = card_badge(card, GREEN);
     let mut hints: Vec<(&str, String)> = vec![("⏎", "ask to reopen it".into())];
+    if let Some(m) = move_hint(app, card) {
+        hints.push(("s", m));
+    }
     with_inside(app, card, &mut hints);
     spans.extend(owned_hints(&hints));
     spans.push(Span::styled("   │   ", fg(BORDER)));
@@ -2212,6 +2225,9 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
         if app.actions_on() {
             hints.push(("X", "cancel"));
         }
+    } else if let Some(m) = &moving {
+        // Nothing running it: s starts it on an account you pick (intent 0580).
+        hints.push(("s", m.as_str()));
     }
     hints.push(("n N", "next that needs you"));
     if max_scroll > 0 {
@@ -2272,11 +2288,15 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
         &[("u", "bring it back")]
     } else if running {
         &[
-            ("s", "move its agent to another account"),
+            ("s", "move its agent to another account, or start it on one"),
             ("X", "cancel: stop its agent, won’t do"),
         ]
     } else if started {
-        &[("C", "done, starting nothing"), ("x", "won’t do")]
+        &[
+            ("s", "start it again on an account you pick"),
+            ("C", "done, starting nothing"),
+            ("x", "won’t do"),
+        ]
     } else {
         &[
             ("d", "start it"),
@@ -5584,7 +5604,9 @@ mod tests {
         let board = rendered(&a, 220, 44);
         assert!(board.contains("no agent"), "{board}");
         assert!(
-            board.contains(&format!(" {reference}   ⏎ reopen it   C done   x won’t do")),
+            board.contains(&format!(
+                " {reference}   ⏎ reopen it   s resume it on an account   C done   x won’t do"
+            )),
             "{board}"
         );
         a.mode = Mode::Peek {

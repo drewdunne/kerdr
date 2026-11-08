@@ -184,7 +184,9 @@ will stop and close, then stops that agent, mid-step or idle, by closing its wor
 tab, for a child running in its parent's workspace), and sets the work aside in Won't do, where
 `u` brings it back. And `s` on the card moves just that card's agent to another account, keeping
 its conversation, without touching the session's other agents or its owner's list, which is what
-`S` edits. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
+`S` edits. On a card with no agent running, `s` asks which account and starts it there: a fresh
+start for work nobody started, as `d` does, or a reopen that resumes its conversation, as `Enter`
+does. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
 
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
@@ -341,7 +343,8 @@ panel shows each usage window and where it stands in the lists. Tenants can foll
 organization or keep their own order. Select an owner with `j k`, choose a model with `h l`, then Enter makes
 it first, `J K` reorders, and `a d` adds or drops in a draft that Enter saves. Backspace asks
 before following the parent. `S` opens the
-viewed session’s list as a draft, each line naming its provider, so the list reads as a
+viewed session’s list as a draft (with no session chosen with `[ ]`, the selected card's
+owner's list: its session's, its home session's, else its tenant's or organization's), each line naming its provider, so the list reads as a
 provider order: whatever is first and ready is what new work runs. Reorder, optionally tick
 “move waiting sessions,” then save.
 The tick sends a separate move request to every reachable configured feed machine.
@@ -438,7 +441,7 @@ Account features work through the optional [feed and action contract](docs/feed.
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
 | `X` | cancel: stop the selected card's agent, close its workspace (or only a child's tab), and set it aside in Won't do (work an agent is at; asks first) |
 | `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
-| `A` / `S` / `s` | accounts / the viewed session owner’s ordered models, for agents that start next / move the selected card’s agent to another account, keeping its conversation |
+| `A` / `S` / `s` | accounts / the ordered models agents start on next, of the viewed session's owner, else the selected card's / move the selected card’s agent to another account, keeping its conversation, or, with none running, start it on the account you pick |
 | `a` | cycle agents: all, each program the feeds name, then any other herdr reports |
 | `b` | backlog |
 | `w` | toggle Won't do view |

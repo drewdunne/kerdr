@@ -643,6 +643,11 @@ impl App {
     /// home machine reopens it, resuming its agent's conversation, and Kerdr goes in once it
     /// answers. Done work it opens again only after asking, so the yes is Andrew's (intent 0278).
     pub fn reopen_action(&mut self, card: &Card) -> Action {
+        self.reopen_action_with(card, json!({}))
+    }
+
+    /// A reopen with more in its request: `s`'s `account`, the one to resume it on (intent 0580).
+    pub(super) fn reopen_action_with(&mut self, card: &Card, extra: Value) -> Action {
         let Some(detail) = &card.detail else {
             return Action::None;
         };
@@ -688,6 +693,9 @@ impl App {
         let mut request = json!({"action":"reopen","id":detail.id});
         if let Some(session) = session {
             request["session"] = json!(session);
+        }
+        if let (Some(fields), Some(more)) = (request.as_object_mut(), extra.as_object()) {
+            fields.extend(more.clone());
         }
         self.action_from = Some(CardSnapshot::of(card));
         Action::Mutate { machine, request }
@@ -800,7 +808,11 @@ impl App {
                 if !self.can_write(machine) {
                     return Action::None;
                 }
-                let request = json!({"action":"dispatch","id":detail.id});
+                let mut request = json!({"action":"dispatch","id":detail.id});
+                // s's account goes with the held start too (intent 0580).
+                if let (Some(fields), Some(more)) = (request.as_object_mut(), extra.as_object()) {
+                    fields.extend(more.clone());
+                }
                 let effect = self.effect_for(&card.key, &request);
                 let n = self.resolver.add_gated(
                     machine,

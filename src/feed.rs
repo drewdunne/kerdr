@@ -60,6 +60,12 @@ pub struct Feed {
         skip_serializing_if = "Option::is_none"
     )]
     pub current: Option<Option<crate::accounts::Current>>,
+    /// The start requests (`dispatch`, `reopen`) this machine's backend starts on an `account`
+    /// Kerdr names, so `s` can start a stopped card on one (intent 0580). Absent on older feeds,
+    /// whose backends would start it on its owner's list instead: Kerdr never sends them one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub starts_on: Vec<String>,
 }
 
 /// A field that's there, even as `null`, is `Some`; only a missing one is `None`.
@@ -100,6 +106,11 @@ impl Feed {
     /// Whether this feed's backend knows the current account, so Kerdr shows and sets it.
     pub fn knows_current(&self) -> bool {
         self.current.is_some()
+    }
+
+    /// Whether this feed's backend starts this request (`dispatch`, `reopen`) on a named account.
+    pub fn starts_on(&self, action: &str) -> bool {
+        self.starts_on.iter().any(|a| a == action)
     }
 }
 

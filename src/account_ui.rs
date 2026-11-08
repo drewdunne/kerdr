@@ -460,6 +460,69 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 CYAN,
             );
         }
+        AccountScreen::Start {
+            reference,
+            start,
+            choices,
+            sel,
+            ..
+        } => {
+            let resumes = start.how == crate::app::run_state::StartHow::Reopen;
+            let mut lines = vec![
+                line(
+                    format!(
+                        "{} · {}",
+                        app.machines[start.machine].name(),
+                        if resumes {
+                            "no agent running; it resumes its conversation"
+                        } else {
+                            "not started yet"
+                        }
+                    ),
+                    DIM,
+                ),
+                line("Choose an account", DIM),
+                Line::raw(""),
+            ];
+            let selected_line = lines.len() + *sel;
+            for (i, code) in choices.iter().enumerate() {
+                let text = if code == "list" {
+                    "follow its owner's list".into()
+                } else if let Some(a) = app.account(start.machine, code) {
+                    format!(
+                        "{:<7} {:<8} {:<15} {}  {}",
+                        a.code,
+                        app.providers(start.machine).label(&a.provider),
+                        a.name,
+                        app.account_numbers(a),
+                        a.status_label(),
+                    )
+                } else {
+                    format!("{code} · no longer available")
+                };
+                lines.push(selected(text, i == *sel));
+            }
+            lines.push(Line::raw(""));
+            lines.extend(wrapped(
+                if resumes {
+                    "It starts again on the chosen account, resuming its conversation, and stays there until moved or it runs out."
+                } else {
+                    "Its agent starts on the chosen account, and stays there until moved or it runs out."
+                },
+                68,
+                fg(FG2),
+                None,
+            ));
+            modal(
+                f,
+                area,
+                &format!("Start {} on an account", reference),
+                lines,
+                "⏎ start    j k choose    esc cancel",
+                selected_line,
+                CYAN,
+            );
+        }
         AccountScreen::Models {
             machine,
             owner,

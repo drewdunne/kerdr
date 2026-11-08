@@ -137,6 +137,14 @@ pub enum AccountScreen {
         choices: Vec<String>,
         sel: usize,
     },
+    /// `s` on a stopped card: which account to start it on (intent 0580).
+    Start {
+        key: String,
+        reference: String,
+        start: crate::app::run_state::Start,
+        choices: Vec<String>,
+        sel: usize,
+    },
     Models {
         machine: usize,
         owner: Owner,
@@ -809,7 +817,7 @@ impl App {
         rows
     }
 
-    fn push_account_screen(&mut self, screen: AccountScreen) {
+    pub(super) fn push_account_screen(&mut self, screen: AccountScreen) {
         self.mode = Mode::Accounts {
             screen,
             back: Box::new(self.mode.clone()),
@@ -854,12 +862,66 @@ impl App {
     }
 
     fn viewed_owner(&self) -> Option<(usize, Owner)> {
-        // S belongs to the viewed session, never whichever card happens to be selected.
         if let Scope::Session(machine, session) = self.scope() {
             let mi = self.machine_index(machine)?;
             return Some((mi, self.account_owner(mi, session)?.clone()));
         }
         None
+    }
+
+    /// Whose list S edits: the viewed session's owner when [ ] chose a session, else the selected
+    /// card's (intent 0580), so it never asks for a session first. A card's owner is its session's,
+    /// else its home session's, else the tenant or organization its record names.
+    pub fn models_owner(&self) -> Option<(usize, Owner)> {
+        if matches!(self.scope(), Scope::Session(..)) {
+            return self.viewed_owner();
+        }
+        self.card_owner(self.selected_for_control()?)
+    }
+
+    fn card_owner(&self, card: &Card) -> Option<(usize, Owner)> {
+        let home = card.detail.as_ref().and_then(|d| d.home.as_ref());
+        let machine = home
+            .and_then(|h| h.machine.as_deref())
+            .and_then(|m| self.machine_index(m))
+            .unwrap_or(card.machine_index);
+        let sessions = [
+            (card.machine_index, card.session.as_deref()),
+            (machine, home.and_then(|h| h.session.as_deref())),
+        ];
+        for (mi, session) in sessions {
+            if let Some(owner) = session.and_then(|s| self.account_owner(mi, s)) {
+                return Some((mi, owner.clone()));
+            }
+        }
+        let d = card.detail.as_ref()?;
+        let named = [d.tenant.as_deref(), d.organization.as_deref()];
+        let feed = self.account_feed(machine)?;
+        named
+            .into_iter()
+            .flatten()
+            .filter(|n| !n.is_empty())
+            .find_map(|n| {
+                feed.owners
+                    .iter()
+                    .find(|o| o.id.eq_ignore_ascii_case(n) || o.name.eq_ignore_ascii_case(n))
+            })
+            .map(|o| (machine, o.clone()))
+    }
+
+    /// What S says when there's no list to open: never "choose a session first".
+    fn no_models_owner_said(&self) -> String {
+        match self.selected_for_control() {
+            None if matches!(self.scope(), Scope::Session(..)) => {
+                "This session has no owner with a list of models yet.".into()
+            }
+            None => "Select a card first: S edits the list of models its owner's agents start on."
+                .into(),
+            Some(card) => format!(
+                "{}'s machine hasn't said who owns it, so there's no list of models to edit yet.",
+                card.reference
+            ),
+        }
     }
 
     /// Whether the machine's backend has a current account to show and set; an older one says
@@ -1048,7 +1110,7 @@ impl App {
         match key.code {
             KeyCode::Char('A') => self.open_accounts(),
             KeyCode::Char('S') => {
-                if let Some((machine, owner)) = self.viewed_owner() {
+                if let Some((machine, owner)) = self.models_owner() {
                     self.push_account_screen(AccountScreen::Models {
                         machine,
                         models: owner.models.clone(),
@@ -1057,68 +1119,17 @@ impl App {
                         move_waiting: false,
                     });
                 } else {
-                    self.say(
-                        "Choose a session with [ ] first; its owner sets the list.",
-                        Tone::Info,
-                    );
+                    self.say(self.no_models_owner_said(), Tone::Info);
                 }
             }
             KeyCode::Char('s') => {
-                if let Some(card) = self.selected().cloned() {
-                    if let Some(agent) = self.move_agent(&card) {
-                        let machine = card.machine_index;
-                        let mut choices: Vec<String> = self
-                            .account_feed(machine)
-                            .into_iter()
-                            .flat_map(|f| &f.accounts)
-                            .map(|a| a.code.clone())
-                            .collect();
-                        choices.sort_by_key(|a| a == &agent.account);
-                        choices.push("list".into());
-                        self.push_account_screen(AccountScreen::Move {
-                            target: Box::new(MoveTarget {
-                                machine,
-                                key: card.key,
-                                reference: card.reference,
-                                agent,
-                            }),
-                            choices,
-                            sel: 0,
-                        });
-                    } else if card.agents.is_empty() {
-                        self.say(
-                            if card.cancellable() {
-                                "This card's agent isn't running, so there's nothing to move: ⏎ goes in, X cancels it."
-                            } else {
-                                "This card has no agent running to move."
-                            },
-                            Tone::Info,
-                        );
-                    } else if self.account_feed(card.machine_index).is_none() {
-                        self.say(
-                            "This card's machine hasn't sent its accounts yet.",
-                            Tone::Info,
-                        );
-                    } else {
-                        let names: Vec<String> = self
-                            .offered(card.machine_index)
-                            .programs()
-                            .iter()
-                            .map(|id| self.providers(card.machine_index).program_label(id))
-                            .collect();
-                        self.say(
-                            if names.is_empty() {
-                                "s moves agents its machine's accounts run; this card has none."
-                                    .to_string()
-                            } else {
-                                format!(
-                                    "s moves agents its machine's accounts run ({}); this card has none.",
-                                    names.join(", ")
-                                )
-                            },
-                            Tone::Info,
-                        );
-                    }
+                if let Some(card) = self.selected_for_control().cloned() {
+                    self.s_on_card(card);
+                } else {
+                    self.say(
+                        "Select a card first: s starts or moves its agent.",
+                        Tone::Info,
+                    );
                 }
             }
             _ => return None,
@@ -1458,6 +1469,27 @@ impl App {
                             "That conversation changed. Open the move picker again.",
                             Tone::Warn,
                         );
+                    }
+                }
+                _ => {}
+            },
+            AccountScreen::Start {
+                key: card,
+                start,
+                choices,
+                sel,
+                ..
+            } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = (*sel + 1).min(choices.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Enter => {
+                    if let Some(to) = choices.get(*sel).cloned() {
+                        let (card, start) = (card.clone(), start.clone());
+                        // Back where s was pressed, so the start answers as ⏎'s or d's would.
+                        self.mode = *back;
+                        return self.start_on_account(&card, &start, &to);
                     }
                 }
                 _ => {}
