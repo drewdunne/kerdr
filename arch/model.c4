@@ -44,6 +44,8 @@ views {
   view index {
     title "Kerdr reads feeds and delegates writes"
     include *
+    // What's built: planned parts have views of their own (arch/planned-*.c4).
+    exclude * -> * where tag is #planned
     autoLayout LeftRight
   }
 }
