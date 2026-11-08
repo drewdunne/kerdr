@@ -545,9 +545,12 @@ start does what `Enter` or `d` would do for it, with the account added to the sa
 `dispatch` is for work nobody started; `reopen` is for work that ran and has no agent now (its
 workspace closed, or open with its agent gone) and for done work, and it resumes the conversation, so
 the picker offers only accounts of the program that conversation ran (the card's `resume.agent`).
-"follow its owner's list" sends the request without `account`. A question its backend answers with
-(a full session, kickoff questions, done work) keeps the account for the yes. A reopen whose agent
-turns out to be running already restarts nothing, and its backend should say so.
+"follow its owner's list" sends `"account":"list"`, which wins over an account a queued start
+kept from an earlier pick; a start with no `account` (⏎, `d`) uses one kept that way. A question its backend answers with
+(a full session, kickoff questions, done work) keeps the account for the yes. A start that restarted nothing (its agent was
+running already) answers `"account_unchanged": true`, with a message saying the account wasn't
+applied; Kerdr shows it and doesn't go in. A backend that can't start it on the account (a stopped
+session it would have to restore as it was) should refuse, saying so, rather than start it on another.
 
 Kerdr sends `account` only to a machine whose feed lists the request in `starts_on`; with no
 `starts_on`, an older backend would start the work on its owner's list without a word, so `s` says

@@ -229,7 +229,7 @@ impl App {
     }
 
     /// Enter on the start picker: the card's start, as ⏎ or d would send it, on the account
-    /// chosen ("list" adds none). Only while the card is still stopped the same way; its own
+    /// chosen ("list": its owner's list, over any account kept for it before). Only while the card is still stopped the same way; its own
     /// checks (a start already on its way, kickoff questions, a full session) still apply.
     pub(super) fn start_on_account(&mut self, key: &str, start: &Start, to: &str) -> Action {
         let Some(card) = self.card(key).cloned() else {
@@ -243,11 +243,8 @@ impl App {
             );
             return Action::None;
         }
-        let extra = if to == "list" {
-            json!({})
-        } else {
-            json!({"account": to})
-        };
+        // "list" goes too: his owner's list, chosen over an account a queued start kept from before.
+        let extra = json!({"account": to});
         match start.how {
             StartHow::Dispatch => self.intent_action_on(card, "dispatch", extra),
             StartHow::Reopen => self.reopen_action_with(&card, extra),
@@ -369,7 +366,8 @@ mod tests {
         press(&mut a, 's');
         let (_, request) = choose(&mut a, "list");
         assert_eq!(request["action"], "dispatch");
-        assert!(request.get("account").is_none(), "{request}");
+        // Named, so it wins over an account a queued start kept from an earlier s.
+        assert_eq!(request["account"], "list", "{request}");
     }
 
     #[test]
