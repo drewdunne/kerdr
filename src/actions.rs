@@ -76,6 +76,11 @@ pub struct Response {
     pub asked: Option<String>,
     /// Something for the Kickoff Questions box to say.
     pub note: Option<String>,
+    /// With a start on an account `s` picked: true when nothing was restarted (its agent was
+    /// running already, or its session is being brought back), so that account wasn't applied
+    /// and the message says so (intent 0580).
+    #[serde(default)]
+    pub account_unchanged: bool,
 }
 
 impl Response {

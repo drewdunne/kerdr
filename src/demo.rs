@@ -690,6 +690,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         ])).unwrap();
         f.owners_source = Some("mock".into());
         f.machine_owner = Some("studio".into());
+        f.starts_on = vec!["dispatch".into(), "reopen".into()];
         for (session, snap) in &m.data.as_ref().unwrap().snapshots {
             if let Ok(snap) = snap {
                 for agent in &snap.agents {

@@ -526,7 +526,39 @@ program the machine's accounts run (a provider's `programs`, or an account's `ru
 an account another program runs is a hand-over; the backend asks first, and Kerdr titles its
 question so ("Hand #45 over to Codex?"). `S` edits the list new agents start on, and moves no agent that's running:
 saved unchanged while an agent there could move, it says that `s` on its card is the key and names
-those cards, those off the list's first account first.
+those cards, those off the list's first account first. It edits the viewed session's owner's list,
+or with no session chosen, the selected card's owner's: its session's, its home session's, else the
+tenant or organization its record names.
+
+## Starting a card on an account
+
+`s` on a card with no agent running starts it on the account you pick. Kerdr sees each card in one
+of three states: an agent the machine's accounts run is at it (`s` moves it, as above); nothing runs
+it and Kerdr can start it (`s` asks which account); or neither, and `s` says why. A card that can
+start does what `Enter` or `d` would do for it, with the account added to the same request:
+
+```json
+{"action":"dispatch","id":"0041","account":"ARK_C"}
+{"action":"reopen","id":"0041","session":"web","account":"ARK_C"}
+```
+
+`dispatch` is for work nobody started; `reopen` is for work that ran and has no agent now (its
+workspace closed, or open with its agent gone) and for done work, and it resumes the conversation, so
+the picker offers only accounts of the program that conversation ran (the card's `resume.agent`).
+"follow its owner's list" sends `"account":"list"`, which wins over an account a queued start
+kept from an earlier pick; a start with no `account` (⏎, `d`) uses one kept that way. A question its backend answers with
+(a full session, kickoff questions, done work) keeps the account for the yes. A start that restarted nothing (its agent was
+running already) answers `"account_unchanged": true`, with a message saying the account wasn't
+applied; Kerdr shows it and doesn't go in. A backend that can't start it on the account (a stopped
+session it would have to restore as it was) should refuse, saying so, rather than start it on another.
+
+Kerdr sends `account` only to a machine whose feed lists the request in `starts_on`; with no
+`starts_on`, an older backend would start the work on its owner's list without a word, so `s` says
+to update it instead:
+
+```json
+"starts_on": ["dispatch", "reopen"]
+```
 
 ## Agents reporting for themselves
 
