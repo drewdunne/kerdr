@@ -1,0 +1,56 @@
+// Planned: Kerdr by owner and team. The top bar picks an owner (whoever the work is for), then one
+// of its teams, instead of a machine and a herdr session, and each team's work shows in that team's
+// own stages, read from the feed. Nothing here is built yet; the parts tagged #planned are new.
+
+specification {
+  tag planned
+}
+
+model {
+  extend kerdr {
+    bar = app "Owner and team bar" {
+      #planned
+      description "{ } steps through owners and [ ] through the chosen owner's teams, at every level; ( ) is kept for an organization level later. The tab row lists what's one level below the choice. Machines move to the machines screen and a Machine row in the filters. A feed with no owners keeps the machine and session bar."
+    }
+    stagecols = app "Columns from stage lists" {
+      #planned
+      description "Backlog and Done are Kerdr's own; between them, each team's stages from the feed. A view mixing lists shows a band per list, and a quiet band folds to one line. A card whose list or stage isn't known gets an unknown column, never another stage."
+    }
+  }
+
+  drew -> kerdr.bar "picks an owner, then a team" {
+    #planned
+  }
+  kerdr.bar -> readfeed "owners with their teams and agent machine; what the adapter accepts" {
+    #planned
+  }
+  kerdr.stagecols -> readfeed "stage lists, each card's list and stage" {
+    #planned
+  }
+  kerdr.bar -> action "create with owner and team, only where the feed says it accepts team" {
+    #planned
+  }
+  readfeed -> records "team and stage on each intent; each owner's stage lists" {
+    #planned
+  }
+  action -> dispatch "file the new intent under that team" {
+    #planned
+  }
+}
+
+views {
+  view planned-owner-team {
+    title "Planned / Kerdr by owner and team"
+    description """
+      The top bar splits by owner, then team, instead of machine and session, and each team's work
+      shows in its own stages. New parts are grey with a dashed border.
+    """
+    include drew, kerdr, kerdr.bar, kerdr.stagecols, readfeed, action, records, dispatch
+    exclude * -> * where tag is not #planned
+    style element.tag = #planned {
+      color gray
+      border dashed
+    }
+    autoLayout LeftRight
+  }
+}
