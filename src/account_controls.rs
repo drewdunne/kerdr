@@ -487,11 +487,9 @@ impl App {
         self.machine
             .as_ref()
             .and_then(|n| self.machine_index(n))
-            // On the owner split, the machine the chosen owner's agents run on (intent 0595).
-            .or_else(|| {
-                self.owner_machine()
-                    .filter(|&mi| with_accounts(&self.machines[mi]))
-            })
+            // On the owner split, the machine the chosen owner's agents run on, even before its
+            // accounts are read: never another machine's in its place (intent 0595).
+            .or_else(|| self.owner_machine())
             .or_else(|| {
                 self.machines
                     .iter()

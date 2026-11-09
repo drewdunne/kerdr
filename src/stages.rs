@@ -19,14 +19,21 @@ pub fn builtin_standard() -> StageList {
         name: "Standard".into(),
         owner: None,
         rev: 0,
-        stages: Stage::STANDARD
-            .iter()
-            .map(|s| StageEntry {
-                id: s.id().into(),
-                name: s.name().into(),
-                retired: false,
-            })
-            .collect(),
+        // Its own names, never what a feed has since called these stages.
+        stages: [
+            ("plan", "Plan"),
+            ("design", "Design"),
+            ("build", "Build"),
+            ("test", "Test"),
+            ("deploy", "Deploy"),
+        ]
+        .into_iter()
+        .map(|(id, name)| StageEntry {
+            id: id.into(),
+            name: name.into(),
+            retired: false,
+        })
+        .collect(),
     }
 }
 
@@ -107,7 +114,8 @@ pub fn card_stage(lists: &[StageList], list: &str, said: Option<&str>, state: &s
                     return stage;
                 }
             }
-            return Stage::work(STANDARD, &s.to_ascii_lowercase(), s);
+            // Named by its id: a card's spelling never renames a stage other cards share.
+            return Stage::work(STANDARD, &s.to_ascii_lowercase(), "");
         }
         return match state {
             "closed" => Stage::Maintain,
@@ -342,13 +350,17 @@ pub fn layout(lists: &[StageList], wants: &[Want], cards: &[(Stage, bool)], fold
                 .map(|b| if b.folded { 1 } else { BAND_ROWS })
                 .sum()
         };
-        for bi in (0..bands.len()).rev() {
-            if need(&bands) <= fold.rows {
-                break;
-            }
-            let b = &bands[bi];
-            if !b.folded && b.needs == 0 && !fold.keep.contains(&b.list) {
-                bands[bi].folded = true;
+        // Then, still too many, those needing you too, from the bottom: every band shows at
+        // least its line, and the one you're on stays open, so a card you go to is drawn.
+        for quiet_only in [true, false] {
+            for bi in (0..bands.len()).rev() {
+                if need(&bands) <= fold.rows {
+                    break;
+                }
+                let b = &bands[bi];
+                if !b.folded && (!quiet_only || b.needs == 0) && !fold.keep.contains(&b.list) {
+                    bands[bi].folded = true;
+                }
             }
         }
     }
@@ -573,6 +585,15 @@ mod tests {
             .collect();
         assert_eq!(folded.len(), 1);
         assert_ne!(folded[0], "t/s");
+        // Still too many, with every band needing you: they fold too, but for the one kept open.
+        let all_need = [(learn, true), (call, true), (Stage::Build, true)];
+        let tight = Fold {
+            rows: BAND_ROWS + 2,
+            keep: vec!["t/s".into()],
+        };
+        let l = layout(&lists, &wants, &all_need, &tight);
+        assert_eq!(l.bands.iter().filter(|b| !b.folded).count(), 1);
+        assert!(l.bands.iter().any(|b| b.list == "t/s" && !b.folded));
         // The band moved onto stays open.
         let keep = folded[0].to_string();
         let l = layout(

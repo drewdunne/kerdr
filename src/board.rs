@@ -838,7 +838,11 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         cards.push(Card {
             key: format!("ws:{}:{}:{}", m.name(), w.session, w.ws.workspace_id),
             // A workspace no record claims is its session's owner's, under No team.
-            owner: crate::owners::session_owner(&owners, &w.session),
+            owner: crate::owners::session_owner(
+                &owners,
+                m.feed.as_ref().map_or(&[][..], |f| &f.owners[..]),
+                &w.session,
+            ),
             team: None,
             reference: label.clone(),
             title: agent_title.unwrap_or_else(|| label.clone()),
@@ -915,7 +919,11 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             sessions.push(SessionRow {
                 machine: name.clone(),
                 session: info.name.clone(),
-                owner: crate::owners::session_owner(&owners, &info.name),
+                owner: crate::owners::session_owner(
+                    &owners,
+                    m.feed.as_ref().map_or(&[][..], |f| &f.owners[..]),
+                    &info.name,
+                ),
                 running: info.running,
                 slots,
                 needs: cards

@@ -161,7 +161,10 @@ impl App {
     /// The tabs for the view: the owner split's, or a machine's sessions.
     pub(super) fn view_tabs(&mut self) -> Vec<Scope> {
         if self.owner_split() {
+            // The machine split's own choices mean nothing here: f's owner filter would be a
+            // second owner choice that can disagree with the bar's.
             self.machine = None;
+            self.owner = None;
             if let Some(o) = &self.owner_pick
                 && o != UNOWNED
                 && self.owner_info(o).is_none()
@@ -171,6 +174,7 @@ impl App {
             return self.owner_tabs();
         }
         self.owner_pick = None;
+        self.machine_filter = None;
         let mut tabs = vec![Scope::All];
         if let Some(name) = self.machine.clone() {
             if self
@@ -463,6 +467,7 @@ impl App {
             return;
         };
         let offset = cur - layout.bands[b].first;
+        let keep_open = self.open_band.clone();
         let mut nb = b as i32 + dir;
         while (0..layout.bands.len() as i32).contains(&nb) {
             let band = &layout.bands[nb as usize];
@@ -486,8 +491,10 @@ impl App {
                 {
                     let r = if dir > 0 { 0 } else { cols[c].len() - 1 };
                     self.select_in(&layout, &cols, c, r);
+                    return;
                 }
-                return;
+                // Nothing to select there (its stages hidden): on to the next band.
+                self.open_band = keep_open.clone();
             }
             nb += dir;
         }
@@ -543,7 +550,17 @@ impl App {
     /// A card's lifecycle rail: Backlog, its list's stages (its own too, when the list lacks it),
     /// Done.
     pub fn rail(&self, card: &Card) -> Vec<Stage> {
-        let list = card.stage.list().unwrap_or(crate::model::STANDARD);
+        // Backlog and Done carry no list: a card there is on the one its record names.
+        let named = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.stage_list.as_deref())
+            .filter(|l| !l.trim().is_empty());
+        let list = card
+            .stage
+            .list()
+            .or(named)
+            .unwrap_or(crate::model::STANDARD);
         let mut rail = vec![Stage::Backlog];
         match stages::find(&self.board.lists, list) {
             Some(l) => rail.extend(
@@ -1155,5 +1172,152 @@ mod tests {
             .expect("its organization heads it");
         let tenant = labels.iter().position(|l| l == "Tinyhost · TNY").unwrap();
         assert!(org < tenant);
+    }
+
+    #[test]
+    fn g_on_an_empty_team_after_a_wide_board_is_safe() {
+        let mut app = owner_app(true);
+        app.choose_view(Scope::Owner("tinyhost".into()));
+        app.sel.col = app.layout().columns.len() - 2;
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .retain(|c| c.team.as_deref() != Some("marketing"));
+        app.rebuild();
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        app.on_key(key('G'));
+        assert!(app.sel.col < app.layout().columns.len());
+    }
+
+    #[test]
+    fn a_queued_or_done_card_on_a_teams_list_keeps_its_lists_rail() {
+        let app = owner_app(true);
+        let mut card = app.card("s:5").unwrap().clone();
+        card.stage = Stage::Backlog;
+        let rail: Vec<&str> = app.rail(&card).iter().map(|s| s.id()).collect();
+        assert_eq!(
+            rail,
+            ["backlog", "plan", "test", "execute", "learn", "maintain"]
+        );
+    }
+
+    #[test]
+    fn the_machine_splits_owner_filter_goes_once_feeds_list_owners() {
+        let mut app = owner_app(false);
+        let owners = std::mem::take(&mut app.machines[0].feed.as_mut().unwrap().owners);
+        app.rebuild();
+        app.owner = Some("tenant:tinyhost".into());
+        app.machines[0].feed.as_mut().unwrap().owners = owners;
+        app.rebuild();
+        assert!(app.owner_split() && app.owner.is_none());
+    }
+
+    #[test]
+    fn a_opens_on_the_owners_machine_even_before_its_accounts_are_read() {
+        let mut app = owner_app(false);
+        let mut laptop = MachineState::new(Machine {
+            name: "laptop".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        });
+        laptop.conn = Conn::Live {
+            latency: Default::default(),
+        };
+        laptop.data = Some(MachineData::default());
+        laptop.feed = Some(Feed {
+            kerdr_feed: 1,
+            accounts: serde_json::from_value(serde_json::json!(
+                [{"code":"KBZ_C","provider":"claude","kind":"login","status":"ready"}]
+            ))
+            .unwrap(),
+            ..Default::default()
+        });
+        app.machines[0].machine.ssh = Some("lab".into());
+        app.machines.push(laptop);
+        app.rebuild();
+        app.choose_view(Scope::Owner("tinyhost".into()));
+        assert_eq!(app.account_machine(), Some(0), "lab, where its work runs");
+    }
+
+    #[test]
+    fn words_given_back_go_where_they_were_first_sent() {
+        let mut app = owner_app(true);
+        app.cfg.actions.command = Some("fixture".into());
+        app.draft = "Sent to Dev first".into();
+        app.draft_came_back = Some(crate::app::Submission {
+            id: "kerdr-1".into(),
+            words: "Sent to Dev first".into(),
+            images: vec![],
+            machine: 0,
+            session: "TNY".into(),
+            filed: Filed {
+                organization: Some("arkship".into()),
+                tenant: Some("tinyhost".into()),
+                team: Some("dev".into()),
+            },
+            unknown: true,
+        });
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        app.on_key(key('c'));
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("c opens the box")
+        };
+        assert_eq!(draft.filed.team.as_deref(), Some("dev"), "the box says Dev");
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        assert_eq!(request["team"], "dev");
+        assert_eq!(request["submission"], "kerdr-1", "the same request");
+    }
+
+    #[test]
+    fn j_goes_past_a_band_whose_stages_are_all_hidden() {
+        let mut app = owner_app(true);
+        // A third list, its only card in a hidden stage, between the other two bands.
+        let feed = app.machines[0].feed.as_mut().unwrap();
+        feed.stage_lists.push(StageList {
+            id: "tinyhost/sales".into(),
+            name: "Sales".into(),
+            owner: Some("tinyhost".into()),
+            rev: 1,
+            stages: vec![StageEntry {
+                id: "call".into(),
+                name: "Call".into(),
+                retired: false,
+            }],
+        });
+        feed.owners[1].teams.push(Team {
+            id: "sales".into(),
+            name: "Sales".into(),
+            retired: false,
+            stages: Some("tinyhost/sales".into()),
+        });
+        let mut c = card("7", Some("tinyhost"), "arkship", Some("sales"), "call");
+        c.stage_list = Some("tinyhost/sales".into());
+        c.attention = Some("needs_you".into());
+        feed.cards.push(c);
+        app.cfg.board.hide_columns = vec!["call".into()];
+        app.rebuild();
+        app.choose_view(Scope::Owner("tinyhost".into()));
+        let layout = app.layout();
+        let order: Vec<&str> = layout.bands.iter().map(|b| b.list.as_str()).collect();
+        let sales = order.iter().position(|l| *l == "tinyhost/sales").unwrap();
+        assert!(sales > 0 && sales < order.len() - 1, "{order:?}");
+        // From the band above it, j passes it by.
+        let above = &layout.bands[sales - 1];
+        let col = (above.first..above.first + above.len)
+            .find(|&c| !app.columns()[c].is_empty())
+            .unwrap();
+        let last = app.columns()[col].len() - 1;
+        app.select_index(col, last);
+        app.on_key(key('j'));
+        let now = app.selected().unwrap();
+        assert_eq!(now.stage.list(), Some(order[sales + 1]));
     }
 }

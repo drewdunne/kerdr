@@ -1328,7 +1328,11 @@ impl App {
             (_, Some(t)) => t.to_string(),
             _ => "default".into(),
         };
-        let (filed, unfiled) = self.filed_for(machine);
+        // Words a save gave back go where they were first sent, as the box then says.
+        let (filed, unfiled) = match &self.draft_came_back {
+            Some(back) => self.sendable(back.machine, &back.filed),
+            None => self.filed_for(machine),
+        };
         // On an owner, its own session; the backend homes it by its owner either way.
         if let Some(code) = self
             .scope()
@@ -1365,40 +1369,50 @@ impl App {
         let Some(info) = self.owner_info(o) else {
             return (Filed::default(), None);
         };
-        let team = match self.scope() {
-            Scope::Team(_, t) => t.clone(),
-            _ => None,
+        let wanted = Filed {
+            organization: Some(info.organization(&self.board.owners).id.clone()),
+            tenant: info.parent.is_some().then(|| info.id.clone()),
+            team: match self.scope() {
+                Scope::Team(_, t) => t.clone(),
+                _ => None,
+            },
         };
+        self.sendable(machine, &wanted)
+    }
+
+    /// What of `wanted` `machine`'s backend takes, by its feed's `create_fields`, and what the box
+    /// says of the rest: a team it can't take goes under No team, an owner it can't take under
+    /// whoever the words say (intent 0595).
+    pub(crate) fn sendable(&self, machine: usize, wanted: &Filed) -> (Filed, Option<String>) {
+        let Some(owner) = wanted.tenant.as_deref().or(wanted.organization.as_deref()) else {
+            return (Filed::default(), None);
+        };
+        let name = self
+            .owner_info(owner)
+            .map(|o| o.label().to_string())
+            .unwrap_or_else(|| owner.to_string());
         let feed = self.machines.get(machine).and_then(|m| m.feed.as_ref());
         let takes = |field: &str| feed.is_some_and(|f| f.creates_with(field));
-        let tenant = info.parent.is_some().then(|| info.id.clone());
-        let organization = Some(info.organization(&self.board.owners).id.clone());
-        if !takes("organization") || (tenant.is_some() && !takes("tenant")) {
+        if !takes("organization") || (wanted.tenant.is_some() && !takes("tenant")) {
             return (
                 Filed::default(),
                 Some(format!(
-                    "This machine's backend can't file new work under {} yet: the agent that writes it up works out whose it is from your words.",
-                    info.label()
+                    "This machine's backend can't file new work under {name} yet: the agent that writes it up works out whose it is from your words."
                 )),
             );
         }
-        let mut filed = Filed {
-            organization,
-            tenant,
-            team: None,
-        };
-        let mut unfiled = None;
-        if let Some(t) = team {
-            if takes("team") {
-                filed.team = Some(t);
-            } else {
-                unfiled = Some(format!(
-                    "This machine's backend can't file work under a team yet: it goes under {}'s No team.",
-                    info.label()
-                ));
-            }
+        if wanted.team.is_some() && !takes("team") {
+            return (
+                Filed {
+                    team: None,
+                    ..wanted.clone()
+                },
+                Some(format!(
+                    "This machine's backend can't file work under a team yet: it goes under {name}'s No team."
+                )),
+            );
         }
-        (filed, unfiled)
+        (wanted.clone(), None)
     }
 
     /// Ctrl+Space: the same letters as the direct keys, listed, so the menu is a reminder and
@@ -1579,11 +1593,14 @@ impl App {
             .collect();
         // Words a save gave back, unchanged: they go again as the send they came back from, even
         // when another send of the same words has since been answered (intent 0445).
-        if let Some(s) = draft
-            .came_back
-            .take()
-            .filter(|s| s.words == words && s.images == images)
-        {
+        // What the backend takes now: one that has stopped taking a team since gets none.
+        let (filed, _) = self.sendable(draft.machine, &draft.filed);
+        draft.filed = filed;
+        if let Some(s) = draft.came_back.take().filter(|s| {
+            s.words == words
+                && s.images == images
+                && self.sendable(s.machine, &s.filed).0 == s.filed
+        }) {
             draft.machine = s.machine;
             draft.session = s.session.clone();
             draft.filed = s.filed.clone();

@@ -84,11 +84,6 @@ pub fn merge<'a>(feeds: impl Iterator<Item = &'a Feed>) -> Vec<OwnerInfo> {
                     if held.code.is_none() {
                         held.code = o.code.clone();
                     }
-                    for s in &o.sessions {
-                        if !held.sessions.contains(s) {
-                            held.sessions.push(s.clone());
-                        }
-                    }
                 }
                 None => out.push(OwnerInfo {
                     id: o.id.clone(),
@@ -177,10 +172,15 @@ pub fn record_owner(
         .unwrap_or_else(|| UNOWNED.into())
 }
 
-/// The owner of a herdr session: the one whose sessions name it, else the one whose code its name
-/// starts with (`TNY`, `TNY-Background`, `P4M-Marketing`). `UNOWNED` for any other.
-pub fn session_owner(owners: &[OwnerInfo], session: &str) -> String {
-    if let Some(o) = owners
+/// The owner of a herdr session on a machine: the one whose sessions in that machine's own feed
+/// name it (`listed`; a `default` session belongs to whoever owns that machine), else the one whose
+/// code its name starts with (`TNY`, `TNY-Background`, `P4M-Marketing`). `UNOWNED` for any other.
+pub fn session_owner(
+    owners: &[OwnerInfo],
+    listed: &[crate::accounts::Owner],
+    session: &str,
+) -> String {
+    if let Some(o) = listed
         .iter()
         .find(|o| o.sessions.iter().any(|s| s == session))
     {
@@ -287,10 +287,17 @@ mod tests {
     #[test]
     fn a_session_belongs_to_its_listed_owner_or_its_codes() {
         let owners = arknet();
-        assert_eq!(session_owner(&owners, "TNY"), "tinyhost");
-        assert_eq!(session_owner(&owners, "TNY-Background"), "tinyhost");
-        assert_eq!(session_owner(&owners, "ARK-Marketing"), "arkship");
-        assert_eq!(session_owner(&owners, "default"), UNOWNED);
+        assert_eq!(session_owner(&owners, &[], "TNY"), "tinyhost");
+        assert_eq!(session_owner(&owners, &[], "TNY-Background"), "tinyhost");
+        assert_eq!(session_owner(&owners, &[], "ARK-Marketing"), "arkship");
+        assert_eq!(session_owner(&owners, &[], "default"), UNOWNED);
+        // One machine's default is its owner's, another machine's someone else's.
+        let mut kbz = owner("kibbelz", None, Some("KBZ"), &[]);
+        kbz.sessions.push("default".into());
+        let mut ark = owner("arkship", None, Some("ARK"), &[]);
+        ark.sessions.push("default".into());
+        assert_eq!(session_owner(&owners, &[kbz], "default"), "kibbelz");
+        assert_eq!(session_owner(&owners, &[ark], "default"), "arkship");
     }
 
     #[test]

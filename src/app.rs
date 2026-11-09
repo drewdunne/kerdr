@@ -1214,7 +1214,11 @@ impl App {
                     self.first_selection_done = true;
                 }
             }
-            None => self.sel.key = None,
+            None => {
+                // An empty view: its columns may be fewer than the last view's.
+                self.sel.key = None;
+                self.sel.col = self.sel.col.min(cols.len().saturating_sub(1));
+            }
         }
     }
 
@@ -1476,7 +1480,13 @@ impl App {
                         .iter()
                         .find(|r| r.machine == m && r.session == s)
                         .map(|r| r.owner.clone())
-                        .unwrap_or_else(|| crate::owners::session_owner(&self.board.owners, &s));
+                        .unwrap_or_else(|| {
+                            let listed = self
+                                .machine_index(&m)
+                                .and_then(|mi| self.machines[mi].feed.as_ref())
+                                .map_or(&[][..], |f| &f.owners[..]);
+                            crate::owners::session_owner(&self.board.owners, listed, &s)
+                        });
                     self.choose_view(if owner.is_empty() {
                         Scope::All
                     } else {
@@ -1771,7 +1781,7 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.move_row(-1),
             KeyCode::Char('g') | KeyCode::Home => self.select_index(self.sel.col, 0),
             KeyCode::Char('G') | KeyCode::End => {
-                let len = self.columns()[self.sel.col].len();
+                let len = self.columns().get(self.sel.col).map_or(0, Vec::len);
                 if len > 0 {
                     self.select_index(self.sel.col, len - 1);
                 }
@@ -2119,11 +2129,15 @@ impl App {
                                         Scope::Owner(_) | Scope::Team(_, None)
                                     ) && self.scope().owner()
                                         == Some(
-                                            crate::owners::session_owner(
-                                                &self.board.owners,
-                                                &w.session,
-                                            )
-                                            .as_str(),
+                                            self.board
+                                                .sessions
+                                                .iter()
+                                                .find(|r| {
+                                                    r.machine == w.machine && r.session == w.session
+                                                })
+                                                .map(|r| r.owner.clone())
+                                                .unwrap_or_default()
+                                                .as_str(),
                                         ))
                             }
                         }

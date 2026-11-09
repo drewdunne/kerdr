@@ -75,7 +75,9 @@ impl Stage {
         Stage::Deploy,
     ];
 
-    /// The stage `id` of the list `list` (its whole id), named `name` until a list says otherwise.
+    /// The stage `id` of the list `list` (its whole id), named `name` until a list says otherwise;
+    /// an empty `name` leaves the one it has (its id, for a stage first seen that way). Names come
+    /// from the feeds' stage lists, so they change only when a list does.
     pub fn work(list: &str, id: &str, name: &str) -> Stage {
         let mut all = interned();
         if let Some(i) = all.iter().position(|s| s.list == list && s.id == id) {
