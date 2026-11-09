@@ -2394,8 +2394,10 @@ impl App {
                         .is_some_and(crate::accounts::valid_signin_url);
                     if !valid || response.ticket.as_deref().is_none_or(str::is_empty) {
                         s.failed = true;
-                        s.message =
-                            "The sign-in did not return a valid HTTPS link and ticket.".into();
+                        let name = self.machines[machine].name();
+                        s.message = format!(
+                            "{name}'s backend sent a sign-in link Kerdr won't open (not a plain https link with a ticket), so that sign-in was cancelled. r tries again; if it happens again, that backend needs a fix."
+                        );
                         if let Some(ticket) = response.ticket {
                             self.account_queue.push_back((
                                 machine,
@@ -2410,7 +2412,10 @@ impl App {
                         // A code to type that isn't one (letters, digits and dashes, 4–32) is
                         // never shown or copied: without it the sign-in can't finish.
                         s.failed = true;
-                        s.message = "The sign-in gave a code to type that Kerdr won't show. Press r to start again, or sign in on that machine itself.".into();
+                        let name = self.machines[machine].name();
+                        s.message = format!(
+                            "{name}'s backend sent a code to type that Kerdr can't show safely, so that sign-in was cancelled. r tries again."
+                        );
                         if let Some(ticket) = response.ticket {
                             self.account_queue.push_back((
                                 machine,
@@ -5012,7 +5017,7 @@ mod tests {
         // It can't finish without the code, so it says so and stops, cancelling that ticket.
         let s = signin_screen(&a);
         assert!(s.user_code.is_none() && s.failed);
-        assert!(s.message.contains("won't show"), "{}", s.message);
+        assert!(s.message.contains("can't show safely"), "{}", s.message);
         let (_, cancel) = sent(a.account_tick());
         assert_eq!(cancel["step"], "cancel");
         assert_eq!(cancel["ticket"], "t");

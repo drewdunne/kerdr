@@ -862,10 +862,10 @@ fn outcome_of(exit: Option<Option<i32>>, request: Option<Request>, machine: &str
             "herdr's window on {machine} closed with exit code {c}; its own message is on the screen you just saw. The board is as it was."
         )),
         (None, Some(None)) => Outcome::Failed(format!(
-            "herdr's window on {machine} was stopped by a signal. The board is as it was."
+            "herdr's window on {machine} was stopped from outside Kerdr; the agents in it are untouched, and ⏎ opens it again."
         )),
         (None, None) => Outcome::Failed(format!(
-            "herdr's window on {machine} closed, and Kerdr couldn't read how. The board is as it was."
+            "Kerdr lost track of herdr's window on {machine} (the system didn't say how it ended); the agents in it are untouched, and ⏎ opens it again."
         )),
     }
 }
@@ -1514,7 +1514,7 @@ esac
             Outcome::Next
         );
         let m = failed(outcome_of(Some(None), None, "m"));
-        assert!(m.contains("stopped by a signal"), "{m}");
+        assert!(m.contains("stopped from outside Kerdr"), "{m}");
         // A failure waits for Enter on the plain screen, where herdr's own words are.
         let mut paused = vec![];
         finish_client(Some(Some(1)), None, "m", |t| paused.push(t.to_string()));

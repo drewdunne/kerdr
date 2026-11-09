@@ -1642,7 +1642,17 @@ impl App {
             .map(|(i, _)| i);
         match idx {
             Some(i) => self.set_tab(i),
-            None => self.say(format!("There's no session tab {n}."), Tone::Info),
+            None => {
+                let count = self
+                    .tabs
+                    .iter()
+                    .filter(|t| matches!(t, Scope::Session(..)))
+                    .count();
+                self.say(
+                    format!("There's no session tab {n}; this view has {count}."),
+                    Tone::Info,
+                )
+            }
         }
     }
 
@@ -7905,6 +7915,43 @@ pub(crate) mod tests {
         app.machines[0].feed.as_mut().unwrap().supports = vec!["retry".into()];
         assert!(!app.resends_to(0));
         assert!(!app.resends_to(99));
+    }
+
+    #[test]
+    fn what_a_key_cant_do_says_why_in_plain_words() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        // A tab number past the last says how many there are (intent 0591).
+        let count = app
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Scope::Session(..)))
+            .count();
+        app.session_tab(count + 5);
+        assert_eq!(
+            app.message().unwrap().0,
+            format!(
+                "There's no session tab {}; this view has {count}.",
+                count + 5
+            )
+        );
+        // u on work that isn't set aside: a fact, not a refusal.
+        let (key, _, _) = waiting_card(&app);
+        select_key(&mut app, &key);
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(press(&mut app, 'u'), Action::None);
+        assert_eq!(
+            app.message(),
+            Some((
+                format!("{reference} isn't set aside, so there's nothing to bring back.").as_str(),
+                Tone::Info
+            ))
+        );
+        // A full board advises; it doesn't refuse.
+        assert_eq!(
+            crate::model::Verdict::Full.text(),
+            "Sessions full: d asks before starting another"
+        );
     }
 
     fn refused(message: &str) -> Result<crate::actions::Response, String> {

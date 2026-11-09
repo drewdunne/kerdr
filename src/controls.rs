@@ -1017,7 +1017,10 @@ impl App {
 
     fn intent_action(&mut self, action: &str, extra: Value) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
-            self.say("Select an intent first.", Tone::Info);
+            self.say(
+                "Nothing is selected for that key to act on: pick a card first.",
+                Tone::Info,
+            );
             return Action::None;
         };
         self.intent_action_on(card, action, extra)
@@ -1027,7 +1030,10 @@ impl App {
     /// row inside a card or the misc list starts that card's work (intent 0404).
     pub(super) fn intent_action_on(&mut self, card: Card, action: &str, extra: Value) -> Action {
         let Some(detail) = &card.detail else {
-            self.say("This workspace has no intent record to change.", Tone::Info);
+            self.say(
+                "This workspace has no intent, so there's nothing to start, reorder or change; ⏎ goes in.",
+                Tone::Info,
+            );
             return Action::None;
         };
         if self.still_saving(&card) || self.still_changing(&card, action) {
@@ -1072,7 +1078,7 @@ impl App {
         if action == "restore" && !card.dismissed() {
             self.say(
                 format!(
-                    "u brings back work from won't do; {} isn't there.",
+                    "{} isn't set aside, so there's nothing to bring back.",
                     card.reference
                 ),
                 Tone::Info,
@@ -1228,12 +1234,15 @@ impl App {
     /// request names the workspace and tab the yes was for, so the backend closes nothing else.
     fn cancel_action(&mut self) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
-            self.say("Select an intent first.", Tone::Info);
+            self.say(
+                "Nothing is selected for that key to act on: pick a card first.",
+                Tone::Info,
+            );
             return Action::None;
         };
         let Some(detail) = &card.detail else {
             self.say(
-                "This workspace has no intent record: X cancels an intent's work. Close the workspace in herdr instead.",
+                "This workspace has no intent, so X has no work to cancel; close the workspace in herdr instead.",
                 Tone::Info,
             );
             return Action::None;

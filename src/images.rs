@@ -564,7 +564,11 @@ fn scratch() -> Result<(tempfile::TempDir, PathBuf), String> {
     let dir = tempfile::Builder::new()
         .prefix("kerdr-clipboard-")
         .tempdir()
-        .map_err(|e| format!("Couldn't make a folder to read the clipboard into: {e}."))?;
+        .map_err(|e| {
+            format!(
+                "Kerdr couldn't make a temporary folder to read the clipboard into ({e}); the temporary folder may be full or read-only."
+            )
+        })?;
     let file = dir.path().join("clipboard.png");
     Ok((dir, file))
 }

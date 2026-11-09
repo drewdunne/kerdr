@@ -201,7 +201,10 @@ impl App {
         } else {
             return RunState::Unavailable(match card.stage {
                 Stage::Backlog => format!("{reference} has nothing to start yet."),
-                _ => format!("{reference} has no agent running and nothing s can start."),
+                _ => format!(
+                    "{reference} is in {} with no agent and no workspace, and Kerdr doesn't know how to start it from there.",
+                    card.stage.name()
+                ),
             });
         };
         if !self.actions_on() {
@@ -369,7 +372,10 @@ impl App {
     /// (a start already on its way, kickoff questions, a full session) still apply.
     pub(super) fn start_on_account(&mut self, key: &str, start: &Start, to: &str) -> Action {
         let Some(card) = self.card(key).cloned() else {
-            self.say("That card is gone from the board.", Tone::Warn);
+            self.say(
+                "That card is gone from the board (finished or moved), so nothing started.",
+                Tone::Warn,
+            );
             return Action::None;
         };
         let reference = card.reference.clone();

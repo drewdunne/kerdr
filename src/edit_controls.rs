@@ -144,7 +144,10 @@ impl App {
     /// `e`: the selected card's text, if it's backlog work.
     pub(super) fn edit_action(&mut self) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
-            self.say("Select an intent first.", Tone::Info);
+            self.say(
+                "Nothing is selected for that key to act on: pick a card first.",
+                Tone::Info,
+            );
             return Action::None;
         };
         self.edit_action_on(card)
@@ -163,7 +166,7 @@ impl App {
     pub fn edit_action_on(&mut self, card: Card) -> Action {
         let Some(detail) = card.detail.clone() else {
             self.say(
-                "This workspace has no intent record: e edits a backlog item's text.",
+                "This workspace has no intent, so there's no text to edit.",
                 Tone::Info,
             );
             return Action::None;
@@ -1673,7 +1676,11 @@ mod tests {
             "won't do; u brings it back",
         );
         // A card with no record behind it.
-        check(&mut app, &|c| c.detail = None, "no intent record");
+        check(
+            &mut app,
+            &|c| c.detail = None,
+            "no intent, so there's no text to edit",
+        );
         // On a card in a working column, too.
         let started = app
             .board
