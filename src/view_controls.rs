@@ -1136,4 +1136,24 @@ mod tests {
             app.mode
         );
     }
+
+    #[test]
+    fn fs_tree_heads_a_tenant_with_its_organization_even_with_no_work_of_its_own() {
+        let mut app = owner_app(false);
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .retain(|c| c.tenant.is_some());
+        app.rebuild();
+        assert!(!app.listed_owners().contains(&"arkship".to_string()));
+        let labels: Vec<String> = app.filter_rows().iter().map(|r| r.label.clone()).collect();
+        let org = labels
+            .iter()
+            .position(|l| l == "Arkship · ARK")
+            .expect("its organization heads it");
+        let tenant = labels.iter().position(|l| l == "Tinyhost · TNY").unwrap();
+        assert!(org < tenant);
+    }
 }

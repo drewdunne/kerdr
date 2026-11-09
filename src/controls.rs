@@ -456,7 +456,23 @@ impl App {
             }
         };
         let mut rows = vec![row("All work".into(), "", 0, Scope::All)];
-        for id in self.listed_owners() {
+        // An organization heads its tenants in the tree even with no work of its own, so a tenant
+        // is never drawn under another organization.
+        let listed = self.listed_owners();
+        let mut tree: Vec<String> = Vec::new();
+        for id in &listed {
+            if let Some(org) = self
+                .owner_info(id)
+                .map(|o| o.organization(&self.board.owners).id.clone())
+                .filter(|org| org != id && !tree.contains(org))
+            {
+                tree.push(org);
+            }
+            if !tree.contains(id) {
+                tree.push(id.clone());
+            }
+        }
+        for id in tree {
             let Some(o) = self.owner_info(&id).cloned() else {
                 rows.push(row("Unowned".into(), "", 0, Scope::Owner(id)));
                 continue;
