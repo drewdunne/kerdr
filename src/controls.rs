@@ -168,9 +168,10 @@ impl App {
         programs
     }
 
-    /// Whether f's filters (owner, project, agents or background) hide any work.
+    /// Whether f's filters (owner, project, machine, agents or background) hide any work.
     pub(crate) fn filtering(&self) -> bool {
         self.owner.is_some()
+            || self.machine_filter.is_some()
             || self.project.is_some()
             || self.provider.is_some()
             || self.background != Background::All
@@ -179,6 +180,10 @@ impl App {
     /// Metadata filters without the selected tab, so other session badges stay meaningful.
     pub(crate) fn card_matches_filters(&self, card: &Card) -> bool {
         self.owner.as_ref().is_none_or(|o| *o == card.owner_key())
+            && self
+                .machine_filter
+                .as_ref()
+                .is_none_or(|m| *m == card.machine)
             && self.project.as_ref().is_none_or(|p| p == card.project())
             && self
                 .provider
@@ -231,6 +236,9 @@ impl App {
     /// each is under way or waiting. Counts ignore the owner and project filters but follow the
     /// agents and background ones, so they say what picking a row would show.
     pub fn filter_rows(&self) -> Vec<FilterRow> {
+        if self.owner_split() {
+            return self.owner_filter_rows();
+        }
         let cards: Vec<&Card> = self
             .board
             .cards
@@ -271,6 +279,7 @@ impl App {
                 project,
                 open,
                 backlog,
+                pick: Pick::Filter,
             }
         };
         let projects = |owner: &str| {
@@ -394,8 +403,214 @@ impl App {
     fn filter_row_shown(&self) -> usize {
         self.filter_rows()
             .iter()
-            .position(|r| r.owner == self.owner && r.project == self.project)
+            .position(|r| self.filter_row_on(r))
             .unwrap_or(0)
+    }
+
+    /// Whether a filter row is what the board shows now: its check mark.
+    pub fn filter_row_on(&self, r: &FilterRow) -> bool {
+        match &r.pick {
+            Pick::Filter => r.owner == self.owner && r.project == self.project,
+            Pick::View(scope) => scope == self.scope(),
+            Pick::Project(p) => *p == self.project,
+            Pick::Machine(m) => *m == self.machine_filter,
+        }
+    }
+
+    /// f's list on the owner split (intent 0595): the tree of owners and their teams, grouped by
+    /// organization, each picking the top bar's view; then the chosen owner's projects, and each
+    /// machine. Counts follow the agents and background filters, as on the machine split.
+    fn owner_filter_rows(&self) -> Vec<FilterRow> {
+        let counted = |c: &&Card| {
+            c.stage != Stage::Misc
+                && !c.dismissed()
+                && self
+                    .provider
+                    .as_ref()
+                    .is_none_or(|p| c.agents.iter().any(|a| &a.agent == p))
+                && self.background.shows(c.background)
+                && self.machine_filter.as_ref().is_none_or(|m| *m == c.machine)
+        };
+        let count = |keep: &dyn Fn(&Card) -> bool| {
+            let (mut open, mut backlog) = (0, 0);
+            for c in self.board.cards.iter().filter(counted).filter(|c| keep(c)) {
+                match c.stage {
+                    Stage::Backlog => backlog += 1,
+                    Stage::Maintain | Stage::Misc => {}
+                    _ => open += 1,
+                }
+            }
+            (open, backlog)
+        };
+        let row = |label: String, kind: &str, depth: u8, scope: Scope| {
+            let (open, backlog) = count(&|c: &Card| scope.contains(c));
+            FilterRow {
+                label,
+                kind: kind.to_string(),
+                depth,
+                owner: None,
+                project: None,
+                open,
+                backlog,
+                pick: Pick::View(scope),
+            }
+        };
+        let mut rows = vec![row("All work".into(), "", 0, Scope::All)];
+        for id in self.listed_owners() {
+            let Some(o) = self.owner_info(&id).cloned() else {
+                rows.push(row("Unowned".into(), "", 0, Scope::Owner(id)));
+                continue;
+            };
+            let tenant = o.parent.is_some();
+            let kind = if tenant {
+                format!(
+                    "{} tenant",
+                    self.owner_info(o.parent.as_deref().unwrap_or_default())
+                        .map(|p| p.label().to_string())
+                        .unwrap_or_default()
+                )
+            } else {
+                "organization".into()
+            };
+            let depth = u8::from(tenant);
+            let label = match o.code.as_deref() {
+                Some(code) => format!("{} · {code}", o.label()),
+                None => o.label().to_string(),
+            };
+            rows.push(row(label, kind.trim(), depth, Scope::Owner(id.clone())));
+            let tabs: Vec<Scope> = {
+                let mut v = Vec::new();
+                for t in o.teams.iter() {
+                    let has = self
+                        .board
+                        .cards
+                        .iter()
+                        .any(|c| c.owner == id && c.team.as_deref() == Some(t.id.as_str()));
+                    if !t.retired || has {
+                        v.push(Scope::Team(id.clone(), Some(t.id.clone())));
+                    }
+                }
+                if self
+                    .board
+                    .cards
+                    .iter()
+                    .any(|c| c.owner == id && c.team.is_none() && !c.dismissed())
+                    && !o.teams.is_empty()
+                {
+                    v.push(Scope::Team(id.clone(), None));
+                }
+                v
+            };
+            for scope in tabs {
+                let Scope::Team(_, t) = &scope else { continue };
+                let name = self.team_name(&id, t.as_deref());
+                rows.push(row(name, "team", depth + 1, scope));
+            }
+        }
+        // The chosen owner's projects.
+        if let Some(owner) = self.scope().owner().map(str::to_string) {
+            let mut projects: Vec<String> = self
+                .board
+                .cards
+                .iter()
+                .filter(|c| c.owner == owner && !c.project().is_empty())
+                .map(|c| c.project().to_string())
+                .collect();
+            projects.sort();
+            projects.dedup();
+            if !projects.is_empty() {
+                let (open, backlog) = count(&|c: &Card| c.owner == owner);
+                rows.push(FilterRow {
+                    label: "All projects".into(),
+                    kind: "project".into(),
+                    depth: 0,
+                    owner: None,
+                    project: None,
+                    open,
+                    backlog,
+                    pick: Pick::Project(None),
+                });
+                for p in projects {
+                    let (open, backlog) = count(&|c: &Card| c.owner == owner && c.project() == p);
+                    rows.push(FilterRow {
+                        label: p.clone(),
+                        kind: "project".into(),
+                        depth: 1,
+                        owner: None,
+                        project: None,
+                        open,
+                        backlog,
+                        pick: Pick::Project(Some(p)),
+                    });
+                }
+            }
+        }
+        // Each machine: only its work, for the times you want one machine's.
+        let machine_count = |m: Option<&str>| {
+            let (mut open, mut backlog) = (0, 0);
+            for c in self.board.cards.iter().filter(|c| {
+                c.stage != Stage::Misc
+                    && !c.dismissed()
+                    && self.background.shows(c.background)
+                    && m.is_none_or(|m| c.machine == m)
+            }) {
+                match c.stage {
+                    Stage::Backlog => backlog += 1,
+                    Stage::Maintain | Stage::Misc => {}
+                    _ => open += 1,
+                }
+            }
+            (open, backlog)
+        };
+        let (open, backlog) = machine_count(None);
+        rows.push(FilterRow {
+            label: "All machines".into(),
+            kind: "machine".into(),
+            depth: 0,
+            owner: None,
+            project: None,
+            open,
+            backlog,
+            pick: Pick::Machine(None),
+        });
+        for m in self.machines.iter().filter(|m| m.is_shown()) {
+            let name = m.name();
+            let (open, backlog) = machine_count(Some(&name));
+            rows.push(FilterRow {
+                label: name.clone(),
+                kind: "machine".into(),
+                depth: 1,
+                owner: None,
+                project: None,
+                open,
+                backlog,
+                pick: Pick::Machine(Some(name)),
+            });
+        }
+        rows
+    }
+
+    /// Enter on a filter row: what it picks.
+    fn apply_filter_row(&mut self, row: FilterRow) {
+        match row.pick {
+            Pick::Filter => self.set_filter(row.owner, row.project),
+            Pick::View(scope) => {
+                self.choose_view(scope);
+                self.backlog_focus = None;
+                set_backlog_selection(&mut self.mode, 0);
+                self.fix_selection();
+            }
+            Pick::Project(p) => {
+                let owner = self.owner.clone();
+                self.set_filter(owner, p);
+            }
+            Pick::Machine(m) => {
+                self.machine_filter = m;
+                self.backlog_focus = None;
+                set_backlog_selection(&mut self.mode, 0);
+                self.fix_selection();
+            }
+        }
     }
 
     /// b in the filter screen: every card, only background work, none of it, then every card.
@@ -414,10 +629,12 @@ impl App {
         self.fix_selection();
     }
 
-    /// F: every owner, project, agent and background card again.
+    /// F: every owner, project, machine, agent and background card again. On the owner split the
+    /// owner is the top bar's, which stays.
     pub(super) fn clear_filters(&mut self) {
         let filtered = self.filtering();
         self.provider = None;
+        self.machine_filter = None;
         self.background = Background::All;
         self.set_filter(None, None);
         if filtered {
@@ -458,7 +675,7 @@ impl App {
                     .into_iter()
                     .nth(sel.min(n.saturating_sub(1)))
                 {
-                    self.set_filter(row.owner, row.project);
+                    self.apply_filter_row(row);
                 }
                 return Action::None;
             }
@@ -1090,11 +1307,21 @@ impl App {
             .owner
             .as_deref()
             .and_then(|o| o.strip_prefix("tenant:"));
-        let session = match (self.scope(), tenant) {
+        let mut session = match (self.scope(), tenant) {
             (Scope::Session(_, s), _) => s.clone(),
             (_, Some(t)) => t.to_string(),
             _ => "default".into(),
         };
+        let (filed, unfiled) = self.filed_for(machine);
+        // On an owner, its own session; the backend homes it by its owner either way.
+        if let Some(code) = self
+            .scope()
+            .owner()
+            .and_then(|o| self.owner_info(o))
+            .and_then(|o| o.code.clone())
+        {
+            session = code;
+        }
         self.mode = Mode::Compose {
             draft: Draft {
                 words: self.draft.clone(),
@@ -1102,9 +1329,60 @@ impl App {
                 session,
                 images: self.draft_images.clone(),
                 came_back: self.draft_came_back.clone(),
+                filed,
+                unfiled,
             },
             back: Box::new(self.mode.clone()),
         };
+    }
+
+    /// Who a new intent made in this view is filed under, sent to `machine`'s backend, and what
+    /// the view wanted that the backend can't take, as the box says it (intent 0595).
+    pub(crate) fn filed_for(&self, machine: usize) -> (Filed, Option<String>) {
+        let Some(o) = self
+            .scope()
+            .owner()
+            .filter(|o| *o != crate::owners::UNOWNED)
+        else {
+            return (Filed::default(), None);
+        };
+        let Some(info) = self.owner_info(o) else {
+            return (Filed::default(), None);
+        };
+        let team = match self.scope() {
+            Scope::Team(_, t) => t.clone(),
+            _ => None,
+        };
+        let feed = self.machines.get(machine).and_then(|m| m.feed.as_ref());
+        let takes = |field: &str| feed.is_some_and(|f| f.creates_with(field));
+        let tenant = info.parent.is_some().then(|| info.id.clone());
+        let organization = Some(info.organization(&self.board.owners).id.clone());
+        if !takes("organization") || (tenant.is_some() && !takes("tenant")) {
+            return (
+                Filed::default(),
+                Some(format!(
+                    "This machine's backend can't file new work under {} yet: the agent that writes it up works out whose it is from your words.",
+                    info.label()
+                )),
+            );
+        }
+        let mut filed = Filed {
+            organization,
+            tenant,
+            team: None,
+        };
+        let mut unfiled = None;
+        if let Some(t) = team {
+            if takes("team") {
+                filed.team = Some(t);
+            } else {
+                unfiled = Some(format!(
+                    "This machine's backend can't file work under a team yet: it goes under {}'s No team.",
+                    info.label()
+                ));
+            }
+        }
+        (filed, unfiled)
     }
 
     /// Ctrl+Space: the same letters as the direct keys, listed, so the menu is a reminder and
@@ -1292,22 +1570,25 @@ impl App {
         {
             draft.machine = s.machine;
             draft.session = s.session.clone();
+            draft.filed = s.filed.clone();
             if !self.submissions.iter().any(|k| k.id == s.id) {
                 self.submissions.push(s);
             }
         } else if let Some(s) = self
             .submissions
             .iter()
-            .find(|s| s.unknown && s.words == words && s.images == images)
+            .find(|s| s.unknown && s.words == words && s.images == images && s.filed == draft.filed)
         {
             draft.machine = s.machine;
             draft.session = s.session.clone();
         }
+        // The same request only with the same words, images, owner and team (intent 0595).
         let id = match self.submissions.iter().find(|s| {
             s.words == words
                 && s.images == images
                 && s.machine == draft.machine
                 && s.session == draft.session
+                && s.filed == draft.filed
         }) {
             Some(s) => s.id.clone(),
             None => {
@@ -1318,6 +1599,7 @@ impl App {
                     images: images.clone(),
                     machine: draft.machine,
                     session: draft.session.clone(),
+                    filed: draft.filed.clone(),
                     unknown: false,
                 });
                 id
@@ -1334,6 +1616,15 @@ impl App {
         }
         let mut request =
             json!({"action":"create","words":words,"session":draft.session,"submission":id});
+        for (field, value) in [
+            ("organization", &draft.filed.organization),
+            ("tenant", &draft.filed.tenant),
+            ("team", &draft.filed.team),
+        ] {
+            if let Some(v) = value {
+                request[field] = json!(v);
+            }
+        }
         if !images.is_empty() {
             request["images"] = Value::Array(images::request_images(&words, &images));
         }
@@ -1799,6 +2090,9 @@ impl App {
                 session: request["session"].as_str().unwrap_or("default").to_string(),
                 source: self.source_of(machine),
                 made: None,
+                organization: request["organization"].as_str().map(str::to_string),
+                tenant: request["tenant"].as_str().map(str::to_string),
+                team: request["team"].as_str().map(str::to_string),
             })
         });
         self.resolver

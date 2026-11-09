@@ -81,6 +81,10 @@ pub struct Placeholder {
     pub source: String,
     /// The record the save made, once its answer names it: the card goes once the feed has it.
     pub made: Option<String>,
+    /// Who it was filed under (intent 0595), so it shows under that owner and team while it saves.
+    pub organization: Option<String>,
+    pub tenant: Option<String>,
+    pub team: Option<String>,
 }
 
 impl Placeholder {
@@ -138,6 +142,9 @@ impl Placeholder {
             }),
             created: Some(chrono::Local::now().date_naive().to_string()),
             stale_days: Some(0),
+            organization: self.organization.clone(),
+            tenant: self.tenant.clone(),
+            team: self.team.clone(),
             ..Default::default()
         }
     }
@@ -162,21 +169,23 @@ impl Effect {
             }
             Effect::Started => {
                 fc.state = Some("active".into());
-                if !fc
-                    .stage
+                let own_list = fc
+                    .stage_list
                     .as_deref()
-                    .and_then(crate::model::Stage::parse)
-                    .is_some_and(|s| {
-                        matches!(
-                            s,
-                            crate::model::Stage::Plan
-                                | crate::model::Stage::Design
-                                | crate::model::Stage::Build
-                                | crate::model::Stage::Test
-                                | crate::model::Stage::Deploy
-                        )
-                    })
-                {
+                    .is_some_and(|l| !l.is_empty() && l != crate::model::STANDARD);
+                let said = fc.stage.as_deref().map(crate::model::Stage::parse);
+                if own_list {
+                    // On a team's own list the backend's column comes with the next read; until
+                    // then the list's first stage, where a card with none goes (intent 0595).
+                    if matches!(
+                        said,
+                        None | Some(Some(
+                            crate::model::Stage::Backlog | crate::model::Stage::Maintain
+                        ))
+                    ) {
+                        fc.stage = None;
+                    }
+                } else if !said.flatten().is_some_and(crate::model::Stage::is_working) {
                     // The backend's column for it comes with the next read; build is where most
                     // started work goes (a guess the feed corrects in seconds).
                     fc.stage = Some("build".into());
@@ -1532,6 +1541,9 @@ mod tests {
             session: "web".into(),
             source: "s".into(),
             made: None,
+            organization: None,
+            tenant: None,
+            team: None,
         };
         assert_eq!(p.title, "Back up the NAS");
         let n = r.add(
@@ -1583,6 +1595,9 @@ mod tests {
             session: "web".into(),
             source: "s".into(),
             made: None,
+            organization: None,
+            tenant: None,
+            team: None,
         }
     }
 

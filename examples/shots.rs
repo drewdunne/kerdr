@@ -59,7 +59,7 @@ fn app(away: bool) -> App {
 fn select(a: &mut App, reference: &str) {
     if let Some(c) = a.board.cards.iter().find(|c| c.reference == reference) {
         a.sel = Selection {
-            col: c.stage.index(),
+            col: a.col_of(c),
             key: Some(c.key.clone()),
         };
     }
@@ -365,6 +365,7 @@ fn main() {
                 bytes: std::sync::Arc::new(vec![]),
             }],
             came_back: None,
+            ..Default::default()
         },
         back: Box::new(Mode::Board),
     };
@@ -453,7 +454,7 @@ fn main() {
         .find(|card| provider.card_visible(card))
     {
         provider.sel = Selection {
-            col: card.stage.index(),
+            col: provider.col_of(card),
             key: Some(card.key.clone()),
         };
     }

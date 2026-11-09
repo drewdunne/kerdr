@@ -200,6 +200,8 @@ impl MachineState {
 pub struct SessionRow {
     pub machine: String,
     pub session: String,
+    /// Its owner by the owners list (intent 0595), or `owners::UNOWNED`.
+    pub owner: String,
     pub running: bool,
     pub slots: Slots,
     pub needs: usize,
@@ -233,6 +235,11 @@ pub struct Board {
     pub sessions: Vec<SessionRow>,
     pub workspaces: Vec<WorkspaceRow>,
     pub machine_order: Vec<String>,
+    /// Every owner the feeds list, by id (intent 0595): empty when none does, and then the top
+    /// bar splits by machine as it always has.
+    pub owners: Vec<crate::owners::OwnerInfo>,
+    /// Every stage list the feeds give, `standard` first, the newest copy of each.
+    pub lists: Vec<crate::feed::StageList>,
 }
 
 struct WsRef<'a> {
@@ -485,6 +492,14 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     // 0411); then the one from its home machine; when copies name different homes (a record with
     // none, or two copies a moment apart, each naming itself), the one that can resume its
     // agent's conversation; else one that's live.
+    let shown = || {
+        machines
+            .iter()
+            .filter(|m| m.is_shown())
+            .filter_map(|m| m.feed.as_ref())
+    };
+    let owners = crate::owners::merge(shown());
+    let lists = crate::stages::merge(shown());
     let mut chosen: BTreeMap<String, (usize, &FeedCard, &Feed)> = BTreeMap::new();
     for (mi, m) in machines.iter().enumerate() {
         if !m.is_shown() {
@@ -562,17 +577,12 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     let mut pending: Vec<Pending> = Vec::new();
     for (key, (mi, fc, _feed)) in &chosen {
         let state = fc.state.as_deref().unwrap_or("active").to_ascii_lowercase();
-        let stage = fc
-            .stage
-            .as_deref()
-            .and_then(Stage::parse)
-            .unwrap_or(if state == "closed" {
-                Stage::Maintain
-            } else if state == "queued" || state == "shelved" {
-                Stage::Backlog
-            } else {
-                Stage::Build
-            });
+        let stage = crate::stages::card_stage(
+            &lists,
+            fc.stage_list.as_deref().unwrap_or(""),
+            fc.stage.as_deref(),
+            &state,
+        );
         let home_mi = fc
             .home
             .as_ref()
@@ -740,8 +750,13 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             || session
                 .as_deref()
                 .is_some_and(|s| cfg.board.is_unlimited(s));
+        let owner =
+            crate::owners::record_owner(&owners, fc.tenant.as_deref(), fc.organization.as_deref());
+        let team = crate::owners::record_team(&owners, &owner, fc.team.as_deref());
         cards.push(Card {
             key: p.key.clone(),
+            owner,
+            team,
             reference: fc.reference(),
             title: fc.title.clone(),
             stage: p.stage,
@@ -822,6 +837,9 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         };
         cards.push(Card {
             key: format!("ws:{}:{}:{}", m.name(), w.session, w.ws.workspace_id),
+            // A workspace no record claims is its session's owner's, under No team.
+            owner: crate::owners::session_owner(&owners, &w.session),
+            team: None,
             reference: label.clone(),
             title: agent_title.unwrap_or_else(|| label.clone()),
             stage: Stage::Misc,
@@ -892,11 +910,12 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             let open_cards = cards
                 .iter()
                 .filter(in_session)
-                .filter(|c| !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc))
+                .filter(|c| c.stage.is_working())
                 .count();
             sessions.push(SessionRow {
                 machine: name.clone(),
                 session: info.name.clone(),
+                owner: crate::owners::session_owner(&owners, &info.name),
                 running: info.running,
                 slots,
                 needs: cards
@@ -960,6 +979,8 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
         sessions,
         workspaces,
         machine_order,
+        owners,
+        lists,
     }
 }
 
@@ -1010,12 +1031,17 @@ fn sort_cards(cards: &mut [Card]) {
     });
 }
 
-/// Which part of the board is in view.
+/// Which part of the board is in view: a machine and its herdr sessions, when no feed lists
+/// owners or the config keeps that split; else an owner, then one of its teams (intent 0595).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Scope {
     All,
     Machine(String),
     Session(String, String),
+    /// All of one owner's work (`owners::UNOWNED` for work no owner claims): its All tab.
+    Owner(String),
+    /// One of an owner's teams; None is its No team tab.
+    Team(String, Option<String>),
 }
 
 impl Scope {
@@ -1026,6 +1052,8 @@ impl Scope {
             Scope::Session(m, s) => {
                 &card.machine == m && card.session.as_deref() == Some(s.as_str())
             }
+            Scope::Owner(o) => &card.owner == o,
+            Scope::Team(o, t) => &card.owner == o && &card.team == t,
         }
     }
 
@@ -1034,6 +1062,16 @@ impl Scope {
             Scope::All => true,
             Scope::Machine(m) => &row.machine == m,
             Scope::Session(m, s) => &row.machine == m && &row.session == s,
+            // Teams share their owner's sessions.
+            Scope::Owner(o) | Scope::Team(o, _) => &row.owner == o,
+        }
+    }
+
+    /// The owner it picks, on the owner split.
+    pub fn owner(&self) -> Option<&str> {
+        match self {
+            Scope::Owner(o) | Scope::Team(o, _) => Some(o),
+            _ => None,
         }
     }
 }
@@ -2541,6 +2579,7 @@ mod tests {
             board.sessions.push(SessionRow {
                 machine: "m".into(),
                 session: s.into(),
+                owner: String::new(),
                 running: true,
                 slots: Slots {
                     used,

@@ -614,7 +614,13 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             Line::styled(first, bold(FG2)),
             Line::raw(""),
             Line::styled(
-                if app.machine.is_none() {
+                if app.owner_split() {
+                    if app.owner_pick.is_none() {
+                        "{ } choose an owner, then [ ] choose a team"
+                    } else {
+                        "[ ] choose a team    { } change owner"
+                    }
+                } else if app.machine.is_none() {
                     "{ } choose a machine, then [ ] choose a session"
                 } else {
                     "[ ] choose session    { } change machine"
@@ -672,8 +678,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     }
     // With a backlog card's keys in front, the rest gives up what the menu already lists. A
     // column the board leaves out names the key for its own screen.
-    let vis = app.visible_columns();
-    let shown = |s: Stage| vis[s.index()];
+    let done_shown = app.visible_columns().last().copied().unwrap_or(false);
     let mut full = vec![
         ("c", "new intent"),
         ("⏎", "jump in"),
@@ -683,7 +688,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         ("f", "filter"),
         ("b", "backlog"),
     ];
-    if !shown(Stage::Maintain) {
+    if !done_shown {
         full.push(("D", "done"));
     }
     full.extend([("ctrl+space", "menu"), ("?", "keys"), ("q", "quit")]);
@@ -708,6 +713,60 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+/// Work under way in a scope, and how much of it needs you, under f's filters.
+fn tab_counts(app: &App, scope: &Scope) -> (usize, usize) {
+    let mine = app
+        .board
+        .cards
+        .iter()
+        .filter(|c| scope.contains(c) && app.card_matches_filters(c) && c.stage != Stage::Misc);
+    let (mut open, mut needs) = (0, 0);
+    for c in mine {
+        if c.stage.is_working() {
+            open += 1;
+        }
+        if c.stage != Stage::Maintain && c.needs_you() {
+            needs += 1;
+        }
+    }
+    (open, needs)
+}
+
+/// An owner's or a team's tab on the owner split (intent 0595): its name, how much is under way,
+/// and how much needs you. A team with nothing open is dimmed, there to start work in.
+fn owner_tab(app: &App, selected: bool, label: String, scope: &Scope) -> Vec<Span<'static>> {
+    let sel_style = Style::default()
+        .bg(CYAN)
+        .fg(BG)
+        .add_modifier(Modifier::BOLD);
+    let (open, needs) = tab_counts(app, scope);
+    let base = if selected {
+        sel_style
+    } else if open == 0 {
+        Style::default().bg(RAISED).fg(DIM)
+    } else {
+        Style::default().bg(RAISED).fg(FG)
+    };
+    let mut spans = vec![Span::styled(format!(" {label}"), base)];
+    spans.push(Span::styled(
+        format!(" {open}"),
+        if selected { base } else { base.fg(DIM) },
+    ));
+    if needs > 0 {
+        spans.push(Span::styled(
+            format!(" ●{needs}"),
+            if selected {
+                base
+            } else {
+                base.fg(ORANGE).add_modifier(Modifier::BOLD)
+            },
+        ));
+    }
+    spans.push(Span::styled(" ", base));
+    spans.push(Span::raw(" "));
+    spans
+}
+
 fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
     let selected = i == app.tab;
     let sel_style = Style::default()
@@ -715,6 +774,12 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
         .fg(BG)
         .add_modifier(Modifier::BOLD);
     match scope {
+        // On all of Kerdr the row lists owners; on an owner, its first tab is All.
+        Scope::Owner(o) if app.owner_pick.is_some() => {
+            owner_tab(app, selected, "All".into(), scope)
+        }
+        Scope::Owner(o) => owner_tab(app, selected, app.owner_short(o), scope),
+        Scope::Team(o, t) => owner_tab(app, selected, app.team_name(o, t.as_deref()), scope),
         Scope::All => {
             let n = app
                 .board
@@ -808,9 +873,39 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
     }
 }
 
+/// What the bar's first box says: the machine, on the machine split; on the owner split all of
+/// Kerdr's work, or the owner, with its code and how full its main session is on the machine its
+/// work runs on (`Tinyhost · TNY 1/3`).
+fn level_label(app: &App) -> String {
+    if !app.owner_split() {
+        return app.machine.as_deref().unwrap_or("All machines").to_string();
+    }
+    let Some(o) = app.owner_pick.as_deref() else {
+        return "All work".into();
+    };
+    let Some(info) = app.owner_info(o) else {
+        return app.owner_short(o);
+    };
+    let mut label = info.label().to_string();
+    if let Some(code) = info.code.as_deref() {
+        label.push_str(&format!(" · {code}"));
+        let machine = info
+            .agent_machine
+            .as_deref()
+            .and_then(|m| app.machine_index(m))
+            .map(|mi| app.machines[mi].name());
+        if let Some(row) = app.board.sessions.iter().find(|r| {
+            r.session == code && r.running && machine.as_deref().is_none_or(|m| r.machine == m)
+        }) {
+            label.push_str(&format!(" {}", row.slots.label()));
+        }
+    }
+    label
+}
+
 fn header(buf: &mut Buffer, rect: Rect, app: &App) {
-    let machine = app.machine.as_deref().unwrap_or("All machines");
-    let label = format!(" {} ▾ ", trunc(machine, (rect.width as usize / 3).max(8)));
+    let machine = level_label(app);
+    let label = format!(" {} ▾ ", trunc(&machine, (rect.width as usize / 3).max(8)));
     let mut left = vec![
         Span::styled(" kerdr ", bold(CYAN)),
         Span::raw(" "),
@@ -828,6 +923,7 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
         .machine
         .as_ref()
         .and_then(|name| app.machine_index(name))
+        .or_else(|| app.owner_machine())
         .or_else(|| {
             app.machines.iter().position(|m| {
                 m.is_shown()
@@ -854,6 +950,7 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
         usage = both;
     }
     if app.machine.is_none()
+        && app.owner_pick.is_none()
         && !usage.is_empty()
         && let Some(mi) = usage_machine
     {
@@ -881,18 +978,27 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
         0
     };
     let avail = (rect.width as usize).saturating_sub(fixed + reserve);
+    // The level's own tab is the box in front, but for an owner's All tab, which is in the row.
+    let skip = if app.owner_split() && app.owner_pick.is_some() {
+        0
+    } else {
+        1
+    };
     let tabs: Vec<_> = app
         .tabs
         .iter()
         .enumerate()
-        .skip(1)
+        .skip(skip)
         .map(|(i, scope)| tab_spans(app, i, scope))
         .collect();
     let widths: Vec<usize> = tabs
         .iter()
         .map(|t| t.iter().map(|s| width(&s.content)).sum())
         .collect();
-    let selected = app.tab.saturating_sub(1).min(tabs.len().saturating_sub(1));
+    let selected = app
+        .tab
+        .saturating_sub(skip)
+        .min(tabs.len().saturating_sub(1));
     let mut start = 0;
     while start < selected && widths[start..=selected].iter().sum::<usize>() + 2 > avail {
         start += 1;
@@ -912,7 +1018,14 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
     }
     let mut right = usage;
     if right.is_empty() {
-        right.push(Span::styled("{ } machine · [ ] session", fg(DIM)));
+        right.push(Span::styled(
+            if app.owner_split() {
+                "{ } owner · [ ] team"
+            } else {
+                "{ } machine · [ ] session"
+            },
+            fg(DIM),
+        ));
     }
     right.push(Span::styled(format!(" · {}", clock(app.now())), fg(DIM)));
     let lw: usize = left.iter().map(|s| width(&s.content)).sum();
@@ -939,6 +1052,7 @@ fn header(buf: &mut Buffer, rect: Rect, app: &App) {
 /// Whether the board shows only part of the work, so its header names what.
 fn filtered(app: &App) -> bool {
     app.owner.is_some()
+        || app.machine_filter.is_some()
         || app.project.is_some()
         || app.provider.is_some()
         || app.background != Background::All
@@ -954,6 +1068,9 @@ fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
     }
     if let Some(p) = &app.project {
         shown.push(p.clone());
+    }
+    if let Some(m) = &app.machine_filter {
+        shown.push(format!("on {m}"));
     }
     if app.provider.is_some() {
         shown.push(app.provider_label());
@@ -1241,32 +1358,128 @@ fn strip(f: &mut Frame, rect: Rect, app: &App) {
 }
 
 fn columns(f: &mut Frame, rect: Rect, app: &App) {
-    let vis = app.visible_columns();
-    let stages: Vec<Stage> = Stage::ALL
+    let layout = app.layout();
+    let vis = app.visible_in(&layout);
+    let cols = app.columns_in(&layout);
+    let done = layout.done();
+    let band_cols = |b: &crate::stages::Band| -> Vec<usize> {
+        (b.first..b.first + b.len).filter(|&c| vis[c]).collect()
+    };
+    // The widest open band sets the columns' width, as the one band always did (intent 0595).
+    let widest = layout
+        .bands
         .iter()
-        .copied()
-        .filter(|s| vis[s.index()])
-        .collect();
-    let n = stages.len() as u16;
+        .filter(|b| !b.folded)
+        .map(|b| band_cols(b).len())
+        .max()
+        .unwrap_or(0);
+    let sides = usize::from(vis[0]) + usize::from(vis[done]);
+    let n = ((sides + widest) as u16).max(1);
     let gap = if rect.width > 160 { 2 } else { 1 };
     let col_w = (rect.width.saturating_sub(gap * (n - 1))) / n;
-    let cols = app.columns();
-    for (k, stage) in stages.iter().enumerate() {
-        let x = rect.x + k as u16 * (col_w + gap);
-        let r = Rect {
-            x,
-            y: rect.y,
-            width: col_w,
-            height: rect.height,
+    let x_of = |k: u16| rect.x + k * (col_w + gap);
+    let full = |x: u16| Rect {
+        x,
+        y: rect.y,
+        width: col_w,
+        height: rect.height,
+    };
+    if vis[0] {
+        column(f, full(x_of(0)), app, &layout.columns[0], &cols[0]);
+    }
+    if vis[done] {
+        column(
+            f,
+            full(x_of(n - 1)),
+            app,
+            &layout.columns[done],
+            &cols[done],
+        );
+    }
+    // Between them, the bands, stacked: a folded one is a line; the open ones share the rest.
+    let first = u16::from(vis[0]);
+    let mid_x = x_of(first);
+    let mid_w = if widest == 0 {
+        0
+    } else {
+        x_of(first + widest as u16 - 1) + col_w - mid_x
+    };
+    let banded = layout.banded();
+    let folded = layout.bands.iter().filter(|b| b.folded).count() as u16;
+    let open = layout.bands.iter().filter(|b| !b.folded).count() as u16;
+    let room = rect.height.saturating_sub(folded);
+    let mut y = rect.y;
+    let mut left_open = open;
+    for band in &layout.bands {
+        if y >= rect.bottom() {
+            break;
+        }
+        let line = Rect {
+            x: mid_x,
+            y,
+            width: mid_w,
+            height: 1,
         };
-        column(f, r, app, *stage, &cols[stage.index()]);
+        if band.folded {
+            band_title(f.buffer_mut(), line, band, true);
+            y += 1;
+            continue;
+        }
+        // The last open band takes what's left over.
+        let h = if left_open <= 1 {
+            rect.bottom().saturating_sub(y)
+        } else {
+            room / open.max(1)
+        };
+        left_open = left_open.saturating_sub(1);
+        let mut top = y;
+        if banded {
+            band_title(f.buffer_mut(), line, band, false);
+            top += 1;
+        }
+        let shown = band_cols(band);
+        let m = (shown.len() as u16).max(1);
+        let w = (mid_w.saturating_sub(gap * (m - 1))) / m;
+        for (k, &ci) in shown.iter().enumerate() {
+            let r = Rect {
+                x: mid_x + k as u16 * (w + gap),
+                y: top,
+                width: w,
+                height: (y + h).saturating_sub(top),
+            };
+            column(f, r, app, &layout.columns[ci], &cols[ci]);
+        }
+        y += h;
     }
 }
 
-fn column(f: &mut Frame, rect: Rect, app: &App, stage: Stage, items: &[usize]) {
+/// A band's title on a board that mixes stage lists: whose list it is and who's on it, and, folded,
+/// how much is in it.
+fn band_title(buf: &mut Buffer, rect: Rect, band: &crate::stages::Band, folded: bool) {
+    let mut left = vec![Span::styled(if folded { "▸ " } else { "▾ " }, fg(CYAN))];
+    left.push(Span::styled(band.title.clone(), bold(FG2)));
+    let mut right = vec![];
+    if band.open == 0 {
+        right.push(Span::styled("nothing under way", fg(DIM)));
+    } else {
+        right.push(Span::styled(format!("{} under way", band.open), fg(FG2)));
+        if band.needs > 0 {
+            right.push(Span::styled(format!(" ●{}", band.needs), bold(ORANGE)));
+        }
+        if folded {
+            right.push(Span::styled(" · j k open it", fg(DIM)));
+        }
+    }
+    put_lr(buf, rect, rect.y, left, right);
+}
+
+fn column(f: &mut Frame, rect: Rect, app: &App, col: &crate::stages::Column, items: &[usize]) {
+    let stage = col.stage;
     let sub = match stage {
         Stage::Maintain => "done".to_string(),
         Stage::Backlog => "your order".to_string(),
+        _ if col.unknown => "unknown stage".to_string(),
+        _ if col.retired => "retired".to_string(),
         _ => String::new(),
     };
     let buf = f.buffer_mut();
@@ -1277,11 +1490,13 @@ fn column(f: &mut Frame, rect: Rect, app: &App, stage: Stage, items: &[usize]) {
         vec![
             Span::styled(
                 stage.name().to_uppercase(),
-                Style::default().fg(FG2).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(if col.unknown { YELLOW } else { FG2 })
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(format!(" {}", items.len()), bold(FG)),
         ],
-        if items.is_empty() {
+        if items.is_empty() && !col.unknown {
             vec![]
         } else {
             vec![Span::styled(sub, fg(DIM))]
@@ -1957,11 +2172,19 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
 
     // The lifecycle rail: where it's been, where it is, what's left.
     lines.push(Line::raw(""));
-    let cell = (w / 7).max(8);
+    // The card's own list's stages, between Backlog and Done (intent 0595).
+    let rail = app.rail(c);
+    let pos = rail.iter().position(|s| *s == c.stage).unwrap_or(0);
+    let cell = (w / rail.len().max(1)).max(8);
     let mut names = Vec::new();
     let mut notes = Vec::new();
-    for s in Stage::ALL.into_iter().filter(|_| c.stage != Stage::Misc) {
-        let (glyph, style) = if s == c.stage {
+    for (k, s) in rail
+        .iter()
+        .copied()
+        .enumerate()
+        .filter(|_| c.stage != Stage::Misc)
+    {
+        let (glyph, style) = if k == pos {
             (
                 "●",
                 bold(if c.attention == Attention::NeedsYou {
@@ -1970,14 +2193,14 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
                     CYAN
                 }),
             )
-        } else if s < c.stage {
+        } else if k < pos {
             ("✓", fg(GREEN))
         } else {
             ("○", fg(DIM))
         };
-        let name_style = if s == c.stage {
+        let name_style = if k == pos {
             style
-        } else if s < c.stage {
+        } else if k < pos {
             fg(FG)
         } else {
             fg(DIM)
@@ -1991,10 +2214,11 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             .detail
             .as_ref()
             .and_then(|d| {
-                d.timeline
-                    .iter()
-                    .rev()
-                    .find(|t| Stage::parse(&t.stage) == Some(s))
+                d.timeline.iter().rev().find(|t| {
+                    t.stage == s.id()
+                        || (s.list().is_none_or(|l| l == crate::model::STANDARD)
+                            && Stage::parse(&t.stage) == Some(s))
+                })
             })
             .map(|t| t.note.clone().or(t.date.clone()).unwrap_or_default())
             .unwrap_or_default();
@@ -2515,31 +2739,58 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
         .unwrap_or_else(|| "this machine".into());
     let buf = f.buffer_mut();
     let y = boxed.bottom() + 1;
-    let where_line = vec![
-        Span::styled("It goes in the backlog of ", fg(FG2)),
-        Span::styled(draft.session.clone(), bold(FG)),
-        Span::styled(" on ", fg(FG2)),
-        Span::styled(machine, bold(FG)),
-        Span::styled(
-            ", the session you're looking at, until you start it.",
+    let filed_to = draft
+        .filed
+        .tenant
+        .clone()
+        .or(draft.filed.organization.clone());
+    let where_line = match (&filed_to, app.owner_split()) {
+        // On the owner split, whose backlog it's in (intent 0595).
+        (Some(owner), _) => {
+            let name = app
+                .owner_info(owner)
+                .map(|o| o.label().to_string())
+                .unwrap_or_else(|| owner.clone());
+            let team = draft
+                .filed
+                .team
+                .as_deref()
+                .map(|t| format!("{}'s backlog", app.team_name(owner, Some(t))))
+                .unwrap_or_else(|| "backlog, under No team".into());
+            vec![
+                Span::styled("It goes in ", fg(FG2)),
+                Span::styled(name, bold(FG)),
+                Span::styled(format!("'s {team}, until you start it."), fg(FG2)),
+            ]
+        }
+        (None, true) => vec![Span::styled(
+            "It goes in the backlog, filed under whoever your words say it's for.",
             fg(FG2),
-        ),
-    ];
+        )],
+        (None, false) => vec![
+            Span::styled("It goes in the backlog of ", fg(FG2)),
+            Span::styled(draft.session.clone(), bold(FG)),
+            Span::styled(" on ", fg(FG2)),
+            Span::styled(machine, bold(FG)),
+            Span::styled(
+                ", the session you're looking at, until you start it.",
+                fg(FG2),
+            ),
+        ],
+    };
     put(buf, inner.x, y, inner.width, fit(where_line, w));
-    for (n, line) in wrap(
-        "Say \"start it now\", or name another session or who it's for, and the agent that writes it up does that instead.",
-        w,
-        2,
-    )
-    .into_iter()
-    .enumerate()
-    {
+    let said = match &draft.unfiled {
+        Some(note) => note.clone(),
+        None => "Say \"start it now\", or name another session or who it's for, and the agent that writes it up does that instead.".to_string(),
+    };
+    let tone = if draft.unfiled.is_some() { YELLOW } else { DIM };
+    for (n, line) in wrap(&said, w, 2).into_iter().enumerate() {
         put(
             buf,
             inner.x,
             y + 1 + n as u16,
             inner.width,
-            vec![Span::styled(line, fg(DIM))],
+            vec![Span::styled(line, fg(tone))],
         );
     }
     // Nothing of his holds the box: an account action, or an earlier intent still saving, runs
@@ -2646,7 +2897,7 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize, ty
     }
     for (n, row) in rows.iter().enumerate().skip(skip).take(list_h as usize) {
         let y = top + (n - skip) as u16;
-        let on = row.owner == app.owner && row.project == app.project;
+        let on = app.filter_row_on(row);
         let counts = format!("{:>3} open {:>4} backlog", row.open, row.backlog);
         let left = vec![
             Span::styled(if on { "✓ " } else { "  " }, bold(CYAN)),
@@ -4220,7 +4471,7 @@ fn done_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     filters(f.buffer_mut(), rows[1], app);
     strip(f, rows[2], app);
     let items = app.done_cards();
-    let total = app.columns()[Stage::Maintain.index()].len();
+    let total = app.columns().last().map_or(0, Vec::len);
     put(
         f.buffer_mut(),
         rows[3].x,
@@ -4756,7 +5007,7 @@ mod tests {
     use ratatui::backend::TestBackend;
 
     fn demo(away: bool) -> App {
-        let mut a = App::new(Config::default(), crate::demo::machines(away));
+        let mut a = App::new(Config::machine_split(), crate::demo::machines(away));
         a.demo = true;
         a.fixed_now = Some(crate::demo::now());
         a.rebuild();

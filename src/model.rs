@@ -4,34 +4,97 @@ use chrono::{DateTime, Local};
 
 use crate::feed::FeedCard;
 
-/// Where a piece of work is in its life. The six working stages are Anthropic's AI-native SDLC
-/// stages (Plan, Design, Build, Test, Deploy, Maintain); Backlog sits in front of them for work
-/// that hasn't started, and Maintain is where finished work goes.
+/// Where a piece of work is in its life. Backlog (not started) and Maintain (done) are Kerdr's own
+/// and the same for everyone; Misc holds conversations no feed records. Every stage between them
+/// is data: a stage of one of the stage lists the feeds give (intent 0595), each team's own
+/// columns. The standard list is Anthropic's AI-native SDLC stages (Plan, Design, Build, Test,
+/// Deploy), which `Stage::Plan` and the rest name, and what a card with no list is on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Stage {
     Backlog,
-    Plan,
-    Design,
-    Build,
-    Test,
-    Deploy,
+    /// A working stage: one stage of one list, by `StageKey`.
+    Work(StageKey),
     Maintain,
     /// Conversations without a feed record; kept outside the working stages.
     Misc,
 }
 
+/// One stage of one stage list, interned so a `Stage` stays small and `Copy`. The standard list's
+/// five come first, in order, so stages sort as they always have.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct StageKey(u32);
+
+/// The id of the standard stage list, the one work with no team, and any card that names no list,
+/// is on.
+pub const STANDARD: &str = "standard";
+
+struct Interned {
+    list: &'static str,
+    id: &'static str,
+    name: &'static str,
+}
+
+static INTERNED: std::sync::LazyLock<std::sync::Mutex<Vec<Interned>>> =
+    std::sync::LazyLock::new(|| {
+        std::sync::Mutex::new(
+            [
+                ("plan", "Plan"),
+                ("design", "Design"),
+                ("build", "Build"),
+                ("test", "Test"),
+                ("deploy", "Deploy"),
+            ]
+            .into_iter()
+            .map(|(id, name)| Interned {
+                list: STANDARD,
+                id,
+                name,
+            })
+            .collect(),
+        )
+    });
+
+fn interned() -> std::sync::MutexGuard<'static, Vec<Interned>> {
+    INTERNED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[allow(non_upper_case_globals)]
 impl Stage {
-    pub const ALL: [Stage; 7] = [
-        Stage::Backlog,
+    pub const Plan: Stage = Stage::Work(StageKey(0));
+    pub const Design: Stage = Stage::Work(StageKey(1));
+    pub const Build: Stage = Stage::Work(StageKey(2));
+    pub const Test: Stage = Stage::Work(StageKey(3));
+    pub const Deploy: Stage = Stage::Work(StageKey(4));
+
+    /// The standard list's working stages, in order.
+    pub const STANDARD: [Stage; 5] = [
         Stage::Plan,
         Stage::Design,
         Stage::Build,
         Stage::Test,
         Stage::Deploy,
-        Stage::Maintain,
     ];
 
-    /// Reads a stage name, accepting the common words people and agents use for each one.
+    /// The stage `id` of the list `list` (its whole id), named `name` until a list says otherwise.
+    pub fn work(list: &str, id: &str, name: &str) -> Stage {
+        let mut all = interned();
+        if let Some(i) = all.iter().position(|s| s.list == list && s.id == id) {
+            if !name.is_empty() && all[i].name != name {
+                all[i].name = Box::leak(name.to_string().into_boxed_str());
+            }
+            return Stage::Work(StageKey(i as u32));
+        }
+        let leak = |s: &str| -> &'static str { Box::leak(s.to_string().into_boxed_str()) };
+        all.push(Interned {
+            list: leak(list),
+            id: leak(id),
+            name: leak(if name.is_empty() { id } else { name }),
+        });
+        Stage::Work(StageKey(all.len() as u32 - 1))
+    }
+
+    /// Reads a stage name, accepting the common words people and agents use for each one: the
+    /// standard list's stages, Backlog and Maintain.
     pub fn parse(s: &str) -> Option<Stage> {
         Some(match s.trim().to_ascii_lowercase().as_str() {
             "backlog" | "queued" | "todo" | "to do" | "shelved" => Stage::Backlog,
@@ -50,11 +113,7 @@ impl Stage {
     pub fn id(self) -> &'static str {
         match self {
             Stage::Backlog => "backlog",
-            Stage::Plan => "plan",
-            Stage::Design => "design",
-            Stage::Build => "build",
-            Stage::Test => "test",
-            Stage::Deploy => "deploy",
+            Stage::Work(StageKey(i)) => interned()[i as usize].id,
             Stage::Maintain => "maintain",
             Stage::Misc => "misc",
         }
@@ -63,18 +122,36 @@ impl Stage {
     pub fn name(self) -> &'static str {
         match self {
             Stage::Backlog => "Backlog",
-            Stage::Plan => "Plan",
-            Stage::Design => "Design",
-            Stage::Build => "Build",
-            Stage::Test => "Test",
-            Stage::Deploy => "Deploy",
+            Stage::Work(StageKey(i)) => interned()[i as usize].name,
             Stage::Maintain => "Maintain",
             Stage::Misc => "Misc",
         }
     }
 
+    /// The whole id of the list a working stage belongs to; None for Kerdr's own.
+    pub fn list(self) -> Option<&'static str> {
+        match self {
+            Stage::Work(StageKey(i)) => Some(interned()[i as usize].list),
+            _ => None,
+        }
+    }
+
+    /// A stage between Backlog and Done, on any list.
+    pub fn is_working(self) -> bool {
+        matches!(self, Stage::Work(_))
+    }
+
+    /// Its column on a board of the standard list alone, for tests that select by column.
+    #[cfg(test)]
     pub fn index(self) -> usize {
-        Stage::ALL.iter().position(|s| *s == self).unwrap_or(0)
+        match self {
+            Stage::Backlog => 0,
+            Stage::Maintain => 6,
+            s => Stage::STANDARD
+                .iter()
+                .position(|x| *x == s)
+                .map_or(0, |p| p + 1),
+        }
     }
 
     /// Backlog and Maintain are drawn as compact lists; the stages between them as cards.
@@ -184,6 +261,11 @@ pub struct Card {
     /// Unique across the whole board: `<source>:<id>` for feed cards, `ws:<machine>:<session>:<id>`
     /// for bare workspaces.
     pub key: String,
+    /// Whose work it is (intent 0595): an owner's id from the feeds' owners list, or
+    /// `owners::UNOWNED`.
+    pub owner: String,
+    /// Which of its owner's teams it's filed under; None is No team.
+    pub team: Option<String>,
     /// The short handle shown first on the card: `#143`, or a workspace's name.
     pub reference: String,
     pub title: String,
@@ -369,10 +451,7 @@ impl Card {
     /// still being written up. What a reopen needs, once its workspace is known to have gone.
     pub fn under_way(&self) -> bool {
         self.detail.is_some()
-            && matches!(
-                self.stage,
-                Stage::Plan | Stage::Design | Stage::Build | Stage::Test | Stage::Deploy
-            )
+            && self.stage.is_working()
             && self.attention != Attention::Done
             && !self.dismissed()
             && self.intake().is_none()

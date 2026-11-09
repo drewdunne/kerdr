@@ -25,6 +25,8 @@ pub mod inside;
 pub mod kickoff_controls;
 #[path = "run_state.rs"]
 pub mod run_state;
+#[path = "view_controls.rs"]
+pub mod view_controls;
 use account_controls::AccountScreen;
 pub(crate) use controls::waiting_work;
 pub use kickoff_controls::Kickoff;
@@ -45,6 +47,22 @@ pub struct Draft {
     /// The send these words came back from, when a save failed or went unheard: sent again
     /// unchanged, they go as that send, so the adapter finds what it may have made (intent 0445).
     pub came_back: Option<Submission>,
+    /// Who it's filed under: the owner and team of the view it was made in (intent 0595).
+    pub filed: Filed,
+    /// What the view wanted to file it under that this machine's backend can't take, said in the
+    /// box before it's sent.
+    pub unfiled: Option<String>,
+}
+
+/// Who a new intent is filed under, from the view it was made in (intent 0595): on all of Kerdr
+/// no one, and the agent that writes it up works it out from the words; on an owner (or its No
+/// team), its organization and, for a tenant, the tenant; on a team, those and the team. Only
+/// what the machine's backend says it takes (`create_fields`).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Filed {
+    pub organization: Option<String>,
+    pub tenant: Option<String>,
+    pub team: Option<String>,
 }
 
 /// Words (and their images) a save gave back while the box held other words, with the send they
@@ -67,6 +85,8 @@ pub struct Submission {
     pub images: Vec<crate::images::Image>,
     pub machine: usize,
     pub session: String,
+    /// The owner and team it was filed under: a resend counts as the same only with the same.
+    pub filed: Filed,
     /// An earlier send of it got no answer, so it may have been made.
     pub unknown: bool,
 }
@@ -81,6 +101,19 @@ pub struct FilterRow {
     pub project: Option<String>,
     pub open: usize,
     pub backlog: usize,
+    /// What Enter on it picks.
+    pub pick: Pick,
+}
+
+/// What a filter row picks: on the machine split, f's owner and project filter; on the owner
+/// split (intent 0595), the top bar's owner or team (one choice, never a second filter), the
+/// chosen owner's project, or a machine.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Pick {
+    Filter,
+    View(Scope),
+    Project(Option<String>),
+    Machine(Option<String>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -460,8 +493,17 @@ pub struct App {
     pub board: Board,
     pub tabs: Vec<Scope>,
     pub tab: usize,
-    /// None is the overview; session tabs belong only to this machine.
+    /// None is the overview; session tabs belong only to this machine. Only on the machine split.
     pub machine: Option<String>,
+    /// The owner the top bar is on, on the owner split (intent 0595); None is all of Kerdr.
+    pub owner_pick: Option<String>,
+    /// f's Machine row on the owner split: only this machine's work.
+    pub machine_filter: Option<String>,
+    /// The band moved onto last on a board that mixes stage lists: it stays open.
+    pub open_band: Option<String>,
+    /// The band h and l from Backlog or Done go into.
+    pub last_band: Option<String>,
+    /// f's owner filter, on the machine split.
     pub owner: Option<String>,
     pub project: Option<String>,
     pub provider: Option<String>,
@@ -558,6 +600,8 @@ pub struct App {
     /// takes its turn and says something else.
     pub answered_at: Option<Instant>,
     pub width: u16,
+    /// The screen's height, for how many bands fit; 0 for no limit.
+    pub height: u16,
     pub demo: bool,
     /// Fixed in demo mode so screenshots don't change; the clock otherwise.
     pub fixed_now: Option<DateTime<Local>>,
@@ -609,6 +653,10 @@ impl App {
             tabs: vec![Scope::All],
             tab: 0,
             machine: None,
+            owner_pick: None,
+            machine_filter: None,
+            open_band: None,
+            last_band: None,
             owner: None,
             project: None,
             provider: None,
@@ -652,6 +700,7 @@ impl App {
             kickoff_checks: 0,
             answered_at: None,
             width: 200,
+            height: 0,
             demo: false,
             fixed_now: None,
             prefix: "ctrl+b".to_string(),
@@ -964,31 +1013,13 @@ impl App {
         } else {
             board::build(&self.machines, &self.cfg)
         };
-        let mut tabs = vec![Scope::All];
-        if let Some(name) = self.machine.clone() {
-            if self
-                .machines
-                .iter()
-                .any(|m| m.is_shown() && m.answers_to(&name))
-            {
-                tabs = vec![Scope::Machine(name.clone())];
-                for r in self
-                    .board
-                    .sessions
-                    .iter()
-                    .filter(|r| r.machine == name && r.running)
-                {
-                    tabs.push(Scope::Session(name.clone(), r.session.clone()));
-                }
-            } else {
-                self.machine = None;
-            }
-        }
+        let tabs = self.view_tabs();
         self.tab = tabs
             .iter()
             .position(|t| *t == current)
             .or_else(|| match &current {
                 Scope::Session(m, _) => tabs.iter().position(|t| *t == Scope::Machine(m.clone())),
+                Scope::Team(o, _) => tabs.iter().position(|t| *t == Scope::Owner(o.clone())),
                 _ => None,
             })
             .unwrap_or(0);
@@ -1088,43 +1119,6 @@ impl App {
         }
     }
 
-    /// Columns drawn at this width: Backlog and Maintain give way first on a narrow screen, the
-    /// Backlog only while nothing in it waits on you. A column the config hides
-    /// (`[board] hide_columns`) never shows, its room going to the others (intent 0444).
-    pub fn visible_columns(&self) -> [bool; 7] {
-        let narrow = self.width < 100;
-        let mut v = Stage::ALL.map(|s| !self.cfg.board.hides(s));
-        if narrow && v[Stage::Backlog.index()] {
-            let backlog_needs_you = self.columns()[Stage::Backlog.index()]
-                .iter()
-                .any(|&i| self.backlog_needs_you(i));
-            v[Stage::Backlog.index()] = backlog_needs_you;
-        }
-        if narrow {
-            v[Stage::Maintain.index()] = false;
-        }
-        v
-    }
-
-    pub fn columns(&self) -> [Vec<usize>; 7] {
-        let mut cols: [Vec<usize>; 7] = Default::default();
-        let scope = self.scope();
-        for (i, c) in self.board.cards.iter().enumerate() {
-            // What sits inside a card on the board is on its line, not in a column (intent 0349).
-            if c.stage != Stage::Misc
-                && scope.contains(c)
-                && self.card_visible(c)
-                && self.holder(i).is_none()
-            {
-                cols[c.stage.index()].push(i);
-            }
-        }
-        for stage in Stage::ALL {
-            self.arrange(stage, &mut cols[stage.index()]);
-        }
-        cols
-    }
-
     pub fn card(&self, key: &str) -> Option<&Card> {
         self.board.cards.iter().find(|c| c.key == key)
     }
@@ -1164,7 +1158,7 @@ impl App {
         // peek keeps its record.
         if holds_card(&self.mode) {
             if let Some(card) = self.selected() {
-                self.sel.col = card.stage.index();
+                self.sel.col = self.col_of(card);
             }
             return;
         }
@@ -1172,12 +1166,13 @@ impl App {
             // A peek is an operation on one stable record, including when its column is hidden.
             // Losing the record must never silently point an action at a neighbor.
             if let Some(card) = self.selected() {
-                self.sel.col = card.stage.index();
+                self.sel.col = self.col_of(card);
             }
             return;
         }
-        let cols = self.columns();
-        let vis = self.visible_columns();
+        let layout = self.layout();
+        let cols = self.columns_in(&layout);
+        let vis = self.visible_in(&layout);
         if let Some(key) = &self.sel.key {
             for (ci, col) in cols.iter().enumerate() {
                 if vis[ci] && col.iter().any(|&i| &self.board.cards[i].key == key) {
@@ -1187,9 +1182,9 @@ impl App {
             }
         }
         // Start on the first card that needs you: that's what you came to the board for.
-        let order = [2usize, 3, 4, 5, 1, 0, 6];
+        let order = Self::start_order(&layout);
         if !self.first_selection_done || self.sel.key.is_some() {
-            for ci in [1usize, 2, 3, 4, 5] {
+            for ci in (1..layout.done()).filter(|&ci| vis[ci]) {
                 if let Some(&i) = cols[ci].iter().find(|&&i| self.board.cards[i].needs_you()) {
                     self.sel = Selection {
                         col: ci,
@@ -1200,14 +1195,15 @@ impl App {
                 }
             }
         }
-        let col = if vis[self.sel.col] && !cols[self.sel.col].is_empty() {
-            Some(self.sel.col)
-        } else {
-            order
-                .iter()
-                .copied()
-                .find(|&ci| vis[ci] && !cols[ci].is_empty())
-        };
+        let col =
+            if self.sel.col < cols.len() && vis[self.sel.col] && !cols[self.sel.col].is_empty() {
+                Some(self.sel.col)
+            } else {
+                order
+                    .iter()
+                    .copied()
+                    .find(|&ci| vis[ci] && !cols[ci].is_empty())
+            };
         match col {
             Some(ci) => {
                 self.sel = Selection {
@@ -1220,58 +1216,6 @@ impl App {
             }
             None => self.sel.key = None,
         }
-    }
-
-    fn select_index(&mut self, col: usize, row: usize) {
-        let cols = self.columns();
-        if let Some(&i) = cols[col].get(row) {
-            self.sel = Selection {
-                col,
-                key: Some(self.board.cards[i].key.clone()),
-            };
-        }
-    }
-
-    fn row(&self) -> usize {
-        let cols = self.columns();
-        self.sel
-            .key
-            .as_deref()
-            .and_then(|k| {
-                cols[self.sel.col]
-                    .iter()
-                    .position(|&i| self.board.cards[i].key == k)
-            })
-            .unwrap_or(0)
-    }
-
-    fn move_col(&mut self, dir: i32) {
-        let cols = self.columns();
-        let vis = self.visible_columns();
-        let row = self.row();
-        let mut ci = self.sel.col as i32;
-        loop {
-            ci += dir;
-            if !(0..7).contains(&ci) {
-                return;
-            }
-            let c = ci as usize;
-            if vis[c] && !cols[c].is_empty() {
-                let r = row.min(cols[c].len() - 1);
-                self.select_index(c, r);
-                return;
-            }
-        }
-    }
-
-    fn move_row(&mut self, dir: i32) {
-        let cols = self.columns();
-        let len = cols[self.sel.col].len();
-        if len == 0 {
-            return;
-        }
-        let row = (self.row() as i32 + dir).clamp(0, len as i32 - 1) as usize;
-        self.select_index(self.sel.col, row);
     }
 
     /// Cards that need you, in board order: column by column, top to bottom, each followed by
@@ -1480,6 +1424,13 @@ impl App {
 
     fn set_tab(&mut self, tab: usize) {
         if tab < self.tabs.len() {
+            // On all of Kerdr the row lists owners: picking one goes a level down (intent 0595).
+            if let (true, None, Scope::Owner(o)) =
+                (self.owner_split(), &self.owner_pick, &self.tabs[tab])
+            {
+                let o = o.clone();
+                return self.pick_owner(Some(o));
+            }
             self.tab = tab;
             self.fix_selection();
         }
@@ -1491,6 +1442,9 @@ impl App {
     }
 
     fn step_machine(&mut self, dir: i32) {
+        if self.owner_split() {
+            return self.step_owner(dir);
+        }
         let choices: Vec<Option<String>> = std::iter::once(None)
             .chain(
                 self.machines
@@ -1507,8 +1461,14 @@ impl App {
     }
 
     fn choose_scope(&mut self, scope: Scope) {
+        if self.owner_split() {
+            return self.choose_view(match scope {
+                Scope::Machine(_) | Scope::Session(..) => Scope::All,
+                other => other,
+            });
+        }
         self.machine = match &scope {
-            Scope::All => None,
+            Scope::All | Scope::Owner(_) | Scope::Team(..) => None,
             Scope::Machine(m) | Scope::Session(m, _) => Some(m.clone()),
         };
         self.rebuild();
@@ -1776,14 +1736,14 @@ impl App {
                 if shift || key.code == KeyCode::Char('H') {
                     self.step_machine(-1)
                 } else {
-                    self.step_tab(-1)
+                    self.step_row(-1, true)
                 }
             }
             KeyCode::Char('l' | 'L') if ca => {
                 if shift || key.code == KeyCode::Char('L') {
                     self.step_machine(1)
                 } else {
-                    self.step_tab(1)
+                    self.step_row(1, true)
                 }
             }
             KeyCode::Char('h') | KeyCode::Left => self.move_col(-1),
@@ -1821,12 +1781,14 @@ impl App {
                     self.open_inside(&k);
                 }
             }
-            KeyCode::Char(']') | KeyCode::Tab => self.step_tab(1),
-            KeyCode::Char('[') | KeyCode::BackTab => self.step_tab(-1),
+            KeyCode::Char(']') => self.step_row(1, true),
+            KeyCode::Char('[') => self.step_row(-1, true),
+            KeyCode::Tab => self.step_row(1, false),
+            KeyCode::BackTab => self.step_row(-1, false),
             KeyCode::Char('}') => self.step_machine(1),
             KeyCode::Char('{') => self.step_machine(-1),
             KeyCode::Char('0') => self.choose_scope(Scope::All),
-            KeyCode::Char(c @ '1'..='9') => self.session_tab(c as usize - '0' as usize),
+            KeyCode::Char(c @ '1'..='9') => self.row_tab(c as usize - '0' as usize),
             KeyCode::Char('/') => {
                 self.mode = Mode::Search(Search {
                     query: String::new(),
@@ -1970,7 +1932,7 @@ impl App {
                 if let Some((Hit::Card(i), _)) = hits.get(s.sel) {
                     let card = &self.board.cards[*i];
                     self.sel = Selection {
-                        col: card.stage.index(),
+                        col: self.col_of(card),
                         key: Some(card.key.clone()),
                     };
                     self.mode = Mode::Peek {
@@ -2016,7 +1978,7 @@ impl App {
             Hit::Card(i) => {
                 let card = self.board.cards[i].clone();
                 self.sel = Selection {
-                    col: card.stage.index(),
+                    col: self.col_of(&card),
                     key: Some(card.key.clone()),
                 };
                 if card.intake() == Some(crate::resolve::SAVING) {
@@ -2119,6 +2081,34 @@ impl App {
                     Scope::All => true,
                     Scope::Machine(m) => &w.machine == m,
                     Scope::Session(m, s) => &w.machine == m && &w.session == s,
+                    // A workspace is its card's owner's, else its session's (intent 0595).
+                    Scope::Owner(_) | Scope::Team(..) => {
+                        let mine = |c: &Card| {
+                            c.machine == w.machine
+                                && c.session.as_deref() == Some(w.session.as_str())
+                                && c.workspace_id.as_deref() == Some(w.id.as_str())
+                        };
+                        match w.card.as_deref().and_then(|k| self.card(k)) {
+                            Some(c) => self.scope().contains(c),
+                            None => {
+                                self.board
+                                    .cards
+                                    .iter()
+                                    .any(|c| mine(c) && self.scope().contains(c))
+                                    || (matches!(
+                                        self.scope(),
+                                        Scope::Owner(_) | Scope::Team(_, None)
+                                    ) && self.scope().owner()
+                                        == Some(
+                                            crate::owners::session_owner(
+                                                &self.board.owners,
+                                                &w.session,
+                                            )
+                                            .as_str(),
+                                        ))
+                            }
+                        }
+                    }
                 };
                 if !in_scope {
                     continue;
@@ -2537,7 +2527,8 @@ impl App {
     /// first), narrowed by the view's search: the Done screen's list (intent 0444).
     pub fn done_cards(&self) -> Vec<usize> {
         let mut cols = self.columns();
-        std::mem::take(&mut cols[Stage::Maintain.index()])
+        cols.pop()
+            .unwrap_or_default()
             .into_iter()
             .filter(|&i| self.matches_view_search(&self.board.cards[i]))
             .collect()
@@ -2558,7 +2549,7 @@ impl App {
         }
         self.wont_do = false;
         self.mode = Mode::Done { sel: 0 };
-        self.sel.col = Stage::Maintain.index();
+        self.sel.col = self.layout().done();
         self.sel.key = self
             .done_cards()
             .first()
@@ -2735,7 +2726,7 @@ pub(crate) mod tests {
 
     #[test]
     fn empty_board_still_switches_machines_and_sessions() {
-        let mut app = App::new(Config::default(), crate::demo::machines(false));
+        let mut app = App::new(Config::machine_split(), crate::demo::machines(false));
         app.project = Some("no-matching-project".into());
         press(&mut app, '}');
         let machine = app.machine.clone().unwrap();
@@ -2743,8 +2734,10 @@ pub(crate) mod tests {
         assert!(matches!(app.scope(), Scope::Session(m, _) if m == &machine));
     }
 
+    /// The demo on the machine split, which these tests were written about; the owner split's
+    /// are in `view_controls`.
     pub(crate) fn demo_app() -> App {
-        App::new(Config::default(), crate::demo::machines(false))
+        App::new(Config::machine_split(), crate::demo::machines(false))
     }
 
     pub(crate) fn press(app: &mut App, c: char) -> Action {
@@ -3992,7 +3985,7 @@ pub(crate) mod tests {
             .unwrap()
             .clone();
         app.sel = Selection {
-            col: card.stage.index(),
+            col: app.col_of(&card),
             key: Some(card.key.clone()),
         };
         assert!(app.backlog_card_for_keys().is_none());

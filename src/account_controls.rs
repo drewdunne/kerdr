@@ -487,6 +487,11 @@ impl App {
         self.machine
             .as_ref()
             .and_then(|n| self.machine_index(n))
+            // On the owner split, the machine the chosen owner's agents run on (intent 0595).
+            .or_else(|| {
+                self.owner_machine()
+                    .filter(|&mi| with_accounts(&self.machines[mi]))
+            })
             .or_else(|| {
                 self.machines
                     .iter()
@@ -866,15 +871,34 @@ impl App {
             let mi = self.machine_index(machine)?;
             return Some((mi, self.account_owner(mi, session)?.clone()));
         }
-        None
+        // The owner the top bar is on (intent 0595), from the feed of the machine its agents run
+        // on, else of any machine that lists it.
+        let id = self.scope().owner()?;
+        let listed = |mi: usize| {
+            self.account_feed(mi)
+                .and_then(|f| f.owners.iter().find(|o| o.id == id))
+                .map(|o| (mi, o.clone()))
+        };
+        self.owner_machine()
+            .and_then(listed)
+            .or_else(|| (0..self.machines.len()).find_map(listed))
     }
 
-    /// Whose list S edits: the viewed session's owner when [ ] chose a session, else the selected
-    /// card's (intent 0580), so it never asks for a session first. A card's owner is its session's,
-    /// else its home session's, else the tenant or organization its record names.
+    /// Whose list S edits: the viewed session's owner when [ ] chose a session, or the owner the
+    /// top bar is on, else the selected card's (intent 0580), so it never asks for a session
+    /// first. A card's owner is its session's, else its home session's, else the tenant or
+    /// organization its record names.
     pub fn models_owner(&self) -> Option<(usize, Owner)> {
         if matches!(self.scope(), Scope::Session(..)) {
             return self.viewed_owner();
+        }
+        if self
+            .scope()
+            .owner()
+            .is_some_and(|o| o != crate::owners::UNOWNED)
+            && let Some(found) = self.viewed_owner()
+        {
+            return Some(found);
         }
         self.card_owner(self.selected_for_control()?)
     }
@@ -2435,7 +2459,7 @@ fn same_screen(a: &AccountScreen, b: &AccountScreen) -> bool {
 mod tests {
     use super::*;
     fn app() -> App {
-        let mut a = App::new(Config::default(), crate::demo::machines(false));
+        let mut a = App::new(Config::machine_split(), crate::demo::machines(false));
         a.cfg.actions.command = Some("fixture".into());
         a
     }

@@ -497,6 +497,29 @@ pub struct Owner {
     pub sessions: Vec<String>,
     /// Its short code (`KBZ`), which a new account's code starts with.
     pub code: Option<String>,
+    /// Its teams (intent 0595): the tabs under it on Kerdr's top bar.
+    #[serde(
+        deserialize_with = "null_default",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub teams: Vec<Team>,
+    /// The machine its new work runs on, as its feed says: A opens there.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_machine: Option<String>,
+}
+
+/// One of an owner's teams. Its id never changes; a retired one stays for its old cards.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct Team {
+    #[serde(deserialize_with = "null_default")]
+    pub id: String,
+    #[serde(deserialize_with = "null_default")]
+    pub name: String,
+    #[serde(deserialize_with = "null_default")]
+    pub retired: bool,
+    /// The whole id of the stage list it uses; absent means `standard`.
+    pub stages: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

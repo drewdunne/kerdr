@@ -517,6 +517,8 @@ mod tests {
         f(&mut fc);
         Card {
             key: format!("{source}:{id}"),
+            owner: String::new(),
+            team: None,
             reference: fc.reference(),
             title: fc.title.clone(),
             stage: Stage::Build,
