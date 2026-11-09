@@ -2392,6 +2392,49 @@ impl App {
             }
             return;
         }
+        // Its agent wasn't running, so the backend started it on the account picked instead, as a
+        // reopen (intent 0591): taken as that reopen's answer, followed while it goes on, and gone
+        // into once it's done while you're still on its card.
+        if action == "account-move"
+            && response.ok
+            && !response.confirmation
+            && (response.follow.is_some()
+                || (response.session.is_some() && response.workspace.is_some()))
+        {
+            let key = match pending.as_ref().and_then(|p| p.screen.as_ref()) {
+                Some(AccountScreen::Move { target, .. }) => Some(target.key.clone()),
+                _ => None,
+            };
+            let id = response
+                .follow
+                .as_ref()
+                .and_then(|f| f.id.clone())
+                .or_else(|| response.id.clone())
+                .or_else(|| {
+                    key.as_deref()
+                        .and_then(|k| self.card(k))
+                        .and_then(|c| c.detail.as_ref())
+                        .map(|d| d.id.clone())
+                });
+            if let Some(id) = id {
+                if visible && let Mode::Accounts { back, .. } = self.mode.clone() {
+                    self.mode = *back;
+                }
+                let mut reopen = json!({"action":"reopen","id":id});
+                if let Some(to) = request["to"].as_str() {
+                    reopen["account"] = json!(to);
+                }
+                self.action_from = key
+                    .as_deref()
+                    .filter(|k| self.sel.key.as_deref() == Some(*k))
+                    .and_then(|k| self.card(k))
+                    .map(CardSnapshot::of);
+                self.queue_action(machine, reopen.clone());
+                let n = self.resolver.last_added();
+                self.finish_job(n, reopen, Ok(response));
+                return;
+            }
+        }
         if action == "account-move" && response.confirmation && !visible {
             self.say(
                 "That move needs confirmation. Open the move picker again to review it.",
@@ -2413,7 +2456,12 @@ impl App {
                     return;
                 }
                 let target = target.clone();
-                if self.target_current(&target) {
+                // A question about the start made because its agent wasn't running (it names the
+                // intent or its session, as a start's question does; a move's names neither) is
+                // about that start, not the agent: its yes isn't refused once the board shows the
+                // agent gone (intent 0591).
+                let starts = response.id.is_some() || response.session.is_some();
+                if starts || self.target_current(&target) {
                     let mut request = request;
                     request["confirm"] = json!(token);
                     self.push_account_screen(AccountScreen::Confirm {
@@ -2422,7 +2470,7 @@ impl App {
                         message: response.message,
                         yes: response.yes.unwrap_or_else(|| "move when it stops".into()),
                         no: response.no.unwrap_or_else(|| "leave it".into()),
-                        target: Some(target),
+                        target: (!starts).then_some(target),
                         ready_at: Instant::now() + Duration::from_millis(500),
                     });
                     return;
@@ -2753,6 +2801,224 @@ mod tests {
         );
         assert!(r.get("override").is_none());
     }
+    const FOLLOW: &str = "f-0123456789abcdef0123";
+
+    /// #44's key and record id.
+    fn card_44(a: &App) -> (String, String) {
+        let c = a.board.cards.iter().find(|c| c.reference == "#44").unwrap();
+        (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+    }
+
+    /// The account move s sends on #44 for ARK_C, its Move picker open.
+    fn move_44(a: &mut App) -> Action {
+        pick(a);
+        press(a, 's');
+        let action = key(a, KeyCode::Enter);
+        let (_, r) = sent(action.clone());
+        assert_eq!(
+            r,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C"})
+        );
+        action
+    }
+
+    /// The backend's answer when its agent wasn't running: the start it made instead, followed.
+    fn started_instead(id: &str) -> Value {
+        json!({"ok":true,
+               "message":"Its agent wasn't running, so it's being started on ARK_C: Starting api; ⏎ again in a minute goes in.",
+               "id":id,"session":"api",
+               "follow":{"token":FOLLOW,"what":"start","id":id,"session":"api","say":"Starting api, then #44…","limit":300}})
+    }
+
+    /// Followed work's end, as its progress answer brings it.
+    fn followed_to(a: &mut App, reply: Value) {
+        for f in &mut a.follows {
+            f.next = Instant::now();
+        }
+        let due = a.progress_due();
+        assert_eq!(due.len(), 1, "one progress request due");
+        assert_eq!(due[0].2, json!({"action":"progress","follow":FOLLOW}));
+        assert!(a.progress_answered(
+            FOLLOW,
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap())
+        ));
+    }
+
+    /// Piece A's backend (intent 0591): s on a card whose agent turns out not to be running starts
+    /// it on the account picked, as a reopen, and answers with `follow`. Kerdr follows it as that
+    /// reopen and goes in once it's done, while you're still on the card.
+    #[test]
+    fn an_account_move_whose_agent_wasnt_running_is_followed_and_goes_in_when_done() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        complete(&mut a, action, started_instead(&id));
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        assert_eq!(a.follows.len(), 1, "followed");
+        assert_eq!(
+            a.follows[0].request,
+            json!({"action":"reopen","id":id,"account":"ARK_C"})
+        );
+        assert_eq!(a.message().unwrap().0, "Starting api, then #44…");
+        followed_to(
+            &mut a,
+            json!({"ok":true,"state":"done","message":"Reopened #44 in api on ARK_C.","id":id,
+                   "session":"api","workspace":"w9","label":"44-again"}),
+        );
+        assert!(a.follows.is_empty());
+        let open = a.open_after.clone().expect("in, once it's done");
+        assert_eq!(
+            (
+                open.session.as_str(),
+                open.workspace.as_str(),
+                open.label.as_str(),
+                open.from.as_str()
+            ),
+            ("api", "w9", "44-again", k.as_str())
+        );
+    }
+
+    /// The same start answered at once with its workspace (no follow): in, as on a reopen's answer.
+    #[test]
+    fn an_account_move_answered_with_a_workspace_goes_in() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"Its agent wasn't running, so it's being started on ARK_C: Reopened #44 in api.",
+                   "id":id,"session":"api","workspace":"w9","label":"44-again"}),
+        );
+        assert!(a.follows.is_empty());
+        let open = a.open_after.clone().expect("in, as on a reopen's answer");
+        assert_eq!(
+            (open.workspace.as_str(), open.from.as_str()),
+            ("w9", k.as_str())
+        );
+    }
+
+    /// That start's question (a full session, say) comes back with a token of its own and "yes" and
+    /// "no": the yes goes back as the same account move with that token, even once the board shows
+    /// the agent gone, and the start it answers is followed and gone into.
+    #[test]
+    fn a_question_from_a_start_made_for_a_move_round_trips_and_its_yes_goes_in() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"confirmation":true,"confirm":"cont-0123456789abcdef","yes":"yes","no":"no",
+                   "id":id,"session":"api","used":2,"limit":2,
+                   "message":"Its agent wasn't running, so it's being started on ARK_C: api has 2 workspaces. Start anyway?"}),
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                yes, no, message, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("no question: {:?}", a.message());
+        };
+        assert_eq!((yes.as_str(), no.as_str()), ("yes", "no"));
+        assert!(
+            message.ends_with("api has 2 workspaces. Start anyway?"),
+            "{message}"
+        );
+        // The board catches up: no agent runs it now.
+        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+            c.agents.clear();
+        }
+        assert!(a.move_agent(a.card(&k).unwrap()).is_none());
+        settle(&mut a);
+        let yes = press(&mut a, 'y');
+        let (_, r) = sent(yes.clone());
+        assert_eq!(
+            r,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C","confirm":"cont-0123456789abcdef"})
+        );
+        complete(&mut a, yes, started_instead(&id));
+        assert_eq!(a.follows.len(), 1, "the start its yes made is followed");
+        followed_to(
+            &mut a,
+            json!({"ok":true,"state":"done","message":"Started #44 in api on ARK_C.","id":id,
+                   "session":"api","workspace":"w9","label":"44-again"}),
+        );
+        assert_eq!(a.open_after.clone().expect("in, once it's done").from, k);
+    }
+
+    /// s on an agent still on its first turn: the backend asks, where it used to queue the move.
+    /// Its yes goes back as the same move with its token; the backend keeps the pid, its start and
+    /// whether it hands over with that token, so the yes needs nothing else. Both wordings: a move,
+    /// and a hand-over to another program.
+    #[test]
+    fn a_first_turn_question_round_trips_and_its_yes_queues_the_move() {
+        for handover in [false, true] {
+            let mut a = app();
+            pick(&mut a);
+            press(&mut a, 's');
+            if handover {
+                press(&mut a, 'j');
+            }
+            let action = key(&mut a, KeyCode::Enter);
+            let (_, asked) = sent(action.clone());
+            let to = asked["to"].as_str().unwrap().to_string();
+            let (text, yes_label) = if handover {
+                (
+                    format!(
+                        "It's still on its first turn, so herdr doesn't know its conversation yet. This agent runs Claude Code. {to} runs Codex, so its conversation can't carry over: a fresh Codex agent starts in the same pane and picks up from the intent's log, its pinboard and the end of this conversation. Hand it over to Codex once that turn ends?"
+                    ),
+                    "hand over when it stops",
+                )
+            } else {
+                (
+                    format!(
+                        "It's still on its first turn, so herdr doesn't know its conversation yet. Move it to {to} once that turn ends? It won't be cut off."
+                    ),
+                    "move when it stops",
+                )
+            };
+            complete(
+                &mut a,
+                action,
+                json!({"ok":false,"confirmation":text,"yes":yes_label,"no":"leave it",
+                       "confirm":"turn-0123456789abcdef","message":text}),
+            );
+            let Mode::Accounts {
+                screen:
+                    AccountScreen::Confirm {
+                        yes, no, message, ..
+                    },
+                ..
+            } = &a.mode
+            else {
+                panic!("no question: {:?}", a.message());
+            };
+            assert_eq!((yes.as_str(), no.as_str()), (yes_label, "leave it"));
+            assert_eq!(message, &text);
+            settle(&mut a);
+            let yes = press(&mut a, 'y');
+            let (_, r) = sent(yes.clone());
+            let mut expected = asked.clone();
+            expected["confirm"] = json!("turn-0123456789abcdef");
+            assert_eq!(r, expected, "the same move, with its token");
+            let word = if handover { "hands over" } else { "moves" };
+            let said = format!(
+                "it's still on its first turn, so herdr doesn't know its conversation yet: it {word} to {to} once that turn ends"
+            );
+            complete(
+                &mut a,
+                yes,
+                json!({"ok":true,"state":"queued","message":said}),
+            );
+            assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+            assert!(a.follows.is_empty());
+            assert_eq!(a.message().unwrap().0, said);
+        }
+    }
+
     #[test]
     fn a_changed_conversation_cannot_use_an_old_confirmation() {
         let mut a = app();

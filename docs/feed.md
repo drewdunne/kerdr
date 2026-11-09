@@ -933,7 +933,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
 |---|---|---|
-| `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, or the question below |
+| `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, the question below, or the answer of a start made instead (below) |
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
@@ -968,6 +968,19 @@ Moves send the feed's `agents[].conversation`. A changed conversation answers
 `{"ok":true,"state":"queued","account":"ARK_C","message":"moving to ARK_C"}` promptly, then restarts
 in a detached worker. Kerdr displays the message; the feed changes the account badge when the
 move finishes. An unavailable target answers `ok: false` before stopping anything.
+
+An agent still on its first turn (its conversation not known yet) gets a question too, worded for
+the turn ("Move it to ARK_C once that turn ends?", or "Hand it over to Codex once that turn
+ends?"); keep what its yes needs (which process, whether it hands over) behind the token, since
+Kerdr sends back only the original fields and `confirm`.
+
+When the agent turns out not to be running, the backend may start the card on the account picked
+instead, as a reopen with `account`, and answer as that reopen would: with `follow` (then `done`
+with `session`, `workspace` and `label`), or with the workspace at once. Kerdr takes it as the
+reopen's answer: it follows it, and goes in when it's done while you're still on the card. A
+question that start asks names the intent (`id`) or its `session`, which a move's question never
+does: its token is the backend's own continuation, and `y` sends the same `account-move` with it
+as `confirm`, even once the board shows the agent gone, since the question is about the start.
 
 ### Signing in
 

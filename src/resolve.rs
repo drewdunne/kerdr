@@ -813,6 +813,11 @@ impl Resolver {
     }
 
     /// Takes a change out as its answer arrives: a failure's effect goes with it.
+    /// The number of the change added last.
+    pub fn last_added(&self) -> u64 {
+        self.next
+    }
+
     pub fn take(&mut self, n: u64) -> Option<Job> {
         let i = self.jobs.iter().position(|j| j.n == n)?;
         Some(self.jobs.remove(i))
