@@ -296,6 +296,17 @@ impl App {
             // than refuse (intent 0591).
             RunState::NoAccounts(machine) => {
                 let name = self.machines[machine].name();
+                // Accounts come with a machine's card feed: with none configured, none will.
+                if self.machines[machine].machine.feed.is_none() {
+                    self.say(
+                        format!(
+                            "{name} has no card feed configured, so it sends no accounts for s to offer on {}.",
+                            card.reference
+                        ),
+                        Tone::Info,
+                    );
+                    return;
+                }
                 if !self.machines[machine].conn.is_live() {
                     self.say(
                         format!(
