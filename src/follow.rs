@@ -727,6 +727,31 @@ mod tests {
     }
 
     #[test]
+    fn a_start_on_an_account_joined_to_a_move_under_way_says_the_account_wasnt_applied() {
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let machine = app.machine_index("build-box").unwrap();
+        let request = json!({"action":"reopen","id":id,"session":"api","account":"ARK_C"});
+        let (machine, request) = sent(
+            &mut app,
+            Action::Mutate {
+                machine,
+                request: request.clone(),
+            },
+        );
+        let mut reply = follow_reply(&id, "move-in", "Moving #39's conversation into herdr…");
+        reply["account_unchanged"] = json!(true);
+        reply["message"] = json!(
+            "#39's conversation is already moving into herdr, so it stays on its own account, not ARK_C."
+        );
+        answer(&mut app, machine, &request, reply);
+        assert_eq!(app.follows.len(), 1, "the move is followed all the same");
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info);
+        assert!(said.contains("not ARK_C"), "{said}");
+    }
+
+    #[test]
     fn a_second_enter_while_it_is_followed_says_what_it_is_doing_and_sends_nothing() {
         let mut app = demo_app();
         let (key, id) = closed_card(&mut app);

@@ -2417,6 +2417,11 @@ impl App {
                 // It goes on after this answer, and Kerdr follows it (intent 0591): shown on its
                 // card in the follow's words until it ends.
                 self.begin_follow(job, follow);
+                // Joined to a move already under way, which an account picked with s didn't
+                // reach: that's said, as on any start that restarted nothing (intent 0591).
+                if response.ok && response.account_unchanged && !response.message.is_empty() {
+                    self.say(response.message.clone(), Tone::Info);
+                }
             } else {
                 // It stays as shown until the feed has it; a start answered yes moves on now.
                 let changes = guessed_wrong
