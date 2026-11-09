@@ -230,6 +230,16 @@ fn event_loop(
                     app.resolver.drop_answered(n, dropped);
                     continue;
                 }
+                // How followed work stands (intent 0591): once it has ended, its machine's feed is
+                // read now, so its card shows it.
+                Answer::Progress(token, machine, result) => {
+                    if app.progress_answered(&token, result)
+                        && let Some(l) = live.as_deref()
+                    {
+                        l.wake_feed(machine);
+                    }
+                    continue;
+                }
                 Answer::Done(done) => *done,
             };
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
@@ -257,6 +267,8 @@ fn event_loop(
         }
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
         run_ready(app, &runner);
+        // Followed work: how it stands, asked on threads of their own (intent 0591).
+        ask_progress(app, &action_tx);
         if let Some(l) = live.as_deref() {
             for machine in start_reads.due(&app.start_awaited_on(), Instant::now()) {
                 l.wake_feed(machine);
@@ -324,8 +336,8 @@ fn event_loop(
         }
         app.settle_refresh(&fed);
         holds.borrow_mut().sync(app);
-        if let Some(key) = app.pending_jump_ready() {
-            jump_cards(
+        match app.pending_jump_ready() {
+            Some(Action::Jump(key)) => jump_cards(
                 terminal,
                 flags,
                 app,
@@ -335,7 +347,29 @@ fn event_loop(
                 &bg,
                 key,
                 true,
-            );
+            ),
+            Some(Action::JumpWorkspace {
+                machine,
+                session,
+                id,
+            }) => {
+                if let Some(mi) = app.machine_index(&machine) {
+                    jump_workspace(
+                        terminal,
+                        flags,
+                        app,
+                        live.as_deref_mut(),
+                        client_config.as_ref(),
+                        &bg,
+                        mi,
+                        session,
+                        id,
+                        None,
+                        None,
+                    );
+                }
+            }
+            _ => {}
         }
         // ⏎ on a card whose start was running: its workspace has opened (intent 0491).
         let remembered = app.enter_when_open.clone();
@@ -654,6 +688,8 @@ enum Answer {
     Handed(u64),
     Dropped(u64, bool),
     Done(Box<ActionResult>),
+    /// A progress request's answer: the followed work's token, its machine, and what came back.
+    Progress(String, usize, Result<crate::actions::Response, String>),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -888,6 +924,28 @@ fn start_action(
     });
 }
 
+/// Sends the progress requests due for followed work, each on a thread of its own, so a slow
+/// machine never holds the board; their answers come back on the channel (intent 0591). They only
+/// read, so nothing waits for them, and q doesn't either.
+fn ask_progress(app: &mut App, tx: &mpsc::Sender<Answer>) {
+    if app.demo {
+        return;
+    }
+    for (token, machine, request) in app.progress_due() {
+        let command = app.cfg.actions.command.clone();
+        let target = app.machines.get(machine).map(|m| m.machine.clone());
+        let (Some(command), Some(target)) = (command, target) else {
+            app.progress_answered(&token, Err("actions are disabled".into()));
+            continue;
+        };
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            let result = crate::actions::run(&target, &command, &request);
+            let _ = tx.send(Answer::Progress(token, machine, result));
+        });
+    }
+}
+
 /// Hands every new change to a card to the runner, which starts each in its turn.
 fn run_ready(app: &mut App, runner: &Runner) {
     for n in app.resolver.take_dropped() {
@@ -1007,8 +1065,12 @@ fn jump_workspace(
                 .map(|w| w.label.clone())
         })
         .unwrap_or_else(|| id.clone());
-    if let Some(said) = app.stuck_refusal(mi, &session, &label) {
-        app.say(said, Tone::Warn);
+    // Its session didn't answer its last read: Kerdr waits for it rather than refuse (intent 0591).
+    if app.stuck_refusal(mi, &session, &label).is_some() {
+        app.wait_for_stuck(mi, &session.clone(), &label, None, Some((session, id)));
+        if let Some(l) = live.as_deref() {
+            l.wake(mi);
+        }
         return None;
     }
     // Going in yourself: a start or reopen still on its way for it takes you nowhere later.
@@ -1180,16 +1242,22 @@ fn jump_cards(
     let mut key = first;
     // Cards Kerdr picked whose workspace turned out to have closed: skipped from then on.
     let mut closed_on_the_way: Vec<String> = Vec::new();
+    // Gone once more into the workspace the board named for a card after its first had closed:
+    // never a third time round (intent 0591).
+    let mut retried = false;
     loop {
         let Some(card) = app.card(&key).cloned() else {
             return;
         };
         let (Some(session), Some(workspace)) = (card.session.clone(), card.workspace_id.clone())
         else {
-            app.say(
-                format!("{} has no herdr workspace to jump into.", card.reference),
-                Tone::Info,
-            );
+            // A ⏎ that waited (for its machine, for a start, on to the next card) makes plain ⏎'s
+            // choice: start it, reopen it, or move it into herdr. Never a dead end (intent 0591).
+            app.sel = Selection {
+                col: card.stage.index(),
+                key: Some(key.clone()),
+            };
+            plain_choice(terminal, flags, app, live, client_config, bg, &key);
             return;
         };
         let mi = card.machine_index;
@@ -1211,8 +1279,13 @@ fn jump_cards(
             }
             return;
         }
-        if let Some(said) = app.stuck_refusal(mi, &session, &card.reference) {
-            app.say(said, Tone::Warn);
+        // Its session didn't answer its last read: wait for it, up to a minute, rather than refuse
+        // (intent 0591).
+        if app.stuck_refusal(mi, &session, &card.reference).is_some() {
+            app.wait_for_stuck(mi, &session, &card.reference, Some(&key), None);
+            if let Some(l) = live.as_deref() {
+                l.wake(mi);
+            }
             return;
         }
         app.sel = Selection {
@@ -1263,7 +1336,16 @@ fn jump_cards(
                 // herdr has just said it closed, so a board slow to notice still counts it gone;
                 // a card that has meanwhile moved to another workspace doesn't reopen.
                 if !app.closed_under_you(&key, card.workspace_id.as_deref()) {
-                    app.say(closed(&card.workspace_name()), Tone::Warn);
+                    match app.after_closed(&key, card.workspace_id.as_deref(), retried) {
+                        Action::Jump(_) => {
+                            retried = true;
+                            continue;
+                        }
+                        Action::Mutate { machine, request } => {
+                            start_action(app, bg.answers, bg.runner, machine, request)
+                        }
+                        _ => app.say(closed(&card.workspace_name()), Tone::Warn),
+                    }
                 }
                 return;
             }
@@ -1272,7 +1354,16 @@ fn jump_cards(
             // session again; otherwise say so.
             Outcome::Stopped if yours => {
                 if !app.closed_under_you(&key, card.workspace_id.as_deref()) {
-                    app.say(stopped(&j.session, &app.machines[mi].name()), Tone::Warn);
+                    match app.after_closed(&key, card.workspace_id.as_deref(), retried) {
+                        Action::Jump(_) => {
+                            retried = true;
+                            continue;
+                        }
+                        Action::Mutate { machine, request } => {
+                            start_action(app, bg.answers, bg.runner, machine, request)
+                        }
+                        _ => app.say(stopped(&j.session, &app.machines[mi].name()), Tone::Warn),
+                    }
                 }
                 return;
             }
@@ -1295,6 +1386,47 @@ fn jump_cards(
                 return;
             }
         }
+    }
+}
+
+/// Plain ⏎'s choice for a card with no workspace open, made for a ⏎ that waited: what jump_action
+/// says to do, done (intent 0591).
+#[allow(clippy::too_many_arguments)]
+fn plain_choice(
+    terminal: &mut DefaultTerminal,
+    flags: &TerminalFlags,
+    app: &mut App,
+    live: Option<&mut Live>,
+    client_config: Option<&PathBuf>,
+    bg: &Bg,
+    key: &str,
+) {
+    match app.jump_action(key.to_string()) {
+        Action::Mutate { machine, request } => {
+            start_action(app, bg.answers, bg.runner, machine, request)
+        }
+        Action::JumpWorkspace {
+            machine,
+            session,
+            id,
+        } => {
+            if let Some(mi) = app.machine_index(&machine) {
+                jump_workspace(
+                    terminal,
+                    flags,
+                    app,
+                    live,
+                    client_config,
+                    bg,
+                    mi,
+                    session,
+                    id,
+                    None,
+                    None,
+                );
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1432,6 +1564,7 @@ mod tests {
                     Err(_) => "failed",
                 }
             ),
+            Answer::Progress(token, _, _) => format!("progress {token}"),
         }
     }
 

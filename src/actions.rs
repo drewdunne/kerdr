@@ -81,6 +81,58 @@ pub struct Response {
     /// and the message says so (intent 0580).
     #[serde(default)]
     pub account_unchanged: bool,
+    /// Work that goes on after this answer, for Kerdr to follow with `progress` requests to the
+    /// same machine (intent 0591): starting a herdr session first, a restore, a move into herdr.
+    #[serde(default, deserialize_with = "follow")]
+    pub follow: Option<Follow>,
+    /// A `progress` answer's state: `running`, `done`, `asks`, `failed` or `unknown`.
+    pub state: Option<String>,
+    /// With `running`: what the followed work is on now.
+    pub say: Option<String>,
+}
+
+/// What an answer with `follow` says Kerdr should wait for (intent 0591, docs/feed.md).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct Follow {
+    /// Opaque, sent back in each `progress` request.
+    pub token: String,
+    /// `start`, `recover`, `move-in`, `dispatch` or `reopen`.
+    #[serde(default)]
+    pub what: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default)]
+    pub session: Option<String>,
+    /// What it's doing, in words for the card: "Starting ARK on arknet-one, then #581…".
+    #[serde(default)]
+    pub say: String,
+    /// Seconds the step may take; past that and a margin, Kerdr stops following and says so.
+    #[serde(default)]
+    pub limit: Option<u64>,
+}
+
+/// A token Kerdr sends back: short and plain, so nothing odd goes into a request.
+fn follow_token_ok(token: &str) -> bool {
+    !token.is_empty()
+        && token.len() <= 64
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+/// `follow` as the answer gives it: an object with a usable token, else none at all, so a backend
+/// that sends something Kerdr can't follow is read as one that doesn't follow.
+fn follow<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Follow>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(serde_json::from_value::<Follow>(value)
+        .ok()
+        .filter(|f| follow_token_ok(&f.token)))
+}
+
+/// The request asking how followed work stands: read-only, so Kerdr may send it as often as it
+/// likes (intent 0591).
+pub fn progress_request(token: &str) -> Value {
+    serde_json::json!({"action": "progress", "follow": token})
 }
 
 impl Response {
@@ -106,6 +158,19 @@ pub fn parse_response(text: &str) -> Result<Response, serde_json::Error> {
     let mut value: Value = serde_json::from_str(text)?;
     if let Some(question) = value["confirmation"].as_str().map(str::to_string) {
         value["message"] = Value::String(question);
+    }
+    serde_json::from_value(value)
+}
+
+/// A `progress` answer: `running` carries `say` and may leave out `message`, which every other
+/// answer must have (intent 0591).
+fn parse_progress(text: &str) -> Result<Response, serde_json::Error> {
+    let mut value: Value = serde_json::from_str(text)?;
+    if value.is_object() && value.get("message").is_none() {
+        value["message"] = Value::String(String::new());
+    }
+    if value.is_object() && value.get("ok").is_none() {
+        value["ok"] = Value::Bool(value["state"] == "running" || value["state"] == "done");
     }
     serde_json::from_value(value)
 }
@@ -204,6 +269,9 @@ pub fn run_keeping_stderr(machine: &Machine, command: &str, request: &Value) -> 
 pub fn deadline_for(request: &Value) -> Duration {
     if starts_work(request) {
         Duration::from_secs(300)
+    } else if request["action"] == "progress" {
+        // A read of a record: a slow one is asked again in a few seconds anyway (intent 0591).
+        Duration::from_secs(20)
     } else {
         Duration::from_secs(120)
     }
@@ -333,10 +401,29 @@ fn answer_of(
     }
     // A backend can request confirmation with a nonzero exit code. Its JSON is the contract,
     // so parse it before interpreting process status.
-    parse_response(&output.stdout).map(|mut response| {
+    let parsed = if request["action"] == "progress" {
+        parse_progress(&output.stdout)
+    } else {
+        parse_response(&output.stdout)
+    };
+    parsed.map(|mut response| {
         response.message = redact(&response.message);
-        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires, &mut response.text, &mut response.was, &mut response.asked, &mut response.note].into_iter().flatten() {
+        for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires, &mut response.text, &mut response.was, &mut response.asked, &mut response.note, &mut response.say].into_iter().flatten() {
             *text = redact(text);
+        }
+        if let Some(follow) = response.follow.as_mut() {
+            follow.say = redact(&follow.say);
+            for text in [&mut follow.id, &mut follow.session].into_iter().flatten() {
+                *text = redact(text);
+            }
+        }
+        // Only the states the protocol knows; anything else reads as one Kerdr can't follow.
+        if response
+            .state
+            .as_deref()
+            .is_some_and(|s| !matches!(s, "running" | "done" | "asks" | "failed" | "unknown"))
+        {
+            response.state = Some("unknown".into());
         }
         for question in &mut response.questions {
             for text in [&mut question.num, &mut question.question, &mut question.background, &mut question.pick, &mut question.why] {

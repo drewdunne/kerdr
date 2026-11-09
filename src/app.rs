@@ -19,6 +19,8 @@ mod controls;
 pub mod edit_controls;
 #[path = "errors.rs"]
 pub(crate) mod errors;
+#[path = "follow.rs"]
+pub mod follow;
 #[path = "inside.rs"]
 pub mod inside;
 #[path = "kickoff_controls.rs"]
@@ -485,7 +487,16 @@ pub struct PendingJump {
     pub key: String,
     pub workspace: String,
     pub machine: String,
+    /// Waiting for one herdr session there that didn't answer its last read, and since when: Kerdr
+    /// goes in once it answers, and gives up after STUCK_WAIT (intent 0591).
+    pub stuck: Option<(String, Instant)>,
+    /// A workspace no card claims, by machine, session and id, in place of a card.
+    pub bare: Option<(usize, String, String)>,
 }
+
+/// How long ⏎ waits for a herdr session that didn't answer its last read before saying it's still
+/// stuck (intent 0591).
+pub const STUCK_WAIT: Duration = Duration::from_secs(60);
 
 pub struct App {
     pub cfg: Config,
@@ -580,9 +591,6 @@ pub struct App {
     /// The machine and record of each such resend still unanswered: its answer is shown as it
     /// is, never sent on again, so one ⏎ asks two machines at most.
     pub resent: Vec<(usize, String)>,
-    /// A card whose conversation runs outside herdr, and when ⏎ said so: a second ⏎ on it soon
-    /// after goes on to the reopen question (intent 0411).
-    pub outside_warned: Option<(String, Instant)>,
     /// Each record a refusal said lives on another machine, that machine, and the home the
     /// board's feed still showed for it when the refusal came: its actions go there, and a
     /// question that machine asks can be answered yes, even before the board catches up. Each
@@ -642,6 +650,12 @@ pub struct App {
     pub enter_when_open: Option<String>,
     /// The words on screen that promise it, which go when it does (intent 0491).
     pub enter_said: Option<String>,
+    /// Work that goes on after its answer, which Kerdr follows (intent 0591, follow.rs).
+    pub follows: Vec<follow::Following>,
+    /// The end of followed work being taken as its request's answer.
+    pub(crate) follow_end: Option<follow::FollowEnd>,
+    /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
+    pub(crate) enter_sent: Option<String>,
 }
 
 impl App {
@@ -693,7 +707,6 @@ impl App {
             pending_reopen: None,
             resend: Default::default(),
             resent: vec![],
-            outside_warned: None,
             moved_home: vec![],
             kickoff_kept: Default::default(),
             kickoff_sent: Default::default(),
@@ -723,6 +736,9 @@ impl App {
             refresh: None,
             enter_when_open: None,
             enter_said: None,
+            follows: vec![],
+            follow_end: None,
+            enter_sent: None,
         };
         app.rebuild();
         app
@@ -1297,6 +1313,42 @@ impl App {
         reopen
     }
 
+    /// herdr has just said the workspace ⏎ went into has closed, or its session has stopped, on a
+    /// card no reopen is owed (closed_under_you): what the board knows now decides, as plain ⏎
+    /// would (intent 0591). The card names another workspace now: into that one, once. Work that
+    /// never started, whose workspace has gone (a planner's): started, as d does, which starts its
+    /// session first when that's what stopped. Otherwise None, and the caller says what happened.
+    pub fn after_closed(&mut self, key: &str, tried: Option<&str>, retried: bool) -> Action {
+        let Some(card) = self.card(key).cloned() else {
+            return Action::None;
+        };
+        if !retried && card.is_open_workspace() && card.workspace_id.as_deref() != tried {
+            return Action::Jump(key.to_string());
+        }
+        let never_started = card.detail.is_some()
+            && !card.dismissed()
+            && card.stage == Stage::Backlog
+            && !matches!(
+                card.state.as_deref(),
+                Some("closed" | "active" | "background")
+            );
+        if never_started && self.actions_on() {
+            // As herdr says it is now, which the board will say at its next read.
+            let mut gone = card.clone();
+            gone.workspace_id = None;
+            gone.session = None;
+            gone.tab_id = None;
+            gone.agents.clear();
+            let action = self.intent_action_on(gone, "dispatch", serde_json::json!({}));
+            if matches!(action, Action::Mutate { .. }) {
+                // Its answer asks or takes you in on the card as the board still shows it.
+                self.action_from = Some(CardSnapshot::of(&card));
+            }
+            return self.by_enter(action);
+        }
+        Action::None
+    }
+
     /// Kerdr owes this card a reopen, its workspace or tab found closed: it starts once no question
     /// is up, whatever account action runs meanwhile (intent 0445).
     pub(crate) fn owe_reopen(&mut self, key: &str, _what: &str) {
@@ -1376,13 +1428,44 @@ impl App {
             key: card.key.clone(),
             workspace: card.workspace_name(),
             machine: card.machine.clone(),
+            stuck: None,
+            bare: None,
         });
     }
 
-    /// The waiting jump, once its machine answers: the card to jump into now. None while it still
-    /// waits, or once Kerdr has said why it can't: the workspace closed while the machine was
-    /// away.
-    pub fn pending_jump_ready(&mut self) -> Option<String> {
+    /// ⏎ into a card or workspace whose herdr session didn't answer its last read: rather than
+    /// refuse, Kerdr waits for that session to answer (it's read again every few seconds), and goes
+    /// in once it does and still has the workspace; after a minute it says it's still stuck, and
+    /// why (intent 0591). Never while you're typing: pending_jump_ready's rules.
+    pub fn wait_for_stuck(
+        &mut self,
+        machine: usize,
+        session: &str,
+        what: &str,
+        key: Option<&str>,
+        bare: Option<(String, String)>,
+    ) {
+        let name = self.machines[machine].name();
+        self.pending_jump = Some(PendingJump {
+            key: key.unwrap_or_default().to_string(),
+            workspace: what.to_string(),
+            machine: name.clone(),
+            stuck: Some((session.to_string(), Instant::now())),
+            bare: bare.map(|(s, id)| (machine, s, id)),
+        });
+        self.say(
+            format!(
+                "Waiting for {session} on {name} to answer; Kerdr goes into {what} when it does. Esc on the board stops waiting."
+            ),
+            Tone::Info,
+        );
+    }
+
+    /// The waiting jump, once its machine (and its stuck session, when it waits for one) answers:
+    /// where to go now, as ⏎ would. A card goes through jump_cards, which makes plain ⏎'s choice
+    /// for one whose workspace closed meanwhile: reopen it, start it, or move it into herdr
+    /// (intent 0591). None while it still waits, or once Kerdr has said why it can't.
+    pub fn pending_jump_ready(&mut self) -> Option<Action> {
         let pending = self.pending_jump.clone()?;
         // Only where going in can't take keys meant for something else: never while typing or
         // answering a question (intent 0445).
@@ -1397,32 +1480,50 @@ impl App {
         {
             return None;
         }
-        let open = match self.card(&pending.key) {
-            Some(c) if !self.machines[c.machine_index].conn.is_live() => return None,
-            Some(c) => Some(c.is_open_workspace()),
-            None => None,
+        let machine = match (&pending.bare, self.card(&pending.key)) {
+            (Some((mi, ..)), _) => Some(*mi),
+            (None, Some(c)) => Some(c.machine_index),
+            (None, None) => None,
         };
-        self.pending_jump = None;
-        let PendingJump {
-            key,
-            workspace,
-            machine,
-        } = pending;
-        match open {
-            Some(true) => return Some(key),
-            // Work still under way, or done, whose workspace closed meanwhile: reopen it instead.
-            Some(false) if self.card(&key).is_some_and(|c| c.reopenable()) && self.actions_on() => {
-                self.owe_reopen(&key, "workspace");
+        if let Some(mi) = machine {
+            if !self.machines[mi].conn.is_live() {
+                return None;
             }
-            Some(false) => self.say(
-                format!("{workspace} closed while {machine} was away."),
-                Tone::Warn,
-            ),
-            None => self.say(
-                format!("{workspace} closed while {machine} was away; it's off the board now."),
-                Tone::Warn,
-            ),
+            if let Some((session, since)) = &pending.stuck
+                && let Some(why) = self.session_stuck(mi, session).map(str::to_string)
+            {
+                if since.elapsed() < STUCK_WAIT {
+                    return None;
+                }
+                self.pending_jump = None;
+                self.say(
+                    format!(
+                        "Kerdr didn't go into {}: {session} on {} still isn't answering after a minute ({why}). R reads it again.",
+                        pending.workspace, pending.machine
+                    ),
+                    Tone::Warn,
+                );
+                return None;
+            }
         }
+        self.pending_jump = None;
+        if let Some((mi, session, id)) = pending.bare {
+            return Some(Action::JumpWorkspace {
+                machine: self.machines[mi].name(),
+                session,
+                id,
+            });
+        }
+        if self.card(&pending.key).is_some() {
+            return Some(Action::Jump(pending.key));
+        }
+        self.say(
+            format!(
+                "{} closed while {} was away; it's off the board now.",
+                pending.workspace, pending.machine
+            ),
+            Tone::Warn,
+        );
         None
     }
 
@@ -1524,7 +1625,10 @@ impl App {
         self.machines.iter().position(|m| m.answers_to(name))
     }
 
-    fn jump_action(&mut self, key: String) -> Action {
+    /// What ⏎ on this card does: go into its workspace, or, with none open, start it, reopen it or
+    /// move its conversation into herdr. Every ⏎ that waited (for its machine, a start, the next
+    /// card) makes this same choice when its turn comes (intent 0591).
+    pub fn jump_action(&mut self, key: String) -> Action {
         let Some(card) = self.card(&key).cloned() else {
             return Action::None;
         };
@@ -1546,13 +1650,19 @@ impl App {
             }
             return Action::Jump(key);
         }
+        // Followed work for it still going (a session starting, a move into herdr): said, and ⏎
+        // goes in once it's open (intent 0591).
+        if self.follow_holds(&card, "enter").is_some() {
+            return Action::None;
+        }
         if let Some(action) = self.outside_first(&card) {
             return action;
         }
         // Work under way whose workspace closed, or done work: reopen it rather than leave a dead
         // end. Done work is opened again only after a yes to the question its backend asks.
         if card.reopenable() {
-            return self.reopen_action(&card);
+            let action = self.reopen_action(&card);
+            return self.by_enter(action);
         }
         if card.dismissed() {
             self.say(
@@ -1575,56 +1685,78 @@ impl App {
             if self.just_started(&card) {
                 return Action::None;
             }
-            return self.intent_action_on(card, "dispatch", serde_json::json!({}));
+            let action = self.intent_action_on(card, "dispatch", serde_json::json!({}));
+            return self.by_enter(action);
         }
-        let what = match card.stage {
-            Stage::Backlog => "it hasn't started",
-            Stage::Maintain => "it's done",
-            _ => "it has no herdr workspace open",
+        // Backlog work that ran (its state says so) and has no workspace now: the reopen, whose
+        // backend resumes its conversation, or starts it when it never ran (intent 0591).
+        if self.actions_on()
+            && card.detail.is_some()
+            && card.stage == Stage::Backlog
+            && matches!(card.state.as_deref(), Some("active" | "background"))
+        {
+            let action = self.reopen_action(&card);
+            return self.by_enter(action);
+        }
+        // What's left can't be started or reopened from here: say why, plainly (intent 0591).
+        let reference = &card.reference;
+        let msg = if card.detail.is_none() {
+            format!(
+                "{} closed, and nothing recorded its conversation, so there's nothing to reopen.",
+                card.workspace_name()
+            )
+        } else if !self.actions_on() {
+            let what = match card.stage {
+                Stage::Backlog => "hasn't started",
+                Stage::Maintain => "is done",
+                _ => "has no herdr workspace open",
+            };
+            format!(
+                "{reference} {what}, and this board has no [actions] command to start or reopen it. m peeks at it."
+            )
+        } else if card.intake().is_some() {
+            format!("{reference} is still being written up; ⏎ goes in once it's under way.")
+        } else {
+            format!(
+                "{reference} has no herdr workspace open, and its record doesn't say it's waiting, under way or done, so Kerdr can't tell what to start. m peeks at it."
+            )
         };
-        let msg = format!(
-            "{} has nothing to jump into: {what}. m peeks at it.",
-            card.reference
-        );
         self.say(msg, Tone::Info);
         Action::None
     }
 
-    /// ⏎ on open work whose conversation runs in a terminal outside herdr: says where, and sends
-    /// nothing, since a reopen here would start a second copy of it. A second ⏎ on it within five
-    /// seconds goes on as ⏎ would, to the question the reopen asks (intent 0411).
+    /// ⏎ on open work whose conversation runs in a terminal outside herdr: it goes on to the reopen,
+    /// whose backend moves that conversation into herdr (stopping the outside copy once its turn
+    /// ends, then resuming it in a workspace of its home session) and answers with `follow`, so
+    /// Kerdr takes you in once it runs there (intent 0591, decision 2: without asking first). This
+    /// says what's happening meanwhile. An older backend still refuses, or asks before a second
+    /// copy, and that shows as it always has. Never anything to send by itself: None.
     fn outside_first(&mut self, card: &Card) -> Option<Action> {
         let outside = card.outside_herdr()?;
         if card.done() || !self.actions_on() {
             return None;
         }
-        if self
-            .outside_warned
-            .take()
-            .is_some_and(|(k, at)| k == card.key && at.elapsed() < Duration::from_secs(5))
-        {
-            return None;
-        }
-        let since = outside
-            .since
-            .as_deref()
-            .and_then(|t| DateTime::parse_from_rfc3339(t).ok())
-            .map(|t| format!(" since {}", self.when(t.with_timezone(&Local))))
-            .unwrap_or_default();
-        self.outside_warned = Some((card.key.clone(), Instant::now()));
         self.say(
             format!(
-                "{}'s conversation is running outside herdr, in {}{since}. Go to that window, or end it there and then press ⏎. To start a second copy here instead, press ⏎ again within five seconds.",
+                "Moving {}'s conversation from {} into herdr…",
                 card.reference,
                 outside.place()
             ),
             Tone::Info,
         );
-        Some(Action::None)
+        None
+    }
+
+    /// Notes that a start or reopen was ⏎'s: when it's followed, its end takes you in (intent 0591).
+    pub(crate) fn by_enter(&mut self, action: Action) -> Action {
+        if let Action::Mutate { request, .. } = &action {
+            self.enter_sent = request["id"].as_str().map(str::to_string);
+        }
+        action
     }
 
     /// A time for a sentence: "13:02" today, "yesterday 13:02", else "Mon 2 Nov 13:02".
-    fn when(&self, t: DateTime<Local>) -> String {
+    pub(super) fn when(&self, t: DateTime<Local>) -> String {
         let today = self.now().date_naive();
         let clock = t.format("%H:%M");
         if t.date_naive() == today {
@@ -1654,7 +1786,7 @@ impl App {
         let on_board = matches!(self.mode, Mode::Board);
         let stops_enter = self.enter_when_open.is_some() && self.enter_can_land_here();
         if key.code == KeyCode::Esc && (on_board || stops_enter) {
-            let let_go = self.resolver.let_go();
+            let let_go = self.resolver.let_go() | self.let_go_follows();
             let was_waiting = self.enter_when_open.is_some();
             self.forget_enter();
             if (self.busy && self.action_from.take().is_some()) || let_go || was_waiting {
@@ -2037,7 +2169,8 @@ impl App {
                     action
                 } else if card.can_reopen() || (card.can_reopen_done() && self.actions_on()) {
                     self.mode = Mode::Board;
-                    self.reopen_action(&card)
+                    let action = self.reopen_action(&card);
+                    self.by_enter(action)
                 } else if waiting_work(&card) && self.actions_on() {
                     // From a peek on it, which keeps it selected wherever its card sits (inside
                     // another card, a hidden column), so a question past the limit still asks.
@@ -2049,7 +2182,8 @@ impl App {
                     if self.just_started(&card) {
                         return Action::None;
                     }
-                    self.intent_action_on(card, "dispatch", serde_json::json!({}))
+                    let action = self.intent_action_on(card, "dispatch", serde_json::json!({}));
+                    self.by_enter(action)
                 } else {
                     self.mode = Mode::Peek {
                         scroll: 0,
@@ -3362,9 +3496,13 @@ pub(crate) mod tests {
             col: Stage::Backlog.index(),
             key: Some(key.clone()),
         };
-        // With no intent actions there's nothing to start it with.
+        // With no intent actions there's nothing to start it with, and ⏎ says why.
         assert_eq!(enter(&mut app), Action::None);
-        assert!(app.message().unwrap().0.contains("nothing to jump into"));
+        assert!(
+            app.message().unwrap().0.contains("no [actions] command"),
+            "{:?}",
+            app.message()
+        );
         app.cfg.actions.command = Some("test-adapter".into());
         let by_d = press(&mut app, 'd');
         app.busy = false;
@@ -3897,22 +4035,26 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_waiting_jump_into_an_intent_whose_workspace_closed_says_so_and_keeps_the_card() {
+    fn a_waiting_jump_into_an_intent_whose_workspace_closed_makes_plain_enters_choice() {
         let mut app = App::new(Config::default(), crate::demo::machines(true));
+        app.cfg.actions.command = Some("test-adapter".into());
         let card = away_card(&app, crate::model::Source::Feed);
         app.wait_to_jump(&card);
         build_box_back_without(&mut app, &card);
         assert!(app.card(&card.key).is_some_and(|c| !c.is_open_workspace()));
-        assert_eq!(app.pending_jump_ready(), None);
-        assert!(app.pending_jump.is_none());
-        let (text, _) = app.message().unwrap();
+        // Its turn: jump_cards takes it, and with no workspace makes the choice ⏎ makes (intent
+        // 0591), never "nothing to jump into".
         assert_eq!(
-            text,
-            format!(
-                "{}'s workspace closed while build-box was away.",
-                card.reference
-            )
+            app.pending_jump_ready(),
+            Some(Action::Jump(card.key.clone()))
         );
+        assert!(app.pending_jump.is_none());
+        let now = app.card(&card.key).unwrap().clone();
+        let Action::Mutate { request, .. } = app.jump_action(card.key.clone()) else {
+            panic!("plain ⏎'s choice sent nothing: {:?}", app.message())
+        };
+        let expected = if now.reopenable() { "reopen" } else { "dispatch" };
+        assert_eq!(request["action"], expected);
     }
 
     #[test]
@@ -3930,7 +4072,7 @@ pub(crate) mod tests {
             data,
             at: Local::now(),
         });
-        assert_eq!(app.pending_jump_ready(), Some(card.key));
+        assert_eq!(app.pending_jump_ready(), Some(Action::Jump(card.key)));
         assert!(app.pending_jump.is_none());
     }
 
@@ -5292,7 +5434,15 @@ pub(crate) mod tests {
             key: Some(key),
         };
         assert_eq!(enter(&mut app), Action::None);
-        assert!(app.message().unwrap().0.contains("nothing to jump into"));
+        // A workspace that closed with no record of its conversation: said plainly (intent 0591).
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("nothing recorded its conversation"),
+            "{:?}",
+            app.message()
+        );
     }
 
     /// Intent 0289: the Wi-Fi outage (0117)'s case, work its agent left open with no workspace.
@@ -5965,7 +6115,9 @@ pub(crate) mod tests {
             app.message()
                 .unwrap()
                 .0
-                .contains("nothing to jump into: it's done")
+                .contains("still being written up"),
+            "{:?}",
+            app.message()
         );
         app.board.cards[i].detail.as_mut().unwrap().intake = None;
         // Homed on a machine this Kerdr doesn't know: said, and nothing sent.
@@ -6375,24 +6527,33 @@ pub(crate) mod tests {
         assert!(app.closed_under_you(&key, Some("w5")));
         esc(&mut app);
         assert_eq!(app.pending_reopen, None);
-        // Its machine was away and its workspace closed meanwhile: reopen when it answers.
+        // Its machine was away and its workspace closed meanwhile: when it answers, the jump goes
+        // on as ⏎, which reopens it (intent 0591).
         app.board.cards[i].workspace_id = None;
         app.board.cards[i].session = None;
         let pending = |app: &App| PendingJump {
             key: key.clone(),
             workspace: "#41's workspace".into(),
             machine: app.card(&key).unwrap().machine.clone(),
+            stuck: None,
+            bare: None,
         };
         app.pending_jump = Some(pending(&app));
-        assert_eq!(app.pending_jump_ready(), None);
-        assert_eq!(app.pending_reopen.as_deref(), Some(key.as_str()));
-        // Without actions, it says what happened, as before.
-        app.pending_reopen = None;
+        assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
+        let Action::Mutate { request, .. } = app.jump_action(key.clone()) else {
+            panic!("no reopen")
+        };
+        assert_eq!(request["action"], "reopen");
+        // Without actions, it says why it can't, plainly.
         app.cfg.actions.command = None;
         app.pending_jump = Some(pending(&app));
-        assert_eq!(app.pending_jump_ready(), None);
-        assert_eq!(app.pending_reopen, None);
-        assert!(app.message().unwrap().0.contains("closed while"));
+        assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
+        assert_eq!(app.jump_action(key.clone()), Action::None);
+        assert!(
+            app.message().unwrap().0.contains("with [actions] configured"),
+            "{:?}",
+            app.message()
+        );
         assert!(!app.closed_under_you(&key, None));
     }
 
@@ -7134,7 +7295,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn enter_on_work_running_outside_herdr_says_where_before_a_second_copy() {
+    fn enter_on_work_running_outside_herdr_moves_it_into_herdr_at_once() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         app.fixed_now = Some(
@@ -7154,22 +7315,19 @@ pub(crate) mod tests {
                 terminal: Some("foot".into()),
                 since: Some(since),
             });
-        assert_eq!(enter(&mut app), Action::None, "nothing is sent");
-        let said = app.message().unwrap().0.to_string();
-        assert!(
-            said.starts_with(&format!(
-                "{reference}'s conversation is running outside herdr, in a foot window since yesterday 13:02."
-            )),
-            "{said}"
-        );
-        assert!(!said.contains("pid") && !said.contains("--"), "{said}");
-        // ⏎ again soon after goes on to the reopen, whose backend asks before a second copy.
+        // One ⏎: the reopen goes at once, whose backend moves the conversation into herdr
+        // (intent 0591, decision 2), and Kerdr says what's happening meanwhile.
         let Action::Mutate { request, .. } = enter(&mut app) else {
-            panic!("the second ⏎ sent nothing")
+            panic!("⏎ sent nothing: {:?}", app.message())
         };
         assert_eq!(request["action"], "reopen");
-        // Search's ⏎ says the same.
-        app.outside_warned = None;
+        let said = app.message().unwrap().0.to_string();
+        assert_eq!(
+            said,
+            format!("Moving {reference}'s conversation from a foot window into herdr…")
+        );
+        assert!(!said.contains("pid") && !said.contains("--"), "{said}");
+        // Search's ⏎ does the same.
         app.mode = Mode::Board;
         app.sel.key = Some(key.clone());
         let search = || Search {
@@ -7183,10 +7341,11 @@ pub(crate) mod tests {
             .find(|(h, _)| matches!(h, Hit::Card(c) if *c == i))
             .map(|(h, _)| h)
             .unwrap();
-        assert_eq!(app.open_hit(hit, search()), Action::None);
-        assert!(app.message().unwrap().0.contains("outside herdr"));
+        let Action::Mutate { request, .. } = app.open_hit(hit, search()) else {
+            panic!("search's ⏎ sent nothing")
+        };
+        assert_eq!(request["action"], "reopen");
         // Done work asks its own question as ever.
-        app.outside_warned = None;
         app.board.cards[i].stage = Stage::Maintain;
         assert!(matches!(enter(&mut app), Action::Mutate { .. }));
     }

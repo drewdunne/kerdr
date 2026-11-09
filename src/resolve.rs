@@ -330,6 +330,13 @@ pub struct Job {
     pub asking: bool,
     /// What a second key last said about it while it asks, which its answer takes down.
     pub said: Option<String>,
+    /// Answered with `follow` (intent 0591): the work goes on in a process of its own on that
+    /// machine, and Kerdr follows it. What it's doing now, in words for its card, and how long it
+    /// may stay shown without the feed showing it: the follow's own limit and a margin.
+    pub follow: Option<(String, Duration)>,
+    /// Asked for by ⏎ on its card, not by a key that only starts it (d): a start ⏎ asked for goes
+    /// in when the followed work is done, as a reopen does (intent 0591).
+    pub by_enter: bool,
 }
 
 impl Job {
@@ -359,6 +366,9 @@ impl Job {
     /// stays until its record is read, however long that takes: its card says so once it's late
     /// (review of intent 0445).
     fn life(&self) -> Duration {
+        if let Some((_, life)) = &self.follow {
+            return *life;
+        }
         match self.effect {
             Some(Effect::StartingOn(_)) => ELSEWHERE_MOST,
             Some(Effect::Saving(_)) => Duration::MAX,
@@ -368,7 +378,7 @@ impl Job {
 
     /// Whether only the feed showing it retires it, not a count of reads.
     fn waits_for_feed(&self) -> bool {
-        matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
+        self.follow.is_some() || matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
     }
 
     /// The record it changes, by id.
@@ -604,6 +614,8 @@ impl Resolver {
             dropping: false,
             asking: false,
             said: None,
+            follow: None,
+            by_enter: false,
         });
         self.next
     }
@@ -819,6 +831,56 @@ impl Resolver {
         self.jobs.insert(at, job);
     }
 
+    /// Keeps a change answered with `follow` showing while Kerdr follows it, saying `say` on its
+    /// card, for at most `life` unless the feed shows it first (intent 0591). A start stays where
+    /// it is, saying so, until the follow says it has started.
+    pub fn settle_following(&mut self, mut job: Job, say: String, life: Duration) {
+        job.settled = Some((Instant::now(), 0));
+        job.follow = Some((say, life));
+        let at = self.jobs.partition_point(|j| j.n < job.n);
+        self.jobs.insert(at, job);
+    }
+
+    /// Marks a change as asked for by ⏎ (Job::by_enter).
+    pub fn mark_by_enter(&mut self, n: u64) {
+        if let Some(job) = self.jobs.iter_mut().find(|j| j.n == n) {
+            job.by_enter = true;
+        }
+    }
+
+    /// What a followed change is doing now, for its card. Whether it's still shown.
+    pub fn follow_say(&mut self, n: u64, say: &str) -> bool {
+        match self.jobs.iter_mut().find(|j| j.n == n) {
+            Some(Job {
+                follow: Some((words, _)),
+                ..
+            }) => {
+                *words = say.to_string();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A followed change has ended. Done, it shows as any change answered yes does from now, until
+    /// the feed has it; otherwise it goes, and its card is as the feed says. Whether it was shown.
+    pub fn end_follow(&mut self, n: u64, done: bool) -> bool {
+        let Some(i) = self.jobs.iter().position(|j| j.n == n && j.follow.is_some()) else {
+            return false;
+        };
+        if !done {
+            self.jobs.remove(i);
+            return true;
+        }
+        let job = &mut self.jobs[i];
+        job.follow = None;
+        job.settled = Some((Instant::now(), 0));
+        if job.effect == Some(Effect::Starting) {
+            job.effect = Some(Effect::Started);
+        }
+        true
+    }
+
     /// A change refused where it was asked, sent on to the machine that refusal named: it goes
     /// back in its place, unanswered, so nothing made after it for its record overtakes it.
     pub fn retarget(
@@ -988,6 +1050,11 @@ impl Resolver {
                     let this = format!("{source}:{}", fc.id);
                     if &this == key {
                         effect.apply(fc, key);
+                        // Followed: what it's doing now, in the backend's words (intent 0591).
+                        if let Some((say, _)) = job.follow.as_ref().filter(|(s, _)| !s.is_empty()) {
+                            fc.status = Some(say.clone());
+                            fc.no_agent = false;
+                        }
                     } else if let Effect::Order(order) = effect
                         && order.iter().any(|(k, _)| *k == this)
                     {
