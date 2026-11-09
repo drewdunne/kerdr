@@ -1980,7 +1980,8 @@ impl App {
                 }
                 KeyCode::Char('y') if Instant::now() >= *ready_at => {
                     if target.as_ref().is_none_or(|t| self.target_answerable(t)) {
-                        request = Some((*machine, pending.clone()));
+                        // A yes is a new request: never the question's op (intent 0591).
+                        request = Some((*machine, crate::actions::without_op(pending)));
                         self.mode = *back;
                         if let Some((mi, r)) = request {
                             return self.send_account(mi, r);
@@ -2166,8 +2167,11 @@ impl App {
         request: Value,
         result: Result<Response, String>,
     ) {
+        // The answer's request carries the op Kerdr gave it as it went (intent 0591).
         let pending = self.account_pending.take().filter(|p| {
-            p.machine == machine && p.request == crate::actions::request_metadata(&request)
+            p.machine == machine
+                && crate::actions::without_op(&p.request)
+                    == crate::actions::without_op(&crate::actions::request_metadata(&request))
         });
         let visible = match (&pending, &self.mode) {
             (Some(p), Mode::Accounts { screen, .. }) => p
@@ -2477,7 +2481,10 @@ impl App {
             ) = (response.confirm, &self.mode)
             {
                 if request["confirm"].as_str() == Some(&token) {
-                    self.say("The backend repeated the same move question. Refresh the account state before trying again.", Tone::Warn);
+                    let name = self.machines[machine].name();
+                    self.fail(format!(
+                        "{name}'s backend asked the same question again after your yes, so nothing moved. That's a fault there, and it's in the error log; s on the card offers the move again."
+                    ));
                     return;
                 }
                 let target = target.clone();
@@ -2646,6 +2653,8 @@ mod tests {
     }
     fn complete(a: &mut App, action: Action, reply: Value) {
         let (mi, r) = sent(action);
+        // As start_action sends it: an account request goes with an op of its own (intent 0591).
+        let r = crate::actions::with_op(r);
         a.finish_action(
             mi,
             r,

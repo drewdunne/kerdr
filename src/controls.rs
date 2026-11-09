@@ -1950,6 +1950,10 @@ impl App {
                 plain,
                 ..
             } => {
+                // A yes is a new request: never the question's op (intent 0591).
+                if let Some(fields) = request.as_object_mut() {
+                    fields.remove("op");
+                }
                 // A question that just appeared, or a key held down, never answers it.
                 let early = key.kind == KeyEventKind::Repeat
                     || ready_at.is_some_and(|at| Instant::now() < at);
