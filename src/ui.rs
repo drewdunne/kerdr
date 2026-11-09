@@ -326,6 +326,35 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
     spans
 }
 
+/// What gets a card that needs you, and has no workspace open, somewhere to answer: what does work
+/// for it, never only that it has none (intent 0591).
+pub(crate) fn where_to_answer(app: &App, c: &Card) -> String {
+    if !app.actions_on() {
+        return "It has no workspace open, and this board has no [actions] command to start one for it.".into();
+    }
+    if c.outside_herdr().is_some() && !c.done() {
+        return "It runs in a terminal outside herdr: ⏎ moves it into herdr to answer in.".into();
+    }
+    if c.dismissed() {
+        return "It's in won't do: u brings it back, then ⏎ starts it.".into();
+    }
+    if c.can_reopen_done() {
+        return "It's done: ⏎ asks to reopen it to answer in.".into();
+    }
+    if c.can_reopen() {
+        return "Its workspace closed: ⏎ reopens it to answer in.".into();
+    }
+    if c.stage == Stage::Backlog {
+        let questions = c.detail.as_ref().is_some_and(|d| d.kickoff.is_some());
+        return if questions {
+            "d asks its questions in the Kickoff box, then starts it.".into()
+        } else {
+            "⏎ starts it, opening a workspace for it.".into()
+        };
+    }
+    "⏎ opens a workspace for it to answer in.".into()
+}
+
 /// Work already started with no workspace open, selected on the board: ⏎ reopens it, and C and
 /// x end it without starting anything (intent 0289). Else what done_hints says.
 fn started_hints(app: &App) -> Vec<Span<'static>> {
@@ -337,7 +366,10 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
     };
     let mut spans = card_badge(card, if card.no_agent() { YELLOW } else { CYAN });
     let mut hints: Vec<(&str, String)> = vec![];
-    if card.reopenable() {
+    if card.outside_herdr().is_some() && !card.done() {
+        // ⏎ moves its conversation into herdr, and goes in (intent 0591).
+        hints.push(("⏎", "move it into herdr".into()));
+    } else if card.reopenable() {
         hints.push(("⏎", "reopen it".into()));
     }
     if let Some(m) = move_hint(app, card) {
@@ -2307,11 +2339,9 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             .unwrap_or_else(|| c.why.clone());
         lines.extend(wrapped(&needs, w, fg(FG), Some(("▌ ", ORANGE))));
         let how = if c.is_open_workspace() {
-            "Answer in its pane: ⏎ jumps in."
-        } else if c.can_reopen() && app.actions_on() {
-            "Its workspace closed: ⏎ reopens it to answer in."
+            "Answer in its pane: ⏎ jumps in.".to_string()
         } else {
-            "It has no workspace open to answer in."
+            where_to_answer(app, c)
         };
         lines.push(Line::from(vec![
             Span::styled("▌ ", fg(ORANGE)),
@@ -4975,7 +5005,14 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                     Some(n) => format!("{} has room: {n} free.", r.session),
                     None => format!("{} has no limit.", r.session),
                 },
-                None => "Its session isn't running, or isn't on a machine Kerdr can see.".into(),
+                // Its backend starts the session first (intent 0591).
+                None => match c.session.as_deref() {
+                    Some(s) => format!(
+                        "{s} isn't running on {}: d starts it there first, then the work in it.",
+                        c.machine
+                    ),
+                    None => "d starts it in its owner's session, starting that session first if it isn't running.".into(),
+                },
             }
         };
         out.extend(wrapped(&advice, w, fg(FG), None));
@@ -5956,8 +5993,46 @@ mod tests {
             terminal: Some("foot".into()),
             since: None,
         });
+        let (key, reference) = (card.key.clone(), card.reference.clone());
         let board = rendered(&a, 220, 44);
         assert!(board.contains("outside herdr · foot"), "{board}");
+        // ⏎ moves it into herdr (intent 0591), and its hint says so rather than "reopen it".
+        a.sel = crate::app::Selection {
+            col: Stage::Build.index(),
+            key: Some(key),
+        };
+        let board = rendered(&a, 220, 44);
+        assert!(
+            board.contains(&format!(" {reference}   ⏎ move it into herdr")),
+            "{board}"
+        );
+        assert!(!board.contains("⏎ reopen it"), "{board}");
+    }
+
+    /// Intent 0591: a card that needs you with no workspace open says what gets it one, never only
+    /// that it has none.
+    #[test]
+    fn work_that_needs_you_with_no_workspace_says_what_gets_it_one() {
+        let mut a = demo(false);
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Backlog && c.detail.is_some() && !c.dismissed())
+            .unwrap()
+            .clone();
+        assert!(where_to_answer(&a, &card).contains("no [actions] command"));
+        a.cfg.actions.command = Some("test-adapter".into());
+        let mut questions = card.clone();
+        questions.detail.as_mut().unwrap().kickoff =
+            serde_json::from_value(serde_json::json!({"asked":"t","questions":[]})).ok();
+        assert!(where_to_answer(&a, &questions).starts_with("d asks its questions"));
+        let mut none = card.clone();
+        none.detail.as_mut().unwrap().kickoff = None;
+        assert!(where_to_answer(&a, &none).starts_with("⏎ starts it"));
+        let mut aside = none.clone();
+        aside.detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        assert!(where_to_answer(&a, &aside).contains("u brings it back"));
     }
 
     #[test]

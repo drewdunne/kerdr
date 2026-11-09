@@ -7319,6 +7319,185 @@ pub(crate) mod tests {
         assert_eq!(app.card(&key).unwrap().machine_index, 0);
     }
 
+    /// The card's conversation runs in a foot window outside herdr, since 13:02 on 1 November.
+    fn runs_outside(app: &mut App, key: &str) -> String {
+        let since = chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 11, 1, 13, 2, 0)
+            .single()
+            .unwrap()
+            .to_rfc3339();
+        for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.detail.as_mut().unwrap().outside_herdr = Some(crate::feed::OutsideHerdr {
+                terminal: Some("foot".into()),
+                since: Some(since.clone()),
+            });
+        }
+        since
+    }
+
+    /// Intent 0591: C and x on work whose conversation runs outside herdr go to its backend, which
+    /// stops it there first and asks before it does; its question is the one asked, and the yes
+    /// carries its token.
+    #[test]
+    fn c_and_x_on_work_running_outside_herdr_ask_its_backend_first() {
+        for (key_char, action, title) in [('C', "close", "Mark"), ('x', "dismiss", "Won't do")] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = closed_workspace_card(&mut app);
+            let reference = app.card(&key).unwrap().reference.clone();
+            let since = runs_outside(&mut app, &key);
+            let Action::Mutate { machine, request } = press(&mut app, key_char) else {
+                panic!("{key_char} sent nothing: {:?}", app.message())
+            };
+            assert_eq!(
+                request,
+                serde_json::json!({"action": action, "id": id, "outside_since": since})
+            );
+            // It can only come back as a question, so the card doesn't show it done meanwhile.
+            assert_eq!(app.effect_for(&key, &request), None);
+            let asked = format!(
+                "{reference}'s Codex conversation is running in a foot window since 13:02, outside herdr. A yes stops that agent once its current turn ends, with nothing lost. Stop it?"
+            );
+            app.finish_action(
+                machine,
+                request,
+                Ok(crate::actions::parse_response(
+                    &serde_json::json!({"ok":false,"confirmation":true,"confirm":"t-1","id":id,"message":asked}).to_string(),
+                )
+                .unwrap()),
+            );
+            let Mode::Confirm {
+                title: t, message, ..
+            } = &app.mode
+            else {
+                panic!("its question wasn't asked: {:?}", app.message())
+            };
+            assert!(t.starts_with(title), "{t}");
+            assert_eq!(message, &asked);
+            settle(&mut app);
+            let Action::Mutate { request, .. } = enter(&mut app) else {
+                panic!("yes sent nothing: {:?}", app.message())
+            };
+            assert_eq!(request["action"], action);
+            assert_eq!(request["override"], true);
+            assert_eq!(request["confirm"], "t-1");
+            assert_eq!(request["outside_since"], since.as_str());
+        }
+    }
+
+    /// Intent 0591: X on work whose conversation runs outside herdr asks, naming that window, and
+    /// its yes names it too, so the backend stops only that one. Moved into herdr meanwhile, the yes
+    /// sends nothing.
+    #[test]
+    fn x_upper_on_work_running_outside_herdr_names_the_window_it_stops() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.fixed_now = Some(
+            chrono::TimeZone::with_ymd_and_hms(&Local, 2026, 11, 2, 9, 0, 0)
+                .single()
+                .unwrap(),
+        );
+        let (key, id) = closed_workspace_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let since = runs_outside(&mut app, &key);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("X didn't ask: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {reference}?"));
+        assert!(
+            message.starts_with("Stops its Codex conversation running in a foot window since"),
+            "{message}"
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(
+            request,
+            serde_json::json!({"action": "cancel", "id": id, "outside_since": since})
+        );
+        // Asked again, and moved into herdr before the yes: nothing is stopped.
+        app.busy = false;
+        press(&mut app, 'X');
+        settle(&mut app);
+        for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.workspace_id = Some("w9".into());
+            c.session = Some("web".into());
+        }
+        assert!(!matches!(enter(&mut app), Action::Mutate { .. }));
+    }
+
+    /// Intent 0591: ⏎ on a card whose herdr session didn't answer its last read waits for it, then
+    /// goes in; after a minute still stuck, it says so instead.
+    #[test]
+    fn a_jump_waits_for_a_stuck_session_then_goes_in() {
+        let mut app = demo_app();
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.is_open_workspace() && app.machines[c.machine_index].conn.is_live())
+            .unwrap()
+            .clone();
+        let (mi, session) = (card.machine_index, card.session.clone().unwrap());
+        app.machines[mi]
+            .snapshot_errors
+            .insert(session.clone(), "timed out".into());
+        app.wait_for_stuck(mi, &session, &card.workspace_name(), Some(&card.key), None);
+        assert!(app.message().unwrap().0.starts_with("Waiting for"));
+        assert_eq!(app.pending_jump_ready(), None);
+        app.machines[mi].snapshot_errors.remove(&session);
+        assert_eq!(
+            app.pending_jump_ready(),
+            Some(Action::Jump(card.key.clone()))
+        );
+        assert!(app.pending_jump.is_none());
+        // Still stuck after a minute.
+        app.machines[mi]
+            .snapshot_errors
+            .insert(session.clone(), "timed out".into());
+        app.wait_for_stuck(mi, &session, &card.workspace_name(), Some(&card.key), None);
+        app.pending_jump.as_mut().unwrap().stuck.as_mut().unwrap().1 -=
+            STUCK_WAIT + Duration::from_secs(1);
+        assert_eq!(app.pending_jump_ready(), None);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.contains("still isn't answering after a minute"),
+            "{said}"
+        );
+        assert!(app.pending_jump.is_none());
+    }
+
+    /// Intent 0591: herdr says the workspace ⏎ went for has closed. A card that has another one
+    /// open goes there, once; work nobody started is started, as plain ⏎ would.
+    #[test]
+    fn a_workspace_closed_under_you_makes_plain_enters_choice() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.workspace_id = Some("w5".into());
+            c.session = Some("web".into());
+            if let Some(d) = c.detail.as_mut() {
+                d.kickoff = None;
+            }
+        }
+        // Another workspace than the one that closed: go there, once.
+        assert_eq!(
+            app.after_closed(&key, Some("w4"), false),
+            Action::Jump(key.clone())
+        );
+        // The one that closed, on work nobody started: it starts.
+        let Action::Mutate { request, .. } = app.after_closed(&key, Some("w5"), false) else {
+            panic!("nothing started: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert!(request.get("workspace").is_none());
+        assert!(app.enter_sent.is_some(), "its answer goes in as ⏎'s would");
+        assert!(app.action_from.is_some());
+    }
+
     #[test]
     fn enter_on_work_running_outside_herdr_moves_it_into_herdr_at_once() {
         let mut app = demo_app();

@@ -1145,44 +1145,17 @@ impl App {
         if let Some(obj) = extra.as_object() {
             request.as_object_mut().unwrap().extend(obj.clone());
         }
-        // Its conversation runs in a terminal outside herdr: C and x stop it there first, as X
-        // does, and the question says so (intent 0591). `outside` tells the backend this yes was
-        // to that; an older one refuses as before.
-        let outside = (ends && started)
-            .then(|| self.outside_said(&card))
-            .flatten();
-        if let Some((_, since)) = &outside {
-            request["outside"] = json!(since);
-        }
-        if ends && let Some((stops, _)) = outside {
-            let reference = &card.reference;
-            let (title, message) = if action == "close" {
-                (
-                    format!("Mark {reference} done?"),
-                    format!(
-                        "Stops {stops} once its current turn ends, then closes {reference} as done. Its log says you closed it from Kerdr, and ⏎ on it later asks to reopen it."
-                    ),
-                )
-            } else {
-                (
-                    format!("Won't do {reference}?"),
-                    format!(
-                        "Stops {stops} once its current turn ends, then sets {reference} aside in Won't do, off the board. Its record keeps where it was; u brings it back, and ⏎ then resumes its conversation."
-                    ),
-                )
-            };
-            self.mode = Mode::Confirm {
-                machine,
-                request,
-                title,
-                message,
-                back: Box::new(self.mode.clone()),
-                target: Some(Box::new(CardSnapshot::of(&card))),
-                queue: false,
-                ready_at: None,
-                plain: false,
-            };
-            return Action::None;
+        // Its conversation runs in a terminal outside herdr: C and x go straight to its backend,
+        // which stops it there first and asks before it does, naming where it runs (intent 0591):
+        // that question is the one he answers, not a second of Kerdr's. `outside_since` is the
+        // window the card shows; an older backend refuses as before.
+        if ends
+            && started
+            && let Some((_, since)) = self.outside_said(&card)
+        {
+            request["outside_since"] = json!(since);
+            self.action_from = Some(CardSnapshot::of(&card));
+            return Action::Mutate { machine, request };
         }
         if ends {
             let (title, message) = match (action, started) {
@@ -1281,7 +1254,8 @@ impl App {
             if !self.can_write(machine) {
                 return Action::None;
             }
-            let request = json!({"action":"cancel","id":detail.id,"outside":since});
+            // `outside_since` names the window this yes was for: its backend stops only that one.
+            let request = json!({"action":"cancel","id":detail.id,"outside_since":since});
             self.mode = Mode::Confirm {
                 machine,
                 request,
@@ -2252,10 +2226,17 @@ impl App {
 
     /// What a start or reopen that shows nothing on its card says instead until it's answered.
     fn asking_line(&self, request: &Value) -> Option<String> {
-        if !matches!(request["action"].as_str(), Some("dispatch" | "reopen")) {
+        let outside = matches!(request["action"].as_str(), Some("close" | "dismiss"))
+            && request.get("outside_since").is_some();
+        if !matches!(request["action"].as_str(), Some("dispatch" | "reopen")) && !outside {
             return None;
         }
         let reference = self.reference_for(request["id"].as_str()?);
+        if outside {
+            return Some(format!(
+                "Asking about stopping {reference}'s conversation outside herdr…"
+            ));
+        }
         Some(if request["queue"] == true {
             format!("Queuing {reference}…")
         } else {
@@ -2305,6 +2286,13 @@ impl App {
     pub(super) fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
         Some(match request["action"].as_str()? {
             "dispatch" | "reopen" if request["queue"] == true || self.asks_first(key, request) => {
+                return None;
+            }
+            // C or x on a conversation outside herdr: its backend asks before it stops it, so
+            // nothing shows until its yes (intent 0591).
+            "close" | "dismiss"
+                if request.get("outside_since").is_some() && request.get("override").is_none() =>
+            {
                 return None;
             }
             "dispatch" => Effect::Starting,
@@ -3529,7 +3517,9 @@ impl App {
                     // Asked about its conversation outside herdr: only while it still runs there,
                     // the same work, so nothing in herdr is stopped by a yes meant for it (intent
                     // 0591).
-                    Some("close" | "dismiss" | "cancel") if request.get("outside").is_some() => {
+                    Some("close" | "dismiss" | "cancel")
+                        if request.get("outside_since").is_some() =>
+                    {
                         c.outside_herdr().is_some()
                             && !c.dismissed()
                             && !c.done()
