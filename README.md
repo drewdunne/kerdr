@@ -2,7 +2,7 @@
 
 **An opinionated kanban cockpit for driving [herdr](https://herdr.dev) sessions.**
 
-![Kerdr's board: every agent's work across two machines, by stage, with what needs you first](docs/screenshots/board.png)
+![Kerdr's board: every owner's work across two machines, by stage, with what needs you first](docs/screenshots/board.png)
 
 Kerdr is a full-screen board for people who run many coding agents at once in herdr. Every
 record of work becomes a card, in a column for the stage its work is at. Agent conversations
@@ -47,11 +47,14 @@ question, something stuck. Everything else keeps running without you.
 
 ## Opinionated, on purpose
 
-- **The stages are Anthropic's.** The columns are the six stages of Anthropic's
+- **The stages start as Anthropic's, and each team can have its own.** The standard columns are
+  the six stages of Anthropic's
   [AI-native SDLC playbook](https://claude.com/resources/articles/the-ai-native-sdlc-playbook):
   Plan, Design, Build, Test, Deploy and Maintain, with a Backlog in front for work that hasn't
-  started. Finished work lands in Maintain. If you'd rather give the cards more room, the config
-  can leave the Backlog and Maintain columns off the board (`hide_columns`); their work stays a
+  started. Finished work lands in Maintain. A feed can give a team a stage list of its own (a
+  marketing team's Plan, Test, Execute, Learn), and its work shows in those columns instead;
+  Backlog and Maintain stay the same for everyone. If you'd rather give the cards more room, the
+  config can leave columns off the board (`hide_columns`); Backlog's and Maintain's work stays a
   key away, in the backlog (`b`) and Done (`D`).
 - **What needs you comes first,** in every column.
 - **Work-in-progress limits.** Each herdr session holds three workspaces with an agent before
@@ -108,9 +111,46 @@ them to each machine's herdr config with `kerdr herdr-keys --install`. Then they
 herdr's own keybinds menu (`prefix ?`) under *custom*, and they work over SSH. `prefix q` works
 without them.
 
+### Owners and teams
+
+When a feed lists owners (whoever the work is for: an organization, or a tenant inside one), the
+top bar splits the board by owner, then by team. On all of Kerdr the tabs are the owners with
+work, grouped under their organization, each with how much is under way and how many cards need
+you (`ARK 1   SHP 8 ●3   PLT 4`); cards name their owner's code. `{` and `}` step through the
+owners, from wherever you are. On an owner the box in front names it, with how full its main
+session is on the machine its work runs on (`Shop · SHP`), and the tabs are its `All`, each of
+its teams, and `No team` while any of its work has none; `[` and `]` step through them, cards on
+`All` name their team, and a team with nothing open is dimmed, there to start work in. Tab goes
+to the next tab in the row, whatever it lists, `1` to `9` pick tab 1 to 9, and `0` goes back to
+all of Kerdr. Work no listed owner claims has an `Unowned` tab of its own, while there is some.
+
+![An owner's work: its teams as tabs, and a band for each stage list its teams use](docs/screenshots/owner-teams.png)
+
+Each team's work moves through its own stages, the columns between Backlog and Done on its tab.
+On a view that mixes teams with different stage lists (an owner's `All`, or all of Kerdr), Backlog
+stays on the left and Done on the right, and between them each list in view gets a band of its
+own columns, stacked and titled with whose list it is and who's on it, the bands with the most
+needing you first. Teams on the same list share a band, so a board whose teams all use one list
+looks as it always did. A band with nothing under way folds to one line, and when the bands
+don't all fit, those with nothing needing you fold first; moving onto one with `j` or `k`, or
+going to one of its cards with `n`, opens it. A card whose list or stage Kerdr wasn't sent gets a
+column of its own at the end of its band, marked as an unknown stage, never another stage's.
+
+![One team's tab: its own stages between Backlog and Done](docs/screenshots/team-stages.png)
+
+`c` files the new intent under the owner and team you're looking at (on all of Kerdr, under no
+one, and your adapter works out whose it is). A machine whose feed doesn't say its adapter takes
+a team gets the intent under the owner's No team, and the box says so before you send it.
+
+Machines leave the top bar but keep their places: `M` lists them, the line under the bar names
+one that needs you, `f` has a Machine row, a card's peek says where it runs, and `A` opens on the
+machine the chosen owner's work runs on. A feed with no owners keeps the machine split below, and
+`[board] split = "machines"` keeps it whatever the feeds list.
+
 ### Every session, every machine
 
-The leftmost tab is the machine selector: `All`, then one machine at a time with `{` and `}`.
+On the machine split (a feed that lists no owners, or `[board] split = "machines"`), the leftmost
+tab is the machine selector: `All`, then one machine at a time with `{` and `}`.
 Only the selected machine's sessions appear beside it. `[` and `]` move between those sessions,
 and `1` to `9` jump straight to a session. `0` returns to the all-machine overview. Machine and session keys work even when the current
 board is empty; the empty view shows these keys and how to reach Misc conversations.
@@ -284,14 +324,17 @@ with `wl-paste` (from wl-clipboard) under Wayland, `xclip` under X11, `osascript
 PowerShell on Windows; where there's no desktop clipboard (over SSH, say), it says so, and a
 pasted path still works.
 
-`f` opens the filters. Its list is every owner (organization or tenant) and its projects, with
-how much of each is under way and waiting; `j`/`k` or the arrows move, `/` searches the list, and
+`f` opens the filters. On the owner split its list is the tree of owners and their teams, grouped
+by organization, then the chosen owner's projects and each machine, with how much of each is under
+way and waiting; Enter on an owner or a team sets the top bar to it, so the bar and `f` are one
+choice, never two filters that can disagree. On the machine split the list is every owner
+(organization or tenant) and its projects. `j`/`k` or the arrows move, `/` searches the list, and
 Enter shows only that one. `a` (or Tab there) cycles the provider herdr reports: All, Claude,
 Codex, and additional detected providers; cards with no reported agent appear in All. `b` there
 cycles background work: every card, only cards marked `bg` (their intent's lane is background, or
 they run in a session `[board] unlimited` names), or none of them. `F` shows everything again.
-These filters combine with machine and session selection, and the top of the board names them
-while one is on. Organization work stays distinct from tenant work.
+These filters combine with the top bar's choice, and the top of the board names them while one is
+on. Organization work stays distinct from tenant work.
 
 ![The filters: who it's for, agents and background work](docs/screenshots/filter.png)
 
@@ -426,22 +469,23 @@ Account features work through the optional [feed and action contract](docs/feed.
 
 | On the board | |
 |---|---|
-| `h j k l` or arrows | move between columns and cards |
+| `h j k l` or arrows | move between columns and cards; on a board of bands, `j` and `k` go on into the band below or above |
 | `Enter` | jump in; on work nobody started, start it, as `d` does; on work whose workspace closed, reopen it; on done work, ask to reopen it (all three with actions) |
 | `m` or `Space` | peek |
 | `o` | the card's own screen: itself, then what's inside (also from the backlog and a peek); there, `j` `k` move, `Enter` goes where the row runs or opens a folded group, `Space` peeks, `d` `e` `y` `x` `C` `X` `s` act on the row, `Esc` goes back |
 | `n` / `N` | next / previous card that needs you, or work inside a card, opening its screen on it (also `Ctrl+Alt+j/k`; in the backlog and Done too) |
-| `[` / `]` | previous / next session (also `Ctrl+Alt+h/l`, `Tab`) |
-| `{` / `}` | previous / next machine (also `Ctrl+Alt+Shift+h/l`) |
-| `0`, `1`..`9` | every session, or session tab 1 to 9 |
+| `{` / `}` | previous / next owner, from wherever you are; on the machine split, machine (also `Ctrl+Alt+Shift+h/l`) |
+| `[` / `]` | previous / next of the chosen owner's tabs: All, each team, No team; on the machine split, session (also `Ctrl+Alt+h/l`) |
+| `Tab` | the next tab in the row: owners on all of Kerdr, teams on an owner, sessions on a machine |
+| `0`, `1`..`9` | all of Kerdr, or tab 1 to 9 in the row |
 | `/` | search everything; in the backlog, Won't do, Done or Misc, search only that list (`Esc` clears it) |
 | `c` | new intent, in your own words (in it, `Ctrl+V` attaches the clipboard's image) |
 | `d` `y` `x` `u` `J` `K` `t` `B` | start, still want it, won't do, bring back, move down / up, to the top, to the bottom (the selected backlog intent) |
 | `e` | edit the selected backlog intent's text, the words that started it, in your own editor: `:wq` saves it, `:cq` leaves it as it was (with actions) |
 | `C` | done: close the selected intent, starting nothing (backlog work, or started work with no workspace open; asks first). `x` sets started work with no workspace aside too |
 | `X` | cancel: stop the selected card's agent, close its workspace (or only a child's tab), and set it aside in Won't do (work an agent is at; asks first) |
-| `f` / `F` | filters / show everything: in `f`, Enter shows only one owner or project, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
-| `A` / `S` / `s` | accounts / the ordered models agents start on next, of the viewed session's owner, else the selected card's / move the selected card’s agent to another account, keeping its conversation, or, with none running, start it on the account you pick |
+| `f` / `F` | filters / show everything: in `f`, Enter sets the top bar to an owner or team, or shows only one project or machine, `/` searches that list, `a` or `Tab` cycles agents, `b` cycles background work (all, bg only, no bg) |
+| `A` / `S` / `s` | accounts, on the machine the chosen owner's work runs on / the ordered models agents start on next, of the chosen owner or the viewed session's, else the selected card's / move the selected card’s agent to another account, keeping its conversation, or, with none running, start it on the account you pick |
 | `a` | cycle agents: all, each program the feeds name, then any other herdr reports |
 | `b` | backlog |
 | `w` | toggle Won't do view |
@@ -581,7 +625,8 @@ slots = 3                   # workspaces with an agent per session before it's f
 unlimited = ["*-bg", "background"] # sessions with no limit; * matches any text
 skip = []                   # sessions never shown
 only = []                   # show only these sessions
-hide_columns = []           # "backlog", "maintain" or both: left off the board, for more room
+hide_columns = []           # "backlog", "maintain", or any stage's id: left off the board
+# split = "machines"        # keep the machine and session split even when a feed lists owners
 
 [[machine]]
 name = "build-box"          # the name on the board
@@ -597,10 +642,14 @@ anywhere in the name. For example, `"*-bg"` includes `pick4me-bg` and `arknet-bg
 `pick4me`; `"background"` remains an exact match. Other characters are literal, and matching
 is case-sensitive. A feed's explicit slot counts and limits still take precedence.
 
-`[board] hide_columns` leaves the Backlog or Maintain column, or both, off the board, and the
-other columns share the room. Only those two can go, since each has a screen of its own: the
-backlog (`b`) and Done (`D`). `n` still reaches a backlog card that needs you, opening the backlog
-on it.
+`[board] hide_columns` (or `hide`) leaves columns off the board, and the others share the room:
+Backlog and Maintain, each of which has a screen of its own (the backlog, `b`, and Done, `D`), and
+any stage by its id, on every stage list that has it (`"deploy"`, `"learn"`). `n` still reaches a
+backlog card that needs you, opening the backlog on it, and a hidden stage's card on its own
+screen; `/` finds them too.
+
+`[board] split` says what the top bar splits the board by: `"owners"` (the default) whenever a
+feed lists owners, else machines; `"machines"` keeps machines and their herdr sessions.
 
 The same file works on every machine: the machine whose hostname matches a `name` is "this
 machine", and Kerdr reaches the others over SSH. If you use the herdr session picker for

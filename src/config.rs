@@ -33,9 +33,25 @@ pub struct BoardConfig {
     pub only: Vec<String>,
     /// Never show these sessions.
     pub skip: Vec<String>,
-    /// Columns the board leaves out, giving their room to the others: `backlog`, `maintain`, or
-    /// both. Only these two can go, since each has a screen of its own (`b` and `D`).
+    /// Columns the board leaves out, giving their room to the others: `backlog`, `maintain`, and
+    /// any stage by its id (`deploy`, `learn`), on every stage list (intent 0595). `hide` names
+    /// the same.
+    #[serde(alias = "hide")]
     pub hide_columns: Vec<String>,
+    /// What the top bar splits the board by: `owners` (the default) when a feed lists them, else
+    /// machines; `machines` keeps the machine and session split whatever the feeds list.
+    pub split: Split,
+}
+
+/// What the top bar splits the board by (intent 0595).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum Split {
+    /// Owners, then each owner's teams, whenever a feed lists owners; else machines.
+    #[default]
+    Owners,
+    /// Machines, then each machine's herdr sessions.
+    Machines,
 }
 
 impl BoardConfig {
@@ -61,24 +77,24 @@ impl BoardConfig {
         })
     }
 
-    /// Whether the config leaves this stage's column off the board.
+    /// Whether the config leaves this stage's column off the board: Backlog and Maintain by any
+    /// of their names, any other stage by its id, on whatever list it's on.
     pub fn hides(&self, stage: crate::model::Stage) -> bool {
-        self.hide_columns
-            .iter()
-            .any(|c| crate::model::Stage::parse(c) == Some(stage))
+        use crate::model::Stage;
+        self.hide_columns.iter().any(|c| match stage {
+            Stage::Backlog | Stage::Maintain => Stage::parse(c) == Some(stage),
+            _ => c.trim().eq_ignore_ascii_case(stage.id()),
+        })
     }
 
-    /// A column name that can't be hidden, as the error to show.
+    /// A column name that can't be hidden, as the error to show: Misc isn't a column.
     fn check_hidden(&self) -> Result<(), String> {
-        use crate::model::Stage;
         for c in &self.hide_columns {
-            match Stage::parse(c) {
-                Some(Stage::Backlog | Stage::Maintain) => {}
-                _ => {
-                    return Err(format!(
-                        "[board] hide_columns: \"{c}\" can't be hidden; only \"backlog\" and \"maintain\" can, since each has a screen of its own (b and D)"
-                    ));
-                }
+            let c = c.trim();
+            if c.is_empty() || c.eq_ignore_ascii_case("misc") {
+                return Err(format!(
+                    "[board] hide_columns: \"{c}\" isn't a column; name \"backlog\", \"maintain\" or a stage's id"
+                ));
             }
         }
         Ok(())
@@ -90,6 +106,17 @@ impl BoardConfig {
     }
 }
 
+impl Config {
+    /// The default config keeping the machine split, as boards were before owners (intent 0595):
+    /// for the tests written about that split.
+    #[cfg(test)]
+    pub fn machine_split() -> Config {
+        let mut c = Config::default();
+        c.board.split = Split::Machines;
+        c
+    }
+}
+
 impl Default for BoardConfig {
     fn default() -> Self {
         BoardConfig {
@@ -98,6 +125,7 @@ impl Default for BoardConfig {
             only: vec![],
             skip: vec![],
             hide_columns: vec![],
+            split: Split::Owners,
         }
     }
 }
@@ -373,7 +401,7 @@ mod tests {
     }
 
     #[test]
-    fn hide_columns_takes_backlog_and_maintain_and_refuses_the_rest() {
+    fn hide_columns_takes_backlog_maintain_and_any_stage_by_id_on_every_list() {
         use crate::model::Stage;
         let dir = std::env::temp_dir().join(format!("kerdr-hide-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -386,11 +414,40 @@ mod tests {
             !Config::default().board.hides(Stage::Backlog),
             "every column shows by default"
         );
-        for bad in ["build", "nonsense"] {
+        // A stage by its id, on every list (intent 0595); `hide` names the same.
+        std::fs::write(&path, "[board]\nhide = ['deploy', 'learn']\n").unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert!(c.board.hides(Stage::Deploy));
+        assert!(
+            c.board
+                .hides(Stage::work("tinyhost/marketing", "learn", "Learn"))
+        );
+        assert!(
+            c.board
+                .hides(Stage::work("arkship/marketing", "deploy", "Deploy"))
+        );
+        assert!(!c.board.hides(Stage::Build));
+        for bad in ["misc", ""] {
             std::fs::write(&path, format!("[board]\nhide_columns = ['{bad}']\n")).unwrap();
             let err = Config::load_from(&path).unwrap_err();
-            assert!(err.contains(bad) && err.contains("hide_columns"), "{err}");
+            assert!(err.contains("hide_columns"), "{err}");
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn split_is_owners_unless_the_config_keeps_machines() {
+        let dir = std::env::temp_dir().join(format!("kerdr-split-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        assert_eq!(Config::default().board.split, Split::Owners);
+        std::fs::write(&path, "[board]\nsplit = 'machines'\n").unwrap();
+        assert_eq!(
+            Config::load_from(&path).unwrap().board.split,
+            Split::Machines
+        );
+        std::fs::write(&path, "[board]\nsplit = 'sideways'\n").unwrap();
+        assert!(Config::load_from(&path).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

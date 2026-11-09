@@ -287,7 +287,7 @@ impl App {
         };
         self.sel.key = selected;
         if let Some(c) = self.selected() {
-            self.sel.col = c.stage.index();
+            self.sel.col = self.col_of(c);
         }
         self.mode = Mode::Card {
             card,
@@ -314,7 +314,7 @@ impl App {
         {
             let c = &self.board.cards[i];
             self.sel = Selection {
-                col: c.stage.index(),
+                col: self.col_of(c),
                 key: Some(c.key.clone()),
             };
             if matches!(self.mode, Mode::Backlog { .. }) {
@@ -424,12 +424,16 @@ impl App {
     /// Cards and the pieces inside them that need you, in board order: a card, then what inside
     /// it needs you, in its screen's order. A column the config hides still counts, in its
     /// place: its cards open on their own screen (intent 0444).
+    /// A folded band's columns count too: going to one of its cards opens it (intent 0595).
     pub(super) fn needs_order(&self) -> Vec<String> {
-        let cols = self.columns();
-        let vis = self.visible_columns();
+        let layout = self.layout();
+        let cols = self.columns_in(&layout);
+        let vis = self.visible_in(&layout);
         let mut out = Vec::new();
-        for ci in 0..7 {
-            if !vis[ci] && !self.cfg.board.hides(Stage::ALL[ci]) {
+        for ci in 0..cols.len() {
+            let col = &layout.columns[ci];
+            let folded = col.band.is_some_and(|b| layout.bands[b].folded);
+            if !vis[ci] && !self.cfg.board.hides(col.stage) && !folded {
                 continue;
             }
             for &i in &cols[ci] {
@@ -520,8 +524,13 @@ impl App {
             return;
         };
         let card = &self.board.cards[i];
+        // A card in a folded band opens it.
+        if let Some(list) = card.stage.list() {
+            self.open_band = Some(list.to_string());
+        }
+        let card = &self.board.cards[i];
         self.sel = Selection {
-            col: card.stage.index(),
+            col: self.col_of(card),
             key: Some(card.key.clone()),
         };
         // Out of every card screen at once, to where the first was opened from.
@@ -551,6 +560,14 @@ impl App {
                 }
                 let back = leave(&self.mode);
                 self.open_card(h, Some(key.to_string()), back);
+            }
+            // A card in a working stage the config hides (intent 0595): its own screen.
+            None if (lists || matches!(self.mode, Mode::Board | Mode::Card { .. }))
+                && self.board.cards[i].stage.is_working()
+                && self.cfg.board.hides(self.board.cards[i].stage) =>
+            {
+                let back = leave(&self.mode);
+                self.open_card(i, None, back);
             }
             // A card in a column the config hides: its own screen, the backlog's or Done's, on it.
             None if (lists || matches!(self.mode, Mode::Board | Mode::Card { .. }))
@@ -586,7 +603,7 @@ impl App {
                     }
                 }
                 self.sel = Selection {
-                    col: self.board.cards[i].stage.index(),
+                    col: self.col_of(&self.board.cards[i]),
                     key: Some(key),
                 };
             }
@@ -595,7 +612,7 @@ impl App {
             None if lists || matches!(self.mode, Mode::Card { .. }) => {
                 self.mode = Mode::Board;
                 self.sel = Selection {
-                    col: self.board.cards[i].stage.index(),
+                    col: self.col_of(&self.board.cards[i]),
                     key: Some(key.to_string()),
                 };
             }

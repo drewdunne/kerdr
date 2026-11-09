@@ -5,11 +5,19 @@ specification {
   element adapter { style { color secondary } }
   element store { style { shape storage; color slate } }
   element service { style { color green } }
+  // Parts designed but not built yet, drawn in arch/planned-*.c4 views of their own.
+  tag planned
 }
 model {
   drew = person "Drew"
   kerdr = app "Kerdr terminal UI" {
-    description "Rust board, owner and project filters, selected machine's sessions, leader menu, intent composer, affirmation review and ranked backlog. Holds no canonical work records."
+    description "Rust board: the owner and team bar (or a machine's sessions for a feed with no owners), columns from each team's stage list, filters, leader menu, intent composer, affirmation review and ranked backlog. Holds no canonical work records."
+    bar = app "Owner and team bar" {
+      description "{ } steps through owners and [ ] through the chosen owner's tabs (All, each team, No team), at every level; ( ) is kept for an organization level later. The tab row lists what's one level below the choice. Machines move to the machines screen and a Machine row in the filters. A feed with no owners, or split = machines, keeps the machine and session bar."
+    }
+    stagecols = app "Columns from stage lists" {
+      description "Backlog and Done are Kerdr's own; between them, each team's stages from the feed. A view mixing lists shows a band per list, and a quiet band folds to one line. A card whose list or stage isn't known gets an unknown column, never another stage."
+    }
   }
   readfeed = adapter "Card feed (read only)" {
     description "Configured command runs on each machine, locally or over SSH. ark-cards --json is the ark-sdlc implementation. Returns versioned cards, home locations and slot counts."
@@ -39,6 +47,13 @@ model {
   dispatch -> records "write work, rank and affirmation state"
   dispatch -> herdr "capacity check; start or shelve"
   kerdr -> local "load settings; save UI choices"
+  // Kerdr by owner and team (intent 0595).
+  drew -> kerdr.bar "picks an owner, then a team"
+  kerdr.bar -> readfeed "owners with their teams and agent machine; what the adapter accepts"
+  kerdr.stagecols -> readfeed "stage lists, each card's list and stage"
+  kerdr.bar -> action "create with owner and team, only where the feed says it accepts team"
+  readfeed -> records "team and stage on each intent; each owner's stage lists"
+  action -> dispatch "file the new intent under that team"
 }
 views {
   view index {
@@ -46,6 +61,15 @@ views {
     include *
     // What's built: planned parts have views of their own (arch/planned-*.c4).
     exclude * -> * where tag is #planned
+    autoLayout LeftRight
+  }
+  view owner-team {
+    title "Kerdr by owner and team"
+    description """
+      The top bar splits by owner, then team, instead of machine and session, and each team's work
+      shows in its own stages, read from the feed (intent 0595).
+    """
+    include drew, kerdr, kerdr.bar, kerdr.stagecols, readfeed, action, records, dispatch
     autoLayout LeftRight
   }
 }

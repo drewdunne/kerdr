@@ -66,6 +66,45 @@ pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub starts_on: Vec<String>,
+    /// The stage lists its cards' stages belong to (intent 0595): each team's own columns. Absent
+    /// on older feeds, whose cards are all on the standard list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub stage_lists: Vec<StageList>,
+    /// The fields this machine's backend takes in `create` besides the words (`organization`,
+    /// `tenant`, `project`, `team`). Absent on older feeds: Kerdr sends none of them there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub create_fields: Vec<String>,
+}
+
+/// One stage list: the columns between Backlog and Done for the teams that use it (intent 0595).
+/// Its id is whole, owner then name (`tinyhost/marketing`), or `standard`.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StageList {
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub id: String,
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub name: String,
+    pub owner: Option<String>,
+    /// Raised whenever its stages change: of two machines' copies, the higher wins.
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub rev: u64,
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub stages: Vec<StageEntry>,
+}
+
+/// One stage of a list. A retired one is kept while work still sits in it.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct StageEntry {
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub id: String,
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub name: String,
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub retired: bool,
 }
 
 /// A field that's there, even as `null`, is `Some`; only a missing one is `None`.
@@ -112,6 +151,11 @@ impl Feed {
     pub fn starts_on(&self, action: &str) -> bool {
         self.starts_on.iter().any(|a| a == action)
     }
+
+    /// Whether this feed's backend takes this field (`team`, `tenant`, …) in a new intent's `create`.
+    pub fn creates_with(&self, field: &str) -> bool {
+        self.create_fields.iter().any(|f| f == field)
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -133,6 +177,13 @@ pub struct FeedCard {
     pub organization: Option<String>,
     #[serde(default)]
     pub project: Option<String>,
+    /// The id of one of its owner's teams (intent 0595); one its owner doesn't list shows under No
+    /// team.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub team: Option<String>,
+    /// The whole id of the stage list its `stage` belongs to; absent means `standard`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage_list: Option<String>,
     /// When the record was first created; keeping it fresh must not change this.
     #[serde(default)]
     pub created: Option<String>,
@@ -532,5 +583,28 @@ mod tests {
         assert_eq!(card.criteria_progress(), None);
         card.criteria[0].met = Some(true);
         assert_eq!(card.criteria_progress(), Some((1, 2)));
+    }
+
+    #[test]
+    fn teams_stage_lists_and_create_fields_are_optional_fields() {
+        let f = parse(r#"{"kerdr_feed":1,
+            "cards":[{"id":"5","title":"t","tenant":"tinyhost","team":"marketing","stage_list":"tinyhost/marketing","stage":"learn"}],
+            "owners":[{"id":"tinyhost","kind":"tenant","parent":"arkship","agent_machine":"arknet-one",
+                       "teams":[{"id":"dev","name":"Dev","retired":false,"stages":"standard"},{"id":"old","name":"Old","retired":true,"stages":null}]}],
+            "stage_lists":[{"id":"tinyhost/marketing","name":"Marketing","owner":"tinyhost","rev":3,
+                            "stages":[{"id":"plan","name":"Plan","retired":false},{"id":"learn","name":"Learn","retired":true}]}],
+            "create_fields":["organization","tenant","project","team"]}"#).unwrap();
+        assert_eq!(f.cards[0].team.as_deref(), Some("marketing"));
+        assert_eq!(f.cards[0].stage_list.as_deref(), Some("tinyhost/marketing"));
+        assert_eq!(f.owners[0].agent_machine.as_deref(), Some("arknet-one"));
+        assert_eq!(f.owners[0].teams.len(), 2);
+        assert!(f.owners[0].teams[1].retired && f.owners[0].teams[1].stages.is_none());
+        assert_eq!(f.stage_lists[0].rev, 3);
+        assert!(f.stage_lists[0].stages[1].retired);
+        assert!(f.creates_with("team") && !f.creates_with("account"));
+        // An older feed has none of them.
+        let old = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"t"}],"owners":[{"id":"a","kind":"organization"}],"stage_lists":null,"create_fields":null}"#).unwrap();
+        assert!(old.stage_lists.is_empty() && old.create_fields.is_empty());
+        assert!(old.owners[0].teams.is_empty() && old.cards[0].team.is_none());
     }
 }

@@ -642,7 +642,19 @@ fn details(
     if c.machine_index != holder.machine_index || itself {
         facts.push(format!("on {}", c.machine));
     }
-    facts.push(format!("owner: {}", c.owner_label()));
+    // On the owner split, the owner by its name on the list, and its team (intent 0595).
+    match app.owner_info(&c.owner).filter(|_| app.owner_split()) {
+        Some(o) => {
+            facts.push(format!("owner: {}", o.label()));
+            if !o.teams.is_empty() {
+                facts.push(format!(
+                    "team: {}",
+                    app.team_name(&c.owner, c.team.as_deref())
+                ));
+            }
+        }
+        None => facts.push(format!("owner: {}", c.owner_label())),
+    }
     for a in &c.agents {
         let what = match a.status.as_str() {
             "done" => "finished its turn, not yet seen",
