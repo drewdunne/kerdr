@@ -240,8 +240,8 @@ fn event_loop(
                     }
                     continue;
                 }
-                Answer::Update(machine, result) => {
-                    app.update_answered(machine, result);
+                Answer::Update(machine, n, result) => {
+                    app.update_answered(machine, n, result);
                     if let Some(l) = live.as_deref() {
                         l.wake_feed(machine);
                     }
@@ -710,7 +710,7 @@ enum Answer {
     Progress(String, usize, Result<crate::actions::Response, String>),
     /// The answer to a request that asked an old backend to bring its ark-sdlc up to date, for
     /// an account picked with s (intent 0591).
-    Update(usize, Result<crate::actions::Response, String>),
+    Update(usize, u64, Result<crate::actions::Response, String>),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -973,19 +973,19 @@ fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
     if app.demo {
         return;
     }
-    let Some((machine, request)) = app.update_due() else {
+    let Some((machine, request, n)) = app.update_due() else {
         return;
     };
     let command = app.cfg.actions.command.clone();
     let target = app.machines.get(machine).map(|m| m.machine.clone());
     let (Some(command), Some(target)) = (command, target) else {
-        app.update_answered(machine, Err("actions are disabled".into()));
+        app.update_answered(machine, n, Err("actions are disabled".into()));
         return;
     };
     let tx = tx.clone();
     std::thread::spawn(move || {
         let result = crate::actions::run(&target, &command, &request);
-        let _ = tx.send(Answer::Update(machine, result));
+        let _ = tx.send(Answer::Update(machine, n, result));
     });
 }
 
@@ -1608,7 +1608,7 @@ mod tests {
                 }
             ),
             Answer::Progress(token, _, _) => format!("progress {token}"),
-            Answer::Update(machine, _) => format!("update on machine {machine}"),
+            Answer::Update(machine, n, _) => format!("update {n} on machine {machine}"),
         }
     }
 

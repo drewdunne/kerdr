@@ -98,8 +98,9 @@ pub struct OwedAccount {
     /// Waiting for this machine's backend to say it can start on an account, after Kerdr asked it to
     /// update: its feed is read every few seconds meanwhile.
     pub update: Option<usize>,
-    /// Whether that update has been asked for, and what its answer said when it failed.
-    pub asked: bool,
+    /// The request that asked for that update, by Kerdr's number for it, and what its answer said
+    /// when it failed: only that request's answer touches this wait (Codex's review).
+    pub asked: Option<u64>,
     pub failed: Option<String>,
     /// It's in won't do, and comes back first; and whether that `restore` has gone. A restore that
     /// went and is neither held nor sent on, with the card still in won't do, didn't happen: its own
@@ -115,7 +116,7 @@ impl OwedAccount {
             to: to.to_string(),
             since: Instant::now(),
             update: None,
-            asked: false,
+            asked: None,
             failed: None,
             restore: false,
             restore_sent: false,
@@ -644,6 +645,25 @@ impl App {
         // 3. Started on that account, or the agent running it now moved there.
         match self.run_state(&card) {
             RunState::Running(agent) => Owed::Done(self.move_to_account(&card, &agent, &owed.to)),
+            // It starts on a machine whose backend can't take an account yet (its restore was sent
+            // on to an older one): that backend is brought up to date first, the account kept
+            // (Codex's review).
+            RunState::Stopped(start) if start.update && !start.restore => {
+                let name = self.machines[start.machine].name();
+                let o = &mut self.owed_accounts[i];
+                o.update = Some(start.machine);
+                o.asked = None;
+                o.failed = None;
+                o.since = Instant::now();
+                self.say(
+                    format!(
+                        "{name}'s backend can't start work on a chosen account yet: Kerdr is bringing its ark-sdlc up to date, then starts {reference} on {}. Esc on the board drops it.",
+                        account_words(&owed.to)
+                    ),
+                    Tone::Info,
+                );
+                Owed::Wait
+            }
             RunState::Stopped(start) if !start.update && !start.restore => {
                 if owed.to != "list" && !self.start_choices(&start).contains(&owed.to) {
                     self.say(
@@ -682,30 +702,34 @@ impl App {
     /// The request that asks an old backend to bring its ark-sdlc up to date, when it's due, with
     /// its machine: a read of the card's text (`edit` without `text`, which changes nothing), which
     /// ark-sdlc's backend pulls before. Sent once (intent 0591).
-    pub fn update_due(&mut self) -> Option<(usize, serde_json::Value)> {
+    pub fn update_due(&mut self) -> Option<(usize, serde_json::Value, u64)> {
         let i = self
             .owed_accounts
             .iter()
-            .position(|o| o.update.is_some() && !o.asked)?;
+            .position(|o| o.update.is_some() && o.asked.is_none())?;
         let machine = self.owed_accounts[i].update?;
-        // One update serves every card waiting on that machine.
+        let key = self.owed_accounts[i].key.clone();
+        let id = self.card(&key)?.detail.as_ref()?.id.clone();
+        self.update_asks += 1;
+        let n = self.update_asks;
+        // One update serves every card waiting on that machine now; one that waits later asks again.
         for o in self
             .owed_accounts
             .iter_mut()
-            .filter(|o| o.update == Some(machine))
+            .filter(|o| o.update == Some(machine) && o.asked.is_none())
         {
-            o.asked = true;
+            o.asked = Some(n);
         }
-        let key = self.owed_accounts[i].key.clone();
-        let id = self.card(&key)?.detail.as_ref()?.id.clone();
-        Some((machine, json!({"action":"edit","id":id})))
+        Some((machine, json!({"action":"edit","id":id}), n))
     }
 
-    /// That request's answer: only whether it reached the backend matters, since the pull comes
-    /// before anything it says. Its machine's feed is read again meanwhile (accounts_awaited_on).
+    /// That request's answer, by its number: only whether it reached the backend matters, since the
+    /// pull comes before anything it says, and only to the waits it was asked for. Its machine's feed
+    /// is read again meanwhile (accounts_awaited_on).
     pub fn update_answered(
         &mut self,
         machine: usize,
+        n: u64,
         result: Result<crate::actions::Response, String>,
     ) {
         let Err(e) = result else {
@@ -715,7 +739,7 @@ impl App {
         for o in self
             .owed_accounts
             .iter_mut()
-            .filter(|o| o.update == Some(machine) && o.asked)
+            .filter(|o| o.update == Some(machine) && o.asked == Some(n))
         {
             o.failed = Some(why.clone());
         }
@@ -993,11 +1017,13 @@ mod tests {
         assert!(said.contains("bringing its ark-sdlc up to date"), "{said}");
         // The update: a read its backend pulls before, sent once.
         let id = a.card(&k).unwrap().detail.as_ref().unwrap().id.clone();
-        assert_eq!(a.update_due(), Some((mi, json!({"action":"edit","id":id}))));
+        let (machine, request, n) = a.update_due().unwrap();
+        assert_eq!((machine, request), (mi, json!({"action":"edit","id":id})));
         assert_eq!(a.update_due(), None);
         assert!(a.accounts_awaited_on().contains(&mi));
         a.update_answered(
             mi,
+            n,
             Ok(crate::actions::parse_response(r#"{"ok":true,"message":""}"#).unwrap()),
         );
         assert_eq!(
@@ -1039,9 +1065,10 @@ mod tests {
         a.message = None;
         press(&mut a, 's');
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
-        a.update_due();
+        let (_, _, n) = a.update_due().unwrap();
         a.update_answered(
             mi,
+            n,
             Err("ssh: connect to host build-box: Connection refused".into()),
         );
         assert_eq!(a.account_owed(), Action::None);
@@ -1255,7 +1282,7 @@ mod tests {
         assert!(a.resent.is_empty(), "the start went on to an older backend");
         let said = a.message().unwrap().0;
         assert!(said.contains("bringing its ark-sdlc up to date"), "{said}");
-        assert_eq!(a.update_due().map(|(m, _)| m), Some(other));
+        assert_eq!(a.update_due().map(|(m, ..)| m), Some(other));
         assert_eq!(a.account_owed(), Action::None);
         a.machines[other].feed.as_mut().unwrap().starts_on =
             STARTS_ON.iter().map(|s| s.to_string()).collect();
@@ -1368,7 +1395,7 @@ mod tests {
             key(&mut a, KeyCode::Down);
         }
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
-        assert_eq!(a.update_due().map(|(m, _)| m), Some(mi));
+        assert_eq!(a.update_due().map(|(m, ..)| m), Some(mi));
         assert_eq!(a.account_owed(), Action::None, "nothing before the update");
         a.machines[mi].feed.as_mut().unwrap().starts_on =
             STARTS_ON.iter().map(|s| s.to_string()).collect();
@@ -1480,7 +1507,7 @@ mod tests {
         let first_id = a.card(&first).unwrap().detail.as_ref().unwrap().id.clone();
         assert_eq!(request["id"], first_id.as_str());
         // The second, once its backend can.
-        assert_eq!(a.update_due().map(|(m, _)| m), Some(m2));
+        assert_eq!(a.update_due().map(|(m, ..)| m), Some(m2));
         a.machines[m2].feed.as_mut().unwrap().starts_on =
             STARTS_ON.iter().map(|s| s.to_string()).collect();
         let Action::Mutate { request, .. } = a.account_owed() else {
@@ -1488,6 +1515,138 @@ mod tests {
         };
         let second_id = a.card(&second).unwrap().detail.as_ref().unwrap().id.clone();
         assert_eq!(request["id"], second_id.as_str());
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty());
+    }
+
+    /// Picks this account in the open start picker, when the start must wait (nothing is sent).
+    fn choose_waiting(a: &mut App, code: &str) {
+        let at = start_screen(a).1.iter().position(|c| c == code).unwrap();
+        for _ in 0..at {
+            key(a, KeyCode::Down);
+        }
+        assert_eq!(key(a, KeyCode::Enter), Action::None);
+    }
+
+    /// Codex's second review: an update's answer touches only the waits its request was for. The
+    /// first card's wait is dropped, a second card asks the same machine to update, and the first's
+    /// request then fails late: the second still starts, once its own update has come.
+    #[test]
+    fn an_old_updates_failure_arriving_after_a_newer_request_leaves_the_newer_wait_alone() {
+        let mut a = app();
+        let first = backlog_card(&a);
+        in_feed(&mut a, &first, |c| c.kickoff = None);
+        let mi = a.card(&first).unwrap().machine_index;
+        let name = a.machines[mi].name();
+        a.machines[mi].feed.as_mut().unwrap().starts_on.clear();
+        select(&mut a, &first);
+        press(&mut a, 's');
+        choose_waiting(&mut a, "ARK_C");
+        let (m, _, old) = a.update_due().unwrap();
+        assert_eq!(m, mi);
+        // Esc drops the first card's wait, its update request still on its way.
+        key(&mut a, KeyCode::Esc);
+        assert!(a.owed_accounts.is_empty());
+        // A second card, homed on the same machine, its account picked: a request of its own.
+        let second = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != first && waiting_work(c))
+            .unwrap()
+            .key
+            .clone();
+        in_feed(&mut a, &second, |c| {
+            c.kickoff = None;
+            c.home = serde_json::from_value(json!({"machine": name, "session": "web"})).ok();
+        });
+        select(&mut a, &second);
+        press(&mut a, 's');
+        assert!(start_screen(&a).0.update);
+        choose_waiting(&mut a, "ARK_C");
+        let (m, _, new) = a.update_due().unwrap();
+        assert_eq!(m, mi);
+        assert_ne!(new, old, "a request of its own");
+        // The first card's request fails, late: the second's wait is untouched.
+        a.update_answered(mi, old, Err("ssh: connection timed out".into()));
+        assert_eq!(a.owed_accounts.len(), 1);
+        assert_eq!(a.owed_accounts[0].failed, None);
+        assert_eq!(a.account_owed(), Action::None);
+        assert_eq!(a.owed_accounts.len(), 1, "the second still waits");
+        assert!(!a.failing(), "{:?}", a.message());
+        // Its own request reached the backend, which can now: it starts, on the account picked.
+        a.update_answered(
+            mi,
+            new,
+            Ok(crate::actions::parse_response(r#"{"ok":true,"message":""}"#).unwrap()),
+        );
+        a.machines[mi].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        let Action::Mutate { machine, request } = a.account_owed() else {
+            panic!("the second didn't start: {:?}", a.message())
+        };
+        let id = a.card(&second).unwrap().detail.as_ref().unwrap().id.clone();
+        assert_eq!(machine, mi);
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"], id.as_str());
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty());
+    }
+
+    /// Codex's second review: a card in won't do whose own machine can take an account, its restore
+    /// sent on to the machine it lives on, whose backend can't yet. Back there, that backend is
+    /// brought up to date, then the card starts there on the account picked.
+    #[test]
+    fn a_restore_sent_on_to_an_older_backend_updates_it_then_starts_there_on_the_account() {
+        let mut a = app();
+        let k = set_aside(&mut a);
+        let here = a.card(&k).unwrap().machine_index;
+        let other = (0..2).find(|&m| m != here).unwrap();
+        a.machines[other].feed.as_mut().unwrap().starts_on.clear();
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let start = start_screen(&a).0.clone();
+        assert!(start.restore && !start.update, "no update asked for here");
+        let (machine, request) = choose(&mut a, "ARK_C");
+        assert_eq!(request["action"], "restore");
+        on_its_way(&mut a, machine, &request);
+        let home = format!("{}/web", a.machines[other].name());
+        answered(
+            &mut a,
+            &request,
+            json!({"ok":false,"message":"lives elsewhere","home":home}),
+        );
+        let ready = a.resolver.ready();
+        assert_eq!(ready[0].1, other, "sent on to where it lives");
+        answered(&mut a, &request, json!({"ok":true,"message":"Restored."}));
+        in_feed(&mut a, &k, |c| c.disposition = None);
+        // Back, on a machine whose backend can't take an account yet: it's brought up to date.
+        assert_eq!(a.account_owed(), Action::None);
+        assert_eq!(a.owed_accounts.len(), 1, "the account is still owed");
+        assert_eq!(a.owed_accounts[0].to, "ARK_C");
+        let said = a.message().unwrap().0.to_string();
+        assert!(said.contains("bringing its ark-sdlc up to date"), "{said}");
+        let (m, update, n) = a.update_due().unwrap();
+        assert_eq!(m, other);
+        assert_eq!(update["action"], "edit");
+        assert!(a.accounts_awaited_on().contains(&other));
+        assert_eq!(
+            a.account_owed(),
+            Action::None,
+            "not before its feed says it can"
+        );
+        a.update_answered(
+            other,
+            n,
+            Ok(crate::actions::parse_response(r#"{"ok":true,"message":""}"#).unwrap()),
+        );
+        a.machines[other].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        let Action::Mutate { machine, request } = a.account_owed() else {
+            panic!("nothing started: {:?}", a.message())
+        };
+        assert_eq!(machine, other, "where it lives");
+        assert_eq!(request["action"], "dispatch");
         assert_eq!(request["account"], "ARK_C");
         assert!(a.owed_accounts.is_empty());
     }

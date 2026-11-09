@@ -659,6 +659,9 @@ pub struct App {
     pub pending_go: Option<(String, Option<String>)>,
     /// Accounts picked with s that their cards are still owed, one for each card (intent 0591).
     pub owed_accounts: Vec<run_state::OwedAccount>,
+    /// The number of the last request asking an old backend to update, so each answer finds the
+    /// waits it was asked for.
+    pub update_asks: u64,
     /// The end of followed work being taken as its request's answer.
     pub(crate) follow_end: Option<follow::FollowEnd>,
     /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
@@ -751,6 +754,7 @@ impl App {
             accounts_wait: None,
             pending_go: None,
             owed_accounts: Vec::new(),
+            update_asks: 0,
             follow_end: None,
             enter_sent: None,
             answer_by_enter: false,
