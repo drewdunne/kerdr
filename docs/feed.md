@@ -387,19 +387,24 @@ Kerdr shows `say`, and asks the same machine, over the same connection, how it s
 ```
 
 - `running`: still going. `say`, when given, replaces the card's line. `message` may be left out.
+  Past its `limit` with its worker still alive, answer `running` with `"late": true` rather than
+  `failed`: it may yet finish. Kerdr keeps following it quietly until its own limit (below).
 - `done`: the step's own answer, read exactly as the request's answer would have been read. For a
   start or a reopen that ends in a workspace, that's a reopen's fields (`session`, `workspace`,
   `label`, optional `tab`), and Kerdr goes in as on a reopen's answer: only while you're still on that
   card, and for a start only when `Enter` asked for it (`d` says where it started instead).
 - `asks`: a question, asked as it would be on a direct answer. A yes sends the original request again
   with `override: true` and the `confirm` token, as on any question.
-- `failed`: shown as the request's failure, `message` and all.
+- `failed`: shown as the request's failure, `message` and all. A worker that ended without
+  finishing is `failed` too; say so, and that the card shows how it stands, since it may have done
+  part of the step.
 - `unknown`: Kerdr says it lost track of the step and that the card shows how it stands. Any other
   `state` reads as `unknown`.
 
 `ok` follows `state` when left out (true for `running` and `done`). Kerdr goes in as soon as the
 card's workspace shows in the feed, even before `done`. While a step is followed, Kerdr sends nothing
-else for that record, and a key that would change it says what's under way instead. Past `limit`
+else for that record, and a key that would change it says what's under way instead, even once its
+workspace shows (its worker may still be bringing the agent back). Past `limit`
 plus a minute with no end (or with the machine not answering), Kerdr stops asking and says, as a
 warning rather than a failure, that the step may still be going on that machine and the card will
 show how it ends. Esc on the board stops waiting for it: it still finishes, and takes you nowhere.
