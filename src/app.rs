@@ -623,6 +623,8 @@ pub struct App {
     pub account_cancels: Vec<(usize, serde_json::Value)>,
     pub signin_open: Option<String>,
     pub account_batch_messages: Vec<String>,
+    /// Some machine's part of that batch didn't happen: the summary is a warning (intent 0591).
+    pub account_batch_failed: bool,
     pub account_pending: Option<account_controls::Pending>,
     /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
     /// your version until a save of it succeeds.
@@ -736,6 +738,7 @@ impl App {
             account_cancels: Vec::new(),
             signin_open: None,
             account_batch_messages: vec![],
+            account_batch_failed: false,
             account_pending: None,
             edits: Default::default(),
             edit_flights: vec![],

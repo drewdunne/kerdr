@@ -318,6 +318,7 @@ pub struct Pending {
 impl App {
     fn queue_waiting_moves(&mut self, owner: &str) {
         self.account_batch_messages.clear();
+        self.account_batch_failed = false;
         for (mi, m) in self
             .machines
             .iter()
@@ -2183,7 +2184,10 @@ impl App {
         let response = match result {
             Ok(r) => r,
             Err(e) => {
+                // Named by what was asked, in words for the accounts screen (intent 0591).
+                let e = account_error(&request, &e);
                 if request["action"] == "account-move-waiting" {
+                    self.account_batch_failed = true;
                     self.account_batch_messages
                         .push(format!("{}: {e}", self.machines[machine].name()));
                     if self.account_queue.is_empty() {
@@ -2228,8 +2232,16 @@ impl App {
                 self.machines[machine].name(),
                 response.message
             ));
+            // A machine whose part didn't happen makes the whole summary a warning, not news
+            // (intent 0591).
+            self.account_batch_failed |= !response.ok;
             if self.account_queue.is_empty() {
-                self.say(self.account_batch_messages.join("; "), Tone::Info);
+                let tone = if self.account_batch_failed {
+                    Tone::Warn
+                } else {
+                    Tone::Info
+                };
+                self.say(self.account_batch_messages.join("; "), tone);
             }
             return;
         }
@@ -2583,11 +2595,55 @@ impl App {
                 _ => {}
             }
         }
-        self.say(
-            response.message,
-            if response.ok { Tone::Good } else { Tone::Warn },
-        );
+        // Done is the success colour; done already, or done with something still to come, is
+        // news; not done is a warning (intent 0591).
+        let did_nothing = response.account_unchanged
+            || matches!(
+                response.status.as_deref(),
+                Some("stale" | "unchanged" | "already")
+            );
+        let left = response
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| response.ok && !n.is_empty() && !response.message.contains(*n))
+            .map(str::to_string);
+        let message = match left {
+            Some(left) => format!("{} {left}", response.message),
+            None => response.message,
+        };
+        let tone = if !response.ok {
+            Tone::Warn
+        } else if did_nothing || response.note.is_some() {
+            Tone::Info
+        } else {
+            Tone::Good
+        };
+        self.say(message, tone);
     }
+}
+
+/// An account request's error, named by what was asked: "Moving the agent to ARK_C: no answer
+/// came…". One whose result is unknown points at the accounts screen, not a card (intent 0591).
+fn account_error(request: &Value, error: &str) -> String {
+    let code = |field: &str| request[field].as_str().unwrap_or("the account").to_string();
+    let what = match request["action"].as_str().unwrap_or_default() {
+        "account-move" => format!("Moving the agent to {}", code("to")),
+        "account-move-waiting" => "Moving the waiting agents".into(),
+        "account-signin" => format!("Signing {} in", code("code")),
+        "account-add" => format!("Adding {}", code("code")),
+        "account-remove" => format!("Removing {}", code("code")),
+        "account-rename" => format!("Renaming {}", code("code")),
+        "account-test" => format!("Testing {}", code("code")),
+        "account-current" => "Setting the current account".into(),
+        "account-models" => "Saving the model list".into(),
+        _ => "Changing accounts".into(),
+    };
+    let error = error.replace(
+        "its card shows how it stands",
+        "the accounts screen (A) shows how it stands",
+    );
+    format!("{what}: {error}")
 }
 
 /// A code to type on a provider's page, as sign-ins give them (`K7QD-3MPWX`): nothing else is
@@ -2638,6 +2694,80 @@ mod tests {
         let mut a = App::new(Config::machine_split(), crate::demo::machines(false));
         a.cfg.actions.command = Some("fixture".into());
         a
+    }
+
+    #[test]
+    fn an_account_answer_is_coloured_by_what_happened_and_an_error_names_what_was_asked() {
+        let mut a = app();
+        let answer = |json: Value| Ok(crate::actions::parse_response(&json.to_string()).unwrap());
+        let test = crate::actions::with_op(json!({"action":"account-test","code":"ARK_C"}));
+        // Done: the success colour. Done already: news, not success (intent 0591).
+        a.finish_action(
+            0,
+            test.clone(),
+            answer(json!({"ok":true,"message":"ARK_C works."})),
+        );
+        assert_eq!(a.message(), Some(("ARK_C works.", Tone::Good)));
+        a.finish_action(
+            0,
+            test.clone(),
+            answer(json!({"ok":true,"status":"stale","message":"ARK_C was checked a moment ago."})),
+        );
+        assert_eq!(a.message().map(|(_, t)| t), Some(Tone::Info));
+        // Done, with its push to come: said, as news.
+        a.finish_action(
+            0,
+            json!({"action":"account-rename","code":"ARK_C","op":"k-0123456789abcdef"}),
+            answer(json!({"ok":true,"message":"Renamed ARK_C.","note":"It reaches your other machines once the push goes through."})),
+        );
+        assert_eq!(
+            a.message(),
+            Some((
+                "Renamed ARK_C. It reaches your other machines once the push goes through.",
+                Tone::Info
+            ))
+        );
+        // No answer: what was asked, and where to look, never a card.
+        a.finish_action(
+            0,
+            test,
+            Err(format!(
+                "the connection to lab dropped before its answer came; {}, and its card shows how it stands.",
+                crate::actions::UNKNOWN
+            )),
+        );
+        let (said, tone) = a.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.starts_with("Testing ARK_C: the connection to lab dropped"),
+            "{said}"
+        );
+        assert!(
+            said.contains("the accounts screen (A) shows how it stands"),
+            "{said}"
+        );
+        // Moving waiting agents: one machine's failure makes the summary a warning.
+        a.account_batch_messages.clear();
+        a.account_batch_failed = false;
+        a.account_queue
+            .push_back((1, json!({"action":"account-move-waiting","owner":"x"})));
+        a.finish_action(
+            0,
+            json!({"action":"account-move-waiting","owner":"x"}),
+            answer(json!({"ok":false,"message":"its lock is held"})),
+        );
+        a.account_queue.clear();
+        a.finish_action(
+            1,
+            json!({"action":"account-move-waiting","owner":"x"}),
+            answer(json!({"ok":true,"message":"moved 2"})),
+        );
+        let (said, tone) = a.message().unwrap();
+        assert_eq!(tone, Tone::Warn, "{said}");
+        assert!(
+            said.contains("its lock is held") && said.contains("moved 2"),
+            "{said}"
+        );
     }
     fn key(a: &mut App, k: KeyCode) -> Action {
         a.on_key(KeyEvent::new(k, KeyModifiers::NONE))
