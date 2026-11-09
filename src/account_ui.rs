@@ -172,13 +172,31 @@ pub(super) fn usage(app: &App, mi: usize) -> Vec<Span<'static>> {
 }
 
 pub(super) fn new_intents(app: &App) -> Vec<Span<'static>> {
+    // On the owner split, the chosen owner's: its main session, on the machine its work runs on
+    // (intent 0595).
+    let owned = match app.scope() {
+        Scope::Owner(_) | Scope::Team(..) => app.owner_machine().and_then(|mi| {
+            let o = app.owner_info(app.scope().owner()?)?;
+            Some((mi, o.code.clone()?))
+        }),
+        _ => None,
+    };
+    let viewed = match (app.scope(), &owned) {
+        (Scope::Session(machine, session), _) => {
+            app.machine_index(machine).map(|mi| (mi, session.clone()))
+        }
+        (_, Some((mi, code))) => Some((*mi, code.clone())),
+        _ => None,
+    };
+    let Some((mi, session)) = viewed else {
+        return vec![];
+    };
+    let session = session.as_str();
     // A current account that's ready there goes ahead of the session's list (intent 0455).
-    if let Scope::Session(machine, session) = app.scope()
-        && let Some(mi) = app.machine_index(machine)
-        && let Some(c) = app
-            .account_feed(mi)
-            .and_then(|f| f.current_account())
-            .filter(|c| c.starts_sessions())
+    if let Some(c) = app
+        .account_feed(mi)
+        .and_then(|f| f.current_account())
+        .filter(|c| c.starts_sessions())
     {
         let provider = app
             .account(mi, &c.account)
@@ -190,9 +208,13 @@ pub(super) fn new_intents(app: &App) -> Vec<Span<'static>> {
             Span::styled("★ current  ", bold(CYAN)),
         ];
     }
-    if let Scope::Session(machine, session) = app.scope()
-        && let Some(mi) = app.machine_index(machine)
-        && let Some(owner) = app.account_owner(mi, session)
+    let owner = match app.scope() {
+        Scope::Session(..) => app.account_owner(mi, session),
+        scope => scope
+            .owner()
+            .and_then(|id| app.account_feed(mi)?.owners.iter().find(|o| o.id == id)),
+    };
+    if let Some(owner) = owner
         && let Some(feed) = app.account_feed(mi)
         && let Some(first) = owner
             .models
