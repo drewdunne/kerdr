@@ -512,6 +512,11 @@ pub enum Problem {
 }
 
 impl Problem {
+    /// Whether only Andrew can clear it: a host key to trust, or a password or key to give.
+    pub fn needs_you(&self) -> bool {
+        matches!(self, Problem::HostKey(_) | Problem::Auth(_))
+    }
+
     pub fn detail(&self) -> &str {
         match self {
             Problem::Unreachable(d)

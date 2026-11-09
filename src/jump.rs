@@ -240,10 +240,27 @@ fn why(out: &transport::Output) -> String {
     }
 }
 
-/// What the board says when herdr on a machine didn't answer a focus in time.
-fn no_answer(machine: &str) -> String {
-    format!("herdr on {machine} didn't answer in 12 s; ⏎ tries again.")
+/// What the board says when herdr on a machine didn't answer a focus in time, after `tries`
+/// tries (intent 0591).
+fn no_answer(machine: &str, tries: usize) -> String {
+    match tries {
+        0 | 1 => format!("herdr on {machine} didn't answer in 12 s; ⏎ tries again."),
+        n => format!(
+            "herdr on {machine} didn't answer in 12 s, {} times in a row, so it's very slow or stuck there; ⏎ tries again.",
+            match n {
+                2 => "two".to_string(),
+                3 => "three".into(),
+                n => n.to_string(),
+            }
+        ),
+    }
 }
+
+/// How many times more a focus herdr didn't answer in time is asked, and one it refused or one
+/// whose connection failed (intent 0591): herdr may be slow, or reloading.
+const FOCUS_TIMEOUTS_AGAIN: usize = 2;
+const FOCUS_REFUSALS_AGAIN: usize = 1;
+const FOCUS_PAUSE: Duration = Duration::from_secs(1);
 
 /// The workspace herdr says a tab it focused is in, from `tab focus`'s answer.
 fn tab_workspace(text: &str) -> Option<String> {
@@ -263,10 +280,31 @@ fn focus(
     t: &Target,
     jump: &Jump,
     mut run: impl FnMut(&[String]) -> transport::Output,
+    pause: &dyn Fn(Duration),
 ) -> Option<Outcome> {
     let workspace = herdr_args(&jump.session, &["workspace", "focus", &jump.workspace]);
-    if let Some(refused) = focus_refused(t, jump, &run(&workspace)) {
-        return Some(refused);
+    // Asked again by itself before anything is said: herdr slow under load, or reloading, or a
+    // connection that dropped for a moment (intent 0591). What it says for sure (the workspace or
+    // its session gone, SSH wanting Andrew) is taken at once.
+    let (mut timeouts, mut refusals) = (0, 0);
+    loop {
+        let out = run(&workspace);
+        let refused = focus_refused(t, jump, &out, timeouts + 1);
+        let passing = matches!(refused, Some(Outcome::Failed(_)))
+            && !transport::classify(t, &out).is_some_and(|p| p.needs_you());
+        if passing && out.timed_out && timeouts < FOCUS_TIMEOUTS_AGAIN {
+            timeouts += 1;
+            continue;
+        }
+        if passing && !out.timed_out && refusals < FOCUS_REFUSALS_AGAIN {
+            refusals += 1;
+            pause(FOCUS_PAUSE);
+            continue;
+        }
+        if refused.is_some() {
+            return refused;
+        }
+        break;
     }
     if let Some(tab) = &jump.tab {
         let out = run(&herdr_args(&jump.session, &["tab", "focus", tab]));
@@ -277,7 +315,7 @@ fn focus(
             // it elsewhere, but nothing is opened.
             let _ = run(&workspace);
             if out.timed_out {
-                return Some(Outcome::Failed(no_answer(&jump.machine.name)));
+                return Some(Outcome::Failed(no_answer(&jump.machine.name, 1)));
             }
             if let Some(problem) = transport::classify(t, &out) {
                 return Some(Outcome::Failed(format!(
@@ -299,16 +337,22 @@ fn focus(
             )));
         }
         if !in_place {
-            return focus_refused(t, jump, &run(&workspace));
+            return focus_refused(t, jump, &run(&workspace), 1);
         }
     }
     None
 }
 
-/// Why herdr's answer to focusing the card's workspace stops the jump, if it does.
-fn focus_refused(t: &Target, jump: &Jump, out: &transport::Output) -> Option<Outcome> {
+/// Why herdr's answer to focusing the card's workspace stops the jump, if it does; `tries` is how
+/// many times it has been asked.
+fn focus_refused(
+    t: &Target,
+    jump: &Jump,
+    out: &transport::Output,
+    tries: usize,
+) -> Option<Outcome> {
     if out.timed_out {
-        return Some(Outcome::Failed(no_answer(&jump.machine.name)));
+        return Some(Outcome::Failed(no_answer(&jump.machine.name, tries)));
     }
     if let Some(problem) = transport::classify(t, out) {
         return Some(Outcome::Failed(format!(
@@ -694,10 +738,15 @@ pub fn run(
     let herdr_bin = jump.machine.herdr.clone();
 
     // A newly attached herdr window opens on the session's focused workspace, on its active tab.
-    let focused = focus(&t, jump, |args| {
-        let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-        transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
-    });
+    let focused = focus(
+        &t,
+        jump,
+        |args| {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
+        },
+        &std::thread::sleep,
+    );
     if let Some(outcome) = focused {
         // Keys pressed while herdr didn't answer (another ⏎) mustn't start a second try before
         // the reason is read.
@@ -1229,12 +1278,17 @@ esac
         mut answer: impl FnMut(&str) -> transport::Output,
     ) -> (Option<Outcome>, Vec<String>) {
         let mut calls = Vec::new();
-        let outcome = focus(&Target::Local, jump, |args| {
-            let line = args.join(" ");
-            let out = answer(&line);
-            calls.push(line);
-            out
-        });
+        let outcome = focus(
+            &Target::Local,
+            jump,
+            |args| {
+                let line = args.join(" ");
+                let out = answer(&line);
+                calls.push(line);
+                out
+            },
+            &|_| {},
+        );
         (outcome, calls)
     }
 
@@ -1470,12 +1524,46 @@ esac
             timed_out: true,
             ..Default::default()
         };
-        let (outcome, _) = focus_with(&jump(None), |_| lost());
+        // Asked three times before anything is said: herdr may be slow under load (intent 0591).
+        let (outcome, calls) = focus_with(&jump(None), |_| lost());
         let Some(Outcome::Failed(m)) = outcome else {
             panic!("{outcome:?}")
         };
-        assert!(m.contains("didn't answer in 12 s"), "{m}");
+        assert_eq!(calls, [FOCUS_W4, FOCUS_W4, FOCUS_W4]);
+        assert!(
+            m.contains("didn't answer in 12 s, three times in a row"),
+            "{m}"
+        );
         assert!(m.contains("⏎ tries again"), "{m}");
+        // Answered the second time: it goes on as if nothing had happened.
+        let mut first = true;
+        let (outcome, calls) = focus_with(&jump(None), |_| {
+            if std::mem::take(&mut first) {
+                lost()
+            } else {
+                says(0, WORKSPACE_FOCUSED)
+            }
+        });
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_W4]);
+        // Refused once (herdr reloading, say), then focused: the same.
+        let mut first = true;
+        let (outcome, calls) = focus_with(&jump(None), |_| {
+            if std::mem::take(&mut first) {
+                says(
+                    1,
+                    r#"{"error":{"code":"server_reloading","message":"herdr is reloading"}}"#,
+                )
+            } else {
+                says(0, WORKSPACE_FOCUSED)
+            }
+        });
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_W4]);
+        // Gone is gone: asked once.
+        let (outcome, calls) = focus_with(&jump(None), |_| says(1, WORKSPACE_GONE));
+        assert_eq!(outcome, Some(Outcome::Closed));
+        assert_eq!(calls, [FOCUS_W4]);
         // A strict tab whose focus timed out says the same, with herdr put back.
         let (answer, _) = herdr_with(None, lost(), says(0, WORKSPACE_FOCUSED));
         let strict = Jump {
