@@ -185,10 +185,10 @@ pub const NO_BACKEND: &str =
     "Kerdr has no action backend set ([actions] command in its config), so nothing was sent";
 
 /// Whether an error leaves the request's result unknown: its answer was lost, or it says nothing
-/// that shows it wasn't sent. Only an error that knows the request never left Kerdr (NOT_SENT),
-/// or never started (a write-up that failed), says it didn't happen.
+/// that shows it wasn't sent. Only an error that knows the request never left Kerdr (NOT_SENT)
+/// says it didn't happen.
 pub fn result_unknown(error: &str) -> bool {
-    !(error.contains(NOT_SENT) || error == crate::resolve::NOT_WRITTEN_UP)
+    !error.contains(NOT_SENT)
 }
 
 /// Why a request is being sent again, as the board is told meanwhile.

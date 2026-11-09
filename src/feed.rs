@@ -83,6 +83,47 @@ pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub supports: Vec<String>,
+    /// What this feed couldn't read, in plain words (intent 0591): the board says it only once it
+    /// has lasted. Anything here that isn't the shape below is passed over, not a failed feed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "read_failures")]
+    pub read_failures: Vec<ReadFailure>,
+}
+
+/// One thing a feed couldn't read: `part` is "feed" (the whole feed failed), "herdr" (herdr on
+/// that machine didn't answer) or "session" (one session, named in `session`, didn't).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ReadFailure {
+    pub part: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub why: String,
+}
+
+impl ReadFailure {
+    /// Which failure this is, whatever its words: a run of the same one counts as one.
+    pub fn key(&self) -> String {
+        match &self.session {
+            Some(session) => format!("{} {session}", self.part),
+            None => self.part.clone(),
+        }
+    }
+}
+
+fn read_failures<'de, D>(d: D) -> Result<Vec<ReadFailure>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| serde_json::from_value(e.clone()).ok())
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// One stage list: the columns between Backlog and Done for the teams that use it (intent 0595).
@@ -453,12 +494,46 @@ pub fn parse(text: &str) -> Result<Feed, String> {
             env!("CARGO_PKG_VERSION")
         ));
     }
+    // It says itself that its cards are empty because it failed: the last good ones stand.
+    if let Some(failed) = feed.read_failures.iter().find(|f| f.part == "feed") {
+        return Err(failed.why.clone());
+    }
     Ok(feed)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_feed_says_what_it_takes_and_what_it_could_not_read() {
+        let feed = parse(
+            r#"{"kerdr_feed":1,"supports":["op","retry","follow"],"read_failures":[
+                {"part":"herdr","why":"herdr on this machine didn't answer within a few seconds"},
+                {"part":"session","session":"web","why":"herdr session web didn't list its tabs in time"},
+                {"nonsense":true}, 7]}"#,
+        )
+        .unwrap();
+        assert!(feed.supports("op") && !feed.supports("telepathy"));
+        // What isn't that shape is passed over: never a failed feed.
+        assert_eq!(feed.read_failures.len(), 2);
+        assert_eq!(feed.read_failures[1].key(), "session web");
+        assert!(
+            parse(r#"{"kerdr_feed":1,"read_failures":"oops"}"#)
+                .unwrap()
+                .read_failures
+                .is_empty()
+        );
+        // An older feed says nothing of either.
+        let old = parse(r#"{"kerdr_feed":1}"#).unwrap();
+        assert!(!old.supports("op") && old.read_failures.is_empty());
+        // One that says it failed as a whole is a failed read: the last good cards stand.
+        assert_eq!(
+            parse(r#"{"kerdr_feed":1,"cards":[],"read_failures":[{"part":"feed","why":"ark-sdlc's card feed hit a bug"}]}"#)
+                .unwrap_err(),
+            "ark-sdlc's card feed hit a bug"
+        );
+    }
 
     #[test]
     fn optional_account_fields_accept_future_providers_and_null_usage() {

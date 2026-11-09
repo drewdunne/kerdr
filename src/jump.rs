@@ -256,6 +256,14 @@ fn no_answer(machine: &str, tries: usize) -> String {
     }
 }
 
+/// Something to say on the board once a jump is over (intent 0591): `take_note` gets it.
+static NOTE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// What the last jump left to say on the board.
+pub fn take_note() -> Option<String> {
+    NOTE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// How many times more a focus herdr didn't answer in time is asked, and one it refused or one
 /// whose connection failed (intent 0591): herdr may be slow, or reloading.
 const FOCUS_TIMEOUTS_AGAIN: usize = 2;
@@ -307,7 +315,25 @@ fn focus(
         break;
     }
     if let Some(tab) = &jump.tab {
-        let out = run(&herdr_args(&jump.session, &["tab", "focus", tab]));
+        let focus_tab = herdr_args(&jump.session, &["tab", "focus", tab]);
+        let mut out = run(&focus_tab);
+        // Refused for something other than the tab being gone: herdr may be reloading, so it's
+        // asked once more before anything is said (intent 0591).
+        if jump.strict
+            && !out.ok()
+            && !out.timed_out
+            && transport::classify(t, &out).is_none()
+            && !tab_gone(&out)
+            && !session_stopped(&out)
+        {
+            pause(FOCUS_PAUSE);
+            out = run(&focus_tab);
+        }
+        // herdr focused it, in another workspace: it's still the card's own tab, moved. Kerdr
+        // goes there rather than call that a refusal (intent 0591).
+        if jump.strict && out.ok() && tab_workspace(&out.stdout).is_some() {
+            return None;
+        }
         let in_place = out.ok() && tab_workspace(&out.stdout).is_some_and(|w| w == jump.workspace);
         if jump.strict && !in_place {
             // Only that tab will do: anything short of herdr saying it focused it, in the card's
@@ -761,18 +787,30 @@ pub fn run(
     };
     let mut cmd = match (&jump.machine.ssh, jump.via) {
         (Some(host), Via::Ssh) => {
-            let out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
+            let mut out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
             if !out.ok() {
-                drop_pending_keys();
-                return Outcome::Failed(format!(
-                    "Couldn't prepare herdr's window on {}: {}",
+                std::thread::sleep(FOCUS_PAUSE);
+                out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
+            }
+            // Only a cosmetic setting failed: the card opens with herdr's own settings, and the
+            // board says so after (intent 0591).
+            let own_settings = !out.ok();
+            if own_settings {
+                *NOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
+                    "herdr's window on {} opened with its own settings, so its sidebar shows: Kerdr couldn't prepare its usual ones ({}).",
                     jump.machine.name,
                     first_line(&out)
                 ));
             }
+            let config = if own_settings {
+                String::new()
+            } else {
+                "HERDR_CONFIG_PATH=\"${XDG_CACHE_HOME:-$HOME/.cache}/kerdr/herdr-client.toml\" "
+                    .to_string()
+            };
             let words: Vec<String> = session_args.iter().map(|a| transport::quote(a)).collect();
             let script = format!(
-                "{}; unset {}; HERDR_CONFIG_PATH=\"${{XDG_CACHE_HOME:-$HOME/.cache}}/kerdr/herdr-client.toml\" KERDR=1 exec {} {}",
+                "{}; unset {}; {config}KERDR=1 exec {} {}",
                 transport::PATH_PREFIX,
                 HERDR_VARS.join(" "),
                 transport::herdr_word(&herdr_bin),
@@ -971,16 +1009,32 @@ pub fn foreground(
     for var in HERDR_VARS {
         cmd.env_remove(var);
     }
-    let ok = cmd.status().map(|s| s.success()).unwrap_or(false);
+    let status = cmd.status();
+    let ok = status.as_ref().is_ok_and(|s| s.success());
     #[cfg(windows)]
     drop(console_modes);
     if !ok {
-        println!("\nThat didn't finish cleanly. Press Enter to go back to Kerdr.");
+        println!(
+            "\n{} Press Enter to go back to Kerdr.",
+            not_finished(cmd, &status)
+        );
         let mut line = String::new();
         let _ = std::io::stdin().read_line(&mut line);
     }
     enter(terminal, flags);
     ok
+}
+
+/// Which command didn't finish, and how, for the plain screen before Enter (intent 0591).
+fn not_finished(cmd: &Command, status: &std::io::Result<std::process::ExitStatus>) -> String {
+    let program = cmd.get_program().to_string_lossy();
+    match status {
+        Ok(s) => match s.code() {
+            Some(code) => format!("{program} ended with exit code {code}, so that didn't finish."),
+            None => format!("{program} was stopped by a signal, so that didn't finish."),
+        },
+        Err(e) => format!("{program} couldn't be run ({e})."),
+    }
 }
 
 pub fn expand_home(path: &str) -> String {
@@ -1387,12 +1441,36 @@ esac
             [FOCUS_W4, FOCUS_T2, FOCUS_W4],
             "herdr put back, nothing opened"
         );
-        // Any other answer short of "focused, in its workspace" stops a strict jump too.
-        for (moves_to, answer) in [
-            (Some("w7"), says(0, TAB_ELSEWHERE)),
-            (None, says(0, "garbled")),
-            (None, says(1, "error: busy")),
-        ] {
+        // herdr focused it, in another workspace: it's still the card's own tab, moved, so Kerdr
+        // goes there and doesn't put herdr back (intent 0591).
+        let (answer, focused) = herdr_with(
+            Some("w7"),
+            says(0, TAB_ELSEWHERE),
+            says(0, WORKSPACE_FOCUSED),
+        );
+        let moved = Jump {
+            strict: true,
+            ..jump(Some("w4:t2"))
+        };
+        let (outcome, calls) = focus_with(&moved, answer);
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2]);
+        assert_eq!(*focused.borrow(), "w7");
+        // Refused once while herdr reloads, then focused: nothing said, and it goes in.
+        let mut first = true;
+        let (outcome, calls) = focus_with(&moved, |line| {
+            if line == FOCUS_W4 {
+                says(0, WORKSPACE_FOCUSED)
+            } else if std::mem::take(&mut first) {
+                says(1, "error: busy")
+            } else {
+                says(0, TAB_FOCUSED)
+            }
+        });
+        assert_eq!(outcome, None);
+        assert_eq!(calls, [FOCUS_W4, FOCUS_T2, FOCUS_T2]);
+        // Any other answer short of "focused" stops a strict jump too.
+        for (moves_to, answer) in [(None, says(0, "garbled")), (None, says(1, "error: busy"))] {
             let (answer_fn, focused) = herdr_with(moves_to, answer, says(0, WORKSPACE_FOCUSED));
             let strict = Jump {
                 strict: true,

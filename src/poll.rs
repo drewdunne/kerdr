@@ -67,6 +67,31 @@ impl Conn {
         }
     }
 
+    /// Why it isn't answering, in a few words, for `R` (intent 0591): "SSH timed out, still
+    /// trying". None when it is, or when nothing keeps it from answering that Kerdr can name.
+    pub fn briefly(&self) -> Option<String> {
+        let detail = match self {
+            Conn::Reconnecting { detail, .. } | Conn::Unreachable { detail, .. } => detail,
+            Conn::HostKey { .. } | Conn::Auth { .. } => return Some("SSH needs you".into()),
+            _ => return None,
+        };
+        let d = detail.to_lowercase();
+        let what = if d.contains("timed out") {
+            "SSH timed out"
+        } else if d.contains("refused") {
+            "its connection was refused"
+        } else if d.contains("resolve") || d.contains("name or service") {
+            "its name can't be found"
+        } else if d.contains("no route") || d.contains("unreachable") {
+            "there's no route to it"
+        } else if d.contains("broken pipe") || d.contains("reset") || d.contains("dropped") {
+            "the connection dropped"
+        } else {
+            "no answer"
+        };
+        Some(format!("{what}, still trying"))
+    }
+
     pub fn needs_you(&self) -> bool {
         matches!(self, Conn::HostKey { .. } | Conn::Auth { .. })
     }
@@ -118,6 +143,9 @@ pub struct MachineData {
     pub keys: bool,
     /// None when the feed wasn't due this time; the last one still stands.
     pub feed: Option<Result<Feed, String>>,
+    /// Why herdr's list of sessions couldn't be read this time, when it couldn't: the machine
+    /// answered, so it's live, and the last list stands (intent 0591).
+    pub sessions_failed: Option<String>,
     /// A feed read that failed after the good one above, when two reads were merged into one.
     pub feed_failed_after: Option<String>,
     /// The same for a session: its last good snapshot, where a later read in the merge failed.
@@ -139,6 +167,12 @@ pub struct Event {
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
         (Some(data), Some(old_data)) => {
+            // The newer read has no list of sessions where the older had one: the older's stands
+            // (intent 0591).
+            if data.sessions_failed.is_some() && old_data.sessions_failed.is_none() {
+                data.sessions = old_data.sessions.clone();
+                data.snapshots = old_data.snapshots.clone();
+            }
             // A session that failed after a good read stays as that read left it, not as the
             // board last showed it (intent 0491).
             let failed = |data: &MachineData, session: &str| {
@@ -404,6 +438,7 @@ pub fn spawn(
         // A failed feed read is read again at once, once in a run of failures (intent 0591): a
         // cut-off read is most often a dropped connection.
         let mut feed_reread = false;
+        let mut list_most = SESSION_MOST;
         loop {
             let feed_owed = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
@@ -412,10 +447,16 @@ pub fn spawn(
                 inbox.reading_feed(index, reader);
             }
             let started = Instant::now();
-            let out = collect(&machine, feed_due);
+            let out = collect(&machine, feed_due, list_most);
             let now = Local::now();
             let (conn, data, wait) = match read(&target, &out, feed_due) {
                 Ok(data) => {
+                    // A list that ran out of time gets longer next pass (intent 0591).
+                    list_most = if out.stdout.contains(SESSIONS_SILENT) {
+                        SESSIONS_MOST_AFTER_SILENCE
+                    } else {
+                        SESSION_MOST
+                    };
                     attempt = 0;
                     first_failure = None;
                     ever_live = true;
@@ -521,6 +562,13 @@ pub const SESSION_SILENT: &str = "this herdr session didn't answer in 5 s";
 /// What the machine shows when herdr's list of sessions ran out of that time: no list, no read.
 pub const SESSIONS_SILENT: &str = "herdr didn't list its sessions in 5 s";
 
+/// How long that list gets on the read after one that ran out of time (intent 0591): herdr slow
+/// under load isn't the machine dropping.
+const SESSIONS_MOST_AFTER_SILENCE: Duration = Duration::from_secs(10);
+
+/// Sets the command that keeps herdr to the time in M.
+const LIMIT_TO_M: &str = "T=limited; command -v timeout >/dev/null 2>&1 && T=\"timeout $M\"\n";
+
 /// That limit, for machines with no `timeout` command, macOS among them: the command in the
 /// background and a watchdog that stops it, with `timeout`'s exit status. The watchdog's output
 /// goes nowhere, or it would hold the read open, and what the shell says of a job it lost isn't let
@@ -538,14 +586,19 @@ const WATCHDOG: &str = r#"limited() {
 
 /// The script one read runs on the machine.
 pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
+    build_script_within(herdr, feed, SESSION_MOST)
+}
+
+/// As build_script, herdr's list of sessions given `list_most` to answer.
+fn build_script_within(herdr: &str, feed: Option<&str>, list_most: Duration) -> String {
     let mut s = String::new();
     s.push_str(PATH_PREFIX);
     s.push('\n');
     s.push_str(&format!("unset {}\n", HERDR_VARS.join(" ")));
     s.push_str(&format!("H={}\n", transport::herdr_word(herdr)));
-    s.push_str(&format!("M={}\n", SESSION_MOST.as_secs()));
+    s.push_str(&format!("M={}\n", list_most.as_secs()));
     s.push_str(WATCHDOG);
-    s.push_str("T=limited; command -v timeout >/dev/null 2>&1 && T=\"timeout $M\"\n");
+    s.push_str(LIMIT_TO_M);
     s.push_str(&format!("echo '{MARK}host'; uname -n\n"));
     s.push_str(&format!(
         "if ! command -v \"$H\" >/dev/null 2>&1; then echo '{MARK}missing'; exit 0; fi\n"
@@ -558,6 +611,8 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
         "S=$($T \"$H\" session list --json 2>&1) || {{ [ $? = 124 ] && S={}; }}; echo '{MARK}sessions'; printf '%s\\n' \"$S\"\n",
         transport::quote(SESSIONS_SILENT)
     ));
+    s.push_str(&format!("M={}\n", SESSION_MOST.as_secs()));
+    s.push_str(LIMIT_TO_M);
     // Session names only split into words here; never expanded as file patterns.
     s.push_str("set -f\n");
     s.push_str(
@@ -657,8 +712,12 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
             version: herdr::version_string(v),
         }));
     }
-    let sessions = herdr::parse_sessions(sections.sessions.as_deref().unwrap_or(""))
-        .map_err(|e| Failure::Ssh(Problem::Other(e)))?;
+    // A list that can't be read is herdr's trouble, not the machine's, which has just answered.
+    let (sessions, sessions_failed) =
+        match herdr::parse_sessions(sections.sessions.as_deref().unwrap_or("")) {
+            Ok(sessions) => (sessions, None),
+            Err(e) => (vec![], Some(sessions_trouble(&e))),
+        };
     let snapshots = sections
         .snapshots
         .into_iter()
@@ -680,18 +739,44 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         snapshots,
         keys: sections.keys.unwrap_or(false),
         feed,
+        sessions_failed,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
     })
 }
 
-fn collect(machine: &Machine, feed_due: bool) -> transport::Output {
+/// Why herdr's list of sessions failed, in words for the board: herdr's, not the machine's.
+fn sessions_trouble(error: &str) -> String {
+    let error = error.trim();
+    if error.is_empty() || error == "herdr printed nothing" {
+        return "herdr printed nothing for its list of sessions".into();
+    }
+    if error == SESSIONS_SILENT {
+        return "herdr is slow there: it didn't list its sessions in time".into();
+    }
+    let said: String = error.chars().take(160).collect();
+    let lower = said.to_lowercase();
+    let setup =
+        if lower.contains("version") || lower.contains("mismatch") || lower.contains("differ") {
+            " On the machines screen (M), u runs herdr's own setup there."
+        } else {
+            ""
+        };
+    format!("herdr answered its list of sessions with something Kerdr can't read: {said}.{setup}")
+}
+
+fn collect(machine: &Machine, feed_due: bool, list_most: Duration) -> transport::Output {
     #[cfg(windows)]
     if machine.is_local() {
+        let _ = list_most;
         return crate::windows::poll(machine, feed_due);
     }
     let target = crate::jump::target(machine);
-    let script = build_script(&machine.herdr, machine.feed.as_deref().filter(|_| feed_due));
+    let script = build_script_within(
+        &machine.herdr,
+        machine.feed.as_deref().filter(|_| feed_due),
+        list_most,
+    );
     transport::run_script(&target, &script, Duration::from_secs(25))
 }
 
@@ -701,7 +786,7 @@ pub fn read_once(machine: &Machine) -> (Conn, Option<MachineData>) {
         Some(host) => Target::Ssh(host.clone()),
         None => Target::Local,
     };
-    let out = collect(machine, machine.feed.is_some());
+    let out = collect(machine, machine.feed.is_some(), SESSION_MOST);
     let now = Local::now();
     match read(&target, &out, machine.feed.is_some()) {
         Ok(data) => (Conn::Live { latency: out.took }, Some(data)),
@@ -1322,11 +1407,40 @@ esac
             let t = Instant::now();
             let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
             assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+            // herdr is slow; the machine has answered, so it stays live (intent 0591).
             match read(&Target::Local, &out, false) {
-                Err(Failure::Ssh(Problem::Other(why))) => assert_eq!(why, SESSIONS_SILENT),
+                Ok(data) => {
+                    assert_eq!(
+                        data.sessions_failed.as_deref(),
+                        Some("herdr is slow there: it didn't list its sessions in time")
+                    );
+                    assert!(data.sessions.is_empty());
+                }
                 _ => panic!("expected it to say why: {}", out.stdout),
             }
         }
+    }
+
+    #[test]
+    fn what_herdr_says_of_its_list_of_sessions_is_herdr_s_trouble_in_plain_words() {
+        assert_eq!(
+            sessions_trouble("herdr printed nothing"),
+            "herdr printed nothing for its list of sessions"
+        );
+        assert_eq!(
+            sessions_trouble("Error: socket closed"),
+            "herdr answered its list of sessions with something Kerdr can't read: Error: socket closed."
+        );
+        assert!(
+            sessions_trouble("herdr client and server versions differ")
+                .contains("u runs herdr's own setup")
+        );
+        // The list gets longer on the read after one that ran out of time, and only the list.
+        let script = build_script_within("herdr", None, SESSIONS_MOST_AFTER_SILENCE);
+        assert!(script.contains("M=10\n"), "{script}");
+        let list = script.find("session list").unwrap();
+        let back = script.find("M=5\n").unwrap();
+        assert!(back > list, "{script}");
     }
 
     /// Whether this machine has a `timeout` command to test.

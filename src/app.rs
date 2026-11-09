@@ -153,6 +153,9 @@ pub struct Refresh {
     pub away: u64,
 }
 
+/// How long after `R` a machine it couldn't bring up to date coming back is said (intent 0591).
+const REFRESH_BACK_WITHIN: Duration = Duration::from_secs(120);
+
 /// How many failures one box shows: a key takes those down, and the rest come up next, so none
 /// goes unseen.
 pub const FAIL_PAGE: usize = 3;
@@ -625,6 +628,8 @@ pub struct App {
     pub account_batch_messages: Vec<String>,
     /// Some machine's part of that batch didn't happen: the summary is a warning (intent 0591).
     pub account_batch_failed: bool,
+    /// Machines `R` couldn't bring up to date, still being tried, and when (intent 0591).
+    pub refresh_behind: Option<(Instant, Vec<usize>)>,
     pub account_pending: Option<account_controls::Pending>,
     /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
     /// your version until a save of it succeeds.
@@ -739,6 +744,7 @@ impl App {
             signin_open: None,
             account_batch_messages: vec![],
             account_batch_failed: false,
+            refresh_behind: None,
             account_pending: None,
             edits: Default::default(),
             edit_flights: vec![],
@@ -955,7 +961,7 @@ impl App {
         self.refresh = (!waiting.is_empty()).then(|| Refresh {
             since,
             waiting,
-            missed: trying.iter().map(|&i| self.machines[i].name()).collect(),
+            missed: trying.iter().map(|&i| self.machine_why(i)).collect(),
             said,
             away: self.away,
         });
@@ -985,6 +991,9 @@ impl App {
         if r.away != self.away {
             return;
         }
+        let whys: Vec<String> = (0..self.machines.len())
+            .map(|i| self.machine_why(i))
+            .collect();
         let machines = &self.machines;
         let missed = &mut r.missed;
         r.waiting.retain(|&i| {
@@ -996,7 +1005,7 @@ impl App {
             }
             let failed = !m.conn.is_live() || (fed.contains(&i) && m.feed_error.is_some());
             if failed {
-                missed.push(m.name());
+                missed.push(whys[i].clone());
             } else if fed.contains(&i) && !m.snapshot_errors.is_empty() {
                 // Its cards are new, but a stuck session's workspaces are as they last were.
                 let mut sessions: Vec<&str> =
@@ -1018,6 +1027,56 @@ impl App {
         } else {
             let names = r.missed.join(", ");
             self.say(format!("Up to date, except {names}."), Tone::Info);
+            // Those still reading again by themselves: said when they land.
+            let behind: Vec<usize> = (0..self.machines.len())
+                .filter(|&i| self.machines[i].is_shown() && !self.machines[i].conn.is_live())
+                .collect();
+            if !behind.is_empty() {
+                self.refresh_behind = Some((Instant::now(), behind));
+            }
+        }
+    }
+
+    /// A machine by name, and why it's behind when that's known: "arknet-one (SSH timed out,
+    /// still trying)" (intent 0591).
+    fn machine_why(&self, i: usize) -> String {
+        let m = &self.machines[i];
+        let why = m.conn.briefly().or_else(|| {
+            m.feed_error
+                .as_ref()
+                .map(|e| format!("its feed failed: {e}"))
+        });
+        match why {
+            Some(why) => format!("{} ({why})", m.name()),
+            None => m.name(),
+        }
+    }
+
+    /// `R` couldn't bring these machines up to date and they've come back since: said once they
+    /// all have, unless something else has been said meanwhile.
+    fn refresh_landed(&mut self) {
+        let Some((at, behind)) = self.refresh_behind.as_mut() else {
+            return;
+        };
+        if at.elapsed() >= REFRESH_BACK_WITHIN {
+            self.refresh_behind = None;
+            return;
+        }
+        let machines = &self.machines;
+        behind.retain(|&i| {
+            machines
+                .get(i)
+                .is_some_and(|m| m.is_shown() && !m.conn.is_live())
+        });
+        if !behind.is_empty() {
+            return;
+        }
+        self.refresh_behind = None;
+        if self
+            .message()
+            .is_none_or(|(said, _)| said.starts_with("Up to date, except"))
+        {
+            self.say("Now up to date.", Tone::Good);
         }
     }
 
@@ -1035,6 +1094,9 @@ impl App {
             m.take(data, ev.at);
         }
         self.keep_machine_problems(ev.machine);
+        if read {
+            self.refresh_landed();
+        }
         // A change that succeeded shows from the feed itself once a read has it (intent 0416).
         if read {
             self.resolver
@@ -3045,8 +3107,26 @@ pub(crate) mod tests {
             "Reading every machine now, and trying 1 again."
         );
         app.settle_refresh(&[0]);
-        let said = format!("Up to date, except {down}.");
+        // Which machine, and why in a few words (intent 0591).
+        let said = format!("Up to date, except {down} (no answer, still trying).");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+        // Its retry lands by itself: that's said, once.
+        app.machines[1].conn = Conn::Live {
+            latency: Duration::from_millis(1),
+        };
+        app.apply(Event {
+            machine: 1,
+            conn: Conn::Live {
+                latency: Duration::from_millis(1),
+            },
+            data: Some(crate::poll::MachineData {
+                feed: Some(Ok(crate::feed::Feed::default())),
+                ..Default::default()
+            }),
+            at: Local::now(),
+        });
+        assert_eq!(app.message(), Some(("Now up to date.", Tone::Good)));
+        assert!(app.refresh_behind.is_none());
     }
 
     #[test]
@@ -3148,7 +3228,7 @@ pub(crate) mod tests {
         app.machines[0].feed_error = Some("timed out".into());
         app.machines[1].conn = Conn::Hidden;
         app.settle_refresh(&[0]);
-        let said = format!("Up to date, except {failed}.");
+        let said = format!("Up to date, except {failed} (its feed failed: timed out).");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
     }
 
@@ -8871,13 +8951,15 @@ pub(crate) mod tests {
         queue.push_gated(n, m, app.resolver.key_of(n), &request);
         let failed = std::collections::HashMap::from([(id.clone(), Some("failed".to_string()))]);
         assert_eq!(queue.written(m, &failed), vec![n]);
-        assert!(queue.is_empty(), "it never starts");
-        // The runner answers it with the reason, which the board shows.
-        app.finish_job(n, request, Err(crate::resolve::NOT_WRITTEN_UP.into()));
-        assert!(!app.starts_when_written(&key));
-        let (said, _) = app.message().unwrap();
-        assert!(said.contains("couldn't be written up"), "{said}");
-        assert!(said.contains("d starts it as it is"), "{said}");
+        // It starts from his words as they are, and the board says so (intent 0591).
+        assert_eq!(queue.startable(), vec![n]);
+        app.starts_from_words(n);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info);
+        assert!(
+            said.contains("couldn't be written up, so it starts from your words as they are"),
+            "{said}"
+        );
     }
 
     #[test]

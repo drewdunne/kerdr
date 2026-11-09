@@ -23,9 +23,6 @@ use crate::model::CardSnapshot;
 /// record exists yet, so nothing may be done to it.
 pub const SAVING: &str = "saving";
 
-/// What a start that waited for its intent's write-up says when the write-up failed (intent 0445).
-pub const NOT_WRITTEN_UP: &str = "it couldn't be written up from your words; d starts it as it is.";
-
 /// What a card says while its change is sent again by itself (intent 0591).
 pub const RETRYING: &str = "Trying again…";
 /// What a new intent's card says while its words are sent again by itself.
@@ -33,6 +30,10 @@ pub const RETRYING_SAVE: &str = "Saving, trying again…";
 
 /// How long a settled effect may stay without the feed showing it.
 const SETTLED_MOST: Duration = Duration::from_secs(60);
+
+/// How long a new intent's card stays quiet after it was saved and no feed shows it yet: feeds
+/// are read again by themselves meanwhile (intent 0591).
+const SAVED_QUIET: Duration = Duration::from_secs(300);
 /// How long a start asked for on another machine shows as starting there: a start over SSH may
 /// take four minutes, and the requests pass there two (intent 0445).
 const ELSEWHERE_MOST: Duration = Duration::from_secs(300);
@@ -127,8 +128,9 @@ impl Placeholder {
     fn card(&self, late: bool) -> FeedCard {
         let status = match (&self.made, late) {
             (Some(id), true) => format!(
-                "Saved as #{}; not on the board yet",
-                id.trim_start_matches('0')
+                "Saved as #{} on {}; not on the board yet",
+                id.trim_start_matches('0'),
+                self.machine
             ),
             _ => "Saving…".into(),
         };
@@ -481,8 +483,8 @@ impl Queue {
     }
 
     /// A read of `machine`'s feed: each record there by id, with its intake. Starts waiting for a
-    /// record it shows written up may start; ones whose write-up failed are taken out, and
-    /// returned, since starting an intent nobody wrote up isn't what d was pressed for. A start
+    /// record it shows written up may start; so may those whose write-up failed, from his words as
+    /// they are, which is what d on them does (intent 0591), and those are returned to be said. A start
     /// behind a save of its record's text, or just after one, isn't judged by a read from before
     /// that save landed: its write-up starts again then (intent 0414).
     pub fn written(
@@ -503,11 +505,13 @@ impl Queue {
             }
             match q.record.as_ref().and_then(|r| intakes.get(r)) {
                 Some(None) => self.items[i].gated = false,
-                Some(Some(intake)) if intake == "failed" => failed.push(q.n),
+                Some(Some(intake)) if intake == "failed" => {
+                    failed.push(q.n);
+                    self.items[i].gated = false;
+                }
                 _ => {}
             }
         }
-        self.items.retain(|q| !failed.contains(&q.n));
         failed
     }
 
@@ -630,6 +634,11 @@ impl Resolver {
             retrying: false,
         });
         self.next
+    }
+
+    /// The request of a change still on its way.
+    pub fn job_request(&self, n: u64) -> Option<&Value> {
+        self.jobs.iter().find(|j| j.n == n).map(|j| &j.request)
     }
 
     /// This change is being sent again by itself (Job::retrying), or, false, has been answered.
@@ -1067,7 +1076,7 @@ impl Resolver {
                 }
                 let late = job
                     .settled
-                    .is_some_and(|(at, _)| at.elapsed() >= SETTLED_MOST);
+                    .is_some_and(|(at, _)| at.elapsed() >= SAVED_QUIET);
                 if let Some(feed) = out.get_mut(job.machine).and_then(|m| m.feed.as_mut()) {
                     let mut card = p.card(late);
                     if job.retrying {
@@ -1883,8 +1892,9 @@ mod tests {
         assert_eq!(q.startable(), vec![1]);
         let mut q = Queue::default();
         q.push_gated(1, 0, None, &start);
+        // Its write-up failed: it starts from his words as they are, and that's said (intent 0591).
         assert_eq!(q.written(0, &feed(Some("failed"))), vec![1]);
-        assert!(q.is_empty());
+        assert_eq!(q.startable(), vec![1]);
         let mut q = Queue::default();
         q.push_gated(1, 0, None, &start);
         assert!(q.drop_unstarted(1));
@@ -2068,7 +2078,17 @@ mod tests {
         r.read(0, Some(&without));
         assert_eq!(
             status(&r).as_deref(),
-            Some("Saved as #9001; not on the board yet")
+            Some("Saving…"),
+            "quiet for five minutes"
+        );
+        for j in &mut r.jobs {
+            j.settled = Some((Instant::now() - SAVED_QUIET, 2));
+        }
+        assert!(!r.expire());
+        r.read(0, Some(&without));
+        assert_eq!(
+            status(&r).as_deref(),
+            Some("Saved as #9001 on here; not on the board yet")
         );
         r.read(
             0,

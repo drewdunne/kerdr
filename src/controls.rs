@@ -2404,6 +2404,25 @@ impl App {
         }
     }
 
+    /// A start that waited for its intent's write-up is going ahead from his words as they are,
+    /// since that write-up failed (intent 0591): said, so it's no surprise on the card.
+    pub fn starts_from_words(&mut self, n: u64) {
+        let Some(id) = self
+            .resolver
+            .job_request(n)
+            .and_then(|r| r["id"].as_str().map(str::to_string))
+        else {
+            return;
+        };
+        let reference = self.reference_for(&id);
+        self.say(
+            format!(
+                "{reference} couldn't be written up, so it starts from your words as they are."
+            ),
+            Tone::Info,
+        );
+    }
+
     /// A change's answer, from the action resolution tool: one that went as shown keeps showing
     /// until the feed has it; any other takes its effect with it, so the card is back as it really
     /// is before anything is said or asked.

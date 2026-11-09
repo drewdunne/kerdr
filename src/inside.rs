@@ -815,6 +815,7 @@ mod tests {
             snapshots: [(session.to_string(), Ok(snap))].into_iter().collect(),
             keys: true,
             feed: None,
+            sessions_failed: None,
             feed_failed_after: None,
             kept_snapshots: Default::default(),
         });

@@ -162,6 +162,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         snapshots: [("web".to_string(), Ok(laptop_snap))].into_iter().collect(),
         keys: true,
         feed: None,
+        sessions_failed: None,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
     });
@@ -226,6 +227,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         .collect(),
         keys: true,
         feed: None,
+        sessions_failed: None,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
     });

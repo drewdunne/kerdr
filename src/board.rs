@@ -38,6 +38,11 @@ pub struct MachineState {
     pub feed_failing_since: Option<DateTime<Local>>,
     /// By session: since when its reads have failed, for as long as they do.
     pub session_failing_since: HashMap<String, DateTime<Local>>,
+    /// By ReadFailure::key: since when its newest feed has said it couldn't read that part.
+    pub read_failing_since: HashMap<String, DateTime<Local>>,
+    /// Why herdr's list of sessions couldn't be read, and since when: the last list stands
+    /// meanwhile, and the machine stays live (intent 0591).
+    pub sessions_failing: Option<(String, DateTime<Local>)>,
 }
 
 impl MachineState {
@@ -61,6 +66,8 @@ impl MachineState {
             feed_failures: 0,
             feed_failing_since: None,
             session_failing_since: HashMap::new(),
+            read_failing_since: HashMap::new(),
+            sessions_failing: None,
         }
     }
 
@@ -88,12 +95,49 @@ impl MachineState {
             .or_else(|| self.snapshot_errors.get(session).cloned())
     }
 
+    /// What its feed says it couldn't read, of what has lasted QUIET_FOR seconds (intent 0591).
+    pub fn read_failures_lasting(&self, now: DateTime<Local>) -> Vec<&crate::feed::ReadFailure> {
+        let Some(feed) = &self.feed else {
+            return vec![];
+        };
+        feed.read_failures
+            .iter()
+            .filter(|f| {
+                self.read_failing_since
+                    .get(&f.key())
+                    .is_some_and(|t| (now - *t).num_seconds() >= crate::poll::QUIET_FOR)
+            })
+            .collect()
+    }
+
+    /// Why this session's row should say something, in the feed's words, once that has lasted:
+    /// the session itself, or herdr on its machine as a whole.
+    fn feed_says_of(&self, session: &str, now: DateTime<Local>) -> Option<String> {
+        self.read_failures_lasting(now)
+            .into_iter()
+            .find(|f| f.part == "herdr" || f.session.as_deref() == Some(session))
+            .map(|f| f.why.clone())
+    }
+
+    /// Why herdr's list of sessions can't be read, once that has lasted QUIET_FOR seconds.
+    pub fn sessions_problem(&self, now: DateTime<Local>) -> Option<&str> {
+        self.sessions_failing
+            .as_ref()
+            .filter(|(_, since)| (now - *since).num_seconds() >= crate::poll::QUIET_FOR)
+            .map(|(why, _)| why.as_str())
+    }
+
     /// Takes in a read made at `at`: notes which agents it saw not working, and when each
     /// workspace's report changed, then keeps the read. A feed it brings stands until the next; one
     /// it doesn't bring leaves the last in place. A session that didn't answer keeps what was known.
     pub fn take(&mut self, mut data: MachineData, at: DateTime<Local>) {
         match data.feed.take() {
             Some(Ok(feed)) => {
+                let saying: HashSet<String> = feed.read_failures.iter().map(|f| f.key()).collect();
+                self.read_failing_since.retain(|k, _| saying.contains(k));
+                for key in saying {
+                    self.read_failing_since.entry(key).or_insert(at);
+                }
                 self.feed = Some(feed);
                 self.feed_error = data.feed_failed_after.take();
                 self.feed_taken = Some(at);
@@ -107,6 +151,20 @@ impl MachineState {
                 self.feed_failing_since.get_or_insert(at);
             }
             None => {}
+        }
+        // herdr's list of sessions couldn't be read this time: the last list and what it showed
+        // stand, as for a session that didn't answer (intent 0591).
+        match data.sessions_failed.take() {
+            Some(why) => {
+                let since = self.sessions_failing.take().map_or(at, |(_, since)| since);
+                self.sessions_failing = Some((why, since));
+                // A read merged after a good one brings that one's list instead.
+                if let Some(last) = self.data.as_ref().filter(|_| data.sessions.is_empty()) {
+                    data.sessions = last.sessions.clone();
+                    data.snapshots = last.snapshots.clone();
+                }
+            }
+            None => self.sessions_failing = None,
         }
         let mut stopped = HashMap::new();
         let mut reported = HashMap::new();
@@ -991,6 +1049,8 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 // Only once it lasts: a read that failed once says nothing (intent 0591).
                 error: m
                     .session_problem(&info.name, now)
+                    .or_else(|| m.sessions_problem(now).map(str::to_string))
+                    .or_else(|| m.feed_says_of(&info.name, now))
                     .or_else(|| m.feed_problem(now).map(str::to_string)),
             });
         }
@@ -1249,6 +1309,94 @@ pub fn jump_request(workspaces: &[Workspace]) -> Option<(String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn herdr_s_list_failing_keeps_the_last_board_and_a_feed_s_reason_is_said_once_it_lasts() {
+        let machine = Machine {
+            name: "lab".into(),
+            ssh: Some("lab".into()),
+            herdr: "herdr".into(),
+            feed: Some("feed".into()),
+            hidden: false,
+        };
+        let snapshot = Snapshot {
+            workspaces: vec![ws("w1", "1-open")],
+            ..Default::default()
+        };
+        let mut m = live(machine, vec![("web", snapshot)], None);
+        let failed = || crate::poll::MachineData {
+            sessions_failed: Some(
+                "herdr is slow there: it didn't list its sessions in time".into(),
+            ),
+            ..Default::default()
+        };
+        let cfg = Config::default();
+        let long_ago = Local::now() - chrono::Duration::seconds(crate::poll::QUIET_FOR + 1);
+        // The list couldn't be read just now: the board is as it was, and nothing is said.
+        m.take(failed(), Local::now());
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert!(board.workspaces.iter().any(|w| w.id == "w1"));
+        assert!(m.conn.is_live());
+        assert_eq!(
+            board
+                .sessions
+                .iter()
+                .find(|s| s.session == "web")
+                .unwrap()
+                .error,
+            None
+        );
+        // It has lasted: its row says why, in herdr's words, not the machine's.
+        m.sessions_failing = Some((m.sessions_failing.take().unwrap().0, long_ago));
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert!(board.workspaces.iter().any(|w| w.id == "w1"));
+        assert_eq!(
+            board
+                .sessions
+                .iter()
+                .find(|s| s.session == "web")
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("herdr is slow there: it didn't list its sessions in time")
+        );
+        // A good read: over. The feed's own reason is said for its session once it has lasted.
+        let mut good = crate::poll::MachineData {
+            sessions: m.data.as_ref().unwrap().sessions.clone(),
+            snapshots: m.data.as_ref().unwrap().snapshots.clone(),
+            ..Default::default()
+        };
+        good.feed = Some(crate::feed::parse(
+            r#"{"kerdr_feed":1,"read_failures":[{"part":"session","session":"web","why":"herdr session web didn't list its tabs in time"}]}"#,
+        ));
+        m.take(good.clone(), long_ago);
+        assert!(m.sessions_failing.is_none());
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert_eq!(
+            board
+                .sessions
+                .iter()
+                .find(|s| s.session == "web")
+                .unwrap()
+                .error
+                .as_deref(),
+            Some("herdr session web didn't list its tabs in time")
+        );
+        m.take(good, Local::now());
+        assert_eq!(
+            m.read_failures_lasting(Local::now()).len(),
+            1,
+            "the same failure, still running"
+        );
+        let mut clear = crate::poll::MachineData {
+            sessions: m.data.as_ref().unwrap().sessions.clone(),
+            snapshots: m.data.as_ref().unwrap().snapshots.clone(),
+            ..Default::default()
+        };
+        clear.feed = Some(crate::feed::parse(r#"{"kerdr_feed":1}"#));
+        m.take(clear, Local::now());
+        assert!(m.read_failing_since.is_empty());
+    }
 
     #[test]
     fn manual_backlog_order_is_independent_of_affirmation_age() {

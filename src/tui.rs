@@ -252,6 +252,10 @@ fn event_loop(
                     app.resending(job, machine, &why);
                     continue;
                 }
+                Answer::NotWrittenUp(n) => {
+                    app.starts_from_words(n);
+                    continue;
+                }
                 Answer::Done(done) => *done,
             };
             // Done, or done in part (intent 0591): its machine's feed is read now, to show it.
@@ -721,6 +725,8 @@ enum Answer {
     /// A change (by its number, or an account request) is being sent again by itself, with the
     /// same op, and why (intent 0591).
     Resending(Option<u64>, usize, crate::actions::Resend),
+    /// A start that waited for its write-up goes ahead from the words as they are: it failed.
+    NotWrittenUp(u64),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -812,18 +818,10 @@ impl Runner {
                         seen.insert(machine, intakes);
                     }
                 }
-                // Its write-up failed: it never starts, and the board says so.
+                // Its write-up failed: it starts from his words as they are, and the board says
+                // so (intent 0591).
                 for n in failed {
-                    if let Some((machine, _, _, request, _)) = waiting.remove(&n) {
-                        let metadata = crate::actions::request_metadata(&request);
-                        let _ = answers.send(Answer::Done(Box::new((
-                            Some(n),
-                            machine,
-                            metadata,
-                            Err(crate::resolve::NOT_WRITTEN_UP.into()),
-                            String::new(),
-                        ))));
-                    }
+                    let _ = answers.send(Answer::NotWrittenUp(n));
                 }
                 for n in queue.startable() {
                     let Some((machine, target, command, request, resends)) = waiting.remove(&n)
@@ -1251,6 +1249,9 @@ fn run_jump(
     );
     bg.holds.borrow_mut().left(app, opened);
     app.unsay(&opening);
+    if let Some(note) = jump::take_note() {
+        app.say(note, Tone::Info);
+    }
     outcome
 }
 
@@ -1643,6 +1644,7 @@ mod tests {
             ),
             Answer::Progress(token, _, _) => format!("progress {token}"),
             Answer::Update(machine, n, _) => format!("update {n} on machine {machine}"),
+            Answer::NotWrittenUp(n) => format!("not written up {n}"),
             Answer::Resending(n, _, why) => format!(
                 "resending {} {}",
                 n.unwrap_or(0),
@@ -1919,7 +1921,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_runner_starts_a_start_once_its_write_up_is_read_and_never_after_a_failed_one() {
+    fn the_runner_starts_a_start_once_its_write_up_is_read_and_from_his_words_after_a_failed_one() {
         // Feeds reach it from the readers' threads, so this happens while Andrew is inside a
         // workspace too (intent 0445).
         let (tx, rx) = mpsc::channel();
@@ -1971,11 +1973,10 @@ mod tests {
                 intakes: intakes(&[("7", Some("pending")), ("9", Some("failed"))]),
             })
             .unwrap();
-        assert_eq!(
-            next(),
-            "done 3 failed",
-            "its write-up failed: never started"
-        );
+        // Its write-up failed: it starts from his words as they are, and that's said (intent 0591).
+        assert_eq!(next(), "not written up 3");
+        assert_eq!(next(), "started 3");
+        assert_eq!(next(), "done 3 ok");
         runner
             .tx
             .send(ToRunner::Feed {

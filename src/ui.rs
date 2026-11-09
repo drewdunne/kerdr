@@ -843,6 +843,21 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
             };
             spans.push(Span::styled(format!("{} ", conn.glyph()), gstyle));
             spans.push(Span::styled(name.clone(), nstyle));
+            // The last good state's age, quietly, while a drop or a failing feed is short
+            // (intent 0591).
+            let now = app.now();
+            let age = m
+                .and_then(|m| {
+                    let quiet_feed =
+                        m.conn.is_live() && m.feed_error.is_some() && m.feed_problem(now).is_none();
+                    let since = match m.conn {
+                        Conn::Reconnecting { .. } => m.last_ok,
+                        _ if quiet_feed => m.feed_taken,
+                        _ => None,
+                    };
+                    since.map(|t| format!(" · cards {} old", ago(t, now)))
+                })
+                .unwrap_or_default();
             if !conn.is_live() && !matches!(conn, Conn::Connecting) {
                 let short = match &conn {
                     Conn::Reconnecting { .. } => "reconnecting",
@@ -853,6 +868,9 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
                     _ => "",
                 };
                 spans.push(Span::styled(format!(" {short}"), fg(conn_color(&conn))));
+            }
+            if !age.is_empty() {
+                spans.push(Span::styled(age, fg(DIM)));
             }
             spans.push(Span::raw(" "));
             spans
@@ -4003,8 +4021,12 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
                 if m.machine.is_local() { "" } else { " over SSH" },
                 latency.as_millis()
             ),
-            match (&m.machine.feed, m.feed_problem(now)) {
+            match (&m.machine.feed, m.feed_problem(now).or(m.sessions_problem(now))) {
                 (Some(_), Some(e)) => format!("Its card feed failed ({e}), so it shows the last cards it sent, with herdr's live view."),
+                (Some(cmd), None) if !m.read_failures_lasting(now).is_empty() => format!(
+                    "Cards come from its feed ({cmd}), which says: {}.",
+                    m.read_failures_lasting(now).iter().map(|f| f.why.as_str()).collect::<Vec<_>>().join("; ")
+                ),
                 (Some(cmd), None) => format!("Cards come from its feed: {cmd}"),
                 (None, _) => "No card feed: every herdr workspace with an agent is a card.".into(),
             },
@@ -4025,7 +4047,7 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
         ],
         Conn::Unreachable { since, retry_at, detail } => vec![
             format!("No answer since {} ({detail}): asleep, off, or off the network.", clock(*since)),
-            format!("Kerdr tries again in {}s, then every 15 seconds; r tries now.", (*retry_at - now).num_seconds().max(0)),
+            format!("Kerdr tries again in {}s, then every 15 seconds; r tries now. ⏎ and d on its cards wait for it, then carry on.", (*retry_at - now).num_seconds().max(0)),
         ],
         Conn::HostKey { detail } => vec![
             format!("SSH asked whether to trust this machine's host key ({detail})."),

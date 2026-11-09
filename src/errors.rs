@@ -229,6 +229,15 @@ impl App {
         if let Some(e) = m.feed_problem(at) {
             now.push(("feed".into(), format!("{name}'s feed failed: {e}")));
         }
+        if let Some(why) = m.sessions_problem(at) {
+            now.push(("sessions".into(), format!("{name}: {why}")));
+        }
+        for failed in m.read_failures_lasting(at) {
+            now.push((
+                format!("read {}", failed.key()),
+                format!("{name}'s feed: {}", failed.why),
+            ));
+        }
         if let Some(data) = &m.data {
             let sessions = data
                 .snapshots
@@ -294,10 +303,10 @@ fn conn_problem(conn: &Conn, name: &str) -> Option<String> {
         }
         Conn::Unreachable { detail, .. } => Some(format!("{name} can't be reached: {detail}")),
         Conn::HostKey { detail } => Some(format!(
-            "SSH wants a decision about {name}'s host key: {detail}"
+            "SSH wants a decision about {name}'s host key: {detail}. On the machines screen (M), ⏎ on it answers it."
         )),
         Conn::Auth { detail } => Some(format!(
-            "SSH wants a password or another key for {name}: {detail}"
+            "SSH wants a password or another key for {name}: {detail}. On the machines screen (M), ⏎ on it lets you type it."
         )),
         Conn::HerdrMissing => Some(format!("{name} has no herdr.")),
         Conn::HerdrTooOld { version } => Some(format!("{name}'s herdr {version} is too old.")),
