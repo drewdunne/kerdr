@@ -2956,6 +2956,14 @@ impl App {
         let reference = self.reference_for(id);
         Some(match request["action"].as_str()? {
             "dispatch" => format!("{reference} didn't start"),
+            // A conversation outside herdr is moved in by its reopen (intent 0591).
+            "reopen"
+                if self.board.cards.iter().any(|c| {
+                    c.detail.as_ref().is_some_and(|d| d.id == id) && c.outside_herdr().is_some()
+                }) =>
+            {
+                format!("{reference} didn't move into herdr")
+            }
             "reopen" => format!("{reference} didn't reopen"),
             "close" => format!("{reference} wasn't marked done"),
             "dismiss" => format!("{reference} wasn't set aside"),
