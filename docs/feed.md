@@ -394,7 +394,10 @@ Kerdr shows `say`, and asks the same machine, over the same connection, how it s
   `label`, optional `tab`), and Kerdr goes in as on a reopen's answer: only while you're still on that
   card, and for a start only when `Enter` asked for it (`d` says where it started instead).
 - `asks`: a question, asked as it would be on a direct answer. A yes sends the original request again
-  with `override: true` and the `confirm` token, as on any question.
+  with `override: true` and the `confirm` token, as on any question. A start `Enter` asked for stays
+  `Enter`'s through its yes: Kerdr goes in when the yes's answer names the workspace, whether that
+  answer comes at once or at the end of another follow. When a question already says how many
+  workspaces its session has, Kerdr doesn't add its own count.
 - `failed`: shown as the request's failure, `message` and all. A worker that ended without
   finishing is `failed` too; say so, and that the card shows how it stands, since it may have done
   part of the step.

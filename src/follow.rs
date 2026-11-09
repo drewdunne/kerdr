@@ -496,6 +496,20 @@ impl App {
         Some(true)
     }
 
+    /// What the bottom line says a card whose ⏎ is remembered is doing, while its work is followed:
+    /// "is moving into herdr", "is starting".
+    pub fn follow_doing(&self, card: &Card) -> Option<&'static str> {
+        let f = self.following_card(card)?;
+        Some(match step_word(&f.follow.what, &f.request) {
+            "move into herdr" => "is moving into herdr",
+            "restore" => "is coming back",
+            "reopen" => "is reopening",
+            "close" | "stop" => "is stopping",
+            "start" => "is starting",
+            _ => "is changing",
+        })
+    }
+
     /// What a card's own screen and its peek say while its work is followed: "◐ Starting ARK on
     /// arknet-one, then #581… · 40 s so far · Kerdr goes in when it's open".
     pub(super) fn follow_line(&self, card: &Card) -> Option<String> {
@@ -1053,6 +1067,134 @@ mod tests {
             ),
             ("web", "w7", card.as_str())
         );
+    }
+
+    /// From the end-to-end test against the real backend: ⏎ on work nobody started, in a stopped
+    /// session that comes back past its limit. Its follow ends asking, the question says the count
+    /// once, in the backend's words, and the yes is answered at once with its workspace (no follow):
+    /// Kerdr goes in, as ⏎ asked. d's start, the same way, stays on the board.
+    #[test]
+    fn a_yes_answered_at_once_with_its_workspace_goes_in_for_enter_and_stays_for_d() {
+        for by_enter in [true, false] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = {
+                let c = app
+                    .board
+                    .cards
+                    .iter()
+                    .find(|c| crate::app::waiting_work(c))
+                    .unwrap();
+                (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+            };
+            for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+                c.detail.as_mut().unwrap().kickoff = None;
+            }
+            let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+            app.sel = Selection {
+                col: app.board.cards[i].stage.index(),
+                key: Some(key.clone()),
+            };
+            let action = if by_enter {
+                key_enter(&mut app)
+            } else {
+                press(&mut app, 'd')
+            };
+            let (machine, request) = sent(&mut app, action);
+            answer(
+                &mut app,
+                machine,
+                &request,
+                follow_reply(&id, "start", "Starting web, then the work…"),
+            );
+            poll(&mut app);
+            progress(
+                &mut app,
+                json!({"ok": false, "state": "asks", "confirmation": true, "confirm": "0123456789abcdef",
+                       "message": "web has 2 workspaces. Start anyway?",
+                       "session": "web", "used": 2, "limit": 2}),
+            );
+            let Mode::Confirm { message, .. } = &app.mode else {
+                panic!("expected the question, got {:?}", app.mode)
+            };
+            assert_eq!(
+                message, "web has 2 workspaces. Start anyway?",
+                "the count is said once"
+            );
+            if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+                *ready_at = None;
+            }
+            let yes = press(&mut app, 'y');
+            let (machine, request) = sent(&mut app, yes);
+            assert_eq!(request["override"], true);
+            answer(
+                &mut app,
+                machine,
+                &request,
+                json!({"ok": true, "message": "Started in web.", "id": id, "session": "web",
+                       "workspace": "w9", "label": "9-new"}),
+            );
+            assert!(app.follows.is_empty());
+            if by_enter {
+                let open = app
+                    .open_after
+                    .clone()
+                    .expect("⏎ through its question goes in");
+                assert_eq!(
+                    (
+                        open.session.as_str(),
+                        open.workspace.as_str(),
+                        open.label.as_str(),
+                        open.from.as_str()
+                    ),
+                    ("web", "w9", "9-new", key.as_str())
+                );
+            } else {
+                assert_eq!(app.open_after, None, "d starts it and stays on the board");
+            }
+        }
+    }
+
+    fn rendered(app: &App) -> String {
+        let mut t = ratatui::Terminal::new(ratatui::backend::TestBackend::new(200, 50)).unwrap();
+        t.draw(|f| crate::ui::draw(f, app)).unwrap();
+        t.backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    /// From the end-to-end test: once its words have gone, the bottom line says what followed
+    /// work is doing in its own terms: a move into herdr isn't a start.
+    #[test]
+    fn the_bottom_line_says_what_followed_work_is_doing() {
+        for (what, doing) in [
+            ("move-in", "is moving into herdr. "),
+            ("start", "is starting. "),
+            ("recover", "is coming back. "),
+        ] {
+            let mut app = demo_app();
+            let (key, id) = closed_card(&mut app);
+            let enter = key_enter(&mut app);
+            let (machine, request) = sent(&mut app, enter);
+            answer(&mut app, machine, &request, follow_reply(&id, what, ""));
+            assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+            // Its words go after 8 s; the bottom line keeps saying where it stands.
+            app.message = None;
+            let screen = rendered(&app);
+            let reference = app.card(&key).unwrap().reference.clone();
+            assert!(
+                screen.contains(&format!(
+                    "{reference} {doing}Kerdr goes in when its workspace opens"
+                )),
+                "{what}: {screen}"
+            );
+            if what != "start" {
+                assert!(!screen.contains("is starting. "), "{what}: {screen}");
+            }
+        }
     }
 
     #[test]

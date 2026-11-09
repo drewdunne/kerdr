@@ -1293,9 +1293,11 @@ fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
 /// start can run for minutes before herdr takes the screen (intent 0491).
 fn remembered_line(app: &App) -> Option<Vec<Span<'static>>> {
     let card = app.card(app.enter_when_open.as_deref()?)?;
+    // In followed work's own words: a move into herdr isn't a start (intent 0591).
+    let doing = app.follow_doing(card).unwrap_or("is starting");
     Some(vec![
         Span::styled(format!("{} ", card.reference), bold(CYAN)),
-        Span::styled("is starting. ", fg(FG)),
+        Span::styled(format!("{doing}. "), fg(FG)),
         Span::styled(
             "Kerdr goes in when its workspace opens · esc stops waiting",
             fg(DIM),

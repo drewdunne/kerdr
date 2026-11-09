@@ -2370,6 +2370,7 @@ impl App {
         };
         let mut job = job;
         let machine = job.machine;
+        let by_enter = job.by_enter;
         self.action_from = job.from.clone();
         self.answer_went_in = job.entered;
         if job.asking
@@ -2465,8 +2466,9 @@ impl App {
                 self.rebuild();
             }
         }
-        // Whether ⏎ asked for it, for a question it asks (Codex's review).
-        self.answer_by_enter = refused.as_ref().is_some_and(|j| j.by_enter);
+        // Whether ⏎ asked for it: a question it asks stays ⏎'s (Codex's review), and a start that
+        // answers with its workspace goes in.
+        self.answer_by_enter = by_enter;
         self.finish_action(machine, request, result);
         self.answer_by_enter = false;
         // Sent on to the machine its refusal named: back in its place in the queue, still shown,
@@ -3260,11 +3262,17 @@ impl App {
                         response.message,
                     )
                 } else {
+                    // The count, unless the backend's own words already give it ("web has 2
+                    // workspaces. Start anyway?"): never said twice.
                     let message = match (response.used, response.limit) {
-                        (Some(used), Some(limit)) => format!(
-                            "{used} active workspaces; the usual limit is {limit}. {}",
-                            response.message
-                        ),
+                        (Some(used), Some(limit))
+                            if !says_the_count(&response.message, used, limit) =>
+                        {
+                            format!(
+                                "{used} active workspaces; the usual limit is {limit}. {}",
+                                response.message
+                            )
+                        }
                         _ => response.message,
                     };
                     (format!("Start {id} in {session}?"), message)
@@ -3319,9 +3327,12 @@ impl App {
                     note = Some(message.clone());
                 }
                 // A reopen takes you in only while you're still on its card; otherwise it says so.
-                // So does a start ⏎ asked for, once its followed work is done (intent 0591).
+                // So does a start ⏎ asked for, whether its answer names the workspace at once (a yes
+                // to its question, say) or once its followed work is done (intent 0591). d's start
+                // stays where you are.
                 let enters = request["action"] == "reopen"
-                    || self.follow_end.as_ref().is_some_and(|e| e.enter);
+                    || self.follow_end.as_ref().is_some_and(|e| e.enter)
+                    || (self.answer_by_enter && request["action"] == "dispatch");
                 if enters
                     && response.ok
                     && !unchanged
@@ -3572,4 +3583,14 @@ impl App {
                 }
         })
     }
+}
+
+/// Whether a backend's question already says how many workspaces its session has, or its limit:
+/// "web has 2 workspaces", "at its usual limit of 3".
+fn says_the_count(message: &str, used: u32, limit: u32) -> bool {
+    let m = message.to_lowercase();
+    m.contains(&format!("{used} workspace"))
+        || m.contains(&format!("{used} active"))
+        || m.contains(&format!("limit of {limit}"))
+        || m.contains(&format!("limit is {limit}"))
 }
