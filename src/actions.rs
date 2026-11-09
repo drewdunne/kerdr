@@ -357,8 +357,9 @@ pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response
 /// As run_handing, sending the same request again, with the same op, by itself (intent 0591):
 /// after a refusal with `retry`, once that many seconds have passed, for up to RETRY_MOST in all;
 /// and, with `resends` (its machine's backend keeps ops), after an answer that was lost, up to
-/// three times over about 30 seconds. A request without an op is never sent again. `tell` hears
-/// each resend before its wait, and `pause` does the waiting (a test's own, which needn't).
+/// three times over about 30 seconds. A change without an op is never sent again; a read (an
+/// item's text, a kickoff check), which changes nothing, is as if it had one. `tell` hears each
+/// resend before its wait, and `pause` does the waiting (a test's own, which needn't).
 pub fn run_resending(
     machine: &Machine,
     command: &str,
@@ -412,7 +413,9 @@ fn resending(
     // What's been waited, which a test's pause doesn't spend.
     let mut waited = Duration::ZERO;
     let mut lost = 0;
-    let op = request.get("op").is_some();
+    // Safe to send again: the backend answers a second send of an op from its record, and a read
+    // changes nothing however often it's sent.
+    let op = request.get("op").is_some() || !changes(request);
     loop {
         let (answered, was_lost) = send(handed.take());
         let began = *first_answer.get_or_insert_with(Instant::now);
@@ -1089,6 +1092,40 @@ printf '%s' "$answer"
         assert_eq!(sends, 1);
         assert!(told.is_empty());
         assert!(result_unknown(&answered.result.unwrap_err()));
+    }
+
+    #[test]
+    fn a_read_refused_for_something_passing_is_asked_again_though_it_has_no_op() {
+        // An item's text, or a kickoff check: nothing changes however often it's sent.
+        let read = json!({"action":"kickoff","id":"0041"});
+        let (answered, told, sends) = over_ssh(
+            &read,
+            false,
+            vec![
+                output(
+                    0,
+                    r#"{"ok":false,"retry":3,"message":"herdr isn't answering yet."}"#,
+                    "",
+                ),
+                output(0, r#"{"ok":true,"message":"","questions":[]}"#, ""),
+            ],
+        );
+        assert!(answered.result.unwrap().ok);
+        assert_eq!(sends, 2);
+        assert_eq!(told.len(), 1);
+        // A change with no op isn't, whatever it's told.
+        let change = json!({"action":"close","id":"0041"});
+        let (answered, _, sends) = over_ssh(
+            &change,
+            true,
+            vec![output(
+                0,
+                r#"{"ok":false,"retry":3,"message":"locked"}"#,
+                "",
+            )],
+        );
+        assert!(!answered.result.unwrap().ok);
+        assert_eq!(sends, 1);
     }
 
     #[test]

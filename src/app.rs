@@ -4850,6 +4850,47 @@ pub(crate) mod tests {
         assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Fail));
     }
 
+    #[test]
+    fn a_new_intent_saved_with_its_push_to_come_says_so_even_where_its_card_says_the_rest() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let request = send_words(&mut app, "Back up the NAS");
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+        app.queue_action(0, request.clone());
+        let left = "saved here; it reaches your other machines once the push goes through.";
+        reply_to(
+            &mut app,
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: format!("Saved as #9005: {left}"),
+                note: Some(left.into()),
+                id: Some("9005".into()),
+                ..Default::default()
+            }),
+        );
+        settle(&mut app);
+        assert_eq!(app.message(), Some((left, Tone::Info)));
+        // Only part of it: said plainly, not as a failure, and the words aren't sent again.
+        let request = send_words(&mut app, "Wake the screens");
+        app.queue_action(0, request.clone());
+        reply_to(
+            &mut app,
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                partial: true,
+                message: "Saved as #9006, but its write-up couldn't start.".into(),
+                id: Some("9006".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(app.message().map(|(_, t)| t), Some(Tone::Warn));
+        assert!(app.submissions.is_empty());
+    }
+
     fn answer(ok: bool, id: Option<&str>) -> Result<crate::actions::Response, String> {
         Ok(crate::actions::Response {
             ok,

@@ -3579,16 +3579,37 @@ impl App {
                 if on_it {
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
                 }
+                // Made, but only part of what follows happened: said plainly, not as a failure
+                // (intent 0591). An older backend's refusal that names what it made is one.
+                if !response.ok && response.partial {
+                    return self.say(short(response.message), Tone::Warn);
+                }
                 if !response.ok {
                     return self.fail(short(response.message));
                 }
+                // Made, with something still to come by itself (its push): said even where the
+                // card would have said it all (intent 0591).
+                let left = response
+                    .note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
                 let mut message = response.message;
+                if let Some(left) = &left
+                    && !message.contains(left.as_str())
+                {
+                    message = format!("{message} {left}");
+                }
                 if self.filtering() {
                     message.push_str(
                         " A filter may hide it until it's written up: F shows everything.",
                     );
                 } else if on_it && matches!(self.mode, Mode::Backlog { .. }) {
-                    // Saved as shown: its card says so.
+                    // Saved as shown: its card says so, and only what's still to come is said.
+                    if let Some(left) = left {
+                        self.say(short(left), Tone::Info);
+                    }
                     return;
                 } else {
                     message.push_str(" b shows it in the backlog.");

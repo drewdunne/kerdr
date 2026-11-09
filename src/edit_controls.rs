@@ -1001,7 +1001,28 @@ impl App {
                 self.edits.remove(key);
                 if partial(&r) {
                     self.fail(partly_saved(reference, r));
+                } else if let Some(left) =
+                    r.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                {
+                    // Saved, with something still to come by itself (its push): said, not red
+                    // (intent 0591).
+                    self.say(format!("{reference}'s text is saved; {left}"), Tone::Info);
                 }
+            }
+            // Only part of it happened, and the backend's words say which: his version stays, and
+            // e checks what's there before it opens it (intent 0591).
+            Ok(r) if r.partial => {
+                if let Some(held) = self.edits.get_mut(key) {
+                    held.machine = machine;
+                    held.check_first = true;
+                }
+                self.say(
+                    format!(
+                        "{reference}'s save happened only in part: {} e checks the text, and opens your version if it isn't there.",
+                        short(r.message)
+                    ),
+                    Tone::Warn,
+                );
             }
             Ok(r) => {
                 let stale = r.status.as_deref() == Some("stale");
@@ -2520,6 +2541,62 @@ mod tests {
         let sent = saves(&mut app, &key, wrote("Newer words."));
         answer(&mut app, &sent, saved());
         assert_eq!(app.message(), None);
+    }
+
+    #[test]
+    fn a_save_that_stands_with_its_push_to_come_says_so_and_a_partial_one_keeps_your_version() {
+        // Release 2's backends: ok means the change stands, with a note for what's left; only
+        // part happening is `partial` (intent 0591).
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        let left = "saved here; it reaches your other machines once the push goes through, which is retried by itself.";
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                message: format!("Saved {reference}'s text: {left}"),
+                note: Some(left.into()),
+                ..Default::default()
+            }),
+        );
+        assert!(app.edits.is_empty(), "saved: his version let go");
+        assert_eq!(
+            app.message(),
+            Some((
+                format!("{reference}'s text is saved; {left}").as_str(),
+                Tone::Info
+            ))
+        );
+        caught_up(&mut app);
+        app.message = None;
+        opened(&mut app, &key, &id, "New words.", "sha256:bb");
+        let sent = saves(&mut app, &key, wrote("Newer words."));
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                partial: true,
+                message: "Its text changed, but its title couldn't be.".into(),
+                ..Default::default()
+            }),
+        );
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.starts_with(&format!(
+                "{reference}'s save happened only in part: Its text changed"
+            )),
+            "{said}"
+        );
+        assert!(!said.contains("wasn't saved"), "{said}");
+        assert!(
+            app.edits.contains_key(&key),
+            "his version stays until e checks"
+        );
     }
 
     #[test]
