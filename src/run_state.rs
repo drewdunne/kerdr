@@ -86,9 +86,10 @@ pub struct AccountsWait {
     pub since: Instant,
 }
 
-/// An account picked for a card that Kerdr still owes it: once the card is stopped (its restore
-/// answered, or its backend brought up to date), started on it; once an agent is running it, moved
-/// to it (intent 0591).
+/// An account picked for a card that Kerdr still owes it, one for each card, each step waiting for
+/// the one before (intent 0591, Codex's review): its machine's backend brought up to date, then the
+/// card brought back from won't do, then started on that account, or moved to it once an agent runs
+/// it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OwedAccount {
     pub key: String,
@@ -100,6 +101,26 @@ pub struct OwedAccount {
     /// Whether that update has been asked for, and what its answer said when it failed.
     pub asked: bool,
     pub failed: Option<String>,
+    /// It's in won't do, and comes back first; and whether that `restore` has gone. A restore that
+    /// went and is neither held nor sent on, with the card still in won't do, didn't happen: its own
+    /// failure said why, and nothing starts.
+    pub restore: bool,
+    pub restore_sent: bool,
+}
+
+impl OwedAccount {
+    fn new(key: &str, to: &str) -> OwedAccount {
+        OwedAccount {
+            key: key.to_string(),
+            to: to.to_string(),
+            since: Instant::now(),
+            update: None,
+            asked: false,
+            failed: None,
+            restore: false,
+            restore_sent: false,
+        }
+    }
 }
 
 /// The feed's word for what takes `account` on a start (`starts_on`), from backends that can.
@@ -258,6 +279,11 @@ impl App {
 
     /// `s` on a card: the picker its state calls for, or why there's none.
     pub(super) fn s_on_card(&mut self, card: Card) {
+        // Work Kerdr follows (a start, a move into herdr) is left alone until it ends: its worker may
+        // still be bringing the agent back (Codex's review).
+        if self.follow_holds(&card, "s").is_some() {
+            return;
+        }
         match self.run_state(&card) {
             RunState::Running(agent) => {
                 self.accounts_wait = None;
@@ -393,14 +419,11 @@ impl App {
         // sent the account before it can take it (intent 0591).
         if start.update {
             let name = self.machines[start.machine].name();
-            self.owed_account = Some(OwedAccount {
-                key: card.key.clone(),
-                to: to.to_string(),
-                since: Instant::now(),
-                update: Some(start.machine),
-                asked: false,
-                failed: None,
-            });
+            let mut owed = OwedAccount::new(&card.key, to);
+            owed.update = Some(start.machine);
+            // Then brought back from won't do, if it's there, before its start.
+            owed.restore = start.restore;
+            self.owe(owed);
             self.say(
                 format!(
                     "{name}'s backend can't start work on a chosen account yet: Kerdr is bringing its ark-sdlc up to date, then starts {reference} on {}. Esc on the board drops it.",
@@ -412,14 +435,10 @@ impl App {
         }
         // In won't do: brought back first; its start goes once that's answered (intent 0591).
         if start.restore {
-            self.owed_account = Some(OwedAccount {
-                key: card.key.clone(),
-                to: to.to_string(),
-                since: Instant::now(),
-                update: None,
-                asked: false,
-                failed: None,
-            });
+            let mut owed = OwedAccount::new(&card.key, to);
+            owed.restore = true;
+            owed.restore_sent = true;
+            self.owe(owed);
             self.say(
                 format!(
                     "Bringing {reference} back from won't do, then starting it on {}.",
@@ -489,90 +508,143 @@ impl App {
         else {
             return false;
         };
-        self.owed_account = Some(OwedAccount {
-            key,
-            to: to.to_string(),
-            since: Instant::now(),
-            update: Some(machine),
-            asked: false,
-            failed: None,
-        });
+        let mut owed = OwedAccount::new(&key, to);
+        owed.update = Some(machine);
+        self.owe(owed);
         true
     }
 
-    /// A restore answered: an account owed to its card goes now, as its start.
-    pub(super) fn restored(&mut self, id: &str, ok: bool) {
-        let Some(owed) = self.owed_account.as_ref() else {
-            return;
-        };
-        let mine = self
-            .card(&owed.key)
-            .and_then(|c| c.detail.as_ref())
-            .is_some_and(|d| d.id == id);
-        if !mine {
-            return;
-        }
-        if !ok {
-            // Its failure is said as any restore's is; nothing starts.
-            self.owed_account = None;
-        }
+    /// An account owed to a card, in place of one owed to it before; others' stay owed.
+    fn owe(&mut self, owed: OwedAccount) {
+        self.owed_accounts.retain(|o| o.key != owed.key);
+        self.owed_accounts.push(owed);
     }
 
-    /// What's owed to an account picked with s, each turn of the board: the start once the card is
-    /// stopped and its backend can take it, the move once an agent runs it, the update asked for
-    /// (as the request to send, by the machine), or why it was given up. Only where an answer
-    /// can't take keys meant for something else.
+    /// What's owed to accounts picked with s, each turn of the board: for the first card whose next
+    /// step is due, that step (its restore, its start, or the move once an agent runs it); and why
+    /// one was given up. Only where an answer can't take keys meant for something else.
     pub fn account_owed(&mut self) -> Action {
-        let Some(owed) = self.owed_account.clone() else {
-            return Action::None;
-        };
         if !self.enter_can_land_here() {
             return Action::None;
         }
+        let mut i = 0;
+        while i < self.owed_accounts.len() {
+            match self.owed_step(i) {
+                Owed::Wait => i += 1,
+                Owed::Drop => {
+                    self.owed_accounts.remove(i);
+                }
+                // A step on its way: it stays owed, and what follows waits for it.
+                Owed::Send(action) => {
+                    if !matches!(action, Action::None) {
+                        return action;
+                    }
+                    i += 1;
+                }
+                Owed::Done(action) => {
+                    self.owed_accounts.remove(i);
+                    if !matches!(action, Action::None) {
+                        return action;
+                    }
+                }
+            }
+        }
+        Action::None
+    }
+
+    /// The next step owed to one card's account.
+    fn owed_step(&mut self, i: usize) -> Owed {
+        let owed = self.owed_accounts[i].clone();
         let Some(card) = self.card(&owed.key).cloned() else {
-            self.owed_account = None;
-            return Action::None;
+            return Owed::Drop;
         };
         let reference = card.reference.clone();
-        // Brought back, and waiting for its restore's answer: the overlay shows it back once that
-        // went yes; until then, nothing.
-        if card.dismissed() || self.still_changing_quietly(&card) {
-            if owed.since.elapsed() > APPLY_WAIT {
-                self.owed_account = None;
-            }
-            return Action::None;
-        }
+        let id = card
+            .detail
+            .as_ref()
+            .map(|d| d.id.clone())
+            .unwrap_or_default();
+        let given_up = |app: &mut App, what: &str| {
+            app.say(
+                format!(
+                    "{reference} didn't start on {}: {what}. s on it tries again.",
+                    account_words(&owed.to)
+                ),
+                Tone::Warn,
+            );
+            Owed::Drop
+        };
+        // 1. Its machine's backend brought up to date.
         if let Some(machine) = owed.update {
             let name = self.machines[machine].name();
             if let Some(failed) = owed.failed {
-                self.owed_account = None;
                 self.fail(format!(
                     "{reference} didn't start: Kerdr couldn't ask {name} to bring its ark-sdlc up to date ({failed}), and its backend can't start work on a chosen account yet. ⏎ starts it on its owner's list there."
                 ));
-                return Action::None;
+                return Owed::Drop;
             }
             let ready = self
                 .account_feed(machine)
                 .is_some_and(|f| STARTS_ON.iter().all(|a| f.starts_on(a)));
             if !ready {
                 if owed.since.elapsed() > UPDATE_WAIT {
-                    self.owed_account = None;
                     self.fail(format!(
                         "{reference} didn't start: {name}'s copy of ark-sdlc still hasn't updated after {} s, so its backend can't start work on a chosen account. ⏎ starts it on its owner's list there; an agent there can say why that copy won't update.",
                         UPDATE_WAIT.as_secs()
                     ));
+                    return Owed::Drop;
                 }
-                return Action::None;
+                return Owed::Wait;
             }
+            // Up to date: the next step has its own time.
+            let o = &mut self.owed_accounts[i];
+            o.update = None;
+            o.since = Instant::now();
         }
-        match self.run_state(&card) {
-            // Started meanwhile: the agent running it now moves to the account picked.
-            RunState::Running(agent) => {
-                self.owed_account = None;
-                self.move_to_account(&card, &agent, &owed.to)
+        // 2. Brought back from won't do.
+        if owed.restore && card.dismissed() {
+            if !owed.restore_sent {
+                let o = &mut self.owed_accounts[i];
+                o.restore_sent = true;
+                o.since = Instant::now();
+                self.say(
+                    format!(
+                        "Bringing {reference} back from won't do, then starting it on {}.",
+                        account_words(&owed.to)
+                    ),
+                    Tone::Info,
+                );
+                return Owed::Send(self.intent_action_on(card, "restore", json!({})));
             }
+            // Gone: held while it's on its way (or answered yes and not in the feed yet), or sent on
+            // to the machine the record lives on (Codex's review).
+            let restoring = self
+                .resolver
+                .holds_where(|r| r["id"] == id.as_str() && r["action"] == "restore")
+                || self
+                    .resend
+                    .iter()
+                    .any(|(_, r, _)| r["id"] == id.as_str() && r["action"] == "restore")
+                || self.resent.iter().any(|(_, r)| *r == id);
+            if !restoring {
+                // It didn't happen: its own failure said why.
+                return Owed::Drop;
+            }
+            if self.owed_accounts[i].since.elapsed() > APPLY_WAIT {
+                return given_up(self, "it didn't come back from won't do in time");
+            }
+            return Owed::Wait;
+        }
+        if self.still_changing_quietly(&card) {
+            if self.owed_accounts[i].since.elapsed() > APPLY_WAIT {
+                return given_up(self, "it never came to where it could start");
+            }
+            return Owed::Wait;
+        }
+        // 3. Started on that account, or the agent running it now moved there.
+        match self.run_state(&card) {
+            RunState::Running(agent) => Owed::Done(self.move_to_account(&card, &agent, &owed.to)),
             RunState::Stopped(start) if !start.update && !start.restore => {
-                self.owed_account = None;
                 if owed.to != "list" && !self.start_choices(&start).contains(&owed.to) {
                     self.say(
                         format!(
@@ -581,22 +653,15 @@ impl App {
                         ),
                         Tone::Info,
                     );
-                    return Action::None;
+                    return Owed::Done(Action::None);
                 }
-                self.send_start(card, &start, &owed.to)
+                Owed::Done(self.send_start(card, &start, &owed.to))
             }
             _ => {
-                if owed.since.elapsed() > APPLY_WAIT {
-                    self.owed_account = None;
-                    self.say(
-                        format!(
-                            "{reference} didn't start on {}: it never came to where it could. s on it tries again.",
-                            account_words(&owed.to)
-                        ),
-                        Tone::Warn,
-                    );
+                if self.owed_accounts[i].since.elapsed() > APPLY_WAIT {
+                    return given_up(self, "it never came to where it could start");
                 }
-                Action::None
+                Owed::Wait
             }
         }
     }
@@ -618,13 +683,20 @@ impl App {
     /// its machine: a read of the card's text (`edit` without `text`, which changes nothing), which
     /// ark-sdlc's backend pulls before. Sent once (intent 0591).
     pub fn update_due(&mut self) -> Option<(usize, serde_json::Value)> {
-        let owed = self.owed_account.as_mut()?;
-        let machine = owed.update?;
-        if owed.asked {
-            return None;
+        let i = self
+            .owed_accounts
+            .iter()
+            .position(|o| o.update.is_some() && !o.asked)?;
+        let machine = self.owed_accounts[i].update?;
+        // One update serves every card waiting on that machine.
+        for o in self
+            .owed_accounts
+            .iter_mut()
+            .filter(|o| o.update == Some(machine))
+        {
+            o.asked = true;
         }
-        owed.asked = true;
-        let key = owed.key.clone();
+        let key = self.owed_accounts[i].key.clone();
         let id = self.card(&key)?.detail.as_ref()?.id.clone();
         Some((machine, json!({"action":"edit","id":id})))
     }
@@ -636,27 +708,30 @@ impl App {
         machine: usize,
         result: Result<crate::actions::Response, String>,
     ) {
-        let Some(owed) = self.owed_account.as_mut() else {
+        let Err(e) = result else {
             return;
         };
-        if owed.update != Some(machine) {
-            return;
-        }
-        if let Err(e) = result {
-            owed.failed = Some(crate::errlog::last_part(&e, 200).to_string());
+        let why = crate::errlog::last_part(&e, 200).to_string();
+        for o in self
+            .owed_accounts
+            .iter_mut()
+            .filter(|o| o.update == Some(machine) && o.asked)
+        {
+            o.failed = Some(why.clone());
         }
     }
 
     /// The machines whose feed is worth reading often for s: one whose accounts it waits for, and
-    /// one it asked to update.
+    /// those it asked to update.
     pub fn accounts_awaited_on(&self) -> Vec<usize> {
         let mut machines: Vec<usize> = self
             .accounts_wait
             .iter()
             .map(|w| w.machine)
-            .chain(self.owed_account.iter().filter_map(|o| o.update))
+            .chain(self.owed_accounts.iter().filter_map(|o| o.update))
             .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live()))
             .collect();
+        machines.sort_unstable();
         machines.dedup();
         machines
     }
@@ -697,6 +772,15 @@ impl App {
             );
         }
     }
+}
+
+/// One card's owed account, this turn: still waiting, given up, a step sent (it stays owed), or
+/// its last step (it's paid).
+enum Owed {
+    Wait,
+    Drop,
+    Send(Action),
+    Done(Action),
 }
 
 /// How a message names an account picked with s: its code, or "its owner's list".
@@ -930,7 +1014,7 @@ mod tests {
         assert_eq!(machine, mi);
         assert_eq!(request["action"], "dispatch");
         assert_eq!(request["account"], "ARK_C");
-        assert!(a.owed_account.is_none());
+        assert!(a.owed_accounts.is_empty());
     }
 
     #[test]
@@ -943,13 +1027,13 @@ mod tests {
         press(&mut a, 's');
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
         a.update_due();
-        a.owed_account.as_mut().unwrap().since -= UPDATE_WAIT + Duration::from_secs(1);
+        a.owed_accounts[0].since -= UPDATE_WAIT + Duration::from_secs(1);
         assert_eq!(a.account_owed(), Action::None);
         let (said, tone) = a.message().unwrap();
         assert_eq!(tone, Tone::Fail);
         assert!(said.contains("still hasn't updated"), "{said}");
         assert!(said.contains("its owner's list"), "{said}");
-        assert!(a.owed_account.is_none());
+        assert!(a.owed_accounts.is_empty());
 
         // And when the request to update couldn't even be sent, it says that.
         a.message = None;
@@ -1183,14 +1267,50 @@ mod tests {
         assert_eq!(request["account"], "ARK_C");
     }
 
+    /// Changes the feed's own record of this card, as its next read would bring it, so the board
+    /// keeps it through rebuilds.
+    fn in_feed(a: &mut App, key: &str, change: impl Fn(&mut crate::feed::FeedCard)) {
+        let id = a.card(key).unwrap().detail.as_ref().unwrap().id.clone();
+        for m in a.machines.iter_mut() {
+            if let Some(f) = m.feed.as_mut() {
+                for c in f.cards.iter_mut().filter(|c| c.id == id) {
+                    change(c);
+                }
+            }
+        }
+        a.rebuild();
+    }
+    /// A request on its way, as the event loop sends it, and its answer, as the loop takes it.
+    fn on_its_way(a: &mut App, machine: usize, request: &Value) {
+        a.queue_action(machine, request.clone());
+        a.resolver.ready();
+    }
+    fn answered(a: &mut App, request: &Value, reply: Value) {
+        let n = a
+            .resolver
+            .unanswered_for(request["action"].as_str().unwrap(), request["id"].as_str())
+            .expect("on its way");
+        a.finish_job(
+            n,
+            request.clone(),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+    /// A backlog card in won't do, with no kickoff questions, its key.
+    fn set_aside(a: &mut App) -> String {
+        let k = backlog_card(a);
+        in_feed(a, &k, |c| {
+            c.disposition = Some("wont_do".into());
+            c.kickoff = None;
+        });
+        assert!(a.card(&k).unwrap().dismissed());
+        k
+    }
+
     #[test]
     fn s_on_a_card_in_wont_do_brings_it_back_then_starts_it_on_the_account() {
         let mut a = app();
-        let k = backlog_card(&a);
-        no_kickoff(&mut a, &k);
-        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
-            c.detail.as_mut().unwrap().disposition = Some("wont_do".into());
-        }
+        let k = set_aside(&mut a);
         select(&mut a, &k);
         press(&mut a, 's');
         assert!(start_screen(&a).0.restore);
@@ -1198,18 +1318,72 @@ mod tests {
         assert_eq!(request["action"], "restore");
         assert!(request.get("account").is_none());
         assert!(a.message().unwrap().0.contains("Bringing"));
+        on_its_way(&mut a, machine, &request);
         // Nothing starts before the restore has answered.
         assert_eq!(a.account_owed(), Action::None);
-        finish(
-            &mut a,
-            machine,
-            request,
-            json!({"ok":true,"message":"Restored."}),
-        );
+        assert_eq!(a.owed_accounts.len(), 1);
+        answered(&mut a, &request, json!({"ok":true,"message":"Restored."}));
         // Its feed shows it back.
-        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
-            c.detail.as_mut().unwrap().disposition = None;
+        in_feed(&mut a, &k, |c| c.disposition = None);
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("nothing started: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty(), "paid once");
+    }
+
+    #[test]
+    fn a_restore_that_failed_starts_nothing() {
+        let mut a = app();
+        let k = set_aside(&mut a);
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let (machine, request) = choose(&mut a, "ARK_C");
+        on_its_way(&mut a, machine, &request);
+        answered(&mut a, &request, json!({"ok":false,"message":"no"}));
+        assert_eq!(a.account_owed(), Action::None);
+        assert!(a.owed_accounts.is_empty());
+        assert_eq!(a.account_owed(), Action::None, "and nothing later either");
+    }
+
+    /// Codex's review: an old backend and won't do at once. The update comes first, then the
+    /// restore, then the start, each after the one before.
+    #[test]
+    fn an_old_backend_and_wont_do_update_then_restore_then_start() {
+        let mut a = app();
+        let k = set_aside(&mut a);
+        let mi = a.card(&k).unwrap().machine_index;
+        a.machines[mi].feed.as_mut().unwrap().starts_on.clear();
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let start = start_screen(&a).0.clone();
+        assert!(start.update && start.restore);
+        let at = start_screen(&a)
+            .1
+            .iter()
+            .position(|c| c == "ARK_C")
+            .unwrap();
+        for _ in 0..at {
+            key(&mut a, KeyCode::Down);
         }
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert_eq!(a.update_due().map(|(m, _)| m), Some(mi));
+        assert_eq!(a.account_owed(), Action::None, "nothing before the update");
+        a.machines[mi].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        let Action::Mutate { machine, request } = a.account_owed() else {
+            panic!("no restore: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "restore");
+        on_its_way(&mut a, machine, &request);
+        assert_eq!(
+            a.account_owed(),
+            Action::None,
+            "nothing before the restore's answer"
+        );
+        answered(&mut a, &request, json!({"ok":true,"message":"Restored."}));
+        in_feed(&mut a, &k, |c| c.disposition = None);
         let Action::Mutate { request, .. } = a.account_owed() else {
             panic!("nothing started: {:?}", a.message())
         };
@@ -1217,18 +1391,123 @@ mod tests {
         assert_eq!(request["account"], "ARK_C");
     }
 
+    /// Codex's review: a restore sent on to the machine the record lives on keeps its account, and
+    /// the start goes there once it's back.
     #[test]
-    fn a_restore_that_failed_starts_nothing() {
+    fn a_restore_sent_on_to_another_machine_still_starts_there() {
         let mut a = app();
-        let k = backlog_card(&a);
-        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
-            c.detail.as_mut().unwrap().disposition = Some("wont_do".into());
-        }
+        let k = set_aside(&mut a);
+        let here = a.card(&k).unwrap().machine_index;
+        let other = (0..2).find(|&m| m != here).unwrap();
         select(&mut a, &k);
         press(&mut a, 's');
         let (machine, request) = choose(&mut a, "ARK_C");
-        finish(&mut a, machine, request, json!({"ok":false,"message":"no"}));
-        assert!(a.owed_account.is_none());
+        on_its_way(&mut a, machine, &request);
+        let home = format!("{}/web", a.machines[other].name());
+        answered(
+            &mut a,
+            &request,
+            json!({"ok":false,"message":"lives elsewhere","home":home}),
+        );
+        assert_eq!(a.account_owed(), Action::None);
+        assert_eq!(a.owed_accounts.len(), 1, "the account is still owed");
+        // The restore, sent on: it keeps its place, now for that machine.
+        let id = request["id"].as_str().unwrap().to_string();
+        assert!(
+            a.resolver
+                .holds_where(|r| r["id"] == id.as_str() && r["action"] == "restore")
+        );
+        let ready = a.resolver.ready();
+        assert_eq!(ready.len(), 1);
+        assert_eq!(ready[0].1, other, "sent on to where it lives");
+        assert_eq!(a.account_owed(), Action::None);
+        answered(&mut a, &request, json!({"ok":true,"message":"Restored."}));
+        in_feed(&mut a, &k, |c| c.disposition = None);
+        let Action::Mutate { machine, request } = a.account_owed() else {
+            panic!("nothing started: {:?}", a.message())
+        };
+        assert_eq!(machine, other, "where it lives");
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["account"], "ARK_C");
+    }
+
+    /// Codex's review: an account owed to one card isn't dropped by one picked for another.
+    #[test]
+    fn accounts_owed_to_two_cards_are_each_paid() {
+        let mut a = app();
+        let first = set_aside(&mut a);
+        select(&mut a, &first);
+        press(&mut a, 's');
+        let (m1, restore) = choose(&mut a, "ARK_C");
+        on_its_way(&mut a, m1, &restore);
+        // A second card, homed on the other machine, whose backend needs bringing up to date.
+        let second = a
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                c.key != first && waiting_work(c) && a.account_feed(c.machine_index).is_some()
+            })
+            .unwrap()
+            .key
+            .clone();
+        let m2 = (0..2).find(|&m| m != m1).unwrap();
+        let name = a.machines[m2].name();
+        in_feed(&mut a, &second, |c| {
+            c.kickoff = None;
+            c.home = serde_json::from_value(json!({"machine": name, "session": "web"})).ok();
+        });
+        a.machines[m2].feed.as_mut().unwrap().starts_on.clear();
+        select(&mut a, &second);
+        press(&mut a, 's');
+        let at = start_screen(&a)
+            .1
+            .iter()
+            .position(|c| c == "ARK_C")
+            .unwrap();
+        for _ in 0..at {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert_eq!(a.owed_accounts.len(), 2);
+        // The first comes back and starts.
+        answered(&mut a, &restore, json!({"ok":true,"message":"Restored."}));
+        in_feed(&mut a, &first, |c| c.disposition = None);
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("the first didn't start: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        let first_id = a.card(&first).unwrap().detail.as_ref().unwrap().id.clone();
+        assert_eq!(request["id"], first_id.as_str());
+        // The second, once its backend can.
+        assert_eq!(a.update_due().map(|(m, _)| m), Some(m2));
+        a.machines[m2].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("the second didn't start: {:?}", a.message())
+        };
+        let second_id = a.card(&second).unwrap().detail.as_ref().unwrap().id.clone();
+        assert_eq!(request["id"], second_id.as_str());
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty());
+    }
+
+    /// Codex's review: s's waits are read for every few seconds, ⏎ waiting or not.
+    #[test]
+    fn s_waiting_on_a_machine_has_its_feed_read_often_without_an_enter() {
+        let mut a = app();
+        let k = backlog_card(&a);
+        let mi = a.card(&k).unwrap().machine_index;
+        a.machines[mi].feed.as_mut().unwrap().starts_on.clear();
+        select(&mut a, &k);
+        press(&mut a, 's');
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert!(a.enter_when_open.is_none());
+        assert!(
+            a.start_awaited_on().contains(&mi),
+            "{:?}",
+            a.start_awaited_on()
+        );
     }
 
     #[test]

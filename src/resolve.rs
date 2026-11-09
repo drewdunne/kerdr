@@ -1125,6 +1125,12 @@ impl Resolver {
         })
     }
 
+    /// Whether a change whose request `matches` is still held: on its way, or answered yes and not
+    /// yet in the feed (a failure lets go of it at once).
+    pub fn holds_where(&self, matches: impl Fn(&Value) -> bool) -> bool {
+        self.jobs.iter().any(|j| matches(&j.request))
+    }
+
     /// The oldest unanswered change whose request `matches`.
     pub fn unanswered_where(&self, matches: impl Fn(&Value) -> bool) -> Option<u64> {
         self.jobs

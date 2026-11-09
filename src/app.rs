@@ -490,8 +490,9 @@ pub struct PendingJump {
     /// Waiting for one herdr session there that didn't answer its last read, and since when: Kerdr
     /// goes in once it answers, and gives up after STUCK_WAIT (intent 0591).
     pub stuck: Option<(String, Instant)>,
-    /// A workspace no card claims, by machine, session and id, in place of a card.
-    pub bare: Option<(usize, String, String)>,
+    /// A workspace no card claims, or one a reopen's answer named, by machine, session and id, in
+    /// place of a card, with the tab to land on when one was named (a child's new tab).
+    pub bare: Option<(usize, String, String, Option<String>)>,
 }
 
 /// How long ⏎ waits for a herdr session that didn't answer its last read before saying it's still
@@ -654,12 +655,18 @@ pub struct App {
     pub follows: Vec<follow::Following>,
     /// s waiting for a machine's accounts before it opens the picker (intent 0591).
     pub accounts_wait: Option<run_state::AccountsWait>,
-    /// An account picked with s that its card is still owed (intent 0591).
-    pub owed_account: Option<run_state::OwedAccount>,
+    /// A waited jump into a workspace that's due: its name and the tab it lands on.
+    pub pending_go: Option<(String, Option<String>)>,
+    /// Accounts picked with s that their cards are still owed, one for each card (intent 0591).
+    pub owed_accounts: Vec<run_state::OwedAccount>,
     /// The end of followed work being taken as its request's answer.
     pub(crate) follow_end: Option<follow::FollowEnd>,
     /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
     pub(crate) enter_sent: Option<String>,
+    /// The answer being taken is to a start ⏎ asked for; and the record whose question, up now,
+    /// such a start asked (Codex's review).
+    pub(crate) answer_by_enter: bool,
+    pub(crate) confirm_by_enter: Option<String>,
 }
 
 impl App {
@@ -742,9 +749,12 @@ impl App {
             enter_said: None,
             follows: vec![],
             accounts_wait: None,
-            owed_account: None,
+            pending_go: None,
+            owed_accounts: Vec::new(),
             follow_end: None,
             enter_sent: None,
+            answer_by_enter: false,
+            confirm_by_enter: None,
         };
         app.rebuild();
         app
@@ -1449,7 +1459,7 @@ impl App {
         session: &str,
         what: &str,
         key: Option<&str>,
-        bare: Option<(String, String)>,
+        bare: Option<(String, String, Option<String>)>,
     ) {
         let name = self.machines[machine].name();
         self.pending_jump = Some(PendingJump {
@@ -1457,7 +1467,7 @@ impl App {
             workspace: what.to_string(),
             machine: name.clone(),
             stuck: Some((session.to_string(), Instant::now())),
-            bare: bare.map(|(s, id)| (machine, s, id)),
+            bare: bare.map(|(s, id, tab)| (machine, s, id, tab)),
         });
         self.say(
             format!(
@@ -1513,7 +1523,9 @@ impl App {
             }
         }
         self.pending_jump = None;
-        if let Some((mi, session, id)) = pending.bare {
+        if let Some((mi, session, id, tab)) = pending.bare {
+            // Where it lands, as it was asked for: its name, and the tab (Codex's review).
+            self.pending_go = Some((pending.workspace.clone(), tab));
             return Some(Action::JumpWorkspace {
                 machine: self.machines[mi].name(),
                 session,
@@ -1994,15 +2006,18 @@ impl App {
                 if self.accounts_wait.take().is_some() {
                     self.say("Stopped waiting for the accounts.", Tone::Info);
                 }
-                if let Some(owed) = self.owed_account.take() {
-                    let reference = self
-                        .card(&owed.key)
-                        .map(|c| c.reference.clone())
-                        .unwrap_or_else(|| "The card".into());
-                    self.say(
-                        format!("{reference} won't start on {} after all.", owed.to),
-                        Tone::Info,
-                    );
+                let dropped: Vec<String> = std::mem::take(&mut self.owed_accounts)
+                    .into_iter()
+                    .map(|owed| {
+                        let reference = self
+                            .card(&owed.key)
+                            .map(|c| c.reference.clone())
+                            .unwrap_or_else(|| "The card".into());
+                        format!("{reference} won't start on {} after all.", owed.to)
+                    })
+                    .collect();
+                if !dropped.is_empty() {
+                    self.say(dropped.join(" "), Tone::Info);
                 }
             }
             _ => {}
@@ -7465,6 +7480,42 @@ pub(crate) mod tests {
         assert!(
             said.contains("still isn't answering after a minute"),
             "{said}"
+        );
+        assert!(app.pending_jump.is_none());
+    }
+
+    /// A workspace a reopen's answer named, with the tab to land on, whose session didn't answer:
+    /// once it does, Kerdr goes to that tab, not just the workspace (Codex's review).
+    #[test]
+    fn a_wait_for_a_stuck_session_keeps_the_tab_it_was_going_to() {
+        let mut app = demo_app();
+        let mi = app.machine_index("build-box").unwrap();
+        let machine = app.machines[mi].name();
+        app.machines[mi]
+            .snapshot_errors
+            .insert("web".into(), "timed out".into());
+        app.wait_for_stuck(
+            mi,
+            "web",
+            "41-checkout",
+            None,
+            Some(("web".into(), "w7".into(), Some("w7:t3".into()))),
+        );
+        assert_eq!(app.pending_jump_ready(), None, "still waiting");
+        assert_eq!(app.pending_go, None);
+        app.machines[mi].snapshot_errors.remove("web");
+        assert_eq!(
+            app.pending_jump_ready(),
+            Some(Action::JumpWorkspace {
+                machine,
+                session: "web".into(),
+                id: "w7".into(),
+            })
+        );
+        assert_eq!(
+            app.pending_go,
+            Some(("41-checkout".into(), Some("w7:t3".into()))),
+            "in to the tab it named"
         );
         assert!(app.pending_jump.is_none());
     }

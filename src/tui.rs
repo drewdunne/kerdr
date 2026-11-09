@@ -369,6 +369,8 @@ fn event_loop(
                 session,
                 id,
             }) => {
+                // The tab it was asked for, as a reopen's answer named it (Codex's review).
+                let (label, tab) = app.pending_go.take().unzip();
                 if let Some(mi) = app.machine_index(&machine) {
                     jump_workspace(
                         terminal,
@@ -380,8 +382,8 @@ fn event_loop(
                         mi,
                         session,
                         id,
-                        None,
-                        None,
+                        label,
+                        tab.flatten(),
                     );
                 }
             }
@@ -1108,7 +1110,7 @@ fn jump_workspace(
         .unwrap_or_else(|| id.clone());
     // Its session didn't answer its last read: Kerdr waits for it rather than refuse (intent 0591).
     if app.stuck_refusal(mi, &session, &label).is_some() {
-        app.wait_for_stuck(mi, &session.clone(), &label, None, Some((session, id)));
+        app.wait_for_stuck(mi, &session.clone(), &label, None, Some((session, id, tab)));
         if let Some(l) = live.as_deref() {
             l.wake(mi);
         }

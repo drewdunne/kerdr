@@ -1953,6 +1953,11 @@ impl App {
                 if early && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w')) {
                     return Some(Action::None);
                 }
+                // Its yes is ⏎'s when the start it answers was (Codex's review).
+                let by_enter = self
+                    .confirm_by_enter
+                    .take()
+                    .filter(|id| request["id"].as_str() == Some(id.as_str()));
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n' | 'q') => {
                         self.mode = *back;
@@ -1968,6 +1973,7 @@ impl App {
                             return Some(Action::None);
                         }
                         request["queue"] = json!(true);
+                        self.enter_sent = by_enter;
                         let action = self.emit_mutation(machine, request);
                         if matches!(action, Action::Mutate { .. }) {
                             self.action_from = target.map(|t| *t);
@@ -1996,13 +2002,17 @@ impl App {
                         {
                             request["override"] = json!(true);
                         }
+                        self.enter_sent = by_enter;
                         let action = self.emit_mutation(machine, request);
                         if matches!(action, Action::Mutate { .. }) {
                             self.action_from = target.map(|t| *t);
                         }
                         return Some(action);
                     }
-                    _ => {}
+                    _ => {
+                        // Still asking: the yes to come is ⏎'s as before.
+                        self.confirm_by_enter = by_enter;
+                    }
                 }
                 return Some(Action::None);
             }
@@ -2455,7 +2465,10 @@ impl App {
                 self.rebuild();
             }
         }
+        // Whether ⏎ asked for it, for a question it asks (Codex's review).
+        self.answer_by_enter = refused.as_ref().is_some_and(|j| j.by_enter);
         self.finish_action(machine, request, result);
+        self.answer_by_enter = false;
         // Sent on to the machine its refusal named: back in its place in the queue, still shown,
         // so a later change to the same record can't overtake it (intent 0416).
         if self.resend.len() > resends
@@ -2715,20 +2728,21 @@ impl App {
     /// only one that's answering: a feed can't show anything from one that isn't, and these wakes
     /// would override its wait between tries (intent 0491).
     pub fn start_awaited_on(&self) -> Vec<usize> {
-        let Some(key) = self.enter_when_open.as_deref() else {
-            return vec![];
-        };
-        let mut machines: Vec<usize> = self
-            .resolver
-            .on_its_way()
-            .filter(|j| j.key.as_deref() == Some(key))
-            .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
-            .filter(|j| j.request["queue"] != true)
-            .map(|j| j.machine)
-            .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live()))
-            .collect();
+        // s's waits for a machine's accounts, or for its backend to update, are read for on their
+        // own, ⏎ or no ⏎ (intent 0591).
+        let mut machines = self.accounts_awaited_on();
+        if let Some(key) = self.enter_when_open.as_deref() {
+            machines.extend(
+                self.resolver
+                    .on_its_way()
+                    .filter(|j| j.key.as_deref() == Some(key))
+                    .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
+                    .filter(|j| j.request["queue"] != true)
+                    .map(|j| j.machine)
+                    .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live())),
+            );
+        }
         machines.extend(self.follows_awaited_on());
-        machines.extend(self.accounts_awaited_on());
         machines.sort_unstable();
         machines.dedup();
         machines
@@ -3009,12 +3023,6 @@ impl App {
         }
         let from = self.action_from.take();
         let id = request["id"].as_str().map(str::to_string);
-        // A restore an account picked with s waited for: its start goes once the card's back.
-        if request["action"] == "restore"
-            && let Some(id) = id.as_deref()
-        {
-            self.restored(id, result.as_ref().is_ok_and(|r| r.ok));
-        }
         // Only this answer's own resend: another record's, still on its way, stays guarded.
         let was_resent = match self
             .resent
@@ -3261,6 +3269,12 @@ impl App {
                     };
                     (format!("Start {id} in {session}?"), message)
                 };
+                // A start ⏎ asked for stays ⏎'s through its yes: if that is followed too, its end
+                // goes in (Codex's review).
+                self.confirm_by_enter = self
+                    .answer_by_enter
+                    .then(|| request["id"].as_str().map(str::to_string))
+                    .flatten();
                 self.mode = Mode::Confirm {
                     machine,
                     request,

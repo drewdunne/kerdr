@@ -363,7 +363,9 @@ impl App {
         self.answer_went_in = went_in;
         self.follow_end = Some(FollowEnd { enter: f.enter });
         self.answer_stderr = String::new();
+        self.answer_by_enter = f.enter;
         self.finish_action(f.machine, f.request.clone(), Ok(response));
+        self.answer_by_enter = false;
         self.follow_end = None;
         self.action_from = None;
         self.answer_went_in = false;
@@ -446,18 +448,21 @@ impl App {
     }
 
     /// ⏎ or another key on a card whose work Kerdr is following, said: nothing else may change it
-    /// until it ends, as its backend would refuse it. None when nothing is followed for it, or its
-    /// workspace shows already (the usual rules speak).
+    /// until it ends, as its backend would refuse it, even once its workspace shows (its worker may
+    /// still be bringing the agent back: Codex's review). None when nothing is followed for it, and
+    /// for ⏎ once its workspace shows, which goes in as usual.
     pub(super) fn follow_holds(&mut self, card: &Card, action: &str) -> Option<bool> {
-        if card.is_open_workspace() {
+        if card.is_open_workspace() && action == "enter" {
             return None;
         }
         let f = self.following_card(card)?;
         let secs = f.began.elapsed().as_secs();
         let doing = f.doing();
         let reference = card.reference.clone();
+        // ⏎ on a start or reopen goes in at its end, even after Esc let it go (Codex's review).
+        let enters = f.enter || matches!(f.request["action"].as_str(), Some("dispatch" | "reopen"));
         let text = if action == "enter" {
-            if f.enter || f.request["action"] == "dispatch" {
+            if enters {
                 format!(
                     "{doing} ({secs} s so far). Kerdr goes in when it's open; Esc stops waiting."
                 )
@@ -469,16 +474,22 @@ impl App {
                 "{doing} ({secs} s so far), so nothing else changes {reference} until it's done."
             )
         };
-        let goes_in = action == "enter" && (f.enter || f.request["action"] == "dispatch");
+        let goes_in = action == "enter" && enters;
         self.say(text, Tone::Info);
         if goes_in {
+            // A fresh ⏎ takes the card again, as it is now, even after Esc let it go: its end goes
+            // in while you're still on it (Codex's review).
             let key = card.key.clone();
+            let (from, away) = (CardSnapshot::of(card), self.away);
             if let Some(f) = self
                 .follows
                 .iter_mut()
                 .find(|f| f.key.as_deref() == Some(key.as_str()))
             {
                 f.enter = true;
+                f.from = Some(from);
+                f.away = away;
+                f.entered = false;
             }
             self.remember_enter(&key);
         }
@@ -827,13 +838,221 @@ mod tests {
         if let Mode::Confirm { ready_at, .. } = &mut app.mode {
             *ready_at = None;
         }
-        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+        let yes = press(&mut app, 'y');
+        let Action::Mutate { request, .. } = &yes else {
             panic!("the yes sent nothing")
         };
         assert_eq!(request["action"], "dispatch");
         assert_eq!(request["override"], true);
         assert_eq!(request["confirm"], "0123456789abcdef");
         assert!(app.follows.is_empty());
+        // The yes is ⏎'s still: followed in turn, its end goes in, as the ⏎ asked.
+        let (machine, request) = sent(&mut app, yes);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web past its limit, then the work…"),
+        );
+        assert_eq!(app.follows.len(), 1);
+        assert!(app.follows[0].enter, "followed as ⏎'s");
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Started in web.", "session": "web",
+                   "workspace": "w9", "label": "9-new"})
+        ));
+        let open = app
+            .open_after
+            .clone()
+            .expect("⏎ through its question goes in");
+        assert_eq!(
+            (
+                open.session.as_str(),
+                open.workspace.as_str(),
+                open.from.as_str()
+            ),
+            ("web", "w9", key.as_str())
+        );
+    }
+
+    /// The card's workspace showing in herdr, as a feed read would show it, while followed work
+    /// may still be bringing its agent back.
+    fn workspace_shows(app: &mut App, key: &str) {
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].workspace_id = Some("w7".into());
+        app.board.cards[i].session = Some("web".into());
+        assert!(app.board.cards[i].is_open_workspace());
+    }
+
+    #[test]
+    fn once_its_workspace_shows_other_keys_still_wait_for_the_followed_work_then_go() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "move-in", "Moving it into herdr…"),
+        );
+        app.forget_enter();
+        // The first answer has let the change go from the resolver; the worker is still at it.
+        let n = app.follows[0].job;
+        app.resolver.end_follow(n, false);
+        workspace_shows(&mut app, &key);
+        for k in ['X', 'x', 'C', 's'] {
+            assert_eq!(press(&mut app, k), Action::None, "{k} sent something");
+            assert!(matches!(app.mode, Mode::Board), "{k} opened {:?}", app.mode);
+            let said = app.message().unwrap().0.to_string();
+            assert!(said.contains("nothing else changes"), "{k}: {said}");
+        }
+        // ⏎ goes in as usual.
+        assert_eq!(key_enter(&mut app), Action::Jump(key.clone()));
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Moved into herdr.", "session": "web",
+                   "workspace": "w7", "label": "39-moved"})
+        ));
+        assert!(app.follows.is_empty());
+        // Once it's done, X does what it does on any card at work: asks first.
+        workspace_shows(&mut app, &key);
+        app.mode = Mode::Board;
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { request, .. } = &app.mode else {
+            panic!("X didn't ask once the move was done: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "cancel");
+    }
+
+    #[test]
+    fn a_late_worker_is_followed_quietly_until_kerdrs_own_limit_and_then_warned_of() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web, then the work…"),
+        );
+        // Past the backend's limit, short of Kerdr's: still running, and said to be late.
+        app.follows[0].began = Instant::now() - Duration::from_secs(300) - Duration::from_secs(5);
+        poll(&mut app);
+        assert!(!progress(
+            &mut app,
+            json!({"ok": true, "state": "running", "say": "Starting web, then the work…",
+                   "id": id, "session": "api", "late": true})
+        ));
+        assert_eq!(app.follows.len(), 1, "still followed");
+        assert!(!app.failing());
+        assert_eq!(
+            app.message().unwrap().1,
+            Tone::Info,
+            "nothing said of it yet"
+        );
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        // Later still, and the worker finishes after all: it goes in as ever.
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Started in web.", "session": "web",
+                   "workspace": "w7", "label": "39-new"})
+        ));
+        assert!(app.open_after.is_some(), "a late end still goes in");
+
+        // Another that's still late at Kerdr's own limit: a warning, never a failure.
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web, then the work…"),
+        );
+        app.follows[0].began =
+            Instant::now() - Duration::from_secs(300) - MARGIN - Duration::from_secs(1);
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "running", "say": "Starting web, then the work…",
+                   "late": true})
+        ));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(said.contains("It may still be going on"), "{said}");
+        assert!(!app.failing());
+        assert!(app.follows.is_empty());
+    }
+
+    #[test]
+    fn a_worker_that_ended_without_saying_how_it_went_is_said_in_the_backends_words() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back…"),
+        );
+        poll(&mut app);
+        progress(
+            &mut app,
+            json!({"ok": false, "state": "failed",
+                   "message": "Bringing web back ended without saying how it went: Killed. The card shows how it stands."}),
+        );
+        assert!(app.follows.is_empty());
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(
+            app.message().unwrap().0,
+            format!(
+                "{reference} didn't reopen: Bringing web back ended without saying how it went: Killed. The card shows how it stands."
+            )
+        );
+        assert_eq!(app.open_after, None);
+        assert!(app.enter_when_open.is_none());
+    }
+
+    #[test]
+    fn esc_then_enter_on_a_followed_reopen_goes_in_when_it_is_done() {
+        let mut app = demo_app();
+        let (card, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back…"),
+        );
+        key(&mut app, KeyCode::Esc);
+        assert!(app.enter_when_open.is_none());
+        assert!(app.follows[0].from.is_none());
+        // ⏎ again: Kerdr waits again, and its end goes in, before the feed shows the workspace.
+        assert_eq!(key_enter(&mut app), Action::None);
+        assert_eq!(app.enter_when_open.as_deref(), Some(card.as_str()));
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Reopened, resuming its Codex conversation.",
+                   "id": id, "session": "web", "workspace": "w7", "label": "39-checkout"})
+        ));
+        let open = app.open_after.clone().expect("the fresh ⏎ goes in");
+        assert_eq!(
+            (
+                open.session.as_str(),
+                open.workspace.as_str(),
+                open.from.as_str()
+            ),
+            ("web", "w7", card.as_str())
+        );
     }
 
     #[test]

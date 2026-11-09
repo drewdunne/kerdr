@@ -703,12 +703,14 @@ impl App {
             {
                 return Some(a.0.clone());
             }
-            // Several in one tab (or none known) are one place: the first, as herdr lists them.
-            let mut tabs: Vec<&Option<String>> = among.iter().map(|(_, t)| t).collect();
-            tabs.dedup();
-            (tabs.len() == 1)
-                .then(|| among.first().map(|a| a.0.clone()))
-                .flatten()
+            // Several in one known tab are one place: the first, as herdr lists them. A tab herdr
+            // didn't name (an older herdr) says nothing about where it is, so it's never taken for
+            // the same tab as another (Codex's review).
+            let first = among.first().and_then(|(_, t)| t.as_ref())?;
+            among
+                .iter()
+                .all(|(_, t)| t.as_ref() == Some(first))
+                .then(|| among[0].0.clone())
         };
         if !waiting.is_empty() {
             return pick(&waiting);
@@ -3412,6 +3414,45 @@ mod tests {
             "{said}"
         );
         assert!(said.contains("doesn't guess"), "{said}");
+    }
+    /// The two tabs' agents with no tab named, as an older herdr lists them.
+    fn tabs_unnamed(a: &mut App, same: Option<&str>) {
+        let snap = a.machines[1]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut("api")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        for g in snap
+            .agents
+            .iter_mut()
+            .filter(|g| g.pane_id == "w1:p1" || g.pane_id == "w1:p9")
+        {
+            g.tab_id = same.map(str::to_string);
+        }
+        a.rebuild();
+    }
+    #[test]
+    fn s_never_takes_agents_in_tabs_herdr_didnt_name_for_one_place() {
+        let mut a = app();
+        let k = two_tabs(&mut a, false);
+        tabs_unnamed(&mut a, None);
+        let card = a.card(&k).unwrap();
+        assert_eq!(card.agents.len(), 2);
+        assert!(a.move_agent(card).is_none(), "no tab says they're together");
+        // s says why and sends nothing, rather than moving the first.
+        assert_eq!(press(&mut a, 's'), Action::None);
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        let said = a.message().unwrap().0;
+        assert!(said.contains("Codex and Claude Code"), "{said}");
+        assert!(said.contains("doesn't guess"), "{said}");
+        // Two in one tab herdr named are one place: the first, as before.
+        tabs_unnamed(&mut a, Some("w1:t1"));
+        let card = a.card(&k).unwrap();
+        assert_eq!(a.move_agent(card).unwrap().pane, "w1:p1");
     }
     #[test]
     fn s_moves_the_agent_really_in_the_pane() {
