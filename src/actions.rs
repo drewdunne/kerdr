@@ -475,6 +475,64 @@ mod tests {
     use serde_json::json;
     use std::fs;
 
+    fn answered(request: &Value, stdout: &str) -> Result<Response, String> {
+        let output = transport::Output {
+            stdout: stdout.into(),
+            stderr: String::new(),
+            status: Some(0),
+            timed_out: false,
+            took: Duration::from_millis(5),
+        };
+        answer_of(&output, request, deadline_for(request))
+    }
+
+    #[test]
+    fn an_answer_with_follow_names_what_to_ask_about_and_how_long_it_may_take() {
+        let r = answered(
+            &json!({"action":"reopen","id":"0581"}),
+            r#"{"ok":true,"message":"Starting ARK; ⏎ again in a minute goes in.","id":"0581","session":"ARK",
+                "follow":{"token":"f-0123456789abcdef0123","what":"start","id":"0581","session":"ARK",
+                          "say":"Starting ARK on arknet-one, then #581…","limit":300}}"#,
+        )
+        .unwrap();
+        let f = r.follow.unwrap();
+        assert_eq!(f.token, "f-0123456789abcdef0123");
+        assert_eq!(f.what, "start");
+        assert_eq!(f.say, "Starting ARK on arknet-one, then #581…");
+        assert_eq!(f.limit, Some(300));
+    }
+
+    #[test]
+    fn a_follow_kerdr_cant_send_back_reads_as_none_and_the_answer_stands() {
+        for follow in [
+            json!({"token":"f-1 ; rm -rf ~","say":"x"}),
+            json!({"token":"","say":"x"}),
+            json!("f-0123"),
+            json!({"say":"no token"}),
+        ] {
+            let reply = json!({"ok":true,"message":"Started.","follow":follow}).to_string();
+            let r = answered(&json!({"action":"dispatch","id":"0581"}), &reply).unwrap();
+            assert!(r.follow.is_none(), "{follow}");
+            assert!(r.ok);
+        }
+    }
+
+    #[test]
+    fn a_progress_answer_may_leave_out_message_and_only_known_states_are_read() {
+        let request = progress_request("f-0123456789abcdef0123");
+        assert_eq!(deadline_for(&request), Duration::from_secs(20));
+        let r = answered(&request, r#"{"ok":true,"state":"running","say":"Waiting for ARK's restore…"}"#).unwrap();
+        assert_eq!(r.state.as_deref(), Some("running"));
+        assert_eq!(r.say.as_deref(), Some("Waiting for ARK's restore…"));
+        let r = answered(&request, r#"{"state":"done","message":"Reopened.","workspace":"w4","session":"ARK"}"#).unwrap();
+        assert!(r.ok, "a done answer without ok is a success");
+        assert_eq!(r.workspace.as_deref(), Some("w4"));
+        let r = answered(&request, r#"{"ok":false,"state":"exploded","message":"?"}"#).unwrap();
+        assert_eq!(r.state.as_deref(), Some("unknown"));
+        // Any other answer still needs its message.
+        assert!(answered(&json!({"action":"reopen","id":"1"}), r#"{"ok":true}"#).is_err());
+    }
+
     fn deadline_answer(
         machine: &Machine,
         command: &str,

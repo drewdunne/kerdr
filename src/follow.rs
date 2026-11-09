@@ -532,3 +532,482 @@ impl App {
         ))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::tests::{demo_app, press};
+    use serde_json::json;
+
+    fn key(app: &mut App, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
+    /// #39, under way on build-box, whose workspace has closed: set in that machine's feed and
+    /// herdr's view, so the board keeps it so through every rebuild. Selected: ⏎ reopens it.
+    pub(crate) fn closed_card(app: &mut App) -> (String, String) {
+        app.cfg.actions.command = Some("test-adapter".into());
+        let mi = app.machine_index("build-box").unwrap();
+        if let Some(data) = app.machines[mi].data.as_mut() {
+            for snap in data.snapshots.values_mut().flatten() {
+                let gone: Vec<String> = snap
+                    .workspaces
+                    .iter()
+                    .filter(|w| w.label.starts_with("39-"))
+                    .map(|w| w.workspace_id.clone())
+                    .collect();
+                snap.workspaces.retain(|w| !gone.contains(&w.workspace_id));
+                snap.agents.retain(|a| !gone.contains(&a.workspace_id));
+            }
+        }
+        let feed = app.machines[mi].feed.as_mut().unwrap();
+        let fc = feed.cards.iter_mut().find(|c| c.id == "39").unwrap();
+        fc.workspace = None;
+        fc.attention = Some("idle".into());
+        fc.blockers.clear();
+        fc.home = Some(crate::feed::Home {
+            machine: Some("build-box".into()),
+            session: Some("api".into()),
+        });
+        fc.resume = Some(crate::feed::Resume {
+            agent: Some("codex".into()),
+            conversation: Some("4f2b8c1e-5d3a-4b6f-9c2e-1a7d3e9b0c41".into()),
+        });
+        app.rebuild();
+        let key = "demo:39".to_string();
+        let card = app.card(&key).expect("#39 on the board").clone();
+        assert!(!card.is_open_workspace() && card.reopenable(), "{card:?}");
+        app.sel = Selection {
+            col: card.stage.index(),
+            key: Some(key.clone()),
+        };
+        (key, "39".into())
+    }
+
+    /// What the event loop does with a key's change: into the action resolution tool, handed to
+    /// the runner.
+    fn sent(app: &mut App, action: Action) -> (usize, Value) {
+        let Action::Mutate { machine, request } = action else {
+            panic!("nothing was sent: {:?}", app.message())
+        };
+        app.queue_action(machine, request.clone());
+        app.resolver.ready();
+        (machine, request)
+    }
+
+    /// The change's answer, as the event loop takes it.
+    fn answer(app: &mut App, machine: usize, request: &Value, reply: Value) {
+        let n = app
+            .resolver
+            .unanswered_for(request["action"].as_str().unwrap(), request["id"].as_str())
+            .expect("the change is on its way");
+        let response = crate::actions::parse_response(&reply.to_string()).unwrap();
+        app.finish_job(n, request.clone(), Ok(response));
+        let _ = machine;
+    }
+
+    const TOKEN: &str = "f-0123456789abcdef0123";
+
+    fn follow_reply(id: &str, what: &str, say: &str) -> Value {
+        json!({"ok": true,
+               "message": "Starting web; ⏎ again in a minute goes in.",
+               "id": id, "session": "api",
+               "follow": {"token": TOKEN, "what": what, "id": id, "session": "api",
+                          "say": say, "limit": 300}})
+    }
+
+    /// The next progress request, as if it were due now.
+    fn poll(app: &mut App) -> Value {
+        for f in &mut app.follows {
+            f.next = Instant::now();
+        }
+        let due = app.progress_due();
+        assert_eq!(due.len(), 1, "one progress request due");
+        let (token, _, request) = due.into_iter().next().unwrap();
+        assert_eq!(token, TOKEN);
+        request
+    }
+
+    fn progress(app: &mut App, reply: Value) -> bool {
+        let response = crate::actions::parse_response(&{
+            let mut r = reply;
+            if r.get("message").is_none() {
+                r["message"] = json!("");
+            }
+            r.to_string()
+        })
+        .unwrap();
+        app.progress_answered(TOKEN, Ok(response))
+    }
+
+    /// What the board shows of this card's status: the feed's, with changes on their way laid over.
+    fn status_shown(app: &App, key: &str) -> Option<String> {
+        let source = key.rsplit_once(':').map(|(s, _)| s).unwrap();
+        let id = key.rsplit_once(':').map(|(_, i)| i).unwrap();
+        app.resolver
+            .overlay(&app.machines)
+            .iter()
+            .filter_map(|m| m.feed.as_ref())
+            .filter(|f| f.source.as_deref().unwrap_or("feed") == source)
+            .flat_map(|f| f.cards.iter())
+            .find(|c| c.id == id)
+            .and_then(|c| c.status.clone())
+    }
+
+    #[test]
+    fn a_followed_reopen_shows_its_words_and_goes_in_when_done() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        assert_eq!(request["action"], "reopen");
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back on its machine, then the work…"),
+        );
+        // Its words, not the message meant for a Kerdr that doesn't follow.
+        assert_eq!(
+            app.message().unwrap().0,
+            "Bringing web back on its machine, then the work…"
+        );
+        assert_eq!(app.follows.len(), 1);
+        assert_eq!(
+            status_shown(&app, &key).as_deref(),
+            Some("Bringing web back on its machine, then the work…")
+        );
+        // ⏎ asked for it: in as soon as it's open, without another key.
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        // Nothing asked until its first wait is up; then the same machine, by token.
+        assert!(app.progress_due().is_empty());
+        let request = poll(&mut app);
+        assert_eq!(request, json!({"action": "progress", "follow": TOKEN}));
+        // One on its way at a time.
+        assert!(app.progress_due().is_empty());
+        assert!(!progress(
+            &mut app,
+            json!({"ok": true, "state": "running", "say": "Reopening it in web…"})
+        ));
+        assert_eq!(app.message().unwrap().0, "Reopening it in web…");
+        assert_eq!(
+            status_shown(&app, &key).as_deref(),
+            Some("Reopening it in web…")
+        );
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Reopened, resuming its Codex conversation.",
+                   "id": id, "session": "web", "workspace": "w7", "label": "41-checkout"})
+        ));
+        assert!(app.follows.is_empty());
+        let open = app.open_after.clone().expect("it goes in, as on a reopen's answer");
+        assert_eq!(
+            (open.session.as_str(), open.workspace.as_str(), open.from.as_str()),
+            ("web", "w7", key.as_str())
+        );
+        assert!(!app.failing());
+    }
+
+    fn key_enter(app: &mut App) -> Action {
+        key(app, KeyCode::Enter)
+    }
+
+    #[test]
+    fn a_second_enter_while_it_is_followed_says_what_it_is_doing_and_sends_nothing() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web on this machine, then the work…"),
+        );
+        app.forget_enter();
+        // Its change has left the resolver (the feed showed it started) but the follow goes on.
+        let n = app.follows[0].job;
+        app.resolver.end_follow(n, false);
+        assert_eq!(key_enter(&mut app), Action::None);
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.starts_with("Starting web on this machine, then the work ("), "{said}");
+        assert!(said.ends_with("Kerdr goes in when it's open; Esc stops waiting."), "{said}");
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        // d, x and the rest wait for it too.
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert!(app.message().unwrap().0.contains("nothing else changes"));
+    }
+
+    #[test]
+    fn a_followed_start_that_asks_puts_the_question_and_the_yes_carries_its_token() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = {
+            let c = app
+                .board
+                .cards
+                .iter()
+                .find(|c| crate::app::waiting_work(c))
+                .unwrap();
+            (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+        };
+        for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.detail.as_mut().unwrap().kickoff = None;
+        }
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.sel = Selection {
+            col: app.board.cards[i].stage.index(),
+            key: Some(key.clone()),
+        };
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        assert_eq!(request["action"], "dispatch");
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web, then the work…"),
+        );
+        poll(&mut app);
+        progress(
+            &mut app,
+            json!({"ok": false, "state": "asks", "confirmation": true, "confirm": "0123456789abcdef",
+                   "message": "web has 3 workspaces, its usual limit. Start anyway?",
+                   "session": "web", "used": 3, "limit": 3}),
+        );
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("expected the question, got {:?}", app.mode)
+        };
+        assert!(title.starts_with("Start"), "{title}");
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["override"], true);
+        assert_eq!(request["confirm"], "0123456789abcdef");
+        assert!(app.follows.is_empty());
+    }
+
+    #[test]
+    fn a_followed_step_that_fails_says_what_didnt_happen_and_the_card_is_as_it_was() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "recover", "Bringing web back…"));
+        poll(&mut app);
+        progress(
+            &mut app,
+            json!({"ok": false, "state": "failed",
+                   "message": "herdr session web wouldn't start (its socket folder is full)."}),
+        );
+        assert!(app.failing());
+        let said = app.message().unwrap().0.to_string();
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(
+            said,
+            format!("{reference} didn't reopen: herdr session web wouldn't start (its socket folder is full).")
+        );
+        assert_eq!(app.open_after, None);
+        assert!(app.enter_when_open.is_none());
+        assert_ne!(status_shown(&app, &key).as_deref(), Some("Bringing web back…"));
+    }
+
+    #[test]
+    fn a_machine_with_no_record_of_it_is_said_plainly() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "move-in", "Moving it into herdr…"));
+        poll(&mut app);
+        progress(
+            &mut app,
+            json!({"ok": false, "state": "unknown",
+                   "message": "This machine has no record of that any more; the card shows how it stands."}),
+        );
+        let reference = app.card(&key).unwrap().reference.clone();
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.starts_with(&format!("Kerdr lost track of {reference}'s move into herdr:")),
+            "{said}"
+        );
+        assert!(app.follows.is_empty());
+    }
+
+    #[test]
+    fn past_its_limit_and_a_margin_it_says_the_step_goes_on_as_a_warning() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web, then the work…"));
+        // Answers with no end, and its time is up.
+        app.follows[0].began = Instant::now() - Duration::from_secs(300) - MARGIN - Duration::from_secs(1);
+        poll(&mut app);
+        assert!(progress(
+            &mut app,
+            json!({"ok": true, "state": "running", "say": "Starting web, then the work…"})
+        ));
+        let reference = app.card(&key).unwrap().reference.clone();
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn, "a warning, never a failure");
+        assert!(!app.failing());
+        assert!(said.contains("It may still be going on"), "{said}");
+        assert!(said.contains(&format!("{reference}'s card shows how it ends")), "{said}");
+        assert!(app.follows.is_empty());
+        assert!(app.enter_when_open.is_none());
+    }
+
+    #[test]
+    fn unanswered_reads_are_asked_again_less_often_and_a_machine_away_past_the_deadline_gives_up() {
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web…"));
+        for n in 1..=POLL_SLOW_AFTER {
+            poll(&mut app);
+            assert!(!app.progress_answered(TOKEN, Err("ssh: connection reset".into())));
+            assert_eq!(app.follows[0].misses, n);
+        }
+        let wait = app.follows[0].next.saturating_duration_since(Instant::now());
+        assert!(wait > POLL_EVERY, "asked less often after {POLL_SLOW_AFTER} misses: {wait:?}");
+        // Its machine stops answering altogether, and its time runs out: given up, as a warning.
+        app.machines[machine].conn = Conn::Reconnecting {
+            since: Local::now(),
+            attempt: 1,
+            retry_at: Local::now(),
+            detail: "gone".into(),
+        };
+        app.follows[0].began = Instant::now() - Duration::from_secs(400);
+        app.follows[0].next = Instant::now();
+        assert!(app.progress_due().is_empty());
+        assert!(app.follows.is_empty());
+        assert_eq!(app.message().unwrap().1, Tone::Warn);
+    }
+
+    #[test]
+    fn esc_lets_it_go_and_its_end_says_where_it_is_instead_of_going_in() {
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "recover", "Bringing web back…"));
+        key(&mut app, KeyCode::Esc);
+        assert!(app.message().unwrap().0.starts_with("Stopped waiting"));
+        poll(&mut app);
+        progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Reopened, resuming its Codex conversation.",
+                   "session": "web", "workspace": "w7"}),
+        );
+        assert_eq!(app.open_after, None);
+        assert!(app.message().unwrap().0.ends_with("⏎ on its card goes in."));
+    }
+
+    #[test]
+    fn going_in_yourself_means_its_end_takes_you_nowhere() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "move-in", "Moving it into herdr…"));
+        app.went_into(&key);
+        poll(&mut app);
+        progress(
+            &mut app,
+            json!({"ok": true, "state": "done", "message": "Moved into herdr.", "session": "web", "workspace": "w7"}),
+        );
+        assert_eq!(app.open_after, None);
+    }
+
+    #[test]
+    fn its_workspace_showing_takes_a_waiting_enter_in_before_the_answer_that_it_is_done() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "move-in", "Moving it into herdr…"));
+        assert_eq!(app.enter_when_open_due(), None, "nothing open yet: still waiting");
+        assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        // The feed shows its workspace.
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].workspace_id = Some("w7".into());
+        app.board.cards[i].session = Some("web".into());
+        assert_eq!(app.enter_when_open_due(), Some(Action::Jump(key.clone())));
+    }
+
+    #[test]
+    fn a_start_d_asked_for_says_where_it_is_and_one_enter_asked_for_goes_in() {
+        for by_enter in [false, true] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = {
+                let c = app
+                    .board
+                    .cards
+                    .iter()
+                    .find(|c| crate::app::waiting_work(c))
+                    .unwrap();
+                (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+            };
+            for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+                c.detail.as_mut().unwrap().kickoff = None;
+            }
+            let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+            app.sel = Selection {
+                col: app.board.cards[i].stage.index(),
+                key: Some(key.clone()),
+            };
+            let action = if by_enter { key_enter(&mut app) } else { press(&mut app, 'd') };
+            let (machine, request) = sent(&mut app, action);
+            answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web, then the work…"));
+            poll(&mut app);
+            progress(
+                &mut app,
+                json!({"ok": true, "state": "done", "message": "Started in web.", "session": "web",
+                       "workspace": "w9", "label": "9-new"}),
+            );
+            if by_enter {
+                assert!(app.open_after.is_some(), "⏎ goes in");
+            } else {
+                assert_eq!(app.open_after, None, "d starts it and leaves you where you are");
+                assert_eq!(app.message().unwrap().0, "Started in web. ⏎ on its card goes in.");
+            }
+        }
+    }
+
+    #[test]
+    fn q_says_followed_work_carries_on_without_kerdr() {
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web, then the work…"));
+        let said = app.still_running().unwrap();
+        assert!(said.contains("carries on there after Kerdr quits"), "{said}");
+        assert!(said.contains("Starting web, then the work"), "{said}");
+    }
+
+    #[test]
+    fn an_answer_without_follow_is_taken_as_ever() {
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            json!({"ok": true, "message": "Reopened.", "id": id, "session": "web", "workspace": "w7"}),
+        );
+        assert!(app.follows.is_empty());
+        assert!(app.open_after.is_some());
+    }
+}
