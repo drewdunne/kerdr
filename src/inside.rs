@@ -561,6 +561,14 @@ impl App {
                 let back = leave(&self.mode);
                 self.open_card(h, Some(key.to_string()), back);
             }
+            // A card in a working stage the config hides (intent 0595): its own screen.
+            None if (lists || matches!(self.mode, Mode::Board | Mode::Card { .. }))
+                && self.board.cards[i].stage.is_working()
+                && self.cfg.board.hides(self.board.cards[i].stage) =>
+            {
+                let back = leave(&self.mode);
+                self.open_card(i, None, back);
+            }
             // A card in a column the config hides: its own screen, the backlog's or Done's, on it.
             None if (lists || matches!(self.mode, Mode::Board | Mode::Card { .. }))
                 && self.cfg.board.hides(self.board.cards[i].stage) =>

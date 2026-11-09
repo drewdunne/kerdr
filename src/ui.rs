@@ -5918,18 +5918,12 @@ mod tests {
         let order = a.columns()[Stage::Build.index()].clone();
         assert_eq!(order[0], last);
         assert_eq!(a.selected().map(|c| c.key.clone()), Some(key));
-        a.on_key(ratatui::crossterm::event::KeyEvent::new(
-            ratatui::crossterm::event::KeyCode::Char('j'),
-            ratatui::crossterm::event::KeyModifiers::NONE,
-        ));
+        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
         assert_eq!(
             a.selected().map(|c| c.key.clone()),
             Some(a.board.cards[order[1]].key.clone())
         );
-        a.on_key(ratatui::crossterm::event::KeyEvent::new(
-            ratatui::crossterm::event::KeyCode::Char('k'),
-            ratatui::crossterm::event::KeyModifiers::NONE,
-        ));
+        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
         assert_eq!(
             a.selected().map(|c| c.key.clone()),
             Some(a.board.cards[order[0]].key.clone())

@@ -1115,4 +1115,25 @@ mod tests {
         app.choose_scope(Scope::Session("lab".into(), "TNY-Background".into()));
         assert_eq!(*app.scope(), Scope::Owner("tinyhost".into()));
     }
+
+    #[test]
+    fn a_hidden_stage_on_any_list_leaves_the_board_and_n_opens_its_cards_own_screen() {
+        let mut app = owner_app(true);
+        app.cfg.board.hide_columns = vec!["learn".into()];
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        let layout = app.layout();
+        let vis = app.visible_in(&layout);
+        let learn = layout
+            .columns
+            .iter()
+            .position(|c| c.stage.id() == "learn")
+            .unwrap();
+        assert!(!vis[learn]);
+        app.on_key(key('n'));
+        assert!(
+            matches!(&app.mode, Mode::Card { card, .. } if card == "s:5"),
+            "{:?}",
+            app.mode
+        );
+    }
 }

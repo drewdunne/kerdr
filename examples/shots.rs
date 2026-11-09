@@ -32,15 +32,18 @@ fn load(path: &Path) -> Font {
 }
 
 fn app(away: bool) -> App {
-    let mut a = App::new(Config::default(), demo::machines(away));
+    app_with(away, Config::default())
+}
+
+fn app_with(away: bool, cfg: Config) -> App {
+    let mut a = App::new(cfg, demo::machines(away));
     a.demo = true;
     a.fixed_now = Some(demo::now());
     a.width = COLS;
+    a.height = ROWS;
     a.rebuild();
     for card in &mut a.board.cards {
         if let Some(detail) = &mut card.detail {
-            detail.organization = Some("example-studio".into());
-            detail.tenant = (card.session.as_deref() == Some("web")).then(|| "shop".into());
             detail.project = Some(card.session.clone().unwrap_or_else(|| "platform".into()));
             detail.created = Some("2026-10-01".into());
             detail.refreshed_at = Some(
@@ -328,11 +331,31 @@ fn main() {
         scroll: 0,
     };
     rasterize(&render(&keys), &fonts, &out.join("keys.png"));
-    let mut machine = app(false);
+    // The machine split, as a feed with no owners (or `[board] split = "machines"`) keeps it.
+    let mut split = Config::default();
+    split.board.split = kerdr::config::Split::Machines;
+    let mut machine = app_with(false, split);
     machine.machine = Some("build-box".into());
     machine.rebuild();
     machine.tab = 1;
     rasterize(&render(&machine), &fonts, &out.join("machine-sessions.png"));
+
+    // An owner's All, mixing its teams' stage lists in bands, and one team's own stages
+    // (intent 0595).
+    let press = |a: &mut App, keys: &str| {
+        for c in keys.chars() {
+            a.on_key(ratatui::crossterm::event::KeyEvent::new(
+                ratatui::crossterm::event::KeyCode::Char(c),
+                ratatui::crossterm::event::KeyModifiers::NONE,
+            ));
+        }
+    };
+    let mut owner = app(false);
+    press(&mut owner, "}}");
+    rasterize(&render(&owner), &fonts, &out.join("owner-teams.png"));
+    let mut team = app(false);
+    press(&mut team, "}}3");
+    rasterize(&render(&team), &fonts, &out.join("team-stages.png"));
 
     let mut backlog = app(false);
     backlog.mode = Mode::Backlog { sel: 0 };
