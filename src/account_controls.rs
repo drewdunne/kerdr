@@ -1077,6 +1077,28 @@ impl App {
             })
     }
 
+    /// Whether a question the backend asked about this move (with a token of its own) may still be
+    /// put and answered. As target_current, except that an agent the picker saw on its first turn,
+    /// with no conversation yet (and so no account on record), is the same agent once herdr learns
+    /// its conversation: the backend's token names that agent's process, and refuses there one that
+    /// replaced it in the pane (intent 0591, Codex's review).
+    fn target_answerable(&self, target: &MoveTarget) -> bool {
+        if self.target_current(target) {
+            return true;
+        }
+        if !target.agent.conversation.is_empty() {
+            return false;
+        }
+        self.card(&target.key)
+            .filter(|c| c.machine_index == target.machine)
+            .and_then(|c| self.move_agent(c))
+            .is_some_and(|a| {
+                a.pane == target.agent.pane
+                    && a.session == target.agent.session
+                    && (target.agent.account.is_empty() || a.account == target.agent.account)
+            })
+    }
+
     fn send_account(&mut self, machine: usize, request: Value) -> Action {
         if !self.can_write(machine) {
             if request["action"] == "account-signin"
@@ -1957,7 +1979,7 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Char('y') if Instant::now() >= *ready_at => {
-                    if target.as_ref().is_none_or(|t| self.target_current(t)) {
+                    if target.as_ref().is_none_or(|t| self.target_answerable(t)) {
                         request = Some((*machine, pending.clone()));
                         self.mode = *back;
                         if let Some((mi, r)) = request {
@@ -2424,9 +2446,12 @@ impl App {
                 if let Some(to) = request["to"].as_str() {
                     reopen["account"] = json!(to);
                 }
+                // Where you were, only while its picker is still open: once Esc has closed it, the
+                // start still goes on and is followed, but its answer takes you nowhere (Codex's
+                // review).
                 self.action_from = key
                     .as_deref()
-                    .filter(|k| self.sel.key.as_deref() == Some(*k))
+                    .filter(|k| visible && self.sel.key.as_deref() == Some(*k))
                     .and_then(|k| self.card(k))
                     .map(CardSnapshot::of);
                 self.queue_action(machine, reopen.clone());
@@ -2461,7 +2486,7 @@ impl App {
                 // about that start, not the agent: its yes isn't refused once the board shows the
                 // agent gone (intent 0591).
                 let starts = response.id.is_some() || response.session.is_some();
-                if starts || self.target_current(&target) {
+                if starts || self.target_answerable(&target) {
                     let mut request = request;
                     request["confirm"] = json!(token);
                     self.push_account_screen(AccountScreen::Confirm {
@@ -3016,6 +3041,111 @@ mod tests {
             assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
             assert!(a.follows.is_empty());
             assert_eq!(a.message().unwrap().0, said);
+        }
+    }
+
+    /// Codex's review: an agent on its first turn, which the picker saw with no conversation, whose
+    /// turn ends (herdr learns its conversation) before the question comes, or before y. Its
+    /// question is still put, and its yes still goes, with its token: the backend's token names the
+    /// agent's process, and refuses there one that replaced it.
+    #[test]
+    fn a_first_turn_question_still_answers_once_the_agents_conversation_is_known() {
+        for before_question in [true, false] {
+            let mut a = app();
+            pick(&mut a);
+            // On its first turn: no record of it yet, and herdr doesn't know its conversation.
+            a.machines[1]
+                .feed
+                .as_mut()
+                .unwrap()
+                .agents
+                .retain(|r| !(r.session == "api" && r.pane == "w1:p1"));
+            let k = a.sel.key.clone().unwrap();
+            for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+                for g in c.agents.iter_mut().filter(|g| g.pane_id == "w1:p1") {
+                    g.conversation = None;
+                }
+            }
+            press(&mut a, 's');
+            let action = key(&mut a, KeyCode::Enter);
+            let (_, asked) = sent(action.clone());
+            assert_eq!(asked["conversation"], "", "the picker saw no conversation");
+            let to = asked["to"].as_str().unwrap().to_string();
+            if before_question {
+                set_conversation(&mut a, "c-known");
+            }
+            let text = format!(
+                "It's still on its first turn, so herdr doesn't know its conversation yet. Move it to {to} once that turn ends? It won't be cut off."
+            );
+            complete(
+                &mut a,
+                action,
+                json!({"ok":false,"confirmation":text,"yes":"move when it stops","no":"leave it",
+                       "confirm":"turn-0123456789abcdef","message":text}),
+            );
+            assert!(
+                matches!(
+                    a.mode,
+                    Mode::Accounts {
+                        screen: AccountScreen::Confirm { .. },
+                        ..
+                    }
+                ),
+                "the question wasn't put: {:?}",
+                a.message()
+            );
+            if !before_question {
+                set_conversation(&mut a, "c-known");
+            }
+            settle(&mut a);
+            let (_, r) = sent(press(&mut a, 'y'));
+            let mut expected = asked.clone();
+            expected["confirm"] = json!("turn-0123456789abcdef");
+            assert_eq!(r, expected);
+        }
+        // An agent the picker saw with its conversation, holding another one now, is still refused.
+        let mut a = app();
+        move_question(&mut a);
+        set_conversation(&mut a, "c-another");
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(a.message().unwrap().0.contains("conversation changed"));
+    }
+
+    /// Codex's review: Esc on the picker while its move is on its way, and the backend starts the
+    /// card instead. The start goes on and is followed, but its answer never takes you anywhere:
+    /// neither one answered at once with its workspace, nor a followed one when it's done.
+    #[test]
+    fn escaping_the_picker_lets_the_start_made_instead_go_on_without_taking_you_anywhere() {
+        for followed in [false, true] {
+            let mut a = app();
+            let (_, id) = card_44(&a);
+            let action = move_44(&mut a);
+            key(&mut a, KeyCode::Esc);
+            assert!(matches!(a.mode, Mode::Board));
+            if followed {
+                complete(&mut a, action, started_instead(&id));
+                assert_eq!(a.follows.len(), 1, "still followed");
+                assert!(a.enter_when_open.is_none(), "no ⏎ remembered");
+                followed_to(
+                    &mut a,
+                    json!({"ok":true,"state":"done","message":"Reopened #44 in api on ARK_C.","id":id,
+                           "session":"api","workspace":"w9","label":"44-again"}),
+                );
+                assert!(a.follows.is_empty());
+            } else {
+                complete(
+                    &mut a,
+                    action,
+                    json!({"ok":true,"message":"Its agent wasn't running, so it's being started on ARK_C: Reopened #44 in api.",
+                           "id":id,"session":"api","workspace":"w9","label":"44-again"}),
+                );
+            }
+            assert_eq!(a.open_after, None, "Esc'd: nowhere to go");
+            assert!(a.enter_when_open.is_none());
+            assert!(matches!(a.mode, Mode::Board));
+            let said = a.message().unwrap().0.to_string();
+            assert!(said.ends_with("⏎ on its card goes in."), "{said}");
         }
     }
 
