@@ -199,8 +199,11 @@ When `Enter` can't open a card, Kerdr says why in plain words. If herdr's window
 it opens (SSH failing, herdr updating itself, versions that don't match), herdr's own message stays
 on the screen until you press Enter. A herdr session that has stopped counts as a closed workspace,
 so work under way reopens. A reopen that opened a new tab lands on that tab. When a card's
-conversation runs in a terminal outside herdr, `Enter` says which and sends nothing; a second
-`Enter` within five seconds goes on to ask about a second copy.
+conversation runs in a terminal outside herdr, `Enter` asks its backend to move it into herdr, and
+goes in once it's there. Work that takes longer than an answer (starting a herdr session, a move
+into herdr) shows what it's doing on its card, and Kerdr follows it to the end without holding the
+board; see [docs/feed.md](docs/feed.md#following-work-that-goes-on-after-its-answer). An `Enter`
+that waited (for a machine, or a start) does what a fresh one would when it goes.
 When the machine asked turns out not to be the work's home any more, Kerdr asks its home instead,
 once, and sends that work's actions there until the board catches up; when it can't (a machine it
 doesn't list, or one not answering), it says so in its own words. Answers longer than 300

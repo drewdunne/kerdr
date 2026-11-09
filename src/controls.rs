@@ -1145,6 +1145,18 @@ impl App {
         if let Some(obj) = extra.as_object() {
             request.as_object_mut().unwrap().extend(obj.clone());
         }
+        // Its conversation runs in a terminal outside herdr: C and x go straight to its backend,
+        // which stops it there first and asks before it does, naming where it runs (intent 0591):
+        // that question is the one he answers, not a second of Kerdr's. `outside_since` is the
+        // window the card shows; an older backend refuses as before.
+        if ends
+            && started
+            && let Some((_, since)) = self.outside_said(&card)
+        {
+            request["outside_since"] = json!(since);
+            self.action_from = Some(CardSnapshot::of(&card));
+            return Action::Mutate { machine, request };
+        }
         if ends {
             let (title, message) = match (action, started) {
                 ("close", _) => (
@@ -1182,6 +1194,30 @@ impl App {
         }
     }
 
+    /// How a question names a conversation running outside herdr, and the `since` Kerdr sends with
+    /// a stop of it (the feed's own words, or ""): "its Codex conversation running in a foot window
+    /// since 13:02". None when the card's conversation runs in herdr or nowhere.
+    pub(super) fn outside_said(&self, card: &Card) -> Option<(String, String)> {
+        let outside = card.outside_herdr()?;
+        let program = card
+            .resume_agent()
+            .map(|a| format!("{} ", self.providers(card.machine_index).program_label(a)))
+            .unwrap_or_default();
+        let since = outside
+            .since
+            .as_deref()
+            .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+            .map(|t| format!(" since {}", self.when(t.with_timezone(&chrono::Local))))
+            .unwrap_or_default();
+        Some((
+            format!(
+                "its {program}conversation running in {}{since}",
+                outside.place()
+            ),
+            outside.since.clone().unwrap_or_default(),
+        ))
+    }
+
     /// X (intent 0321): the agent at the selected card's work stopped, mid-step or idle, by
     /// closing its workspace (only its tab, for a child running in its parent's workspace), and the
     /// work set aside in Won't do, its state kept, so u brings it back and ⏎ then resumes its
@@ -1204,6 +1240,37 @@ impl App {
         }
         self.backlog_focus = Some(card.key.clone());
         let reference = card.reference.clone();
+        // Its agent runs in a terminal outside herdr: X stops it there, after the usual question,
+        // and sets the work aside (intent 0591). An older backend refuses, saying so.
+        if !card.cancellable()
+            && !card.dismissed()
+            && !card.done()
+            && card.intake() != Some("pending")
+            && let Some((stops, since)) = self.outside_said(&card)
+        {
+            let Some(machine) = self.home_machine(&card) else {
+                return Action::None;
+            };
+            if !self.can_write(machine) {
+                return Action::None;
+            }
+            // `outside_since` names the window this yes was for: its backend stops only that one.
+            let request = json!({"action":"cancel","id":detail.id,"outside_since":since});
+            self.mode = Mode::Confirm {
+                machine,
+                request,
+                title: format!("Cancel {reference}?"),
+                message: format!(
+                    "Stops {stops} once its current turn ends, then sets {reference} aside in Won't do. Anything it hadn't committed stays as it left it. Its log says you cancelled it; u brings it back, and ⏎ then resumes its conversation in herdr."
+                ),
+                back: Box::new(self.mode.clone()),
+                target: Some(Box::new(CardSnapshot::of(&card))),
+                queue: false,
+                ready_at: None,
+                plain: false,
+            };
+            return Action::None;
+        }
         if !card.cancellable() {
             let said = if card.dismissed() {
                 format!("{reference} is in won't do already.")
@@ -1886,6 +1953,11 @@ impl App {
                 if early && matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w')) {
                     return Some(Action::None);
                 }
+                // Its yes is ⏎'s when the start it answers was (Codex's review).
+                let by_enter = self
+                    .confirm_by_enter
+                    .take()
+                    .filter(|id| request["id"].as_str() == Some(id.as_str()));
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n' | 'q') => {
                         self.mode = *back;
@@ -1901,6 +1973,7 @@ impl App {
                             return Some(Action::None);
                         }
                         request["queue"] = json!(true);
+                        self.enter_sent = by_enter;
                         let action = self.emit_mutation(machine, request);
                         if matches!(action, Action::Mutate { .. }) {
                             self.action_from = target.map(|t| *t);
@@ -1916,18 +1989,30 @@ impl App {
                             );
                             return Some(Action::None);
                         }
+                        // A backend's own question on C, x or X carries its token: the yes goes back
+                        // with `override`, as a start's does (intent 0591). Kerdr's own question on
+                        // them has none, and its yes goes as it always has.
                         if !plain
-                            && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+                            && (matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+                                || (request.get("confirm").is_some()
+                                    && matches!(
+                                        request["action"].as_str(),
+                                        Some("close" | "dismiss" | "cancel")
+                                    )))
                         {
                             request["override"] = json!(true);
                         }
+                        self.enter_sent = by_enter;
                         let action = self.emit_mutation(machine, request);
                         if matches!(action, Action::Mutate { .. }) {
                             self.action_from = target.map(|t| *t);
                         }
                         return Some(action);
                     }
-                    _ => {}
+                    _ => {
+                        // Still asking: the yes to come is ⏎'s as before.
+                        self.confirm_by_enter = by_enter;
+                    }
                 }
                 return Some(Action::None);
             }
@@ -2072,7 +2157,11 @@ impl App {
         let shows = effect.is_some();
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
         let asking = (!shows).then(|| self.asking_line(&request)).flatten();
+        let by_enter = self.enter_sent.take().is_some_and(|e| e == id);
         let n = self.resolver.add(machine, request, from, key, effect);
+        if by_enter {
+            self.resolver.mark_by_enter(n);
+        }
         if let Some(line) = asking {
             self.resolver.mark_asking(n);
             self.say(line, Tone::Info);
@@ -2147,10 +2236,17 @@ impl App {
 
     /// What a start or reopen that shows nothing on its card says instead until it's answered.
     fn asking_line(&self, request: &Value) -> Option<String> {
-        if !matches!(request["action"].as_str(), Some("dispatch" | "reopen")) {
+        let outside = matches!(request["action"].as_str(), Some("close" | "dismiss"))
+            && request.get("outside_since").is_some();
+        if !matches!(request["action"].as_str(), Some("dispatch" | "reopen")) && !outside {
             return None;
         }
         let reference = self.reference_for(request["id"].as_str()?);
+        if outside {
+            return Some(format!(
+                "Asking about stopping {reference}'s conversation outside herdr…"
+            ));
+        }
         Some(if request["queue"] == true {
             format!("Queuing {reference}…")
         } else {
@@ -2200,6 +2296,13 @@ impl App {
     pub(super) fn effect_for(&self, key: &str, request: &Value) -> Option<Effect> {
         Some(match request["action"].as_str()? {
             "dispatch" | "reopen" if request["queue"] == true || self.asks_first(key, request) => {
+                return None;
+            }
+            // C or x on a conversation outside herdr: its backend asks before it stops it, so
+            // nothing shows until its yes (intent 0591).
+            "close" | "dismiss"
+                if request.get("outside_since").is_some() && request.get("override").is_none() =>
+            {
                 return None;
             }
             "dispatch" => Effect::Starting,
@@ -2267,6 +2370,7 @@ impl App {
         };
         let mut job = job;
         let machine = job.machine;
+        let by_enter = job.by_enter;
         self.action_from = job.from.clone();
         self.answer_went_in = job.entered;
         if job.asking
@@ -2320,12 +2424,23 @@ impl App {
                 }
                 _ => {}
             }
-            // It stays as shown until the feed has it; a start answered yes moves on now.
-            let changes = guessed_wrong
-                || matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
-            self.resolver.settle(job);
-            if changes {
-                self.rebuild();
+            if let Some(follow) = response.follow.clone() {
+                // It goes on after this answer, and Kerdr follows it (intent 0591): shown on its
+                // card in the follow's words until it ends.
+                self.begin_follow(job, follow);
+                // Joined to a move already under way, which an account picked with s didn't
+                // reach: that's said, as on any start that restarted nothing (intent 0591).
+                if response.ok && response.account_unchanged && !response.message.is_empty() {
+                    self.say(response.message.clone(), Tone::Info);
+                }
+            } else {
+                // It stays as shown until the feed has it; a start answered yes moves on now.
+                let changes = guessed_wrong
+                    || matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
+                self.resolver.settle(job);
+                if changes {
+                    self.rebuild();
+                }
             }
         } else {
             refused = Some(job);
@@ -2351,7 +2466,11 @@ impl App {
                 self.rebuild();
             }
         }
+        // Whether ⏎ asked for it: a question it asks stays ⏎'s (Codex's review), and a start that
+        // answers with its workspace goes in.
+        self.answer_by_enter = by_enter;
         self.finish_action(machine, request, result);
+        self.answer_by_enter = false;
         // Sent on to the machine its refusal named: back in its place in the queue, still shown,
         // so a later change to the same record can't overtake it (intent 0416).
         if self.resend.len() > resends
@@ -2379,6 +2498,10 @@ impl App {
         let Some(id) = card.detail.as_ref().map(|d| d.id.clone()) else {
             return false;
         };
+        // Work that goes on after its answer, still followed (intent 0591).
+        if let Some(holds) = self.follow_holds(card, action) {
+            return holds;
+        }
         let Some(job) = self.resolver.starting(&id) else {
             return false;
         };
@@ -2579,7 +2702,8 @@ impl App {
         if self.resolver.starting(&id).is_some() {
             return self.go_into_opened(&card);
         }
-        if self.started_lately(&id) {
+        // Followed work still going: it goes in once the card shows it open (intent 0591).
+        if self.started_lately(&id) || self.following(&id).is_some() {
             return None;
         }
         self.forget_enter();
@@ -2606,18 +2730,21 @@ impl App {
     /// only one that's answering: a feed can't show anything from one that isn't, and these wakes
     /// would override its wait between tries (intent 0491).
     pub fn start_awaited_on(&self) -> Vec<usize> {
-        let Some(key) = self.enter_when_open.as_deref() else {
-            return vec![];
-        };
-        let mut machines: Vec<usize> = self
-            .resolver
-            .on_its_way()
-            .filter(|j| j.key.as_deref() == Some(key))
-            .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
-            .filter(|j| j.request["queue"] != true)
-            .map(|j| j.machine)
-            .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live()))
-            .collect();
+        // s's waits for a machine's accounts, or for its backend to update, are read for on their
+        // own, ⏎ or no ⏎ (intent 0591).
+        let mut machines = self.accounts_awaited_on();
+        if let Some(key) = self.enter_when_open.as_deref() {
+            machines.extend(
+                self.resolver
+                    .on_its_way()
+                    .filter(|j| j.key.as_deref() == Some(key))
+                    .filter(|j| j.starts() && !j.asking && !j.waits_for_write_up())
+                    .filter(|j| j.request["queue"] != true)
+                    .map(|j| j.machine)
+                    .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live())),
+            );
+        }
+        machines.extend(self.follows_awaited_on());
         machines.sort_unstable();
         machines.dedup();
         machines
@@ -2627,6 +2754,7 @@ impl App {
     /// asks nor takes you in when it answers, since you're already there (intent 0445).
     pub fn went_into(&mut self, key: &str) {
         self.forget_enter();
+        self.entered_follow(key);
         if let Some(id) = self
             .card(key)
             .and_then(|c| c.detail.as_ref())
@@ -2703,6 +2831,11 @@ impl App {
             return Some(
                 "Being written up from your words; it starts as soon as that's done.".into(),
             );
+        }
+        if !card.is_open_workspace()
+            && let Some(line) = self.follow_line(card)
+        {
+            return Some(line);
         }
         let Some(job) = self.resolver.starting(id) else {
             // Any other change still on its way: shown as done, but not yet saved.
@@ -2816,7 +2949,10 @@ impl App {
     /// when nothing is.
     pub fn still_running(&self) -> Option<String> {
         let running = self.resolver.running();
-        let first = running.first()?;
+        let Some(first) = running.first() else {
+            // Followed work carries on on its machine; only Kerdr's reads of it stop (intent 0591).
+            return self.follows_running();
+        };
         let reference = first
             .id()
             .map(|id| self.reference_for(id))
@@ -2841,6 +2977,14 @@ impl App {
         let reference = self.reference_for(id);
         Some(match request["action"].as_str()? {
             "dispatch" => format!("{reference} didn't start"),
+            // A conversation outside herdr is moved in by its reopen (intent 0591).
+            "reopen"
+                if self.board.cards.iter().any(|c| {
+                    c.detail.as_ref().is_some_and(|d| d.id == id) && c.outside_herdr().is_some()
+                }) =>
+            {
+                format!("{reference} didn't move into herdr")
+            }
             "reopen" => format!("{reference} didn't reopen"),
             "close" => format!("{reference} wasn't marked done"),
             "dismiss" => format!("{reference} wasn't set aside"),
@@ -2947,14 +3091,25 @@ impl App {
                     }
                     // s's account goes on only to a backend that starts on one: an older one would
                     // start it on its owner's list without a word (intent 0580).
+                    // That one is brought up to date first, then started there (intent 0591).
                     if request.get("account").is_some()
                         && !self
                             .account_feed(to)
                             .is_some_and(|f| f.starts_on(request["action"].as_str().unwrap_or("")))
                     {
-                        self.fail(format!(
-                            "{reference} lives on {name} now, whose backend can't start work on a chosen account yet; nothing started. Update it, or ⏎ starts it on its owner's list there."
-                        ));
+                        let account = request["account"].as_str().unwrap_or("list").to_string();
+                        if self.owe_after_update(&id, to, &account) {
+                            self.say(
+                                format!(
+                                    "{reference} lives on {name} now, whose backend can't start work on a chosen account yet: Kerdr is bringing its ark-sdlc up to date, then starts {reference} there. Esc on the board drops it."
+                                ),
+                                Tone::Info,
+                            );
+                        } else {
+                            self.fail(format!(
+                                "{reference} lives on {name} now, whose backend can't start work on a chosen account yet, and it's gone from the board, so nothing started."
+                            ));
+                        }
                         return;
                     }
                     let mut request = request;
@@ -2978,10 +3133,26 @@ impl App {
         if request["action"] == "kickoff" {
             return self.finish_kickoff_check(machine, &request, result);
         }
+        // Answered with `follow`: its words are on its card and the message line already, and its
+        // end is taken as this request's answer when it comes (intent 0591, follow.rs). Its
+        // `message` is for a Kerdr that doesn't follow.
+        if let Ok(response) = &result
+            && response.ok
+            && !response.confirmation
+            && response.follow.is_some()
+        {
+            return;
+        }
         // A question, or after a yes a new one: something changed, so it carries a new token.
         let asks = |response: &Response| {
             (response.confirmation || !response.questions.is_empty())
-                && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+                && (matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+                    || (response.confirmation
+                        && response.confirm.is_some()
+                        && matches!(
+                            request["action"].as_str(),
+                            Some("close" | "dismiss" | "cancel")
+                        )))
                 && (request["override"] != true
                     || response
                         .confirm
@@ -2999,6 +3170,19 @@ impl App {
                 // Only while you're still on that work: a question that pops up over typing would
                 // take the next key for its answer.
                 if !from.as_ref().is_some_and(|f| self.still_on(f, None)) {
+                    // A stop C, x or X asked for, which its backend asks about first (intent 0591).
+                    let stop = match request["action"].as_str() {
+                        Some("close") => Some(("wasn't marked done", "C")),
+                        Some("dismiss") => Some(("wasn't set aside", "x")),
+                        Some("cancel") => Some(("wasn't cancelled", "X")),
+                        _ => None,
+                    };
+                    if let Some((what, key)) = stop {
+                        self.fail(format!(
+                            "{reference} {what}: it needs a yes first, and {key} on it again asks."
+                        ));
+                        return;
+                    }
                     let key = if request["action"] == "reopen" {
                         "⏎"
                     } else {
@@ -3066,21 +3250,39 @@ impl App {
                     });
                 let (title, message) = if at_most {
                     (format!("Queue {reference} in {session}?"), response.message)
+                } else if request["action"] == "close" {
+                    (format!("Mark {reference} done?"), response.message)
+                } else if request["action"] == "dismiss" {
+                    (format!("Won't do {reference}?"), response.message)
+                } else if request["action"] == "cancel" {
+                    (format!("Cancel {reference}?"), response.message)
                 } else if request["action"] == "reopen" {
                     (
                         format!("Reopen {reference} in {session}?"),
                         response.message,
                     )
                 } else {
+                    // The count, unless the backend's own words already give it ("web has 2
+                    // workspaces. Start anyway?"): never said twice.
                     let message = match (response.used, response.limit) {
-                        (Some(used), Some(limit)) => format!(
-                            "{used} active workspaces; the usual limit is {limit}. {}",
-                            response.message
-                        ),
+                        (Some(used), Some(limit))
+                            if !says_the_count(&response.message, used, limit) =>
+                        {
+                            format!(
+                                "{used} active workspaces; the usual limit is {limit}. {}",
+                                response.message
+                            )
+                        }
                         _ => response.message,
                     };
                     (format!("Start {id} in {session}?"), message)
                 };
+                // A start ⏎ asked for stays ⏎'s through its yes: if that is followed too, its end
+                // goes in (Codex's review).
+                self.confirm_by_enter = self
+                    .answer_by_enter
+                    .then(|| request["id"].as_str().map(str::to_string))
+                    .flatten();
                 self.mode = Mode::Confirm {
                     machine,
                     request,
@@ -3125,7 +3327,13 @@ impl App {
                     note = Some(message.clone());
                 }
                 // A reopen takes you in only while you're still on its card; otherwise it says so.
-                if request["action"] == "reopen"
+                // So does a start ⏎ asked for, whether its answer names the workspace at once (a yes
+                // to its question, say) or once its followed work is done (intent 0591). d's start
+                // stays where you are.
+                let enters = request["action"] == "reopen"
+                    || self.follow_end.as_ref().is_some_and(|e| e.enter)
+                    || (self.answer_by_enter && request["action"] == "dispatch");
+                if enters
                     && response.ok
                     && !unchanged
                     && let (Some(session), Some(workspace)) =
@@ -3156,6 +3364,19 @@ impl App {
                 }
                 // Answers kept on leaving the Kickoff Questions box: how many are left.
                 if request["action"] == "answer" && response.ok {
+                    note = Some(message.clone());
+                }
+                // Followed work done, not gone into: what it did, and where it is.
+                if self.follow_end.is_some()
+                    && response.ok
+                    && note.is_none()
+                    && self.open_after.is_none()
+                    && !self.answer_went_in
+                    && !message.trim().is_empty()
+                {
+                    if response.workspace.is_some() && !message.contains('⏎') {
+                        message.push_str(" ⏎ on its card goes in.");
+                    }
                     note = Some(message.clone());
                 }
                 // Started: its answers are saved, and what was kept of them is done with.
@@ -3331,6 +3552,17 @@ impl App {
                     }
                     // Started where it was asked: its home hasn't moved since.
                     Some("dispatch") => waiting_work(c) && target.is_none_or(|t| t.same_work(c)),
+                    // Asked about its conversation outside herdr: only while it still runs there,
+                    // the same work, so nothing in herdr is stopped by a yes meant for it (intent
+                    // 0591).
+                    Some("close" | "dismiss" | "cancel")
+                        if request.get("outside_since").is_some() =>
+                    {
+                        c.outside_herdr().is_some()
+                            && !c.dismissed()
+                            && !c.done()
+                            && target.is_some_and(|t| t.same_work(c))
+                    }
                     // Still open with no workspace, the same work (intent 0289).
                     Some("close") => c.closable() && target.is_some_and(|t| t.same_work(c)),
                     // Still the same work, open where the yes was given (intent 0321).
@@ -3351,4 +3583,14 @@ impl App {
                 }
         })
     }
+}
+
+/// Whether a backend's question already says how many workspaces its session has, or its limit:
+/// "web has 2 workspaces", "at its usual limit of 3".
+fn says_the_count(message: &str, used: u32, limit: u32) -> bool {
+    let m = message.to_lowercase();
+    m.contains(&format!("{used} workspace"))
+        || m.contains(&format!("{used} active"))
+        || m.contains(&format!("limit of {limit}"))
+        || m.contains(&format!("limit is {limit}"))
 }

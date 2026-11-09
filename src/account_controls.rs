@@ -616,35 +616,133 @@ impl App {
         Some((message, choices))
     }
 
+    /// The feed's record of the agent at this card that matters: the one waiting for usage, else
+    /// the one in the card's own tab, else the first (friction F-0378: a workspace with Codex in
+    /// its first tab and Claude Code out of usage in its second is about the second).
     pub fn account_agent(&self, card: &Card) -> Option<&AccountAgent> {
         let feed = self.account_feed(card.machine_index)?;
         let session = card.session.as_deref()?;
-        card.agents
+        let records: Vec<(&AccountAgent, &str)> = card
+            .agents
             .iter()
-            .find_map(|a| feed.agent_on_pane(session, &a.pane_id, a.conversation.as_deref()))
+            .filter_map(|a| {
+                feed.agent_on_pane(session, &a.pane_id, a.conversation.as_deref())
+                    .map(|r| (r, a.pane_id.as_str()))
+            })
+            .collect();
+        let own = self.jump_tab(card).0;
+        let in_own = |pane: &str| own.is_some() && self.agent_tab(card, pane) == own;
+        records
+            .iter()
+            .find(|(r, _)| r.waiting_for_usage())
+            .or_else(|| records.iter().find(|(_, pane)| in_own(pane)))
+            .or_else(|| records.first())
+            .map(|(r, _)| *r)
     }
 
-    /// The agent s moves: the one the feed records on this card, or else the card's agent with
-    /// nothing recorded yet, of a program the machine's accounts run. The engine moves that by its
-    /// pane, takes its conversation from herdr and records it from then on; moving is how an
-    /// account gets set (intent 0264).
-    pub fn move_agent(&self, card: &Card) -> Option<AccountAgent> {
-        if let Some(agent) = self.account_agent(card) {
-            return Some(agent.clone());
-        }
-        self.account_feed(card.machine_index)?;
-        let session = card.session.clone()?;
+    /// The herdr tab a pane of this card's is in, from its machine's last read.
+    pub fn agent_tab(&self, card: &Card, pane: &str) -> Option<String> {
+        self.machines
+            .get(card.machine_index)?
+            .snapshot(card.session.as_deref()?)?
+            .agents
+            .iter()
+            .find(|a| a.pane_id == pane)
+            .and_then(|a| a.tab_id.clone())
+    }
+
+    /// The agents at this card s could move, each with the tab it's in: the feed's record of each
+    /// pane, or one with nothing recorded yet of a program the machine's accounts run. The engine
+    /// moves that by its pane, takes its conversation from herdr and records it from then on; moving
+    /// is how an account gets set (intent 0264).
+    fn movable_agents(&self, card: &Card) -> Vec<(AccountAgent, Option<String>)> {
+        let Some(feed) = self.account_feed(card.machine_index) else {
+            return Vec::new();
+        };
+        let Some(session) = card.session.clone() else {
+            return Vec::new();
+        };
         let programs = self.offered(card.machine_index).programs();
         card.agents
             .iter()
-            .find(|a| programs.contains(&a.agent) && !a.pane_id.is_empty())
-            .map(|a| AccountAgent {
-                pane: a.pane_id.clone(),
-                session,
-                conversation: a.conversation.clone().unwrap_or_default(),
-                program: a.agent.clone(),
-                ..AccountAgent::default()
+            .filter(|a| !a.pane_id.is_empty())
+            .filter_map(|a| {
+                let agent =
+                    match feed.agent_on_pane(&session, &a.pane_id, a.conversation.as_deref()) {
+                        Some(r) => r.clone(),
+                        None if programs.contains(&a.agent) => AccountAgent {
+                            pane: a.pane_id.clone(),
+                            session: session.clone(),
+                            conversation: a.conversation.clone().unwrap_or_default(),
+                            program: a.agent.clone(),
+                            ..AccountAgent::default()
+                        },
+                        None => return None,
+                    };
+                Some((agent, self.agent_tab(card, &a.pane_id)))
             })
+            .collect()
+    }
+
+    /// The agent s moves (friction F-0378): the one waiting for usage, else the one in the tab ⏎
+    /// lands on for this card, else the only one. Never the first of several in different tabs
+    /// when nothing says which: [`App::agent_unclear`] says why instead.
+    pub fn move_agent(&self, card: &Card) -> Option<AccountAgent> {
+        let agents = self.movable_agents(card);
+        let waiting: Vec<&(AccountAgent, Option<String>)> = agents
+            .iter()
+            .filter(|(a, _)| a.waiting_for_usage())
+            .collect();
+        let own = self.jump_tab(card).0;
+        let pick = |among: &[&(AccountAgent, Option<String>)]| -> Option<AccountAgent> {
+            if let [one] = among {
+                return Some(one.0.clone());
+            }
+            if let Some(own) = &own
+                && let Some(a) = among.iter().find(|(_, tab)| tab.as_ref() == Some(own))
+            {
+                return Some(a.0.clone());
+            }
+            // Several in one known tab are one place: the first, as herdr lists them. A tab herdr
+            // didn't name (an older herdr) says nothing about where it is, so it's never taken for
+            // the same tab as another (Codex's review).
+            let first = among.first().and_then(|(_, t)| t.as_ref())?;
+            among
+                .iter()
+                .all(|(_, t)| t.as_ref() == Some(first))
+                .then(|| among[0].0.clone())
+        };
+        if !waiting.is_empty() {
+            return pick(&waiting);
+        }
+        let all: Vec<&(AccountAgent, Option<String>)> = agents.iter().collect();
+        pick(&all)
+    }
+
+    /// Why s doesn't move any of this card's agents when it has several it could, in different
+    /// tabs, and nothing says which is its own (friction F-0378): never a guess.
+    pub(super) fn agent_unclear(&self, card: &Card) -> Option<String> {
+        let agents = self.movable_agents(card);
+        if agents.len() < 2 || self.move_agent(card).is_some() {
+            return None;
+        }
+        let named: Vec<String> = agents
+            .iter()
+            .map(|(a, tab)| {
+                let program = self
+                    .agent_program(card.machine_index, a)
+                    .unwrap_or_else(|| "an agent".into());
+                match tab.as_deref().and_then(|t| t.rsplit_once(":t")) {
+                    Some((_, n)) => format!("{program} in tab {n}"),
+                    None => program,
+                }
+            })
+            .collect();
+        Some(format!(
+            "{}'s workspace runs {}, and nothing says which is its own, so s doesn't guess which to move: ⏎ goes in, where you can see which one needs it.",
+            card.reference,
+            named.join(" and ")
+        ))
     }
 
     /// The program an agent runs, in words: what the feed records, else herdr's name for it.
@@ -976,6 +1074,28 @@ impl App {
                     && a.session == target.agent.session
                     && a.conversation == target.agent.conversation
                     && a.account == target.agent.account
+            })
+    }
+
+    /// Whether a question the backend asked about this move (with a token of its own) may still be
+    /// put and answered. As target_current, except that an agent the picker saw on its first turn,
+    /// with no conversation yet (and so no account on record), is the same agent once herdr learns
+    /// its conversation: the backend's token names that agent's process, and refuses there one that
+    /// replaced it in the pane (intent 0591, Codex's review).
+    fn target_answerable(&self, target: &MoveTarget) -> bool {
+        if self.target_current(target) {
+            return true;
+        }
+        if !target.agent.conversation.is_empty() {
+            return false;
+        }
+        self.card(&target.key)
+            .filter(|c| c.machine_index == target.machine)
+            .and_then(|c| self.move_agent(c))
+            .is_some_and(|a| {
+                a.pane == target.agent.pane
+                    && a.session == target.agent.session
+                    && (target.agent.account.is_empty() || a.account == target.agent.account)
             })
     }
 
@@ -1859,7 +1979,7 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Char('y') if Instant::now() >= *ready_at => {
-                    if target.as_ref().is_none_or(|t| self.target_current(t)) {
+                    if target.as_ref().is_none_or(|t| self.target_answerable(t)) {
                         request = Some((*machine, pending.clone()));
                         self.mode = *back;
                         if let Some((mi, r)) = request {
@@ -2294,6 +2414,52 @@ impl App {
             }
             return;
         }
+        // Its agent wasn't running, so the backend started it on the account picked instead, as a
+        // reopen (intent 0591): taken as that reopen's answer, followed while it goes on, and gone
+        // into once it's done while you're still on its card.
+        if action == "account-move"
+            && response.ok
+            && !response.confirmation
+            && (response.follow.is_some()
+                || (response.session.is_some() && response.workspace.is_some()))
+        {
+            let key = match pending.as_ref().and_then(|p| p.screen.as_ref()) {
+                Some(AccountScreen::Move { target, .. }) => Some(target.key.clone()),
+                _ => None,
+            };
+            let id = response
+                .follow
+                .as_ref()
+                .and_then(|f| f.id.clone())
+                .or_else(|| response.id.clone())
+                .or_else(|| {
+                    key.as_deref()
+                        .and_then(|k| self.card(k))
+                        .and_then(|c| c.detail.as_ref())
+                        .map(|d| d.id.clone())
+                });
+            if let Some(id) = id {
+                if visible && let Mode::Accounts { back, .. } = self.mode.clone() {
+                    self.mode = *back;
+                }
+                let mut reopen = json!({"action":"reopen","id":id});
+                if let Some(to) = request["to"].as_str() {
+                    reopen["account"] = json!(to);
+                }
+                // Where you were, only while its picker is still open: once Esc has closed it, the
+                // start still goes on and is followed, but its answer takes you nowhere (Codex's
+                // review).
+                self.action_from = key
+                    .as_deref()
+                    .filter(|k| visible && self.sel.key.as_deref() == Some(*k))
+                    .and_then(|k| self.card(k))
+                    .map(CardSnapshot::of);
+                self.queue_action(machine, reopen.clone());
+                let n = self.resolver.last_added();
+                self.finish_job(n, reopen, Ok(response));
+                return;
+            }
+        }
         if action == "account-move" && response.confirmation && !visible {
             self.say(
                 "That move needs confirmation. Open the move picker again to review it.",
@@ -2315,7 +2481,12 @@ impl App {
                     return;
                 }
                 let target = target.clone();
-                if self.target_current(&target) {
+                // A question about the start made because its agent wasn't running (it names the
+                // intent or its session, as a start's question does; a move's names neither) is
+                // about that start, not the agent: its yes isn't refused once the board shows the
+                // agent gone (intent 0591).
+                let starts = response.id.is_some() || response.session.is_some();
+                if starts || self.target_answerable(&target) {
                     let mut request = request;
                     request["confirm"] = json!(token);
                     self.push_account_screen(AccountScreen::Confirm {
@@ -2324,7 +2495,7 @@ impl App {
                         message: response.message,
                         yes: response.yes.unwrap_or_else(|| "move when it stops".into()),
                         no: response.no.unwrap_or_else(|| "leave it".into()),
-                        target: Some(target),
+                        target: (!starts).then_some(target),
                         ready_at: Instant::now() + Duration::from_millis(500),
                     });
                     return;
@@ -2655,6 +2826,329 @@ mod tests {
         );
         assert!(r.get("override").is_none());
     }
+    const FOLLOW: &str = "f-0123456789abcdef0123";
+
+    /// #44's key and record id.
+    fn card_44(a: &App) -> (String, String) {
+        let c = a.board.cards.iter().find(|c| c.reference == "#44").unwrap();
+        (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+    }
+
+    /// The account move s sends on #44 for ARK_C, its Move picker open.
+    fn move_44(a: &mut App) -> Action {
+        pick(a);
+        press(a, 's');
+        let action = key(a, KeyCode::Enter);
+        let (_, r) = sent(action.clone());
+        assert_eq!(
+            r,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C"})
+        );
+        action
+    }
+
+    /// The backend's answer when its agent wasn't running: the start it made instead, followed.
+    fn started_instead(id: &str) -> Value {
+        json!({"ok":true,
+               "message":"Its agent wasn't running, so it's being started on ARK_C: Starting api; ⏎ again in a minute goes in.",
+               "id":id,"session":"api",
+               "follow":{"token":FOLLOW,"what":"start","id":id,"session":"api","say":"Starting api, then #44…","limit":300}})
+    }
+
+    /// Followed work's end, as its progress answer brings it.
+    fn followed_to(a: &mut App, reply: Value) {
+        for f in &mut a.follows {
+            f.next = Instant::now();
+        }
+        let due = a.progress_due();
+        assert_eq!(due.len(), 1, "one progress request due");
+        assert_eq!(due[0].2, json!({"action":"progress","follow":FOLLOW}));
+        assert!(a.progress_answered(
+            FOLLOW,
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap())
+        ));
+    }
+
+    /// Piece A's backend (intent 0591): s on a card whose agent turns out not to be running starts
+    /// it on the account picked, as a reopen, and answers with `follow`. Kerdr follows it as that
+    /// reopen and goes in once it's done, while you're still on the card.
+    #[test]
+    fn an_account_move_whose_agent_wasnt_running_is_followed_and_goes_in_when_done() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        complete(&mut a, action, started_instead(&id));
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        assert_eq!(a.follows.len(), 1, "followed");
+        assert_eq!(
+            a.follows[0].request,
+            json!({"action":"reopen","id":id,"account":"ARK_C"})
+        );
+        assert_eq!(a.message().unwrap().0, "Starting api, then #44…");
+        followed_to(
+            &mut a,
+            json!({"ok":true,"state":"done","message":"Reopened #44 in api on ARK_C.","id":id,
+                   "session":"api","workspace":"w9","label":"44-again"}),
+        );
+        assert!(a.follows.is_empty());
+        let open = a.open_after.clone().expect("in, once it's done");
+        assert_eq!(
+            (
+                open.session.as_str(),
+                open.workspace.as_str(),
+                open.label.as_str(),
+                open.from.as_str()
+            ),
+            ("api", "w9", "44-again", k.as_str())
+        );
+    }
+
+    /// The same start answered at once with its workspace (no follow): in, as on a reopen's answer.
+    #[test]
+    fn an_account_move_answered_with_a_workspace_goes_in() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"Its agent wasn't running, so it's being started on ARK_C: Reopened #44 in api.",
+                   "id":id,"session":"api","workspace":"w9","label":"44-again"}),
+        );
+        assert!(a.follows.is_empty());
+        let open = a.open_after.clone().expect("in, as on a reopen's answer");
+        assert_eq!(
+            (open.workspace.as_str(), open.from.as_str()),
+            ("w9", k.as_str())
+        );
+    }
+
+    /// That start's question (a full session, say) comes back with a token of its own and "yes" and
+    /// "no": the yes goes back as the same account move with that token, even once the board shows
+    /// the agent gone, and the start it answers is followed and gone into.
+    #[test]
+    fn a_question_from_a_start_made_for_a_move_round_trips_and_its_yes_goes_in() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"confirmation":true,"confirm":"cont-0123456789abcdef","yes":"yes","no":"no",
+                   "id":id,"session":"api","used":2,"limit":2,
+                   "message":"Its agent wasn't running, so it's being started on ARK_C: api has 2 workspaces. Start anyway?"}),
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                yes, no, message, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("no question: {:?}", a.message());
+        };
+        assert_eq!((yes.as_str(), no.as_str()), ("yes", "no"));
+        assert!(
+            message.ends_with("api has 2 workspaces. Start anyway?"),
+            "{message}"
+        );
+        // The board catches up: no agent runs it now.
+        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+            c.agents.clear();
+        }
+        assert!(a.move_agent(a.card(&k).unwrap()).is_none());
+        settle(&mut a);
+        let yes = press(&mut a, 'y');
+        let (_, r) = sent(yes.clone());
+        assert_eq!(
+            r,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C","confirm":"cont-0123456789abcdef"})
+        );
+        complete(&mut a, yes, started_instead(&id));
+        assert_eq!(a.follows.len(), 1, "the start its yes made is followed");
+        followed_to(
+            &mut a,
+            json!({"ok":true,"state":"done","message":"Started #44 in api on ARK_C.","id":id,
+                   "session":"api","workspace":"w9","label":"44-again"}),
+        );
+        assert_eq!(a.open_after.clone().expect("in, once it's done").from, k);
+    }
+
+    /// s on an agent still on its first turn: the backend asks, where it used to queue the move.
+    /// Its yes goes back as the same move with its token; the backend keeps the pid, its start and
+    /// whether it hands over with that token, so the yes needs nothing else. Both wordings: a move,
+    /// and a hand-over to another program.
+    #[test]
+    fn a_first_turn_question_round_trips_and_its_yes_queues_the_move() {
+        for handover in [false, true] {
+            let mut a = app();
+            pick(&mut a);
+            press(&mut a, 's');
+            if handover {
+                press(&mut a, 'j');
+            }
+            let action = key(&mut a, KeyCode::Enter);
+            let (_, asked) = sent(action.clone());
+            let to = asked["to"].as_str().unwrap().to_string();
+            let (text, yes_label) = if handover {
+                (
+                    format!(
+                        "It's still on its first turn, so herdr doesn't know its conversation yet. This agent runs Claude Code. {to} runs Codex, so its conversation can't carry over: a fresh Codex agent starts in the same pane and picks up from the intent's log, its pinboard and the end of this conversation. Hand it over to Codex once that turn ends?"
+                    ),
+                    "hand over when it stops",
+                )
+            } else {
+                (
+                    format!(
+                        "It's still on its first turn, so herdr doesn't know its conversation yet. Move it to {to} once that turn ends? It won't be cut off."
+                    ),
+                    "move when it stops",
+                )
+            };
+            complete(
+                &mut a,
+                action,
+                json!({"ok":false,"confirmation":text,"yes":yes_label,"no":"leave it",
+                       "confirm":"turn-0123456789abcdef","message":text}),
+            );
+            let Mode::Accounts {
+                screen:
+                    AccountScreen::Confirm {
+                        yes, no, message, ..
+                    },
+                ..
+            } = &a.mode
+            else {
+                panic!("no question: {:?}", a.message());
+            };
+            assert_eq!((yes.as_str(), no.as_str()), (yes_label, "leave it"));
+            assert_eq!(message, &text);
+            settle(&mut a);
+            let yes = press(&mut a, 'y');
+            let (_, r) = sent(yes.clone());
+            let mut expected = asked.clone();
+            expected["confirm"] = json!("turn-0123456789abcdef");
+            assert_eq!(r, expected, "the same move, with its token");
+            let word = if handover { "hands over" } else { "moves" };
+            let said = format!(
+                "it's still on its first turn, so herdr doesn't know its conversation yet: it {word} to {to} once that turn ends"
+            );
+            complete(
+                &mut a,
+                yes,
+                json!({"ok":true,"state":"queued","message":said}),
+            );
+            assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+            assert!(a.follows.is_empty());
+            assert_eq!(a.message().unwrap().0, said);
+        }
+    }
+
+    /// Codex's review: an agent on its first turn, which the picker saw with no conversation, whose
+    /// turn ends (herdr learns its conversation) before the question comes, or before y. Its
+    /// question is still put, and its yes still goes, with its token: the backend's token names the
+    /// agent's process, and refuses there one that replaced it.
+    #[test]
+    fn a_first_turn_question_still_answers_once_the_agents_conversation_is_known() {
+        for before_question in [true, false] {
+            let mut a = app();
+            pick(&mut a);
+            // On its first turn: no record of it yet, and herdr doesn't know its conversation.
+            a.machines[1]
+                .feed
+                .as_mut()
+                .unwrap()
+                .agents
+                .retain(|r| !(r.session == "api" && r.pane == "w1:p1"));
+            let k = a.sel.key.clone().unwrap();
+            for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+                for g in c.agents.iter_mut().filter(|g| g.pane_id == "w1:p1") {
+                    g.conversation = None;
+                }
+            }
+            press(&mut a, 's');
+            let action = key(&mut a, KeyCode::Enter);
+            let (_, asked) = sent(action.clone());
+            assert_eq!(asked["conversation"], "", "the picker saw no conversation");
+            let to = asked["to"].as_str().unwrap().to_string();
+            if before_question {
+                set_conversation(&mut a, "c-known");
+            }
+            let text = format!(
+                "It's still on its first turn, so herdr doesn't know its conversation yet. Move it to {to} once that turn ends? It won't be cut off."
+            );
+            complete(
+                &mut a,
+                action,
+                json!({"ok":false,"confirmation":text,"yes":"move when it stops","no":"leave it",
+                       "confirm":"turn-0123456789abcdef","message":text}),
+            );
+            assert!(
+                matches!(
+                    a.mode,
+                    Mode::Accounts {
+                        screen: AccountScreen::Confirm { .. },
+                        ..
+                    }
+                ),
+                "the question wasn't put: {:?}",
+                a.message()
+            );
+            if !before_question {
+                set_conversation(&mut a, "c-known");
+            }
+            settle(&mut a);
+            let (_, r) = sent(press(&mut a, 'y'));
+            let mut expected = asked.clone();
+            expected["confirm"] = json!("turn-0123456789abcdef");
+            assert_eq!(r, expected);
+        }
+        // An agent the picker saw with its conversation, holding another one now, is still refused.
+        let mut a = app();
+        move_question(&mut a);
+        set_conversation(&mut a, "c-another");
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(a.message().unwrap().0.contains("conversation changed"));
+    }
+
+    /// Codex's review: Esc on the picker while its move is on its way, and the backend starts the
+    /// card instead. The start goes on and is followed, but its answer never takes you anywhere:
+    /// neither one answered at once with its workspace, nor a followed one when it's done.
+    #[test]
+    fn escaping_the_picker_lets_the_start_made_instead_go_on_without_taking_you_anywhere() {
+        for followed in [false, true] {
+            let mut a = app();
+            let (_, id) = card_44(&a);
+            let action = move_44(&mut a);
+            key(&mut a, KeyCode::Esc);
+            assert!(matches!(a.mode, Mode::Board));
+            if followed {
+                complete(&mut a, action, started_instead(&id));
+                assert_eq!(a.follows.len(), 1, "still followed");
+                assert!(a.enter_when_open.is_none(), "no ⏎ remembered");
+                followed_to(
+                    &mut a,
+                    json!({"ok":true,"state":"done","message":"Reopened #44 in api on ARK_C.","id":id,
+                           "session":"api","workspace":"w9","label":"44-again"}),
+                );
+                assert!(a.follows.is_empty());
+            } else {
+                complete(
+                    &mut a,
+                    action,
+                    json!({"ok":true,"message":"Its agent wasn't running, so it's being started on ARK_C: Reopened #44 in api.",
+                           "id":id,"session":"api","workspace":"w9","label":"44-again"}),
+                );
+            }
+            assert_eq!(a.open_after, None, "Esc'd: nowhere to go");
+            assert!(a.enter_when_open.is_none());
+            assert!(matches!(a.mode, Mode::Board));
+            let said = a.message().unwrap().0.to_string();
+            assert!(said.ends_with("⏎ on its card goes in."), "{said}");
+        }
+    }
+
     #[test]
     fn a_changed_conversation_cannot_use_an_old_confirmation() {
         let mut a = app();
@@ -2741,7 +3235,8 @@ mod tests {
         assert!(matches!(a.mode, Mode::Board));
         // The programs come from the feed's providers, in its words.
         let said = a.message().unwrap().0;
-        assert!(said.contains("(Claude Code, Codex)"), "{said}");
+        assert!(said.contains("(they run Claude Code, Codex)"), "{said}");
+        assert!(said.contains("second copy"), "{said}");
     }
 
     #[test]
@@ -3220,6 +3715,140 @@ mod tests {
         let card = a.selected().unwrap();
         assert!(card.agents.iter().all(|g| g.conversation.is_none()));
         assert_eq!(a.account_agent(card).unwrap().account, "OLD_C");
+    }
+    /// #44's workspace with Codex in its first tab and Claude Code in its second, the second out
+    /// of usage or not (friction F-0378).
+    fn two_tabs(a: &mut App, second_waiting: bool) -> String {
+        pick(a);
+        let key = a.sel.key.clone().unwrap();
+        let snap = a.machines[1]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut("api")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        for g in snap.agents.iter_mut().filter(|g| g.pane_id == "w1:p1") {
+            g.tab_id = Some("w1:t1".into());
+            g.agent = Some("codex".into());
+        }
+        let mut second = snap
+            .agents
+            .iter()
+            .find(|g| g.pane_id == "w1:p1")
+            .unwrap()
+            .clone();
+        second.pane_id = "w1:p9".into();
+        second.tab_id = Some("w1:t2".into());
+        second.agent = Some("claude".into());
+        snap.agents.push(second);
+        let feed = a.machines[1].feed.as_mut().unwrap();
+        for r in feed
+            .agents
+            .iter_mut()
+            .filter(|r| r.session == "api" && r.pane == "w1:p1")
+        {
+            r.waiting = None;
+            r.program = "codex".into();
+            r.account = "KBZ_X".into();
+        }
+        let mut claude = feed
+            .agents
+            .iter()
+            .find(|r| r.session == "api" && r.pane == "w1:p1")
+            .unwrap()
+            .clone();
+        claude.pane = "w1:p9".into();
+        claude.conversation = "c-claude".into();
+        claude.program = "claude".into();
+        claude.account = "KBZ_C".into();
+        claude.handed_from = None;
+        claude.waiting = second_waiting.then(|| crate::accounts::Waiting {
+            why: "usage".into(),
+            until: None,
+        });
+        feed.agents.push(claude);
+        a.rebuild();
+        assert_eq!(a.card(&key).unwrap().agents.len(), 2, "both tabs' agents");
+        key
+    }
+    #[test]
+    fn s_moves_the_agent_out_of_usage_not_the_first_tabs() {
+        let mut a = app();
+        let k = two_tabs(&mut a, true);
+        let card = a.card(&k).unwrap();
+        assert_eq!(a.account_agent(card).unwrap().pane, "w1:p9");
+        press(&mut a, 's');
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["action"], "account-move");
+        assert_eq!(r["pane"], "w1:p9");
+        assert_eq!(r["conversation"], "c-claude");
+    }
+    #[test]
+    fn s_moves_the_agent_of_the_cards_own_tab() {
+        let mut a = app();
+        let k = two_tabs(&mut a, false);
+        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+            c.own_tab = Some("w1:t2".into());
+        }
+        let card = a.card(&k).unwrap();
+        assert_eq!(a.move_agent(card).unwrap().pane, "w1:p9");
+    }
+    #[test]
+    fn s_never_guesses_among_agents_in_different_tabs() {
+        let mut a = app();
+        let k = two_tabs(&mut a, false);
+        let card = a.card(&k).unwrap();
+        assert!(a.move_agent(card).is_none());
+        press(&mut a, 's');
+        assert!(matches!(a.mode, Mode::Board));
+        let said = a.message().unwrap().0;
+        assert!(
+            said.contains("Codex in tab 1 and Claude Code in tab 2"),
+            "{said}"
+        );
+        assert!(said.contains("doesn't guess"), "{said}");
+    }
+    /// The two tabs' agents with no tab named, as an older herdr lists them.
+    fn tabs_unnamed(a: &mut App, same: Option<&str>) {
+        let snap = a.machines[1]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut("api")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        for g in snap
+            .agents
+            .iter_mut()
+            .filter(|g| g.pane_id == "w1:p1" || g.pane_id == "w1:p9")
+        {
+            g.tab_id = same.map(str::to_string);
+        }
+        a.rebuild();
+    }
+    #[test]
+    fn s_never_takes_agents_in_tabs_herdr_didnt_name_for_one_place() {
+        let mut a = app();
+        let k = two_tabs(&mut a, false);
+        tabs_unnamed(&mut a, None);
+        let card = a.card(&k).unwrap();
+        assert_eq!(card.agents.len(), 2);
+        assert!(a.move_agent(card).is_none(), "no tab says they're together");
+        // s says why and sends nothing, rather than moving the first.
+        assert_eq!(press(&mut a, 's'), Action::None);
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        let said = a.message().unwrap().0;
+        assert!(said.contains("Codex and Claude Code"), "{said}");
+        assert!(said.contains("doesn't guess"), "{said}");
+        // Two in one tab herdr named are one place: the first, as before.
+        tabs_unnamed(&mut a, Some("w1:t1"));
+        let card = a.card(&k).unwrap();
+        assert_eq!(a.move_agent(card).unwrap().pane, "w1:p1");
     }
     #[test]
     fn s_moves_the_agent_really_in_the_pane() {

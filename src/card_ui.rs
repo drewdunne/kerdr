@@ -691,12 +691,12 @@ fn details(
             out.extend(wrapped(&text, w, fg(FG), Some(("▌ ", ORANGE))));
             let how = if c.is_open_workspace() {
                 if c.tab_id.is_some() {
-                    "⏎ goes to its tab."
+                    "⏎ goes to its tab.".to_string()
                 } else {
-                    "⏎ goes to its agent."
+                    "⏎ goes to its agent.".to_string()
                 }
             } else {
-                "⏎ reopens it to answer in."
+                crate::ui::where_to_answer(app, c)
             };
             out.push(Line::from(vec![
                 Span::styled("▌ ", fg(ORANGE)),
@@ -808,6 +808,8 @@ fn footer(f: &mut Frame, rect: Rect, app: &App, holder: &Card, focus: &str, here
                         c.session.clone().unwrap_or_default()
                     ))
                 }
+            } else if c.outside_herdr().is_some() && !c.done() && app.actions_on() {
+                Some("move it into herdr".into())
             } else if c.can_reopen_done() && app.actions_on() {
                 Some("ask to reopen it".into())
             } else if c.reopenable() && app.actions_on() {

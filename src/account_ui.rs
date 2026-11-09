@@ -490,17 +490,16 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             ..
         } => {
             let resumes = start.how == crate::app::run_state::StartHow::Reopen;
+            let state = if start.outside {
+                "running in a terminal outside herdr; it moves into herdr"
+            } else if resumes {
+                "no agent running; it resumes its conversation"
+            } else {
+                "not started yet"
+            };
             let mut lines = vec![
                 line(
-                    format!(
-                        "{} · {}",
-                        app.machines[start.machine].name(),
-                        if resumes {
-                            "no agent running; it resumes its conversation"
-                        } else {
-                            "not started yet"
-                        }
-                    ),
+                    format!("{} · {state}", app.machines[start.machine].name()),
                     DIM,
                 ),
                 line("Choose an account", DIM),
@@ -525,20 +524,36 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 lines.push(selected(text, i == *sel));
             }
             lines.push(Line::raw(""));
-            lines.extend(wrapped(
-                if resumes {
-                    "It starts again on the chosen account, resuming its conversation, and stays there until moved or it runs out."
-                } else {
-                    "Its agent starts on the chosen account, and stays there until moved or it runs out."
-                },
-                68,
-                fg(FG2),
-                None,
-            ));
+            // What happens first, before the start itself (intent 0591).
+            let mut first = String::new();
+            if start.restore {
+                first.push_str("It comes back from won't do first. ");
+            }
+            if start.update {
+                first.push_str(&format!(
+                    "{}'s ark-sdlc is brought up to date first, since its backend can't take an account yet. ",
+                    app.machines[start.machine].name()
+                ));
+            }
+            let then = if start.outside {
+                "Its conversation stops in the terminal once its turn ends and carries on in herdr on the chosen account, and stays there until moved or it runs out."
+            } else if resumes {
+                "It starts again on the chosen account, resuming its conversation, and stays there until moved or it runs out."
+            } else {
+                "Its agent starts on the chosen account, and stays there until moved or it runs out."
+            };
+            lines.extend(wrapped(&format!("{first}{then}"), 68, fg(FG2), None));
+            let title = if start.restore {
+                format!("Bring {} back on an account", reference)
+            } else if start.outside {
+                format!("Move {} into herdr on an account", reference)
+            } else {
+                format!("Start {} on an account", reference)
+            };
             modal(
                 f,
                 area,
-                &format!("Start {} on an account", reference),
+                &title,
                 lines,
                 "⏎ start    j k choose    esc cancel",
                 selected_line,

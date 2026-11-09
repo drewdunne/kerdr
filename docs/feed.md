@@ -102,7 +102,7 @@ know rather than guessing.
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
-| `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it says where it runs and sends nothing; a second `Enter` within five seconds goes on to the reopen, whose backend asks before starting a second copy. |
+| `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
 ## Owners, teams and stage lists
 
@@ -199,7 +199,7 @@ operation; the backend defines which additional fields that operation needs:
 ```
 
 The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore`, `move`,
-`close`, `cancel` and `edit`.
+`close`, `cancel`, `edit` and `progress`.
 `create` carries the user's own words, the session they were looking at, and an id for this
 submission, nothing else:
 
@@ -247,7 +247,7 @@ same words again.
 the active backlog and `restore` brings it back. `move` changes backlog order. `reopen`,
 `close`, `cancel` and `edit` are described below, and so is `dismiss` for work already started.
 
-Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission`, `confirm`, `text`, `was` and `from` (strings),
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission`, `confirm`, `text`, `was`, `from`, `account`, `outside_since` and `follow` (strings),
 `override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
@@ -259,8 +259,9 @@ with any failure it shows, in the log the README's "Errors are kept" describes.
 ```
 
 `ok` (boolean) and `message` (string) are required. Optional fields are `confirmation` (boolean,
-default false), `used` and `limit` (nonnegative integers or null), and `status`, `session`, `id`,
-`workspace`, `label`, `tab`, `home`, `confirm`, `text` and `was` (strings or null). Unknown response fields are allowed for future additions. A valid JSON response is
+default false), `used` and `limit` (nonnegative integers or null), `status`, `session`, `id`,
+`workspace`, `label`, `tab`, `home`, `confirm`, `text`, `was`, `state` and `say` (strings or null), and
+`follow` (an object, below). Unknown response fields are allowed for future additions. A valid JSON response is
 read even if the command exits nonzero, allowing the backend to explain a refused action or ask
 for confirmation:
 
@@ -348,6 +349,75 @@ says the two copies disagree. When the home is a machine Kerdr doesn't list, or 
 answering, Kerdr says that in its own words instead of the message, since the message's "⏎ again"
 holds only when Kerdr sends it on. A home naming the machine asked is shown as the message.
 
+## Following work that goes on after its answer
+
+Some steps take longer than an answer should: starting a herdr session and waiting for its restore,
+moving a conversation into herdr from a terminal outside it. A backend can answer at once and finish
+the step in a process of its own, and say so with `follow`:
+
+```json
+{"ok":true,"message":"Starting herdr session web on build-box, then #41 in it; ⏎ again in a minute goes in.","id":"0041","session":"web",
+ "follow":{"token":"f-0123456789abcdef0123","what":"start","id":"0041","session":"web","say":"Starting herdr session web, then #41 in it…","limit":300}}
+```
+
+| Field | Meaning |
+|---|---|
+| `token` | Required. What Kerdr sends back to ask how it stands: 1 to 64 letters, digits, `-`, `_` or `.`. Kerdr treats an answer whose `follow` has no usable `token` as one without `follow`. |
+| `what` | `start` (a herdr session being started, then the work), `recover` (a session's restore under way), `move-in` (a conversation moved into herdr), `dispatch` or `reopen`. Kerdr only words its own lines from it. |
+| `id`, `session` | The record and session it's for. |
+| `say` | What's happening, in a short line: Kerdr shows it on the card and its status line until the step ends. |
+| `limit` | Seconds the step should take at most; 300 when left out. Kerdr reads 10 to 3600. |
+
+Kerdr shows `say`, and asks the same machine, over the same connection, how it stands: first after
+2 seconds, then every 3, and every 10 after three questions in a row that got no answer:
+
+```json
+{"action":"progress","follow":"f-0123456789abcdef0123"}
+```
+
+`progress` only reads: answer it at once, with no pull and no lock, within 20 seconds. Its answer has
+`state`:
+
+```json
+{"ok":true,"state":"running","say":"Restoring herdr session web: 2 of 3 agents back…"}
+{"ok":true,"state":"done","message":"Reopened #41 in web, resuming its Codex conversation.","id":"0041","session":"web","workspace":"w12","label":"41-checkout-expired-cards"}
+{"ok":false,"state":"asks","message":"web is at its usual limit of 3. Open it anyway?","confirmation":true,"confirm":"opaque","session":"web","used":3,"limit":3}
+{"ok":false,"state":"failed","message":"herdr session web didn't start: its server exited at once."}
+{"ok":false,"state":"unknown","message":"No step by that token."}
+```
+
+- `running`: still going. `say`, when given, replaces the card's line. `message` may be left out.
+  Past its `limit` with its worker still alive, answer `running` with `"late": true` rather than
+  `failed`: it may yet finish. Kerdr keeps following it quietly until its own limit (below).
+- `done`: the step's own answer, read exactly as the request's answer would have been read. For a
+  start or a reopen that ends in a workspace, that's a reopen's fields (`session`, `workspace`,
+  `label`, optional `tab`), and Kerdr goes in as on a reopen's answer: only while you're still on that
+  card, and for a start only when `Enter` asked for it (`d` says where it started instead).
+- `asks`: a question, asked as it would be on a direct answer. A yes sends the original request again
+  with `override: true` and the `confirm` token, as on any question. A start `Enter` asked for stays
+  `Enter`'s through its yes: Kerdr goes in when the yes's answer names the workspace, whether that
+  answer comes at once or at the end of another follow. When a question already says how many
+  workspaces its session has, Kerdr doesn't add its own count.
+- `failed`: shown as the request's failure, `message` and all. A worker that ended without
+  finishing is `failed` too; say so, and that the card shows how it stands, since it may have done
+  part of the step.
+- `unknown`: Kerdr says it lost track of the step and that the card shows how it stands. Any other
+  `state` reads as `unknown`.
+
+`ok` follows `state` when left out (true for `running` and `done`). Kerdr goes in as soon as the
+card's workspace shows in the feed, even before `done`. While a step is followed, Kerdr sends nothing
+else for that record, and a key that would change it says what's under way instead, even once its
+workspace shows (its worker may still be bringing the agent back). Past `limit`
+plus a minute with no end (or with the machine not answering), Kerdr stops asking and says, as a
+warning rather than a failure, that the step may still be going on that machine and the card will
+show how it ends. Esc on the board stops waiting for it: it still finishes, and takes you nowhere.
+Quitting Kerdr leaves it going, and `q` says so.
+
+Both ways keep working. A Kerdr that doesn't follow reads the answer as an ordinary one and shows
+`message`, so word `message` for it: what's happening, and that `Enter` again in a minute goes in. A
+backend that never sends `follow` works with this Kerdr as before, and Kerdr only ever sends
+`progress` with a token a `follow` gave it, so a backend that doesn't know `progress` is never asked.
+
 ## Starting work nobody started
 
 `Enter` on a card for backlog work nobody has started (no workspace open, its state not
@@ -357,6 +427,12 @@ the card's home machine, and a `confirmation` answer asks the same question befo
 one; a search hit starts from a peek on it, and a start from a peek stays in the peek, so the
 question still finds its card. A second `Enter` before the feed shows the work under way sends
 nothing. The backlog screen's `Enter` peeks, and in that peek `Enter` leaves starting to `d`.
+
+An `Enter` that waited makes this same choice when it goes, as a fresh `Enter` would: one waiting
+for a machine or a herdr session to answer (a session that didn't answer its last read is waited
+for up to a minute), one remembered while a start was under way, and `Ctrl+Space` `Space` on to the
+next card. A card whose workspace closed meanwhile is started, reopened or moved into herdr; never
+"nothing to jump into".
 
 ## Editing a backlog item's text
 
@@ -520,6 +596,17 @@ didn't say the work was done (one asked while it was still under way). Done work
 already (its workspace, or its conversation in another pane) is asked about the same way. Kerdr rechecks before
 sending the yes that the card is still the same work with no new workspace.
 
+### Moving a conversation in from outside herdr
+
+`Enter` on a card whose feed says `outside_herdr` sends the same `reopen` at once, with no question
+in Kerdr, and says it's moving the conversation into herdr. The backend does the move however it
+can do it safely: ark-sdlc's waits for the agent's turn to end, stops the process outside herdr,
+makes sure it has gone, and resumes the conversation in a workspace in the intent's home session.
+Answer with `follow` (`what: "move-in"`) while it does, and with a reopen's fields when it's done:
+Kerdr goes in. A backend that would rather ask first, or can't move it, answers as a reopen would,
+with a question or a plain refusal, and Kerdr shows that as it does today. `s` on such a card offers
+the accounts of the conversation's program and sends the same `reopen` with `account`.
+
 Kerdr refuses a dismissed card itself ("u brings it back"), and a card homed on a machine it
 doesn't know. Refuse in the backend, with a plain `message` and no question, whatever only it can
 tell: a record another account owns, one homed on another machine, or one with no record of
@@ -540,8 +627,15 @@ Kerdr offers it for an open record that isn't dismissed or still being written u
 or in a working column, with no workspace open. `x` (`dismiss`) works on the same started work,
 not only on the backlog: the record leaves the board for the Won't do view, keeping its state, and
 `restore` brings it back where it was. Kerdr refuses a card with a workspace open itself, since its
-agent may be there; refuse in the backend, with a plain `message`, whatever only it can tell, such
-as the work's agent conversation still running outside any workspace. Done work is refused too.
+agent may be there; refuse in the backend, with a plain `message`, whatever only it can tell. Done
+work is refused too.
+
+When the feed says the card's conversation runs outside herdr (`outside_herdr`), Kerdr asks nothing
+itself: it sends `close` or `dismiss` at once with `outside_since`, the `since` the card shows (or
+`""`), and shows nothing on the card until the answer. Ask before stopping an agent that's at work:
+answer with a question naming where it runs and a `confirm` token, and Kerdr's yes sends the request
+again with `override: true` and that token, only while the card still runs outside herdr as the same
+work. A backend that doesn't stop such agents refuses, as before, and Kerdr shows its message.
 Before sending the yes, Kerdr rechecks that the card is still the same work, still open, with no
 workspace, and, for `x` on started work, not back in the backlog.
 
@@ -574,8 +668,19 @@ open somewhere, or its conversation still running, say so and leave the record a
 sending the yes, Kerdr rechecks that the card is the same work, still open in that workspace and
 tab.
 
-`X` on a card with no workspace open says `x` and `C` are for it instead. Children in tabs of a
-workspace that closes stop too and stay open with no agent; `x` or `C` ends them.
+`X` on a card with no workspace open says `x` and `C` are for it instead, except on a card whose
+conversation runs outside herdr: Kerdr asks first, naming that window ("Stops its Codex conversation
+running in a foot window since 13:02 once its current turn ends, then sets #41 aside…"), and its yes
+sends `cancel` with no `session` or `workspace`, naming the window it was for:
+
+```json
+{"action":"cancel","id":"0041","outside_since":"2026-11-01T13:02:00+01:00"}
+```
+
+Stop that process, and only while it's the one started at `outside_since`, then set the record aside
+as `cancel` does; when it isn't, or `outside_since` is empty, ask, and Kerdr asks it. A backend that
+needs a workspace refuses, as before. Children in tabs of a workspace that closes stop too and stay
+open with no agent; `x` or `C` ends them.
 
 ## Moving one card's agent to another account
 
@@ -584,7 +689,10 @@ conversation there; the session's other agents and its owner's list stay as they
 `account-move` (see [Account actions](#account-actions)), keyed by the card's pane. A card an
 agent is at says so on the board's bottom line (`s move its agent off KBZ_C`), in its peek, and in
 the `Ctrl+Space` menu. An agent is movable when the feed records it or herdr reports it running a
-program the machine's accounts run (a provider's `programs`, or an account's `runs`). A move to
+program the machine's accounts run (a provider's `programs`, or an account's `runs`). With several in
+the card's workspace, `s` moves the one waiting for usage, else the one in the card's own tab (where
+`Enter` lands), else the only one; it never guesses among agents in different tabs, and says so
+instead, naming them. A move to
 an account another program runs is a hand-over; the backend asks first, and Kerdr titles its
 question so ("Hand #45 over to Codex?"). `S` edits the list new agents start on, and moves no agent that's running:
 saved unchanged while an agent there could move, it says that `s` on its card is the key and names
@@ -615,12 +723,26 @@ applied; Kerdr shows it and doesn't go in. A backend that can't start it on the 
 session it would have to restore as it was) should refuse, saying so, rather than start it on another.
 
 Kerdr sends `account` only to a machine whose feed lists the request in `starts_on`; with no
-`starts_on`, an older backend would start the work on its owner's list without a word, so `s` says
-to update it instead:
+`starts_on`, an older backend would start the work on its owner's list without a word:
 
 ```json
 "starts_on": ["dispatch", "reopen"]
 ```
+
+So for such a machine `s` still opens the picker, and on a pick Kerdr asks that backend to bring
+itself up to date first, with a read that changes nothing (`{"action":"edit","id":"0041"}`, which
+ark-sdlc's backend pulls before), reads its feed every few seconds, and sends the start once the feed
+lists it in `starts_on`. After 90 seconds without, it says that machine's copy hasn't updated, and
+starts nothing. The same goes for a start sent on to the machine a record lives on now.
+
+Around it, `s` does the step first rather than refuse. When the machine hasn't sent its accounts
+yet, it waits for them (up to a minute; Esc stops it) and opens the picker while you're still on the
+card. A card in won't do is offered too: on a pick Kerdr sends `restore`, and the start once that's
+answered and the card is back. A card whose conversation runs outside herdr starts with `reopen`, as
+`Enter` sends it, with `account`. When the card changed while the picker was open, the account goes to
+how it is now: an agent that started on it meanwhile is moved there (`account-move`), a card that
+starts differently now is started that way, and when that account can't take it now, the picker
+opens again with the accounts that can.
 
 ## Agents reporting for themselves
 
@@ -811,7 +933,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
 |---|---|---|
-| `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, or the question below |
+| `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, the question below, or the answer of a start made instead (below) |
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
@@ -846,6 +968,19 @@ Moves send the feed's `agents[].conversation`. A changed conversation answers
 `{"ok":true,"state":"queued","account":"ARK_C","message":"moving to ARK_C"}` promptly, then restarts
 in a detached worker. Kerdr displays the message; the feed changes the account badge when the
 move finishes. An unavailable target answers `ok: false` before stopping anything.
+
+An agent still on its first turn (its conversation not known yet) gets a question too, worded for
+the turn ("Move it to ARK_C once that turn ends?", or "Hand it over to Codex once that turn
+ends?"); keep what its yes needs (which process, whether it hands over) behind the token, since
+Kerdr sends back only the original fields and `confirm`.
+
+When the agent turns out not to be running, the backend may start the card on the account picked
+instead, as a reopen with `account`, and answer as that reopen would: with `follow` (then `done`
+with `session`, `workspace` and `label`), or with the workspace at once. Kerdr takes it as the
+reopen's answer: it follows it, and goes in when it's done while you're still on the card. A
+question that start asks names the intent (`id`) or its `session`, which a move's question never
+does: its token is the backend's own continuation, and `y` sends the same `account-move` with it
+as `confirm`, even once the board shows the agent gone, since the question is about the start.
 
 ### Signing in
 
