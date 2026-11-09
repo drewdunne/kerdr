@@ -219,16 +219,24 @@ impl App {
             return;
         };
         let name = m.name();
+        // Only what has lasted (intent 0591): a short drop, or a read that failed once, is kept
+        // quiet here as on the board.
+        let at = self.now();
         let mut now: Vec<(String, String)> = vec![];
-        if let Some(problem) = conn_problem(&m.conn, &name) {
+        if let Some(problem) = conn_problem(&m.conn, &name).filter(|_| m.conn.lasting(at)) {
             now.push(("conn".into(), problem));
         }
-        if let Some(e) = &m.feed_error {
+        if let Some(e) = m.feed_problem(at) {
             now.push(("feed".into(), format!("{name}'s feed failed: {e}")));
         }
         if let Some(data) = &m.data {
-            for (session, snap) in &data.snapshots {
-                if let Err(e) = snap {
+            let sessions = data
+                .snapshots
+                .keys()
+                .chain(m.snapshot_errors.keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            for session in sessions {
+                if let Some(e) = m.session_problem(session, at) {
                     now.push((
                         format!("session {session}"),
                         format!("{name}'s herdr session {session} didn't answer: {e}"),
@@ -547,8 +555,8 @@ mod tests {
     fn a_machine_that_stops_answering_is_kept_once_until_it_changes() {
         let (_dir, mut app, path) = board();
         let name = app.machines[1].name();
-        let dropped = |attempt| Conn::Reconnecting {
-            since: Local::now(),
+        let dropped = |attempt, ago: i64| Conn::Reconnecting {
+            since: Local::now() - chrono::Duration::seconds(ago),
             attempt,
             retry_at: Local::now(),
             detail: "ssh: connect to host lab port 22: Connection timed out".into(),
@@ -559,9 +567,13 @@ mod tests {
             data: None,
             at: Local::now(),
         };
-        app.apply(event(dropped(1)));
-        app.apply(event(dropped(2)));
-        app.apply(event(dropped(3)));
+        // A short drop is kept quiet: most come back within a try or two (intent 0591).
+        app.apply(event(dropped(1, 2)));
+        app.apply(event(dropped(2, 6)));
+        assert!(lines(&path).is_empty(), "{:?}", lines(&path));
+        // Once it lasts, it's kept, once.
+        app.apply(event(dropped(3, crate::poll::QUIET_FOR)));
+        app.apply(event(dropped(4, crate::poll::QUIET_FOR + 15)));
         let l = one(&path);
         assert_eq!(l["source"], "machine");
         assert_eq!(l["shown"], "board");
@@ -572,7 +584,7 @@ mod tests {
                 .unwrap()
                 .contains("Connection timed out")
         );
-        // Worse is a change; back is not an error; dropping again is a new one.
+        // Worse is a change; back is not an error; dropping again is a new one, once it lasts.
         app.apply(event(Conn::Unreachable {
             since: Local::now(),
             retry_at: Local::now(),
@@ -583,8 +595,65 @@ mod tests {
             latency: Duration::from_millis(5),
         }));
         assert_eq!(lines(&path).len(), 2);
-        app.apply(event(dropped(1)));
+        app.apply(event(dropped(1, 2)));
+        assert_eq!(lines(&path).len(), 2);
+        app.apply(event(dropped(5, crate::poll::QUIET_FOR + 1)));
         assert_eq!(lines(&path).len(), 3);
+    }
+
+    #[test]
+    fn a_feed_or_a_session_that_fails_once_is_kept_quiet_until_it_lasts() {
+        let (_dir, mut app, path) = board();
+        let read = |feed: Result<crate::feed::Feed, String>, session: Result<(), String>, at| {
+            let mut data = crate::poll::MachineData {
+                feed: Some(feed),
+                ..Default::default()
+            };
+            data.snapshots.insert(
+                "web".into(),
+                session.map(|_| crate::herdr::Snapshot::default()),
+            );
+            Event {
+                machine: 1,
+                conn: Conn::Live {
+                    latency: Duration::from_millis(5),
+                },
+                data: Some(data),
+                at,
+            }
+        };
+        let good = || crate::feed::parse(r#"{"kerdr_feed":1}"#);
+        let now = Local::now();
+        app.apply(read(good(), Ok(()), now));
+        // One failed feed read, re-read at once and good: nothing said, nothing kept.
+        app.apply(read(Err(crate::poll::FEED_EMPTY.into()), Ok(()), now));
+        app.apply(read(good(), Ok(()), now));
+        assert!(app.machines[1].feed_problem(now).is_none());
+        // A session slow once under load: the same.
+        app.apply(read(good(), Err(crate::poll::SESSION_SILENT.into()), now));
+        assert!(app.machines[1].session_problem("web", now).is_none());
+        assert!(lines(&path).is_empty(), "{:?}", lines(&path));
+        // Three feed reads in a row fail: now it's said, with its reason, and kept once.
+        for _ in 0..3 {
+            app.apply(read(
+                Err(crate::poll::FEED_CUT_OFF.into()),
+                Err(crate::poll::SESSION_SILENT.into()),
+                now,
+            ));
+        }
+        assert_eq!(
+            app.machines[1].feed_problem(now),
+            Some(crate::poll::FEED_CUT_OFF)
+        );
+        let kept = lines(&path);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0]["message"].as_str().unwrap().contains("cut off"));
+        // The session's failure, once it has lasted QUIET_FOR, is said too.
+        let later = now + chrono::Duration::seconds(crate::poll::QUIET_FOR);
+        assert_eq!(
+            app.machines[1].session_problem("web", later).as_deref(),
+            Some(crate::poll::SESSION_SILENT)
+        );
     }
 
     #[test]

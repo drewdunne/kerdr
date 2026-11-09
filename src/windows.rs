@@ -222,13 +222,26 @@ fn poll_with_deadline(machine: &Machine, feed_due: bool, deadline: Duration) -> 
             stdout.push_str(&format!(
                 "@@KERDR feed_error\n{}\n",
                 if feed.timed_out {
-                    "the feed timed out".to_string()
+                    crate::poll::FEED_CUT_OFF.to_string()
                 } else {
-                    format!(
-                        "the feed failed (exit {:?}): {}",
-                        feed.status,
-                        feed.stderr.trim()
-                    )
+                    // Its last line says why, as often as not; the rest stays out of the board.
+                    let said = feed
+                        .stderr
+                        .lines()
+                        .map(str::trim)
+                        .rfind(|l| !l.is_empty())
+                        .unwrap_or_default()
+                        .chars()
+                        .take(160)
+                        .collect::<String>();
+                    let how = feed
+                        .status
+                        .map_or_else(|| "a signal stopped it".into(), |c| format!("exit {c}"));
+                    if said.is_empty() {
+                        format!("it stopped ({how}) without saying why")
+                    } else {
+                        format!("it stopped ({how}): {said}")
+                    }
                 }
             ));
         }
@@ -378,7 +391,10 @@ ping -n 6 127.0.0.1 >nul
         };
         let out = poll_with_deadline(&machine, true, Duration::from_secs(2));
         let sections = crate::poll::split_sections(&out.stdout);
-        assert_eq!(sections.feed_error.as_deref(), Some("the feed timed out"));
+        assert_eq!(
+            sections.feed_error.as_deref(),
+            Some(crate::poll::FEED_CUT_OFF)
+        );
         assert!(sections.feed.is_none(), "timed-out valid JSON was accepted");
     }
 }

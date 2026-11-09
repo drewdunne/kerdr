@@ -421,14 +421,36 @@ impl FeedCard {
 }
 
 /// Reads a feed, accepting only the version this Kerdr knows.
+/// A feed's cards, or why they can't be read, in words for the board (intent 0591).
 pub fn parse(text: &str) -> Result<Feed, String> {
-    let start = text.find('{').ok_or("the feed printed no JSON")?;
-    let feed: Feed =
-        serde_json::from_str(&text[start..]).map_err(|e| format!("the feed's JSON: {e}"))?;
+    let Some(start) = text.find('{') else {
+        // What it printed instead is its own reason, as often as not.
+        let said: String = text
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty())
+            .unwrap_or_default()
+            .chars()
+            .take(120)
+            .collect();
+        return Err(if said.is_empty() {
+            "it printed no cards".into()
+        } else {
+            format!("it printed no cards; it said: {said}")
+        });
+    };
+    let feed: Feed = serde_json::from_str(&text[start..]).map_err(|e| {
+        if e.is_eof() {
+            "its answer was cut off partway (most often the connection dropping)".to_string()
+        } else {
+            format!("its answer couldn't be read ({e})")
+        }
+    })?;
     if feed.kerdr_feed != 1 {
         return Err(format!(
-            "the feed is version {}; this Kerdr reads version 1",
-            feed.kerdr_feed
+            "its cards use feed version {}, and this Kerdr ({}) reads version 1: update Kerdr here, or restart it if it's already updated",
+            feed.kerdr_feed,
+            env!("CARGO_PKG_VERSION")
         ));
     }
     Ok(feed)

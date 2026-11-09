@@ -56,6 +56,17 @@ impl Conn {
         matches!(self, Conn::Live { .. })
     }
 
+    /// Whether what's wrong has lasted long enough to be said (intent 0591): a drop is quiet for
+    /// its first QUIET_FOR seconds, since most come back within a try or two; anything that needs
+    /// Andrew, or a machine that can't be reached at all, is said at once.
+    pub fn lasting(&self, now: DateTime<Local>) -> bool {
+        match self {
+            Conn::Connecting | Conn::Live { .. } | Conn::Hidden => false,
+            Conn::Reconnecting { since, .. } => (now - *since).num_seconds() >= QUIET_FOR,
+            _ => true,
+        }
+    }
+
     pub fn needs_you(&self) -> bool {
         matches!(self, Conn::HostKey { .. } | Conn::Auth { .. })
     }
@@ -357,6 +368,17 @@ pub fn backoff(attempt: u32) -> Duration {
 
 const GIVE_UP_AFTER: i64 = 120;
 
+/// How long, in seconds, a machine that dropped, or a herdr session or a feed that fails, stays
+/// quiet before the board says why (intent 0591): the last good state shows meanwhile.
+pub const QUIET_FOR: i64 = 30;
+
+/// How many failed feed reads in a row the board waits for before it says the feed is failing,
+/// unless QUIET_FOR passes first. A failed read is read again at once, once.
+pub const FEED_QUIET_READS: u32 = 3;
+
+/// How soon a failed feed read is read again.
+const FEED_REREAD: Duration = Duration::from_secs(1);
+
 pub fn spawn(
     index: usize,
     machine: Machine,
@@ -379,6 +401,9 @@ pub fn spawn(
         // rather than making it wait seconds behind the feed. Never a machine's first read, or
         // an empty board would say there are no cards before its feed has come (intent 0491).
         let mut quick_first = false;
+        // A failed feed read is read again at once, once in a run of failures (intent 0591): a
+        // cut-off read is most often a dropped connection.
+        let mut feed_reread = false;
         loop {
             let feed_owed = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
@@ -394,12 +419,17 @@ pub fn spawn(
                     attempt = 0;
                     first_failure = None;
                     ever_live = true;
+                    let feed_failed = matches!(data.feed, Some(Err(_)));
+                    let again = feed_due && feed_failed && !feed_reread;
                     // The inbox keeps this feed even if a newer read takes this one's place.
                     if feed_due {
-                        last_feed = Some(Instant::now());
+                        last_feed = (!again).then(Instant::now);
                         fed_once = true;
+                        feed_reread = feed_failed;
                     }
-                    let wait = if feed_owed && !feed_due {
+                    let wait = if again {
+                        FEED_REREAD
+                    } else if feed_owed && !feed_due {
                         Duration::ZERO
                     } else {
                         timing.every
@@ -479,6 +509,12 @@ const MARK: &str = "@@KERDR ";
 /// with it its machine, off the board (intent 0491). Generous, since LAB-Server's load spikes.
 pub const SESSION_MOST: Duration = Duration::from_secs(5);
 
+/// What a feed cut off by its 12-second limit fails with.
+pub const FEED_CUT_OFF: &str = "it took over 12 s and was cut off";
+
+/// What a feed that printed nothing at all fails with.
+pub const FEED_EMPTY: &str = "it printed nothing";
+
 /// What a session that ran out of that time shows in its row.
 pub const SESSION_SILENT: &str = "this herdr session didn't answer in 5 s";
 
@@ -533,8 +569,11 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
     ));
     if let Some(cmd) = feed {
         s.push_str(&format!("KERDR_FEED={}\n", transport::quote(cmd)));
+        // A feed cut off by its time limit says so, rather than looking empty or half-written,
+        // and one that didn't end its line can't hide the marker after it (intent 0591).
         s.push_str(&format!(
-            "echo '{MARK}feed'; cd \"$HOME\" && if command -v timeout >/dev/null 2>&1; then timeout 12 sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; else sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; fi\n"
+            "echo '{MARK}feed'; cd \"$HOME\" && if command -v timeout >/dev/null 2>&1; then timeout 12 sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; else sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; fi; r=$?; echo; [ $r = 124 ] && printf '{MARK}feed_error\\n%s\\n' {}\n",
+            transport::quote(FEED_CUT_OFF)
         ));
     }
     s.push_str(&format!("echo '{MARK}end'\n"));
@@ -605,7 +644,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
             .stderr
             .lines()
             .rfind(|l| !l.trim().is_empty())
-            .unwrap_or("the read stopped part way")
+            .unwrap_or("the connection dropped partway through a read")
             .trim()
             .to_string();
         return Err(Failure::Ssh(Problem::Other(detail)));
@@ -629,7 +668,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         Some(match (sections.feed_error, sections.feed.as_deref()) {
             (Some(error), _) => Err(error),
             (_, Some(body)) if !body.trim().is_empty() => feed::parse(body),
-            _ => Err("the feed printed nothing".to_string()),
+            _ => Err(FEED_EMPTY.to_string()),
         })
     } else {
         None
@@ -1036,6 +1075,128 @@ esac
     }
 
     #[cfg(unix)]
+    /// A stand-in herdr for this machine, which notes each read in `log`, and a machine that reads
+    /// it with `feed` as its feed.
+    #[cfg(unix)]
+    fn noting_machine(dir: &std::path::Path, log: &std::path::Path, feed: &str) -> Machine {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  --version) echo read >>"{log}"; echo "herdr 0.9.1";;
+  "session list --json") echo '{{"sessions":[]}}';;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: bin.display().to_string(),
+            feed: Some(feed.to_string()),
+            hidden: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_feed_read_is_read_again_at_once_but_only_once_in_a_row() {
+        // A cut-off read is most often a dropped connection: the next one is asked for at once,
+        // not at the next turn of the feed (intent 0591).
+        let lines = |log: &std::path::Path| -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let timing = || Timing {
+            every: Duration::from_secs(600),
+            feed_every: Duration::from_secs(3600),
+        };
+        // Empty the first time, whole the second.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let feed = format!(
+            r#"echo feed >>"{l}"; [ "$(grep -c feed "{l}")" -lt 2 ] && exit 0; echo '{{"kerdr_feed":1}}'"#,
+            l = log.display()
+        );
+        let inbox = Arc::new(Inbox::default());
+        let poller = spawn(
+            0,
+            noting_machine(dir.path(), &log, &feed),
+            timing(),
+            inbox,
+            0,
+        );
+        let by = Instant::now() + Duration::from_secs(20);
+        while lines(&log).len() < 4 && Instant::now() < by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(lines(&log), ["read", "feed", "read", "feed"]);
+        let _ = poller.wake.send(Wake::Stop);
+        // Empty every time: read again once, then it waits its turn.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let feed = format!(r#"echo feed >>"{}""#, log.display());
+        let inbox = Arc::new(Inbox::default());
+        let poller = spawn(
+            0,
+            noting_machine(dir.path(), &log, &feed),
+            timing(),
+            inbox,
+            0,
+        );
+        let by = Instant::now() + Duration::from_secs(20);
+        while lines(&log).len() < 4 && Instant::now() < by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(2500));
+        assert_eq!(lines(&log), ["read", "feed", "read", "feed"]);
+        let _ = poller.wake.send(Wake::Stop);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_feed_cut_off_by_its_limit_says_so_and_an_empty_one_says_it_printed_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let run = |feed: &str| {
+            let machine = noting_machine(dir.path(), &log, feed);
+            let script = build_script(&machine.herdr, machine.feed.as_deref())
+                .replace("timeout 12", "timeout 1");
+            let out = transport::run_script(&Target::Local, &script, Duration::from_secs(10));
+            read(&Target::Local, &out, true)
+                .ok()
+                .expect("the read works")
+                .feed
+                .unwrap()
+        };
+        if std::process::Command::new("sh")
+            .args(["-c", "command -v timeout"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            assert_eq!(
+                run(r#"printf '{"kerdr_feed":1,"cards":['; sleep 5"#).unwrap_err(),
+                FEED_CUT_OFF
+            );
+        }
+        assert_eq!(run("true").unwrap_err(), FEED_EMPTY);
+        assert_eq!(
+            run(r#"printf '{"kerdr_feed":1,"cards":['"#).unwrap_err(),
+            "its answer was cut off partway (most often the connection dropping)"
+        );
+        assert!(run(r#"echo '{"kerdr_feed":1}'"#).is_ok());
+    }
+
     #[test]
     fn the_script_finds_running_sessions_without_jq() {
         let script = build_script("herdr", None);

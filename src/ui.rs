@@ -1155,8 +1155,9 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         Conn::HerdrTooOld { .. } | Conn::HerdrMissing => 3,
         _ => 9,
     };
+    // A drop shows here only once it lasts; its tab is marked meanwhile (intent 0591).
     let mut troubled: Vec<usize> = (0..app.machines.len())
-        .filter(|&i| rank(&app.machines[i].conn) < 9)
+        .filter(|&i| rank(&app.machines[i].conn) < 9 && app.machines[i].conn.lasting(now))
         .collect();
     troubled.sort_by_key(|&i| rank(&app.machines[i].conn));
     let &i = troubled.first()?;
@@ -4002,7 +4003,7 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
                 if m.machine.is_local() { "" } else { " over SSH" },
                 latency.as_millis()
             ),
-            match (&m.machine.feed, &m.feed_error) {
+            match (&m.machine.feed, m.feed_problem(now)) {
                 (Some(_), Some(e)) => format!("Its card feed failed ({e}), so it shows the last cards it sent, with herdr's live view."),
                 (Some(cmd), None) => format!("Cards come from its feed: {cmd}"),
                 (None, _) => "No card feed: every herdr workspace with an agent is a card.".into(),

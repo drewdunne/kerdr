@@ -32,6 +32,12 @@ pub struct MachineState {
     /// By session: why its snapshot in `data` is the last good one, when its newest failed. It
     /// stays on the board, and its row says this (intent 0491).
     pub snapshot_errors: HashMap<String, String>,
+    /// How many feed reads in a row have failed, and since when (intent 0591): the board says so
+    /// only once it lasts (feed_problem).
+    pub feed_failures: u32,
+    pub feed_failing_since: Option<DateTime<Local>>,
+    /// By session: since when its reads have failed, for as long as they do.
+    pub session_failing_since: HashMap<String, DateTime<Local>>,
 }
 
 impl MachineState {
@@ -52,7 +58,34 @@ impl MachineState {
             stopped: HashMap::new(),
             reported: HashMap::new(),
             snapshot_errors: HashMap::new(),
+            feed_failures: 0,
+            feed_failing_since: None,
+            session_failing_since: HashMap::new(),
         }
+    }
+
+    /// Why its feed is failing, once that has lasted (intent 0591): FEED_QUIET_READS reads in a
+    /// row, or QUIET_FOR seconds. Before that the board shows the last cards it sent, quietly.
+    pub fn feed_problem(&self, now: DateTime<Local>) -> Option<&str> {
+        let lasted = self.feed_failures >= crate::poll::FEED_QUIET_READS
+            || self
+                .feed_failing_since
+                .is_some_and(|t| (now - t).num_seconds() >= crate::poll::QUIET_FOR);
+        self.feed_error.as_deref().filter(|_| lasted)
+    }
+
+    /// Why a herdr session's read fails, once that has lasted QUIET_FOR seconds (intent 0591): a
+    /// single slow read under load says nothing, and its last snapshot stays on the board.
+    pub fn session_problem(&self, session: &str, now: DateTime<Local>) -> Option<String> {
+        let since = self.session_failing_since.get(session)?;
+        if (now - *since).num_seconds() < crate::poll::QUIET_FOR {
+            return None;
+        }
+        self.data
+            .as_ref()
+            .and_then(|d| d.snapshots.get(session))
+            .and_then(|s| s.as_ref().err().cloned())
+            .or_else(|| self.snapshot_errors.get(session).cloned())
     }
 
     /// Takes in a read made at `at`: notes which agents it saw not working, and when each
@@ -64,8 +97,15 @@ impl MachineState {
                 self.feed = Some(feed);
                 self.feed_error = data.feed_failed_after.take();
                 self.feed_taken = Some(at);
+                // A read merged in after it failed: the first of a new run.
+                self.feed_failures = u32::from(self.feed_error.is_some());
+                self.feed_failing_since = self.feed_error.as_ref().map(|_| at);
             }
-            Some(Err(e)) => self.feed_error = Some(e),
+            Some(Err(e)) => {
+                self.feed_error = Some(e);
+                self.feed_failures += 1;
+                self.feed_failing_since.get_or_insert(at);
+            }
             None => {}
         }
         let mut stopped = HashMap::new();
@@ -130,6 +170,19 @@ impl MachineState {
                 };
                 self.snapshot_errors.insert(session.clone(), why);
             }
+        }
+        // Since when each failing session has failed: it's said only once that lasts.
+        let failing: HashSet<String> = data
+            .snapshots
+            .iter()
+            .filter(|(_, s)| s.is_err())
+            .map(|(name, _)| name.clone())
+            .chain(self.snapshot_errors.keys().cloned())
+            .collect();
+        self.session_failing_since
+            .retain(|name, _| failing.contains(name));
+        for name in failing {
+            self.session_failing_since.entry(name).or_insert(at);
         }
         self.data = Some(data);
         self.last_ok = Some(at);
@@ -483,6 +536,7 @@ fn last_two(id: &str) -> Option<String> {
 }
 
 pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
+    let now = Local::now();
     let all_ws = workspaces(machines, cfg);
     let mut claimed: HashSet<(usize, String, String)> = HashSet::new();
     let mut cards = Vec::new();
@@ -934,12 +988,10 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                     .count(),
                 cards: open_cards,
                 cached: !m.conn.is_live(),
-                error: data
-                    .snapshots
-                    .get(&info.name)
-                    .and_then(|s| s.as_ref().err().cloned())
-                    .or_else(|| m.snapshot_errors.get(&info.name).cloned())
-                    .or_else(|| m.feed_error.clone()),
+                // Only once it lasts: a read that failed once says nothing (intent 0591).
+                error: m
+                    .session_problem(&info.name, now)
+                    .or_else(|| m.feed_problem(now).map(str::to_string)),
             });
         }
     }
@@ -1372,10 +1424,29 @@ mod tests {
             next.snapshots.insert("web".into(), Err(why.to_string()));
             next
         };
-        m.take(silent(crate::poll::SESSION_SILENT), Local::now());
+        // A single slow read says nothing; one that has lasted says why (intent 0591).
+        let quiet = Local::now() - chrono::Duration::seconds(crate::poll::QUIET_FOR - 5);
+        m.take(silent(crate::poll::SESSION_SILENT), quiet);
+        let cfg = Config::default();
+        let board = build(std::slice::from_ref(&m), &cfg);
+        assert!(board.workspaces.iter().any(|w| w.id == "w1"));
+        let row = board.sessions.iter().find(|s| s.session == "web").unwrap();
+        assert_eq!(row.error, None);
+        let mut m = live(
+            machine.clone(),
+            vec![(
+                "web",
+                Snapshot {
+                    workspaces: vec![ws("w1", "1-open")],
+                    ..Default::default()
+                },
+            )],
+            None,
+        );
+        let lasted = Local::now() - chrono::Duration::seconds(crate::poll::QUIET_FOR);
+        m.take(silent(crate::poll::SESSION_SILENT), lasted);
         let data = m.data.as_ref().unwrap();
         assert_eq!(data.snapshots["web"].as_ref().unwrap().workspaces.len(), 1);
-        let cfg = Config::default();
         let board = build(std::slice::from_ref(&m), &cfg);
         assert!(board.workspaces.iter().any(|w| w.id == "w1"));
         let row = board.sessions.iter().find(|s| s.session == "web").unwrap();

@@ -863,6 +863,7 @@ printf '%s' "$answer"
 
     /// Resends as run_resending makes them, each send given `deadline`: what it told, and the
     /// waits it asked for, which pass at once.
+    #[cfg(unix)]
     #[allow(clippy::type_complexity)]
     fn resent(
         command: &str,

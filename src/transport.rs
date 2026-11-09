@@ -534,7 +534,7 @@ pub fn classify(target: &Target, out: &Output) -> Option<Problem> {
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
-        .unwrap_or("SSH failed")
+        .unwrap_or("SSH ended without saying why")
         .to_string();
     Some(
         if err.contains("host key verification failed")
