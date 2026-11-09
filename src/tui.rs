@@ -1295,7 +1295,7 @@ fn jump_cards(
             // A ⏎ that waited (for its machine, for a start, on to the next card) makes plain ⏎'s
             // choice: start it, reopen it, or move it into herdr. Never a dead end (intent 0591).
             app.sel = Selection {
-                col: card.stage.index(),
+                col: app.col_of(&card),
                 key: Some(key.clone()),
             };
             plain_choice(terminal, flags, app, live, client_config, bg, &key);
