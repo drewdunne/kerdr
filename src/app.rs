@@ -4790,7 +4790,7 @@ pub(crate) mod tests {
         let (text, tone) = app.message().unwrap();
         assert_eq!(tone, Tone::Fail);
         assert!(
-            text.contains("may not have been saved (timed out)"),
+            text.contains("may not have been saved: timed out."),
             "{text}"
         );
         assert_eq!(app.draft, "Back up the NAS");
@@ -7286,7 +7286,22 @@ pub(crate) mod tests {
             serde_json::json!({"action": "close", "id": "1"}),
             Err("Couldn't close it.".into()),
         );
-        assert_eq!(last_said(&app).unwrap().0, "1: Couldn't close it.");
+        // Nothing says it wasn't sent, so nobody knows whether it happened: named by what was
+        // asked, never as a change that didn't happen (intent 0591).
+        assert_eq!(
+            last_said(&app).unwrap().0,
+            "Marking 1 done: Couldn't close it."
+        );
+        reply_to(
+            &mut app,
+            0,
+            serde_json::json!({"action": "close", "id": "1"}),
+            Err(crate::actions::NO_BACKEND.into()),
+        );
+        assert_eq!(
+            last_said(&app).unwrap().0,
+            "1 wasn't marked done: Kerdr has no action backend set ([actions] command in its config), so nothing was sent"
+        );
     }
 
     #[test]
@@ -7711,6 +7726,141 @@ pub(crate) mod tests {
             c.detail.as_ref().unwrap().id.clone(),
             c.machine_index,
         )
+    }
+
+    fn status_of(app: &App, key: &str) -> Option<String> {
+        app.card(key)?.detail.as_ref()?.status.clone()
+    }
+
+    #[test]
+    fn a_change_sent_again_by_itself_says_so_quietly_on_its_card_and_nowhere_red() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        app.queue_action(machine, serde_json::json!({"action": "refresh", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        assert!(
+            request["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("k-"))
+        );
+        app.message = None;
+        app.resending(
+            Some(n),
+            machine,
+            &crate::actions::Resend::Retry {
+                wait: Duration::from_secs(5),
+                message: "#1's record is locked by a pull under way.".into(),
+            },
+        );
+        assert_eq!(
+            status_of(&app, &key).as_deref(),
+            Some(crate::resolve::RETRYING)
+        );
+        assert_eq!(app.message(), None, "nothing said while it tries again");
+        // Its answer at last takes the words down, and a change that went says nothing.
+        app.finish_job(n, request, done("Refreshed."));
+        assert_ne!(
+            status_of(&app, &key).as_deref(),
+            Some(crate::resolve::RETRYING)
+        );
+        assert_eq!(app.message(), None);
+    }
+
+    #[test]
+    fn a_change_that_stands_with_its_push_still_to_come_says_what_is_left() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "refresh", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.message = None;
+        let left = "saved here; it reaches your other machines once the push goes through, which is retried by itself.";
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: format!("Refreshed {reference}: {left}"),
+                note: Some(left.into()),
+                ..Default::default()
+            }),
+        );
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "it stands: not a failure");
+        assert!(said.contains(left), "{said}");
+    }
+
+    #[test]
+    fn a_change_done_only_in_part_is_a_warning_that_says_what_happened_without_didnt() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                partial: true,
+                message: "marked done, but its workspace couldn't be closed: herdr didn't answer."
+                    .into(),
+                ..Default::default()
+            }),
+        );
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert_eq!(
+            said,
+            format!(
+                "{reference}: marked done, but its workspace couldn't be closed: herdr didn't answer."
+            )
+        );
+        assert!(!said.contains("wasn't marked done"), "{said}");
+    }
+
+    #[test]
+    fn an_answer_that_never_came_names_what_was_asked_and_never_says_it_didnt_happen() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        let lost = format!(
+            "the connection to arknet-one dropped before its answer came; {}, and its card shows how it stands.",
+            crate::actions::UNKNOWN
+        );
+        app.finish_job(n, request, Err(lost.clone()));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Fail);
+        assert_eq!(said, format!("Marking {reference} done: {lost}"));
+        // A request never sent is known not to have happened, and says so.
+        app.message = None;
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request, Err(crate::actions::NO_BACKEND.into()));
+        assert!(
+            app.message().unwrap().0.starts_with(&format!(
+                "{reference} wasn't marked done: Kerdr has no action backend"
+            )),
+            "{:?}",
+            app.message()
+        );
+    }
+
+    #[test]
+    fn only_a_machine_whose_feed_says_it_keeps_ops_is_sent_a_lost_request_again() {
+        let mut app = demo_app();
+        assert!(!app.resends_to(0), "the demo's feed says nothing of ops");
+        app.machines[0].feed.as_mut().unwrap().supports = vec!["op".into(), "retry".into()];
+        assert!(app.resends_to(0));
+        app.machines[0].feed.as_mut().unwrap().supports = vec!["retry".into()];
+        assert!(!app.resends_to(0));
+        assert!(!app.resends_to(99));
     }
 
     fn refused(message: &str) -> Result<crate::actions::Response, String> {

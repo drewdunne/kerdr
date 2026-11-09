@@ -76,6 +76,13 @@ pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub create_fields: Vec<String>,
+    /// What this machine's backend does beyond feed version 1 (intent 0591): `op` (it keeps a
+    /// record of each request by its op, so the same request sent again is never done twice),
+    /// `retry` (a refusal that will likely clear by itself says how long to wait) and `follow`.
+    /// Absent on older feeds: Kerdr never sends a request to them again by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub supports: Vec<String>,
 }
 
 /// One stage list: the columns between Backlog and Done for the teams that use it (intent 0595).
@@ -117,6 +124,11 @@ where
 }
 
 impl Feed {
+    /// Whether this machine's backend says it does `what` (Feed::supports).
+    pub fn supports(&self, what: &str) -> bool {
+        self.supports.iter().any(|s| s == what)
+    }
+
     /// The record of the agent in a pane: of the conversation herdr sees there, and none when no
     /// record has it. Where herdr doesn't know the conversation yet, the newest record on the pane,
     /// which is the first, since a feed lists `agents` newest first. A pane can hold records left

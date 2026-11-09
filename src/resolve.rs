@@ -24,8 +24,12 @@ use crate::model::CardSnapshot;
 pub const SAVING: &str = "saving";
 
 /// What a start that waited for its intent's write-up says when the write-up failed (intent 0445).
-pub const NOT_WRITTEN_UP: &str =
-    "couldn't be written up from your words, so it didn't start; d starts it as it is.";
+pub const NOT_WRITTEN_UP: &str = "it couldn't be written up from your words; d starts it as it is.";
+
+/// What a card says while its change is sent again by itself (intent 0591).
+pub const RETRYING: &str = "Trying again…";
+/// What a new intent's card says while its words are sent again by itself.
+pub const RETRYING_SAVE: &str = "Saving, trying again…";
 
 /// How long a settled effect may stay without the feed showing it.
 const SETTLED_MOST: Duration = Duration::from_secs(60);
@@ -337,6 +341,9 @@ pub struct Job {
     /// Asked for by ⏎ on its card, not by a key that only starts it (d): a start ⏎ asked for goes
     /// in when the followed work is done, as a reopen does (intent 0591).
     pub by_enter: bool,
+    /// Being sent again by itself, with the same op: refused for something passing, or its answer
+    /// lost (intent 0591). Its card says so quietly meanwhile, not in red.
+    pub retrying: bool,
 }
 
 impl Job {
@@ -588,6 +595,8 @@ pub struct Resolver {
 
 impl Resolver {
     /// Takes a change: it shows at once, and runs once nothing else for its record is running.
+    /// One that can change something gets an op of its own (intent 0591): every key Andrew
+    /// presses is a new request, and only Kerdr's own resends of it keep its op.
     pub fn add(
         &mut self,
         machine: usize,
@@ -596,6 +605,7 @@ impl Resolver {
         key: Option<String>,
         effect: Option<Effect>,
     ) -> u64 {
+        let request = crate::actions::with_op(request);
         self.next += 1;
         self.jobs.push(Job {
             n: self.next,
@@ -617,8 +627,20 @@ impl Resolver {
             said: None,
             follow: None,
             by_enter: false,
+            retrying: false,
         });
         self.next
+    }
+
+    /// This change is being sent again by itself (Job::retrying), or, false, has been answered.
+    pub fn note_retrying(&mut self, n: u64, retrying: bool) -> bool {
+        match self.jobs.iter_mut().find(|j| j.n == n) {
+            Some(job) if job.retrying != retrying => {
+                job.retrying = retrying;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// This change shows nothing on its card because nothing has started (Job::asking).
@@ -1047,7 +1069,11 @@ impl Resolver {
                     .settled
                     .is_some_and(|(at, _)| at.elapsed() >= SETTLED_MOST);
                 if let Some(feed) = out.get_mut(job.machine).and_then(|m| m.feed.as_mut()) {
-                    feed.cards.push(p.card(late));
+                    let mut card = p.card(late);
+                    if job.retrying {
+                        card.status = Some(RETRYING_SAVE.into());
+                    }
+                    feed.cards.push(card);
                 }
                 continue;
             }
@@ -1064,6 +1090,10 @@ impl Resolver {
                         if let Some((say, _)) = job.follow.as_ref().filter(|(s, _)| !s.is_empty()) {
                             fc.status = Some(say.clone());
                             fc.no_agent = false;
+                        }
+                        // Sent again by itself meanwhile: said quietly, on the card (intent 0591).
+                        if job.retrying {
+                            fc.status = Some(RETRYING.into());
                         }
                     } else if let Effect::Order(order) = effect
                         && order.iter().any(|(k, _)| *k == this)

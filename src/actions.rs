@@ -1,6 +1,6 @@
 //! Opt-in actions sent as JSON to a command on the card's home machine.
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -89,6 +89,119 @@ pub struct Response {
     pub state: Option<String>,
     /// With `running`: what the followed work is on now.
     pub say: Option<String>,
+    /// On a refusal that will likely clear by itself (a lock held, a push race, herdr slow to
+    /// answer, the same op's earlier send still running): seconds to wait before sending the same
+    /// request, with the same op, again (intent 0591).
+    #[serde(default, deserialize_with = "seconds")]
+    pub retry: Option<u64>,
+    /// The answer an earlier send of the same op got, given again: nothing was done twice.
+    #[serde(default)]
+    pub repeat: bool,
+    /// With `ok: false`: part of the change happened, and the message says which part.
+    #[serde(default)]
+    pub partial: bool,
+}
+
+/// `retry` as a backend gives it: whole or fractional seconds, rounded up; anything else is none.
+fn seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_f64()
+        .filter(|s| s.is_finite() && *s >= 0.0)
+        .map(|s| s.ceil().min(3600.0) as u64))
+}
+
+/// Whether a request can change something, and so carries an `op` (intent 0591): every action
+/// except `progress`, `kickoff` and an `edit` that only reads its text.
+pub fn changes(request: &Value) -> bool {
+    match request["action"].as_str() {
+        None | Some("progress" | "kickoff") => false,
+        Some("edit") => request.get("text").is_some(),
+        Some(_) => true,
+    }
+}
+
+/// A fresh id for one request Andrew makes, `k-` and 16 lowercase hex digits: the backend does
+/// a request with an op it has seen once, and answers a second send of it from its record.
+pub fn new_op() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    // RandomState is seeded from the system's randomness, afresh for each one made.
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_u64(COUNT.fetch_add(1, Ordering::Relaxed));
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    format!("k-{:016x}", h.finish())
+}
+
+/// The request with an op of its own when it can change something, in place of any it carried:
+/// each key Andrew presses is a new request, a yes to a question included, which would otherwise
+/// get the question back from the record. Only an automatic resend keeps its op.
+pub fn with_op(mut request: Value) -> Value {
+    if let Some(fields) = request.as_object_mut() {
+        fields.remove("op");
+    }
+    if changes(&request) {
+        request["op"] = Value::String(new_op());
+    }
+    request
+}
+
+/// The request as Andrew asked for it, without the op Kerdr gave it: what the backend fingerprints.
+pub fn without_op(request: &Value) -> Value {
+    let mut request = request.clone();
+    if let Some(fields) = request.as_object_mut() {
+        fields.remove("op");
+    }
+    request
+}
+
+/// How long Kerdr keeps sending a request again for refusals that say they're passing (`retry`),
+/// counted from its first answer (intent 0591).
+pub const RETRY_MOST: Duration = Duration::from_secs(120);
+
+/// The waits before each resend of a request whose answer was lost (no answer in time, the
+/// connection dropped, the answer cut off), to a backend that keeps ops: three, over about 30 s.
+pub const LOST_WAITS: [Duration; 3] = [
+    Duration::from_secs(5),
+    Duration::from_secs(10),
+    Duration::from_secs(15),
+];
+
+/// What the words of an error say when nobody can tell whether the request happened: its answer
+/// was lost. Every such error ends so, and the board tells them apart by it.
+pub const UNKNOWN: &str = "Kerdr can't tell whether it happened";
+
+/// How every error ends that Kerdr gives for a request it never sent: known not to have happened.
+pub const NOT_SENT: &str = "so nothing was sent";
+
+/// What a request says when Kerdr has no action backend to send it to.
+pub const NO_BACKEND: &str =
+    "Kerdr has no action backend set ([actions] command in its config), so nothing was sent";
+
+/// Whether an error leaves the request's result unknown: its answer was lost, or it says nothing
+/// that shows it wasn't sent. Only an error that knows the request never left Kerdr (NOT_SENT),
+/// or never started (a write-up that failed), says it didn't happen.
+pub fn result_unknown(error: &str) -> bool {
+    !(error.contains(NOT_SENT) || error == crate::resolve::NOT_WRITTEN_UP)
+}
+
+/// Why a request is being sent again, as the board is told meanwhile.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Resend {
+    /// Refused for something passing: sent again after `wait`, the backend's words meanwhile.
+    Retry { wait: Duration, message: String },
+    /// Its answer was lost: sent again after `wait`, the `attempt`th time.
+    Lost {
+        wait: Duration,
+        error: String,
+        attempt: usize,
+    },
 }
 
 /// What an answer with `follow` says Kerdr should wait for (intent 0591, docs/feed.md).
@@ -241,6 +354,101 @@ pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response
     run_with_deadline(machine, command, request, deadline_for(request), None).0
 }
 
+/// As run_handing, sending the same request again, with the same op, by itself (intent 0591):
+/// after a refusal with `retry`, once that many seconds have passed, for up to RETRY_MOST in all;
+/// and, with `resends` (its machine's backend keeps ops), after an answer that was lost, up to
+/// three times over about 30 seconds. A request without an op is never sent again. `tell` hears
+/// each resend before its wait, and `pause` does the waiting (a test's own, which needn't).
+pub fn run_resending(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+) -> Answered {
+    run_resending_within(
+        machine,
+        command,
+        request,
+        handed,
+        resends,
+        tell,
+        pause,
+        deadline_for(request),
+    )
+}
+
+/// As run_resending, each send given `deadline` to answer.
+#[allow(clippy::too_many_arguments)]
+fn run_resending_within(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+    deadline: Duration,
+) -> Answered {
+    resending(request, handed, resends, tell, pause, &mut |handed| {
+        let (result, stderr, lost) = run_with_deadline(machine, command, request, deadline, handed);
+        (keep_stderr(result, stderr, request), lost)
+    })
+}
+
+/// The resends themselves: `send` sends the request once, and says whether its answer was lost.
+fn resending(
+    request: &Value,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+    send: &mut dyn FnMut(Option<transport::Handed>) -> (Answered, bool),
+) -> Answered {
+    let mut handed = handed;
+    let mut first_answer: Option<Instant> = None;
+    // What's been waited, which a test's pause doesn't spend.
+    let mut waited = Duration::ZERO;
+    let mut lost = 0;
+    let op = request.get("op").is_some();
+    loop {
+        let (answered, was_lost) = send(handed.take());
+        let began = *first_answer.get_or_insert_with(Instant::now);
+        if op {
+            match &answered.result {
+                Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => {
+                    let wait = Duration::from_secs(r.retry.unwrap_or(1).clamp(1, 60));
+                    if began.elapsed().max(waited) + wait <= RETRY_MOST {
+                        tell(&Resend::Retry {
+                            wait,
+                            message: r.message.clone(),
+                        });
+                        pause(wait);
+                        waited += wait;
+                        continue;
+                    }
+                }
+                Err(error) if was_lost && resends && lost < LOST_WAITS.len() => {
+                    let wait = LOST_WAITS[lost];
+                    lost += 1;
+                    tell(&Resend::Lost {
+                        wait,
+                        error: error.clone(),
+                        attempt: lost,
+                    });
+                    pause(wait);
+                    waited += wait;
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        return answered;
+    }
+}
+
 /// As run, calling `handed` once the adapter has the whole request: from then on it carries on
 /// if Kerdr quits (review of intent 0445).
 pub fn run_handing(
@@ -309,7 +517,13 @@ fn answer_with_stderr(
     deadline: Duration,
     handed: Option<transport::Handed>,
 ) -> Answered {
-    let (result, stderr) = run_with_deadline(machine, command, request, deadline, handed);
+    let (result, stderr, _) = run_with_deadline(machine, command, request, deadline, handed);
+    keep_stderr(result, stderr, request)
+}
+
+/// An answer, with the end of what its command printed on standard error made fit for the error
+/// log: nothing typed into the request in it, nor a credential.
+fn keep_stderr(result: Result<Response, String>, stderr: String, request: &Value) -> Answered {
     // Its end says what finally went wrong; the board never sees this.
     let stderr = crate::errlog::last_part(&stderr, crate::errlog::MOST_STDERR);
     let typed = typed_in(request);
@@ -329,34 +543,40 @@ pub fn typed_in(request: &Value) -> Vec<&str> {
     typed
 }
 
-/// The answer, and what the command printed on standard error, unscrubbed.
+/// The answer, what the command printed on standard error, unscrubbed, and whether the answer
+/// was lost (none in time, or none that could be read): the request may or may not have happened.
 fn run_with_deadline(
     machine: &Machine,
     command: &str,
     request: &Value,
     deadline: Duration,
     handed: Option<transport::Handed>,
-) -> (Result<Response, String>, String) {
+) -> (Result<Response, String>, String, bool) {
     if command.trim().is_empty() {
-        return (
-            Err("actions are disabled; configure [actions] command".into()),
-            String::new(),
-        );
+        return (Err(NO_BACKEND.into()), String::new(), false);
     }
     let json = match serde_json::to_string(request) {
         Ok(json) => json,
-        Err(e) => return (Err(format!("the action request: {e}")), String::new()),
+        Err(e) => {
+            return (
+                Err(format!(
+                    "Kerdr couldn't build that request (a fault in Kerdr: {e}), {NOT_SENT}"
+                )),
+                String::new(),
+                false,
+            );
+        }
     };
     if json.len() > most_bytes(request) {
         let said = if most_bytes(request) > MAX_JSON_BYTES {
             format!(
-                "the action request is too large (maximum 64 KiB, and {} of images)",
+                "the request is too large to send (64 KiB at most, and {} of images), so nothing was sent",
                 crate::images::size(crate::images::MAX_IMAGES_BYTES)
             )
         } else {
-            "the action request is too large (maximum 64 KiB)".into()
+            "the request is too large to send (64 KiB at most), so nothing was sent".into()
         };
-        return (Err(said), String::new());
+        return (Err(said), String::new(), false);
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -365,7 +585,23 @@ fn run_with_deadline(
     // The configured command is source; user data is JSON on stdin, never source.
     let output = transport::run_adapter_handing(&target, command, Some(&json), deadline, handed);
     let stderr = output.stderr.clone();
-    (answer_of(&output, request, deadline), stderr)
+    let result = answer_of(
+        &output,
+        request,
+        deadline,
+        &machine.name,
+        machine.ssh.is_some(),
+    );
+    let lost = result.is_err() && lost(&output, machine.ssh.is_some());
+    (result, stderr, lost)
+}
+
+/// Whether an answer was lost on its way: none came in time, or the connection to its machine
+/// dropped (ssh's own exit, 255). Either way the request may or may not have happened. A backend
+/// that stopped without a proper answer, or sent one far too long, isn't lost: sent again, it
+/// would most likely do the same.
+fn lost(output: &transport::Output, ssh: bool) -> bool {
+    output.timed_out || (ssh && output.status == Some(255))
 }
 
 /// What a command's output means.
@@ -373,6 +609,8 @@ fn answer_of(
     output: &transport::Output,
     request: &Value,
     deadline: Duration,
+    machine: &str,
+    over_ssh: bool,
 ) -> Result<Response, String> {
     let redact = |text: &str| redact_credentials(text, request);
     if output.timed_out {
@@ -390,14 +628,24 @@ fn answer_of(
                 n => format!("{n} minutes"),
             };
             return Err(format!(
-                "{verb} {} is taking more than {how_long}; it may still open. Look at its card before trying again.",
+                "{verb} {} is taking more than {how_long}; it may still open, so {UNKNOWN} yet, and its card shows how it goes.",
                 reference(request)
             ));
         }
-        return Err("the action timed out; its result is unknown. Check the canonical record before trying again. Do not retry automatically.".into());
+        let minutes = deadline.as_secs().div_ceil(60);
+        let within = match minutes {
+            0 | 1 => "a minute".to_string(),
+            2 => "two minutes".into(),
+            n => format!("{n} minutes"),
+        };
+        return Err(format!(
+            "no answer came from {machine} within {within}; {UNKNOWN}, and its card shows how it stands."
+        ));
     }
     if output.stdout.len() > most_answer_bytes(request) {
-        return Err("the action's JSON response is too large; its result is unknown. Do not retry automatically.".into());
+        return Err(format!(
+            "{machine}'s action backend sent an answer far too long to read (a fault there; it's in the error log); {UNKNOWN}, and its card shows how it stands."
+        ));
     }
     // A backend can request confirmation with a nonzero exit code. Its JSON is the contract,
     // so parse it before interpreting process status.
@@ -406,6 +654,7 @@ fn answer_of(
     } else {
         parse_response(&output.stdout)
     };
+    let ssh = over_ssh && output.status == Some(255);
     parsed.map(|mut response| {
         response.message = redact(&response.message);
         for text in [&mut response.yes, &mut response.no, &mut response.url, &mut response.ticket, &mut response.confirm, &mut response.session, &mut response.id, &mut response.workspace, &mut response.label, &mut response.tab, &mut response.home, &mut response.machine, &mut response.user_code, &mut response.expires, &mut response.text, &mut response.was, &mut response.asked, &mut response.note, &mut response.say].into_iter().flatten() {
@@ -436,18 +685,22 @@ fn answer_of(
             *status = redact(status);
         }
         response
-    }).map_err(|error| {
-        let status = output.status.map_or_else(|| "no exit status".into(), |s| format!("exit {s}"));
-        // An edit's error output may quote the text it was sent (a secret its check found, say),
-        // so it's left out for a save.
-        let detail: String = if request["action"] == "edit" && request.get("text").is_some() {
-            String::new()
-        } else {
-            redact(output.stderr.trim()).chars().take(1024).collect()
+    }).map_err(|_| {
+        // ssh's own exit when the connection failed or dropped: nothing of the backend's.
+        if ssh {
+            return format!(
+                "the connection to {machine} dropped before its answer came; {UNKNOWN}, and its card shows how it stands."
+            );
+        }
+        // What it printed may be a traceback, or quote what it was sent: it goes to the error
+        // log, scrubbed, never to the board (intent 0591).
+        let how = match output.status {
+            Some(code) => format!("exit {code}"),
+            None => "stopped by a signal".into(),
         };
-        let detail = if detail.is_empty() { String::new() } else { format!(": {detail}") };
-        let error = redact(&error.to_string());
-        format!("the action's JSON response is invalid ({status}): {error}{detail}. Its result is unknown. Do not retry automatically.")
+        format!(
+            "{machine}'s action backend stopped without a proper answer ({how}, and what it printed is in Kerdr's error log); {UNKNOWN}, and its card shows how it stands."
+        )
     })
 }
 
@@ -483,7 +736,7 @@ mod tests {
             timed_out: false,
             took: Duration::from_millis(5),
         };
-        answer_of(&output, request, deadline_for(request))
+        answer_of(&output, request, deadline_for(request), "arknet-one", true)
     }
 
     #[test]
@@ -568,6 +821,385 @@ mod tests {
         } else {
             format!("sh {}", quote(path.to_str().unwrap()))
         }
+    }
+
+    /// A fake backend that keeps a record of each op as release 2's backends do (intent 0591):
+    /// a request it has an answer for gets it again, with `repeat`, and nothing is done twice.
+    /// Every request goes in requests.log and every change in done.log; the first answer of all
+    /// is lost on its way (it sleeps past Kerdr's deadline) once the change is done.
+    #[cfg(unix)]
+    fn op_keeping_backend(dir: &std::path::Path) -> String {
+        let d = quote(dir.to_str().unwrap());
+        fixture(
+            dir,
+            &format!(
+                r#"req=$(cat)
+dir={d}
+printf '%s\n' "$req" >> "$dir/requests.log"
+op=$(printf '%s' "$req" | sed -n 's/.*"op":"\(k-[0-9a-f]*\)".*/\1/p')
+if [ -n "$op" ] && [ -f "$dir/$op.answer" ]; then
+  sed 's/}}$/,"repeat":true}}/' "$dir/$op.answer"
+  exit 0
+fi
+echo done >> "$dir/done.log"
+answer='{{"ok":true,"message":"Marked #41 done.","id":"0041"}}'
+[ -n "$op" ] && printf '%s' "$answer" > "$dir/$op.answer"
+if [ ! -f "$dir/lost-once" ]; then : > "$dir/lost-once"; sleep 4; fi
+printf '%s' "$answer"
+"#
+            ),
+            "",
+        )
+    }
+
+    #[cfg(unix)]
+    fn lines(dir: &std::path::Path, name: &str) -> Vec<String> {
+        fs::read_to_string(dir.join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Resends as run_resending makes them, each send given `deadline`: what it told, and the
+    /// waits it asked for, which pass at once.
+    #[allow(clippy::type_complexity)]
+    fn resent(
+        command: &str,
+        request: &Value,
+        resends: bool,
+        deadline: Duration,
+    ) -> (Answered, Vec<Resend>, Vec<Duration>) {
+        let mut told = vec![];
+        let waits = std::cell::RefCell::new(vec![]);
+        let answered = run_resending_within(
+            &machine(),
+            command,
+            request,
+            None,
+            resends,
+            &mut |r| told.push(r.clone()),
+            &|d| waits.borrow_mut().push(d),
+            deadline,
+        );
+        (answered, told, waits.into_inner())
+    }
+
+    #[test]
+    fn a_request_that_can_change_something_gets_a_fresh_op_and_a_read_gets_none() {
+        for request in [
+            json!({"action":"dispatch","id":"0041"}),
+            json!({"action":"close","id":"0041"}),
+            json!({"action":"edit","id":"0041","text":"New words.","was":"sha256:aa"}),
+            json!({"action":"account-move","account":"ARK_C"}),
+            json!({"action":"create","words":"Back up the NAS"}),
+        ] {
+            let a = with_op(request.clone());
+            let b = with_op(a.clone());
+            let op = a["op"].as_str().unwrap();
+            assert!(
+                op.len() == 18
+                    && op.starts_with("k-")
+                    && op[2..]
+                        .chars()
+                        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+                "{op}"
+            );
+            // A new key press is a new request: never the op of the one before (a question's).
+            assert_ne!(a["op"], b["op"]);
+            assert_eq!(without_op(&b), request);
+        }
+        for read in [
+            json!({"action":"progress","follow":"f-0123456789abcdef0123"}),
+            json!({"action":"kickoff","id":"0041"}),
+            json!({"action":"edit","id":"0041"}),
+        ] {
+            assert_eq!(with_op(read.clone()), read, "a read carries no op");
+        }
+    }
+
+    #[test]
+    fn retry_is_read_as_whole_seconds_and_anything_else_is_none() {
+        let read = |retry: &str| {
+            parse_response(&format!(
+                r#"{{"ok":false,"message":"locked","retry":{retry}}}"#
+            ))
+            .unwrap()
+            .retry
+        };
+        assert_eq!(read("5"), Some(5));
+        assert_eq!(read("2.5"), Some(3));
+        assert_eq!(read("\"5\""), None);
+        assert_eq!(read("-1"), None);
+        assert_eq!(read("null"), None);
+        let r = parse_response(
+            r#"{"ok":false,"partial":true,"repeat":true,"message":"Saved here, but not pushed."}"#,
+        )
+        .unwrap();
+        assert!(r.partial && r.repeat && r.retry.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_reply_lost_after_the_change_went_through_is_asked_again_and_never_done_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = op_keeping_backend(dir.path());
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let (answered, told, waits) = resent(&command, &request, true, Duration::from_millis(1500));
+        // The resend got the recorded answer: the change stands, done once.
+        let r = answered.result.unwrap();
+        assert!(r.ok && r.repeat, "{r:?}");
+        assert_eq!(r.message, "Marked #41 done.");
+        assert_eq!(lines(dir.path(), "done.log").len(), 1, "done twice");
+        // Sent twice, the same request with the same op.
+        let sent = lines(dir.path(), "requests.log");
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0], sent[1]);
+        assert!(sent[0].contains(request["op"].as_str().unwrap()));
+        assert_eq!(waits, [Duration::from_secs(5)]);
+        assert!(
+            matches!(&told[..], [Resend::Lost { attempt: 1, .. }]),
+            "{told:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_old_backend_that_keeps_no_ops_is_never_sent_a_request_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let command = op_keeping_backend(dir.path());
+        // Its feed doesn't list "op": a lost answer's result is said to be unknown, as before.
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let (answered, told, waits) =
+            resent(&command, &request, false, Duration::from_millis(1500));
+        let error = answered.result.unwrap_err();
+        assert!(result_unknown(&error), "{error}");
+        assert!(error.contains("no answer came from here"), "{error}");
+        assert_eq!(lines(dir.path(), "requests.log").len(), 1);
+        assert!(told.is_empty() && waits.is_empty());
+        // Nor is a request without an op, whatever its machine says.
+        let dir = tempfile::tempdir().unwrap();
+        let command = op_keeping_backend(dir.path());
+        let (answered, told, _) = resent(
+            &command,
+            &json!({"action":"close","id":"0041"}),
+            true,
+            Duration::from_millis(1500),
+        );
+        assert!(answered.result.is_err());
+        assert_eq!(lines(dir.path(), "requests.log").len(), 1);
+        assert!(told.is_empty());
+    }
+
+    /// A send whose answer is what `outputs` holds next, read as from arknet-one over SSH.
+    fn over_ssh(
+        request: &Value,
+        resends: bool,
+        outputs: Vec<transport::Output>,
+    ) -> (Answered, Vec<Resend>, usize) {
+        let mut outputs = outputs.into_iter();
+        let mut sends = 0;
+        let mut told = vec![];
+        let answered = resending(
+            request,
+            None,
+            resends,
+            &mut |r| told.push(r.clone()),
+            &|_| {},
+            &mut |_| {
+                sends += 1;
+                let out = outputs.next().expect("sent more often than expected");
+                let result = answer_of(&out, request, deadline_for(request), "arknet-one", true);
+                let lost = result.is_err() && lost(&out, true);
+                (
+                    Answered {
+                        result,
+                        stderr: out.stderr.clone(),
+                    },
+                    lost,
+                )
+            },
+        );
+        (answered, told, sends)
+    }
+
+    fn output(status: i32, stdout: &str, stderr: &str) -> transport::Output {
+        transport::Output {
+            status: Some(status),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+            timed_out: false,
+            took: Duration::from_millis(5),
+        }
+    }
+
+    #[test]
+    fn an_ssh_drop_in_the_middle_of_an_action_is_sent_again_once_the_connection_is_back() {
+        let request = with_op(json!({"action":"move","id":"0041","stage":"build"}));
+        let dropped = || {
+            output(
+                255,
+                r#"{"ok":true,"mess"#,
+                "client_loop: send disconnect: Broken pipe\n",
+            )
+        };
+        // Back after the second try: the backend's record answers, with `repeat`.
+        let (answered, told, sends) = over_ssh(
+            &request,
+            true,
+            vec![
+                dropped(),
+                output(
+                    255,
+                    "",
+                    "ssh: connect to host arknet-one port 22: Connection refused\n",
+                ),
+                output(
+                    0,
+                    r#"{"ok":true,"message":"Moved #41 to build.","repeat":true}"#,
+                    "",
+                ),
+            ],
+        );
+        let r = answered.result.unwrap();
+        assert!(r.ok && r.repeat);
+        assert_eq!(sends, 3);
+        assert!(
+            matches!(
+                &told[..],
+                [
+                    Resend::Lost { attempt: 1, .. },
+                    Resend::Lost { attempt: 2, .. }
+                ]
+            ),
+            "{told:?}"
+        );
+        // Three resends at most, about 30 s in all; then its result is said to be unknown.
+        let (answered, told, sends) = over_ssh(&request, true, (0..4).map(|_| dropped()).collect());
+        assert_eq!(sends, 4);
+        assert_eq!(LOST_WAITS.iter().sum::<Duration>(), Duration::from_secs(30));
+        assert_eq!(told.len(), 3);
+        assert_eq!(
+            answered.result.unwrap_err(),
+            "the connection to arknet-one dropped before its answer came; Kerdr can't tell whether it happened, and its card shows how it stands."
+        );
+        // To a backend that keeps no ops: said at once, never resent.
+        let (answered, told, sends) = over_ssh(&request, false, vec![dropped()]);
+        assert_eq!(sends, 1);
+        assert!(told.is_empty());
+        assert!(result_unknown(&answered.result.unwrap_err()));
+    }
+
+    #[test]
+    fn a_backend_that_crashed_isnt_sent_the_request_again_and_isnt_called_a_dropped_connection() {
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let crashed = output(
+            1,
+            "",
+            "Traceback (most recent call last):\nKeyError: 'stage'\n",
+        );
+        let (answered, told, sends) = over_ssh(&request, true, vec![crashed]);
+        assert_eq!(sends, 1, "a crash would most likely crash again");
+        assert!(told.is_empty());
+        let error = answered.result.unwrap_err();
+        assert!(
+            error.starts_with(
+                "arknet-one's action backend stopped without a proper answer (exit 1,"
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.contains("KeyError") && !error.contains("Traceback"),
+            "{error}"
+        );
+        assert!(
+            answered.stderr.contains("KeyError"),
+            "kept for the error log"
+        );
+        // Exit 255 from a backend on this machine is its own, not ssh's.
+        let local = answer_of(
+            &output(255, "", ""),
+            &request,
+            deadline_for(&request),
+            "here",
+            false,
+        );
+        assert!(
+            local
+                .unwrap_err()
+                .starts_with("here's action backend stopped")
+        );
+        assert!(!lost(&output(255, "", ""), false));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_held_lock_answered_with_retry_is_sent_again_quietly_with_the_same_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = quote(dir.path().to_str().unwrap());
+        let command = fixture(
+            dir.path(),
+            &format!(
+                r##"req=$(cat)
+printf '%s\n' "$req" >> {d}/requests.log
+if [ "$(wc -l < {d}/requests.log)" -lt 3 ]; then
+  printf '%s' '{{"ok":false,"retry":2,"message":"#41 is being changed by another request; Kerdr asks again shortly."}}'
+  exit 0
+fi
+echo done >> {d}/done.log
+printf '%s' '{{"ok":true,"message":"Marked #41 done."}}'
+"##
+            ),
+            "",
+        );
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let (answered, told, waits) = resent(&command, &request, false, Duration::from_secs(20));
+        assert!(answered.result.unwrap().ok);
+        assert_eq!(waits, [Duration::from_secs(2); 2]);
+        assert!(
+            matches!(&told[0], Resend::Retry { message, .. } if message.contains("being changed")),
+            "{told:?}"
+        );
+        let sent = lines(dir.path(), "requests.log");
+        assert_eq!(sent.len(), 3);
+        assert!(
+            sent.iter().all(|s| *s == sent[0]),
+            "the same request, the same op"
+        );
+        assert_eq!(lines(dir.path(), "done.log").len(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn retries_stop_after_two_minutes_and_the_last_refusal_is_shown_as_it_is() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = quote(dir.path().to_str().unwrap());
+        let command = fixture(
+            dir.path(),
+            &format!(
+                r##"cat >> {d}/requests.log
+echo >> {d}/requests.log
+printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull under way."}}'
+"##
+            ),
+            "",
+        );
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let (answered, told, waits) = resent(&command, &request, true, Duration::from_secs(20));
+        // 50 s, 50 s, and a third wait would pass two minutes.
+        assert_eq!(waits, [Duration::from_secs(50); 2]);
+        assert_eq!(told.len(), 2);
+        let r = answered.result.unwrap();
+        assert!(!r.ok && r.retry == Some(50));
+        assert_eq!(r.message, "#41 is still locked by a pull under way.");
+        // Without an op it isn't followed at all.
+        let (_, told, waits) = resent(
+            &command,
+            &json!({"action":"close","id":"0041"}),
+            true,
+            Duration::from_secs(20),
+        );
+        assert!(told.is_empty() && waits.is_empty());
     }
 
     #[test]
@@ -837,21 +1469,32 @@ mod tests {
     }
 
     #[test]
-    fn malformed_output_is_reported_with_command_failure_detail() {
+    fn a_backend_that_stops_without_an_answer_says_so_plainly_and_logs_what_it_printed() {
         let dir = tempfile::tempdir().unwrap();
         let command = fixture(
             dir.path(),
-            "cat >/dev/null\necho 'not JSON'\necho 'tracker unavailable' >&2\nexit 7\n",
-            "[Console]::In.ReadToEnd() | Out-Null; Write-Output 'not JSON'; [Console]::Error.WriteLine('tracker unavailable'); exit 7",
+            "cat >/dev/null\necho 'not JSON'\necho 'Traceback: KeyError tracker unavailable' >&2\nexit 7\n",
+            "[Console]::In.ReadToEnd() | Out-Null; Write-Output 'not JSON'; [Console]::Error.WriteLine('Traceback: KeyError tracker unavailable'); exit 7",
         );
-        let error = run(&machine(), &command, &json!({"action":"refresh","id":"4"})).unwrap_err();
-        assert!(error.contains("JSON"), "{error}");
-        assert!(error.contains("7"), "{error}");
-        assert!(error.contains("tracker unavailable"), "{error}");
+        let request = json!({"action":"refresh","id":"4"});
+        let answered = run_keeping_stderr(&machine(), &command, &request);
+        let error = answered.result.unwrap_err();
+        assert_eq!(
+            error,
+            "here's action backend stopped without a proper answer (exit 7, and what it printed is in Kerdr's error log); Kerdr can't tell whether it happened, and its card shows how it stands."
+        );
+        assert!(result_unknown(&error));
+        // What it printed goes to the error log, never the board: no traceback, no class name.
+        assert!(!error.contains("KeyError"), "{error}");
+        assert!(
+            answered.stderr.contains("tracker unavailable"),
+            "{}",
+            answered.stderr
+        );
     }
 
     #[test]
-    fn a_timeout_warns_that_the_result_is_unknown_and_must_not_be_retried() {
+    fn a_timeout_says_plainly_that_nobody_knows_whether_it_happened() {
         let dir = tempfile::tempdir().unwrap();
         let command = fixture(
             dir.path(),
@@ -866,9 +1509,15 @@ mod tests {
             None,
         )
         .unwrap_err();
-        assert!(error.contains("timed out"), "{error}");
-        assert!(error.contains("result is unknown"), "{error}");
-        assert!(error.contains("Do not retry automatically"), "{error}");
+        assert_eq!(
+            error,
+            "no answer came from here within a minute; Kerdr can't tell whether it happened, and its card shows how it stands."
+        );
+        assert!(result_unknown(&error));
+        // Words for Andrew, not for an agent.
+        for agentish in ["canonical", "Do not retry", "result is unknown"] {
+            assert!(!error.contains(agentish), "{error}");
+        }
     }
 
     #[test]
@@ -1033,13 +1682,22 @@ mod tests {
             "[Console]::Error.WriteLine([Console]::In.ReadToEnd()); [Console]::Error.WriteLine('leak: kerdr-fixture-secret-line'); exit 1",
         );
         let save = json!({"action":"edit","id":"0414","text":"kerdr-fixture-secret-line","was":"sha256:aa"});
-        let error = run(&machine(), &command, &save).unwrap_err();
+        let answered = run_keeping_stderr(&machine(), &command, &save);
+        let error = answered.result.unwrap_err();
         assert!(!error.contains("kerdr-fixture-secret-line"), "{error}");
-        assert!(error.contains("invalid (exit 1)"), "{error}");
-        // A read sends no text, so its error output is shown as any action's is.
+        assert!(error.contains("(exit 1,"), "{error}");
+        // Nor the error log: what was typed is scrubbed from what the save's command printed.
+        assert!(
+            !answered.stderr.contains("kerdr-fixture-secret-line"),
+            "{}",
+            answered.stderr
+        );
+        // A read's error output goes to the error log as any action's does, never the board.
         let read = json!({"action":"edit","id":"0414"});
-        let error = run(&machine(), &command, &read).unwrap_err();
-        assert!(error.contains("leak: kerdr-fixture-secret-line"), "{error}");
+        let answered = run_keeping_stderr(&machine(), &command, &read);
+        let error = answered.result.unwrap_err();
+        assert!(!error.contains("leak"), "{error}");
+        assert!(answered.stderr.contains("leak: kerdr-fixture-secret-line"));
     }
 
     #[test]

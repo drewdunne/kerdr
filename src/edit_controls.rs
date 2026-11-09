@@ -131,7 +131,7 @@ fn partly_saved(reference: &str, r: Response) -> String {
 
 /// An action's error to its first clause: "the action timed out" rather than its advice on
 /// retrying, which a save's own message replaces.
-fn first_clause(error: &str) -> &str {
+pub(super) fn first_clause(error: &str) -> &str {
     let end = [error.find("; "), error.find(". ")]
         .into_iter()
         .flatten()
@@ -1172,9 +1172,12 @@ mod tests {
             .resolver
             .ready()
             .into_iter()
-            .find(|(_, m, r, gated)| *m == machine && *r == request && !gated)
-            .map(|(n, ..)| n)
+            .find(|(_, m, r, gated)| {
+                *m == machine && crate::actions::without_op(r) == request && !gated
+            })
+            .map(|(n, _, r, _)| (n, r))
             .expect("it goes to the runner at once");
+        let (n, request) = n;
         app.job_started(n);
         app.resolver.handed(n);
         Sent {
@@ -1274,8 +1277,16 @@ mod tests {
         assert!(intro.contains(&reference), "{intro}");
         let sent = saves(&mut app, &key, wrote("New words."));
         assert_eq!(sent.machine, machine);
+        // A save changes something: it carries an op of its own (intent 0591).
+        assert!(
+            sent.request["op"]
+                .as_str()
+                .is_some_and(|op| op.len() == 18 && op.starts_with("k-")),
+            "{}",
+            sent.request
+        );
         assert_eq!(
-            sent.request,
+            crate::actions::without_op(&sent.request),
             json!({"action":"edit","id":id,"text":"New words.","was":"sha256:aa","from":crate::config::hostname()})
         );
         answer(&mut app, &sent, saved());

@@ -2881,7 +2881,7 @@ mod tests {
         assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
         assert_eq!(a.follows.len(), 1, "followed");
         assert_eq!(
-            a.follows[0].request,
+            crate::actions::without_op(&a.follows[0].request),
             json!({"action":"reopen","id":id,"account":"ARK_C"})
         );
         assert_eq!(a.message().unwrap().0, "Starting api, then #44…");
