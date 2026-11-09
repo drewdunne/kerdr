@@ -27,6 +27,8 @@ Kerdr shows the last good feed, with herdr's live view, when a run fails.
       "tenant": "shop",
       "organization": "my-org",
       "project": "checkout",
+      "team": "dev",
+      "stage_list": "standard",
       "created": "2026-10-19",
       "refreshed_at": "2026-10-21",
       "backlog_rank": 10,
@@ -73,8 +75,10 @@ know rather than guessing.
 | `source` | Names the feed. Cards are unique by `source` and `id`, so two machines running the same feed show each card once (the copy from its `home.machine` wins). |
 | `sessions` | Slot use per herdr session, when your records count slots their own way. Without it, Kerdr counts workspaces with an agent against `[board] slots`. `limit: null` means no limit. |
 | `id`, `ref` | The card's identity, and the short handle drawn first on it (default: `#` and the id without leading zeros). |
-| `tenant`, `organization`, `project` | Optional scope labels for filtering and showing where work belongs. Leave an unknown scope absent. |
-| `stage` | `backlog`, `plan`, `design`, `build`, `test`, `deploy` or `maintain`: the column. Kerdr also accepts common synonyms (`review` is test, `done` is maintain). |
+| `tenant`, `organization`, `project` | Optional scope labels for filtering and showing where work belongs. Leave an unknown scope absent. When the feed lists `owners` (see [Owners, teams and stage lists](#owners-teams-and-stage-lists)), a card's owner is its `tenant`, else its `organization`, matched by id against that list: use the list's ids. |
+| `team` | Optional: the id of one of its owner's teams. A team its owner doesn't list shows under No team. |
+| `stage` | The column: `backlog` for work not started and `maintain` for finished work, on every list; otherwise a stage of the card's `stage_list`. On the standard list (no `stage_list`) that's `plan`, `design`, `build`, `test` or `deploy`, and Kerdr also accepts common synonyms (`review` is test, `done` is maintain); on any other list, only its stage ids. A stage its list doesn't have shows in a column of its own, marked unknown, never in another stage. With no `stage`, open work goes in Build on the standard list and in the first stage of any other. |
+| `stage_list` | Optional: the whole id of the stage list its `stage` belongs to (`tinyhost/marketing`); absent means `standard`. |
 | `state` | Free text: `queued` and `shelved` group the backlog; `closed` is finished work. |
 | `priority` | `high` cards go first, with a ▲. |
 | `lane` | `background` adds a `bg` tag. |
@@ -99,6 +103,50 @@ know rather than guessing.
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it says where it runs and sends nothing; a second `Enter` within five seconds goes on to the reopen, whose backend asks before starting a second copy. |
+
+## Owners, teams and stage lists
+
+All optional additions to format 1, which an older Kerdr ignores. When any machine's feed lists
+`owners` (see [Accounts](#accounts) for the rest of an owner's fields), Kerdr's top bar splits the
+board by owner and then by team instead of by machine and herdr session; with none, it keeps the
+machine split.
+
+```json
+{
+  "owners": [
+    {"id": "studio", "kind": "organization", "name": "Example Studio", "code": "ARK", "parent": null,
+     "sessions": ["default"], "agent_machine": "build-box"},
+    {"id": "shop", "kind": "tenant", "name": "Shop", "code": "SHP", "parent": "studio",
+     "sessions": ["web", "shop-bg"], "agent_machine": "laptop",
+     "teams": [{"id": "dev", "name": "Dev", "retired": false, "stages": "standard"},
+               {"id": "marketing", "name": "Marketing", "retired": false, "stages": "shop/marketing"}]}
+  ],
+  "stage_lists": [
+    {"id": "standard", "name": "Standard", "owner": null, "rev": 1,
+     "stages": [{"id": "plan", "name": "Plan", "retired": false}, {"id": "design", "name": "Design", "retired": false},
+                {"id": "build", "name": "Build", "retired": false}, {"id": "test", "name": "Test", "retired": false},
+                {"id": "deploy", "name": "Deploy", "retired": false}]},
+    {"id": "shop/marketing", "name": "Marketing", "owner": "shop", "rev": 3,
+     "stages": [{"id": "plan", "name": "Plan", "retired": false}, {"id": "test", "name": "Test", "retired": false},
+                {"id": "execute", "name": "Execute", "retired": false}, {"id": "learn", "name": "Learn", "retired": false}]}
+  ],
+  "create_fields": ["organization", "tenant", "project", "team"]
+}
+```
+
+| Field | What Kerdr does with it |
+|---|---|
+| `owners[].teams` | The owner's teams, its tabs on the top bar after `All`: `id` (never changes, so renaming a team keeps its cards), `name`, `retired` (kept for its old cards and shown only while it holds one) and `stages`, the whole id of the stage list it uses (absent: `standard`). |
+| `owners[].agent_machine` | The machine the owner's new work runs on, by the name Kerdr knows it by: `A` opens there when the owner is chosen, and the bar shows how full the owner's main session (its `code`) is there. |
+| `owners[].sessions` | Its herdr sessions: a workspace no card claims is the owner's whose sessions name its session, else whose `code` its session's name starts with (`SHP`, `SHP-Background`). |
+| `stage_lists` | Every list a team uses or an open card names, `standard` among them. A list's `id` is whole, owner then name (`shop/marketing`), so two owners' lists of one name never mix. `rev` goes up whenever its stages change: of two machines' copies of a list, Kerdr uses the one with the higher `rev`. A stage taken out of a list stays, `retired`, while work still sits in it; its column shows only while it holds a card. Without `standard`, Kerdr uses its own: Plan, Design, Build, Test and Deploy. |
+| `create_fields` | The fields this machine's action backend takes in `create` besides the words. Kerdr sends `organization`, `tenant` and `team` only when they're listed here; see [Creating a new intent](#actions). |
+
+The bar lists the owners with work in the order the feeds give them, each organization followed by
+the tenants inside it. Owners are merged across machines by `id`, the first machine's copy (this
+one's) leading. On a view whose cards all share one list, the columns are Backlog, that list's
+stages and Done. On a view that mixes lists, each list gets a band of its own between Backlog and
+Done; see the README.
 
 ## Work inside a card
 
@@ -171,8 +219,22 @@ that ignores the field drops the images, so update it before its users get a Ker
 {"action":"create","words":"Moving it failed: [Image #1]","session":"default","submission":"kerdr-18f2c3a9d0e1-4d3","images":[{"tag":1,"type":"image/png","data":"iVBORw0KGgoAAAANSUhEUg…"}]}
 ```
 
-Kerdr sends the same `submission` again only for the same words and images to the same session,
-and only while an earlier send of them never got an answer (a timeout, say). When a record already
+On the owner split, `create` carries the view it was made in: on all of Kerdr, no owner, and your
+backend works out whose it is from the words; on an owner, or its No team tab, the owner's
+`organization` (the organization itself, or a tenant's) and, for a tenant, `tenant`; on a team,
+those and `team`. Kerdr sends each only to a backend whose feed lists it in `create_fields`, and
+says in the box before you send that the intent will go under No team (or under no owner) when the
+backend can't take it. File the record under that owner and team, home it where that owner's work
+runs, and refuse a `team` that isn't one of the request's owner's teams (or is retired), so a
+board that's out of date can't file work under another owner's team. Kerdr sends `create` to the
+machine it runs on.
+
+```json
+{"action":"create","words":"A spring sale email","session":"SHP","submission":"kerdr-18f2c3a9d0e1-4d4","organization":"studio","tenant":"shop","team":"marketing"}
+```
+
+Kerdr sends the same `submission` again only for the same words, images, owner and team to the
+same session, and only while an earlier send of them never got an answer (a timeout, say). When a record already
 exists for it, answer with that record's `id` instead of making another. Changed words or images
 are new work with a new `submission`.
 
