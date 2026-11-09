@@ -584,4 +584,27 @@ mod tests {
         card.criteria[0].met = Some(true);
         assert_eq!(card.criteria_progress(), Some((1, 2)));
     }
+
+    #[test]
+    fn teams_stage_lists_and_create_fields_are_optional_fields() {
+        let f = parse(r#"{"kerdr_feed":1,
+            "cards":[{"id":"5","title":"t","tenant":"tinyhost","team":"marketing","stage_list":"tinyhost/marketing","stage":"learn"}],
+            "owners":[{"id":"tinyhost","kind":"tenant","parent":"arkship","agent_machine":"arknet-one",
+                       "teams":[{"id":"dev","name":"Dev","retired":false,"stages":"standard"},{"id":"old","name":"Old","retired":true,"stages":null}]}],
+            "stage_lists":[{"id":"tinyhost/marketing","name":"Marketing","owner":"tinyhost","rev":3,
+                            "stages":[{"id":"plan","name":"Plan","retired":false},{"id":"learn","name":"Learn","retired":true}]}],
+            "create_fields":["organization","tenant","project","team"]}"#).unwrap();
+        assert_eq!(f.cards[0].team.as_deref(), Some("marketing"));
+        assert_eq!(f.cards[0].stage_list.as_deref(), Some("tinyhost/marketing"));
+        assert_eq!(f.owners[0].agent_machine.as_deref(), Some("arknet-one"));
+        assert_eq!(f.owners[0].teams.len(), 2);
+        assert!(f.owners[0].teams[1].retired && f.owners[0].teams[1].stages.is_none());
+        assert_eq!(f.stage_lists[0].rev, 3);
+        assert!(f.stage_lists[0].stages[1].retired);
+        assert!(f.creates_with("team") && !f.creates_with("account"));
+        // An older feed has none of them.
+        let old = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"t"}],"owners":[{"id":"a","kind":"organization"}],"stage_lists":null,"create_fields":null}"#).unwrap();
+        assert!(old.stage_lists.is_empty() && old.create_fields.is_empty());
+        assert!(old.owners[0].teams.is_empty() && old.cards[0].team.is_none());
+    }
 }

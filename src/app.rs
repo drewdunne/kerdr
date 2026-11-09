@@ -1462,10 +1462,29 @@ impl App {
 
     fn choose_scope(&mut self, scope: Scope) {
         if self.owner_split() {
-            return self.choose_view(match scope {
-                Scope::Machine(_) | Scope::Session(..) => Scope::All,
-                other => other,
-            });
+            // Machines left the top bar (intent 0595): a machine is f's Machine row, and a
+            // session is its owner's work.
+            return match scope {
+                Scope::Machine(m) => {
+                    self.machine_filter = Some(m);
+                    self.fix_selection();
+                }
+                Scope::Session(m, s) => {
+                    let owner = self
+                        .board
+                        .sessions
+                        .iter()
+                        .find(|r| r.machine == m && r.session == s)
+                        .map(|r| r.owner.clone())
+                        .unwrap_or_else(|| crate::owners::session_owner(&self.board.owners, &s));
+                    self.choose_view(if owner.is_empty() {
+                        Scope::All
+                    } else {
+                        Scope::Owner(owner)
+                    })
+                }
+                other => self.choose_view(other),
+            };
         }
         self.machine = match &scope {
             Scope::All | Scope::Owner(_) | Scope::Team(..) => None,

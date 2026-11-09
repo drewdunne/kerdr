@@ -389,7 +389,9 @@ fn event_loop(
             }
             _ => {}
         }
-        app.width = terminal.size()?.width;
+        let size = terminal.size()?;
+        app.width = size.width;
+        app.height = size.height;
         app.keep_box_errors();
         terminal.draw(|f| crate::ui::draw(f, app))?;
         let wait = if back_at.is_some_and(|at| at.elapsed() < READ_LANDS) {

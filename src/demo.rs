@@ -507,9 +507,19 @@ pub fn machines(away: bool) -> Vec<MachineState> {
     ];
     // Shop's marketing team works in stages of its own (intent 0595).
     for (id, title, stage, attention) in [
-        ("54", "Spring sale email to past buyers", "execute", "running"),
+        (
+            "54",
+            "Spring sale email to past buyers",
+            "execute",
+            "running",
+        ),
         ("55", "Landing page headline test", "test", "needs_you"),
-        ("56", "What the October newsletter taught us", "learn", "waiting"),
+        (
+            "56",
+            "What the October newsletter taught us",
+            "learn",
+            "waiting",
+        ),
     ] {
         let mut c = card(C {
             id,
@@ -538,7 +548,11 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         c.updated = Some(at(17, 11));
         // Whose work it is: the shop's web app and the platform's API are tenants' work; the
         // backups are the studio's own (intent 0595).
-        let session = c.home.as_ref().and_then(|h| h.session.clone()).unwrap_or_default();
+        let session = c
+            .home
+            .as_ref()
+            .and_then(|h| h.session.clone())
+            .unwrap_or_default();
         c.organization = Some("studio".into());
         match (c.id.as_str(), session.as_str()) {
             ("38", _) => {}
@@ -739,7 +753,12 @@ pub fn machines(away: bool) -> Vec<MachineState> {
                 {"id":"plan","name":"Plan"},{"id":"test","name":"Test"},{"id":"execute","name":"Execute"},
                 {"id":"learn","name":"Learn"}]}
         ])).unwrap();
-        f.create_fields = vec!["organization".into(), "tenant".into(), "project".into(), "team".into()];
+        f.create_fields = vec![
+            "organization".into(),
+            "tenant".into(),
+            "project".into(),
+            "team".into(),
+        ];
         f.owners_source = Some("mock".into());
         f.machine_owner = Some("studio".into());
         f.starts_on = vec!["dispatch".into(), "reopen".into()];

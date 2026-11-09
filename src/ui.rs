@@ -1416,7 +1416,11 @@ fn columns(f: &mut Frame, rect: Rect, app: &App) {
             if b.folded {
                 return 1;
             }
-            let most = band_cols(b).iter().map(|&c| cols[c].len()).max().unwrap_or(0) as u16;
+            let most = band_cols(b)
+                .iter()
+                .map(|&c| cols[c].len())
+                .max()
+                .unwrap_or(0) as u16;
             u16::from(banded) + 2 + most.max(1) * 5 + 1
         })
         .collect();
@@ -1439,7 +1443,11 @@ fn columns(f: &mut Frame, rect: Rect, app: &App) {
             } else {
                 (u32::from(room) * u32::from(w) / u32::from(open_want.max(1))) as u16
             }
-            .max(if b.folded { 1 } else { crate::stages::BAND_ROWS.min(room) })
+            .max(if b.folded {
+                1
+            } else {
+                crate::stages::BAND_ROWS.min(room)
+            })
         })
         .collect();
     let last_open = layout.bands.iter().rposition(|b| !b.folded);
@@ -1466,11 +1474,12 @@ fn columns(f: &mut Frame, rect: Rect, app: &App) {
             rect.bottom().saturating_sub(y + below)
         } else {
             // Leave the open bands below room for a card each.
-            heights[bi].min(
-                rect.bottom()
-                    .saturating_sub(y + below + open_below * crate::stages::BAND_ROWS),
-            )
-            .max(crate::stages::BAND_ROWS.min(rect.bottom().saturating_sub(y)))
+            heights[bi]
+                .min(
+                    rect.bottom()
+                        .saturating_sub(y + below + open_below * crate::stages::BAND_ROWS),
+                )
+                .max(crate::stages::BAND_ROWS.min(rect.bottom().saturating_sub(y)))
         };
         let mut top = y;
         if banded {
@@ -5445,6 +5454,72 @@ mod tests {
             .collect()
     }
 
+    /// The demo on the owner split (intent 0595), as `kerdr --demo` shows it.
+    fn owner_demo() -> App {
+        let mut a = App::new(Config::default(), crate::demo::machines(false));
+        a.demo = true;
+        a.fixed_now = Some(crate::demo::now());
+        a.width = 176;
+        a.height = 44;
+        a.rebuild();
+        a
+    }
+
+    #[test]
+    fn the_owner_split_bar_lists_owners_then_an_owners_teams() {
+        let mut a = owner_demo();
+        let top = row(&a, 176, 44, 0);
+        assert!(top.contains("All work ▾"), "{top}");
+        for code in ["ARK", "SHP", "PLT"] {
+            assert!(top.contains(code), "{top}");
+        }
+        assert!(
+            !top.contains("laptop ▾") && !top.contains("All machines"),
+            "{top}"
+        );
+        a.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('}'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        a.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('}'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        let top = row(&a, 176, 44, 0);
+        assert!(top.contains("Shop · SHP"), "{top}");
+        for tab in ["All 8", "Dev 4", "Marketing 3", "No team 1"] {
+            assert!(top.contains(tab), "{top}");
+        }
+        let screen = rendered(&a, 176, 44);
+        assert!(
+            screen.contains("Shop Marketing's stages"),
+            "a band for each list"
+        );
+        assert!(screen.contains("Standard stages · Dev, No team"));
+        assert!(screen.contains("EXECUTE") && screen.contains("LEARN"));
+        // On Marketing's tab, its own stages and no bands.
+        a.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('3'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
+        let screen = rendered(&a, 176, 44);
+        assert!(!screen.contains("Standard stages") && !screen.contains("DESIGN"));
+        assert!(screen.contains("EXECUTE"));
+    }
+
+    #[test]
+    fn the_owner_split_hint_names_owner_and_team_keys() {
+        let mut a = owner_demo();
+        for m in &mut a.machines {
+            if let Some(f) = &mut m.feed {
+                f.accounts.clear();
+            }
+        }
+        a.rebuild();
+        let top = row(&a, 176, 44, 0);
+        assert!(top.contains("{ } owner · [ ] team"), "{top}");
+    }
+
     /// F-0294 and intent 0321: a card an agent is at says on the board itself that s moves its
     /// agent, off the account it's on, and X cancels it; its peek says what s does.
     #[test]
@@ -5843,12 +5918,18 @@ mod tests {
         let order = a.columns()[Stage::Build.index()].clone();
         assert_eq!(order[0], last);
         assert_eq!(a.selected().map(|c| c.key.clone()), Some(key));
-        a.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        a.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('j'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(
             a.selected().map(|c| c.key.clone()),
             Some(a.board.cards[order[1]].key.clone())
         );
-        a.on_key(KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE));
+        a.on_key(ratatui::crossterm::event::KeyEvent::new(
+            ratatui::crossterm::event::KeyCode::Char('k'),
+            ratatui::crossterm::event::KeyModifiers::NONE,
+        ));
         assert_eq!(
             a.selected().map(|c| c.key.clone()),
             Some(a.board.cards[order[0]].key.clone())

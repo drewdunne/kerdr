@@ -935,4 +935,184 @@ mod tests {
         app.on_key(key('}'));
         assert_eq!(*app.scope(), Scope::Machine("lab".into()));
     }
+
+    fn send_words(app: &mut App, words: &str) -> serde_json::Value {
+        app.cfg.actions.command = Some("fixture".into());
+        app.busy = false;
+        app.draft = words.into();
+        app.mode = Mode::Board;
+        app.on_key(key('c'));
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        request
+    }
+
+    #[test]
+    fn c_files_the_new_intent_under_the_view_its_made_in() {
+        let mut app = owner_app(true);
+        let request = send_words(&mut app, "All of Kerdr's");
+        assert!(request.get("organization").is_none() && request.get("team").is_none());
+        app.choose_view(Scope::Owner("arkship".into()));
+        let request = send_words(&mut app, "Arkship's own");
+        assert_eq!(request["organization"], "arkship");
+        assert!(request.get("tenant").is_none() && request.get("team").is_none());
+        app.choose_view(Scope::Team("tinyhost".into(), None));
+        let request = send_words(&mut app, "Tinyhost, no team");
+        assert_eq!(request["organization"], "arkship");
+        assert_eq!(request["tenant"], "tinyhost");
+        assert!(request.get("team").is_none());
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        let request = send_words(&mut app, "Tinyhost's marketing");
+        assert_eq!(request["tenant"], "tinyhost");
+        assert_eq!(request["team"], "marketing");
+        assert_eq!(request["session"], "TNY", "its owner's session");
+    }
+
+    #[test]
+    fn a_backend_that_cant_take_a_team_files_it_under_no_team_and_says_so_first() {
+        let mut app = owner_app(true);
+        app.machines[0].feed.as_mut().unwrap().create_fields =
+            vec!["organization".into(), "tenant".into()];
+        app.rebuild();
+        app.cfg.actions.command = Some("fixture".into());
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        app.on_key(key('c'));
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("c opens the box")
+        };
+        assert!(
+            draft
+                .unfiled
+                .as_deref()
+                .is_some_and(|n| n.contains("No team"))
+        );
+        let request = send_words(&mut app, "Marketing's, but no team here");
+        assert_eq!(request["tenant"], "tinyhost");
+        assert!(request.get("team").is_none());
+        // An older backend that names nothing it takes gets no owner at all.
+        app.machines[0].feed.as_mut().unwrap().create_fields.clear();
+        app.rebuild();
+        let request = send_words(&mut app, "No owner either");
+        assert!(request.get("tenant").is_none() && request.get("organization").is_none());
+    }
+
+    #[test]
+    fn the_same_words_under_another_team_are_another_request() {
+        let mut app = owner_app(true);
+        app.choose_view(Scope::Team("tinyhost".into(), Some("dev".into())));
+        let first = send_words(&mut app, "Same words");
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        let second = send_words(&mut app, "Same words");
+        assert_ne!(first["submission"], second["submission"]);
+    }
+
+    #[test]
+    fn a_new_intent_shows_under_its_team_while_it_saves() {
+        let mut app = owner_app(true);
+        app.choose_view(Scope::Team("tinyhost".into(), Some("marketing".into())));
+        let request = send_words(&mut app, "A spring campaign");
+        app.queue_action(0, request);
+        let saving = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.intake() == Some(crate::resolve::SAVING))
+            .expect("its card shows at once");
+        assert_eq!(saving.owner, "tinyhost");
+        assert_eq!(saving.team.as_deref(), Some("marketing"));
+    }
+
+    #[test]
+    fn cards_name_their_owner_on_all_of_kerdr_and_their_team_on_an_owner() {
+        let mut app = owner_app(true);
+        let dev = app.card("s:1").unwrap().clone();
+        assert_eq!(app.whose_tag(&dev).as_deref(), Some("TNY"));
+        app.choose_view(Scope::Owner("tinyhost".into()));
+        assert_eq!(app.whose_tag(&dev).as_deref(), Some("Dev"));
+        let none = app.card("s:2").unwrap().clone();
+        assert_eq!(app.whose_tag(&none), None);
+        app.choose_view(Scope::Team("tinyhost".into(), Some("dev".into())));
+        assert_eq!(app.whose_tag(&dev), None, "every card there is Dev's");
+    }
+
+    #[test]
+    fn a_and_s_follow_the_chosen_owner() {
+        let mut app = owner_app(false);
+        app.machines[0].feed.as_mut().unwrap().accounts = serde_json::from_value(
+            serde_json::json!([{"code":"ARK_C","provider":"claude","kind":"token","status":"ready"}]),
+        )
+        .unwrap();
+        app.rebuild();
+        app.choose_view(Scope::Owner("tinyhost".into()));
+        assert_eq!(app.owner_machine(), Some(0), "its agents run on lab");
+        assert_eq!(app.account_machine(), Some(0));
+        let (_, owner) = app.models_owner().expect("S edits the chosen owner's list");
+        assert_eq!(owner.id, "tinyhost");
+    }
+
+    #[test]
+    fn a_workspace_no_record_claims_is_its_sessions_owners() {
+        let mut app = owner_app(false);
+        let snap = crate::herdr::Snapshot {
+            workspaces: vec![crate::herdr::Workspace {
+                workspace_id: "w9".into(),
+                label: "scratch".into(),
+                ..Default::default()
+            }],
+            agents: vec![crate::herdr::Agent {
+                agent: Some("claude".into()),
+                agent_status: Some("working".into()),
+                pane_id: "w9:p1".into(),
+                workspace_id: "w9".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let data = app.machines[0].data.as_mut().unwrap();
+        data.sessions.push(crate::herdr::SessionInfo {
+            name: "TNY".into(),
+            running: true,
+            default: false,
+            socket_path: None,
+        });
+        data.snapshots.insert("TNY".into(), Ok(snap));
+        app.rebuild();
+        let misc = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Misc)
+            .expect("a workspace card");
+        assert_eq!(misc.owner, "tinyhost");
+        assert_eq!(misc.team, None);
+    }
+
+    #[test]
+    fn an_owner_whose_work_has_gone_stays_while_chosen() {
+        let mut app = owner_app(false);
+        app.choose_view(Scope::Owner("arkship".into()));
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .retain(|c| c.tenant.is_some());
+        app.rebuild();
+        assert_eq!(*app.scope(), Scope::Owner("arkship".into()));
+        app.on_key(key('0'));
+        assert!(!app.tabs.contains(&Scope::Owner("arkship".into())));
+    }
+
+    #[test]
+    fn a_machine_from_m_is_fs_machine_row_and_a_session_is_its_owners_work() {
+        let mut app = owner_app(false);
+        app.choose_scope(Scope::Machine("lab".into()));
+        assert_eq!(app.machine_filter.as_deref(), Some("lab"));
+        assert_eq!(*app.scope(), Scope::All);
+        app.choose_scope(Scope::Session("lab".into(), "TNY-Background".into()));
+        assert_eq!(*app.scope(), Scope::Owner("tinyhost".into()));
+    }
 }

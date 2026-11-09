@@ -522,7 +522,7 @@ impl App {
                 let (open, backlog) = count(&|c: &Card| c.owner == owner);
                 rows.push(FilterRow {
                     label: "All projects".into(),
-                    kind: "project".into(),
+                    kind: format!("{}'s", self.owner_short(&owner)),
                     depth: 0,
                     owner: None,
                     project: None,
@@ -565,7 +565,7 @@ impl App {
         let (open, backlog) = machine_count(None);
         rows.push(FilterRow {
             label: "All machines".into(),
-            kind: "machine".into(),
+            kind: String::new(),
             depth: 0,
             owner: None,
             project: None,
