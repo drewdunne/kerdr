@@ -652,6 +652,10 @@ pub struct App {
     pub enter_said: Option<String>,
     /// Work that goes on after its answer, which Kerdr follows (intent 0591, follow.rs).
     pub follows: Vec<follow::Following>,
+    /// s waiting for a machine's accounts before it opens the picker (intent 0591).
+    pub accounts_wait: Option<run_state::AccountsWait>,
+    /// An account picked with s that its card is still owed (intent 0591).
+    pub owed_account: Option<run_state::OwedAccount>,
     /// The end of followed work being taken as its request's answer.
     pub(crate) follow_end: Option<follow::FollowEnd>,
     /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
@@ -737,6 +741,8 @@ impl App {
             enter_when_open: None,
             enter_said: None,
             follows: vec![],
+            accounts_wait: None,
+            owed_account: None,
             follow_end: None,
             enter_sent: None,
         };
@@ -1982,6 +1988,21 @@ impl App {
                 }
                 if self.pending_jump.take().is_some() {
                     self.say("Stopped waiting.", Tone::Info);
+                }
+                // s waiting for accounts, or for a card to be brought back or its backend brought
+                // up to date: what's under way finishes, and nothing starts after it (intent 0591).
+                if self.accounts_wait.take().is_some() {
+                    self.say("Stopped waiting for the accounts.", Tone::Info);
+                }
+                if let Some(owed) = self.owed_account.take() {
+                    let reference = self
+                        .card(&owed.key)
+                        .map(|c| c.reference.clone())
+                        .unwrap_or_else(|| "The card".into());
+                    self.say(
+                        format!("{reference} won't start on {} after all.", owed.to),
+                        Tone::Info,
+                    );
                 }
             }
             _ => {}
@@ -4053,7 +4074,11 @@ pub(crate) mod tests {
         let Action::Mutate { request, .. } = app.jump_action(card.key.clone()) else {
             panic!("plain ⏎'s choice sent nothing: {:?}", app.message())
         };
-        let expected = if now.reopenable() { "reopen" } else { "dispatch" };
+        let expected = if now.reopenable() {
+            "reopen"
+        } else {
+            "dispatch"
+        };
         assert_eq!(request["action"], expected);
     }
 
@@ -6112,10 +6137,7 @@ pub(crate) mod tests {
         app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
         assert_eq!(enter(&mut app), Action::None);
         assert!(
-            app.message()
-                .unwrap()
-                .0
-                .contains("still being written up"),
+            app.message().unwrap().0.contains("still being written up"),
             "{:?}",
             app.message()
         );
@@ -6550,7 +6572,10 @@ pub(crate) mod tests {
         assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
         assert_eq!(app.jump_action(key.clone()), Action::None);
         assert!(
-            app.message().unwrap().0.contains("with [actions] configured"),
+            app.message()
+                .unwrap()
+                .0
+                .contains("with [actions] configured"),
             "{:?}",
             app.message()
         );

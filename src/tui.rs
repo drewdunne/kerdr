@@ -240,6 +240,13 @@ fn event_loop(
                     }
                     continue;
                 }
+                Answer::Update(machine, result) => {
+                    app.update_answered(machine, result);
+                    if let Some(l) = live.as_deref() {
+                        l.wake_feed(machine);
+                    }
+                    continue;
+                }
                 Answer::Done(done) => *done,
             };
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
@@ -326,6 +333,15 @@ fn event_loop(
         // reopening (intent 0411), whatever account action runs (intent 0445).
         if !app.demo
             && let Action::Mutate { machine, request } = app.next_owed()
+        {
+            start_action(app, &action_tx, &runner, machine, request);
+        }
+        // s: the picker once a machine's accounts have come, and an account picked for a card
+        // that's owed it (brought back, its backend brought up to date first: intent 0591).
+        app.accounts_wait_due();
+        ask_update(app, &action_tx);
+        if !app.demo
+            && let Action::Mutate { machine, request } = app.account_owed()
         {
             start_action(app, &action_tx, &runner, machine, request);
         }
@@ -690,6 +706,9 @@ enum Answer {
     Done(Box<ActionResult>),
     /// A progress request's answer: the followed work's token, its machine, and what came back.
     Progress(String, usize, Result<crate::actions::Response, String>),
+    /// The answer to a request that asked an old backend to bring its ark-sdlc up to date, for
+    /// an account picked with s (intent 0591).
+    Update(usize, Result<crate::actions::Response, String>),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -944,6 +963,28 @@ fn ask_progress(app: &mut App, tx: &mpsc::Sender<Answer>) {
             let _ = tx.send(Answer::Progress(token, machine, result));
         });
     }
+}
+
+/// Asks an old backend to bring its ark-sdlc up to date, on a thread of its own, when an account
+/// picked with s waits for it: a read its backend pulls before (intent 0591).
+fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
+    if app.demo {
+        return;
+    }
+    let Some((machine, request)) = app.update_due() else {
+        return;
+    };
+    let command = app.cfg.actions.command.clone();
+    let target = app.machines.get(machine).map(|m| m.machine.clone());
+    let (Some(command), Some(target)) = (command, target) else {
+        app.update_answered(machine, Err("actions are disabled".into()));
+        return;
+    };
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let result = crate::actions::run(&target, &command, &request);
+        let _ = tx.send(Answer::Update(machine, result));
+    });
 }
 
 /// Hands every new change to a card to the runner, which starts each in its turn.
@@ -1565,6 +1606,7 @@ mod tests {
                 }
             ),
             Answer::Progress(token, _, _) => format!("progress {token}"),
+            Answer::Update(machine, _) => format!("update on machine {machine}"),
         }
     }
 

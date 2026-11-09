@@ -378,7 +378,8 @@ impl Job {
 
     /// Whether only the feed showing it retires it, not a count of reads.
     fn waits_for_feed(&self) -> bool {
-        self.follow.is_some() || matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
+        self.follow.is_some()
+            || matches!(self.effect, Some(Effect::StartingOn(_) | Effect::Saving(_)))
     }
 
     /// The record it changes, by id.
@@ -865,7 +866,11 @@ impl Resolver {
     /// A followed change has ended. Done, it shows as any change answered yes does from now, until
     /// the feed has it; otherwise it goes, and its card is as the feed says. Whether it was shown.
     pub fn end_follow(&mut self, n: u64, done: bool) -> bool {
-        let Some(i) = self.jobs.iter().position(|j| j.n == n && j.follow.is_some()) else {
+        let Some(i) = self
+            .jobs
+            .iter()
+            .position(|j| j.n == n && j.follow.is_some())
+        else {
             return false;
         };
         if !done {

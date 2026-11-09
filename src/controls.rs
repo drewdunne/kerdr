@@ -1159,12 +1159,16 @@ impl App {
             let (title, message) = if action == "close" {
                 (
                     format!("Mark {reference} done?"),
-                    format!("Stops {stops} once its current turn ends, then closes {reference} as done. Its log says you closed it from Kerdr, and ⏎ on it later asks to reopen it."),
+                    format!(
+                        "Stops {stops} once its current turn ends, then closes {reference} as done. Its log says you closed it from Kerdr, and ⏎ on it later asks to reopen it."
+                    ),
                 )
             } else {
                 (
                     format!("Won't do {reference}?"),
-                    format!("Stops {stops} once its current turn ends, then sets {reference} aside in Won't do, off the board. Its record keeps where it was; u brings it back, and ⏎ then resumes its conversation."),
+                    format!(
+                        "Stops {stops} once its current turn ends, then sets {reference} aside in Won't do, off the board. Its record keeps where it was; u brings it back, and ⏎ then resumes its conversation."
+                    ),
                 )
             };
             self.mode = Mode::Confirm {
@@ -1233,7 +1237,10 @@ impl App {
             .map(|t| format!(" since {}", self.when(t.with_timezone(&chrono::Local))))
             .unwrap_or_default();
         Some((
-            format!("its {program}conversation running in {}{since}", outside.place()),
+            format!(
+                "its {program}conversation running in {}{since}",
+                outside.place()
+            ),
             outside.since.clone().unwrap_or_default(),
         ))
     }
@@ -1279,7 +1286,9 @@ impl App {
                 machine,
                 request,
                 title: format!("Cancel {reference}?"),
-                message: format!("Stops {stops} once its current turn ends, then sets {reference} aside in Won't do. Anything it hadn't committed stays as it left it. Its log says you cancelled it; u brings it back, and ⏎ then resumes its conversation in herdr."),
+                message: format!(
+                    "Stops {stops} once its current turn ends, then sets {reference} aside in Won't do. Anything it hadn't committed stays as it left it. Its log says you cancelled it; u brings it back, and ⏎ then resumes its conversation in herdr."
+                ),
                 back: Box::new(self.mode.clone()),
                 target: Some(Box::new(CardSnapshot::of(&card))),
                 queue: false,
@@ -2726,6 +2735,7 @@ impl App {
             .filter(|&m| self.machines.get(m).is_some_and(|m| m.conn.is_live()))
             .collect();
         machines.extend(self.follows_awaited_on());
+        machines.extend(self.accounts_awaited_on());
         machines.sort_unstable();
         machines.dedup();
         machines
@@ -2998,6 +3008,12 @@ impl App {
         }
         let from = self.action_from.take();
         let id = request["id"].as_str().map(str::to_string);
+        // A restore an account picked with s waited for: its start goes once the card's back.
+        if request["action"] == "restore"
+            && let Some(id) = id.as_deref()
+        {
+            self.restored(id, result.as_ref().is_ok_and(|r| r.ok));
+        }
         // Only this answer's own resend: another record's, still on its way, stays guarded.
         let was_resent = match self
             .resent
@@ -3064,14 +3080,25 @@ impl App {
                     }
                     // s's account goes on only to a backend that starts on one: an older one would
                     // start it on its owner's list without a word (intent 0580).
+                    // That one is brought up to date first, then started there (intent 0591).
                     if request.get("account").is_some()
                         && !self
                             .account_feed(to)
                             .is_some_and(|f| f.starts_on(request["action"].as_str().unwrap_or("")))
                     {
-                        self.fail(format!(
-                            "{reference} lives on {name} now, whose backend can't start work on a chosen account yet; nothing started. Update it, or ⏎ starts it on its owner's list there."
-                        ));
+                        let account = request["account"].as_str().unwrap_or("list").to_string();
+                        if self.owe_after_update(&id, to, &account) {
+                            self.say(
+                                format!(
+                                    "{reference} lives on {name} now, whose backend can't start work on a chosen account yet: Kerdr is bringing its ark-sdlc up to date, then starts {reference} there. Esc on the board drops it."
+                                ),
+                                Tone::Info,
+                            );
+                        } else {
+                            self.fail(format!(
+                                "{reference} lives on {name} now, whose backend can't start work on a chosen account yet, and it's gone from the board, so nothing started."
+                            ));
+                        }
                         return;
                     }
                     let mut request = request;

@@ -360,10 +360,16 @@ fn move_hint(app: &App, card: &Card) -> Option<String> {
             Some("move its agent to another account".into())
         }
         RunState::Running(agent) => Some(format!("move its agent off {}", agent.account)),
+        RunState::Stopped(start) if start.restore => Some("bring it back on an account".into()),
+        RunState::Stopped(start) if start.outside => {
+            Some("move it into herdr on an account".into())
+        }
         RunState::Stopped(start) if start.how == StartHow::Reopen => {
             Some("resume it on an account".into())
         }
         RunState::Stopped(_) => Some("start it on an account".into()),
+        // Its machine's accounts are on their way: s waits for them (intent 0591).
+        RunState::NoAccounts(_) => Some("start it on an account".into()),
         RunState::Unavailable(_) => None,
     }
 }

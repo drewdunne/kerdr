@@ -616,35 +616,131 @@ impl App {
         Some((message, choices))
     }
 
+    /// The feed's record of the agent at this card that matters: the one waiting for usage, else
+    /// the one in the card's own tab, else the first (friction F-0378: a workspace with Codex in
+    /// its first tab and Claude Code out of usage in its second is about the second).
     pub fn account_agent(&self, card: &Card) -> Option<&AccountAgent> {
         let feed = self.account_feed(card.machine_index)?;
         let session = card.session.as_deref()?;
-        card.agents
+        let records: Vec<(&AccountAgent, &str)> = card
+            .agents
             .iter()
-            .find_map(|a| feed.agent_on_pane(session, &a.pane_id, a.conversation.as_deref()))
+            .filter_map(|a| {
+                feed.agent_on_pane(session, &a.pane_id, a.conversation.as_deref())
+                    .map(|r| (r, a.pane_id.as_str()))
+            })
+            .collect();
+        let own = self.jump_tab(card).0;
+        let in_own = |pane: &str| own.is_some() && self.agent_tab(card, pane) == own;
+        records
+            .iter()
+            .find(|(r, _)| r.waiting_for_usage())
+            .or_else(|| records.iter().find(|(_, pane)| in_own(pane)))
+            .or_else(|| records.first())
+            .map(|(r, _)| *r)
     }
 
-    /// The agent s moves: the one the feed records on this card, or else the card's agent with
-    /// nothing recorded yet, of a program the machine's accounts run. The engine moves that by its
-    /// pane, takes its conversation from herdr and records it from then on; moving is how an
-    /// account gets set (intent 0264).
-    pub fn move_agent(&self, card: &Card) -> Option<AccountAgent> {
-        if let Some(agent) = self.account_agent(card) {
-            return Some(agent.clone());
-        }
-        self.account_feed(card.machine_index)?;
-        let session = card.session.clone()?;
+    /// The herdr tab a pane of this card's is in, from its machine's last read.
+    pub fn agent_tab(&self, card: &Card, pane: &str) -> Option<String> {
+        self.machines
+            .get(card.machine_index)?
+            .snapshot(card.session.as_deref()?)?
+            .agents
+            .iter()
+            .find(|a| a.pane_id == pane)
+            .and_then(|a| a.tab_id.clone())
+    }
+
+    /// The agents at this card s could move, each with the tab it's in: the feed's record of each
+    /// pane, or one with nothing recorded yet of a program the machine's accounts run. The engine
+    /// moves that by its pane, takes its conversation from herdr and records it from then on; moving
+    /// is how an account gets set (intent 0264).
+    fn movable_agents(&self, card: &Card) -> Vec<(AccountAgent, Option<String>)> {
+        let Some(feed) = self.account_feed(card.machine_index) else {
+            return Vec::new();
+        };
+        let Some(session) = card.session.clone() else {
+            return Vec::new();
+        };
         let programs = self.offered(card.machine_index).programs();
         card.agents
             .iter()
-            .find(|a| programs.contains(&a.agent) && !a.pane_id.is_empty())
-            .map(|a| AccountAgent {
-                pane: a.pane_id.clone(),
-                session,
-                conversation: a.conversation.clone().unwrap_or_default(),
-                program: a.agent.clone(),
-                ..AccountAgent::default()
+            .filter(|a| !a.pane_id.is_empty())
+            .filter_map(|a| {
+                let agent =
+                    match feed.agent_on_pane(&session, &a.pane_id, a.conversation.as_deref()) {
+                        Some(r) => r.clone(),
+                        None if programs.contains(&a.agent) => AccountAgent {
+                            pane: a.pane_id.clone(),
+                            session: session.clone(),
+                            conversation: a.conversation.clone().unwrap_or_default(),
+                            program: a.agent.clone(),
+                            ..AccountAgent::default()
+                        },
+                        None => return None,
+                    };
+                Some((agent, self.agent_tab(card, &a.pane_id)))
             })
+            .collect()
+    }
+
+    /// The agent s moves (friction F-0378): the one waiting for usage, else the one in the tab ⏎
+    /// lands on for this card, else the only one. Never the first of several in different tabs
+    /// when nothing says which: [`App::agent_unclear`] says why instead.
+    pub fn move_agent(&self, card: &Card) -> Option<AccountAgent> {
+        let agents = self.movable_agents(card);
+        let waiting: Vec<&(AccountAgent, Option<String>)> = agents
+            .iter()
+            .filter(|(a, _)| a.waiting_for_usage())
+            .collect();
+        let own = self.jump_tab(card).0;
+        let pick = |among: &[&(AccountAgent, Option<String>)]| -> Option<AccountAgent> {
+            if let [one] = among {
+                return Some(one.0.clone());
+            }
+            if let Some(own) = &own
+                && let Some(a) = among.iter().find(|(_, tab)| tab.as_ref() == Some(own))
+            {
+                return Some(a.0.clone());
+            }
+            // Several in one tab (or none known) are one place: the first, as herdr lists them.
+            let mut tabs: Vec<&Option<String>> = among.iter().map(|(_, t)| t).collect();
+            tabs.dedup();
+            (tabs.len() == 1)
+                .then(|| among.first().map(|a| a.0.clone()))
+                .flatten()
+        };
+        if !waiting.is_empty() {
+            return pick(&waiting);
+        }
+        let all: Vec<&(AccountAgent, Option<String>)> = agents.iter().collect();
+        pick(&all)
+    }
+
+    /// Why s doesn't move any of this card's agents when it has several it could, in different
+    /// tabs, and nothing says which is its own (friction F-0378): never a guess.
+    pub(super) fn agent_unclear(&self, card: &Card) -> Option<String> {
+        let agents = self.movable_agents(card);
+        if agents.len() < 2 || self.move_agent(card).is_some() {
+            return None;
+        }
+        let named: Vec<String> = agents
+            .iter()
+            .map(|(a, tab)| {
+                let program = self
+                    .agent_program(card.machine_index, a)
+                    .unwrap_or_else(|| "an agent".into());
+                match tab.as_deref().and_then(|t| t.rsplit_once(":t")) {
+                    Some((_, n)) => format!("{program} in tab {n}"),
+                    None => program,
+                }
+            })
+            .collect();
+        Some(format!(
+            "{}'s workspace runs {}, and nothing says which is its own, so s doesn't guess which to move: ⏎ goes in, where you can see which one needs it.",
+            card.reference,
+            named.join(" and ")
+        ))
     }
 
     /// The program an agent runs, in words: what the feed records, else herdr's name for it.
@@ -2741,7 +2837,8 @@ mod tests {
         assert!(matches!(a.mode, Mode::Board));
         // The programs come from the feed's providers, in its words.
         let said = a.message().unwrap().0;
-        assert!(said.contains("(Claude Code, Codex)"), "{said}");
+        assert!(said.contains("(they run Claude Code, Codex)"), "{said}");
+        assert!(said.contains("second copy"), "{said}");
     }
 
     #[test]
@@ -3220,6 +3317,101 @@ mod tests {
         let card = a.selected().unwrap();
         assert!(card.agents.iter().all(|g| g.conversation.is_none()));
         assert_eq!(a.account_agent(card).unwrap().account, "OLD_C");
+    }
+    /// #44's workspace with Codex in its first tab and Claude Code in its second, the second out
+    /// of usage or not (friction F-0378).
+    fn two_tabs(a: &mut App, second_waiting: bool) -> String {
+        pick(a);
+        let key = a.sel.key.clone().unwrap();
+        let snap = a.machines[1]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut("api")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        for g in snap.agents.iter_mut().filter(|g| g.pane_id == "w1:p1") {
+            g.tab_id = Some("w1:t1".into());
+            g.agent = Some("codex".into());
+        }
+        let mut second = snap
+            .agents
+            .iter()
+            .find(|g| g.pane_id == "w1:p1")
+            .unwrap()
+            .clone();
+        second.pane_id = "w1:p9".into();
+        second.tab_id = Some("w1:t2".into());
+        second.agent = Some("claude".into());
+        snap.agents.push(second);
+        let feed = a.machines[1].feed.as_mut().unwrap();
+        for r in feed
+            .agents
+            .iter_mut()
+            .filter(|r| r.session == "api" && r.pane == "w1:p1")
+        {
+            r.waiting = None;
+            r.program = "codex".into();
+            r.account = "KBZ_X".into();
+        }
+        let mut claude = feed
+            .agents
+            .iter()
+            .find(|r| r.session == "api" && r.pane == "w1:p1")
+            .unwrap()
+            .clone();
+        claude.pane = "w1:p9".into();
+        claude.conversation = "c-claude".into();
+        claude.program = "claude".into();
+        claude.account = "KBZ_C".into();
+        claude.handed_from = None;
+        claude.waiting = second_waiting.then(|| crate::accounts::Waiting {
+            why: "usage".into(),
+            until: None,
+        });
+        feed.agents.push(claude);
+        a.rebuild();
+        assert_eq!(a.card(&key).unwrap().agents.len(), 2, "both tabs' agents");
+        key
+    }
+    #[test]
+    fn s_moves_the_agent_out_of_usage_not_the_first_tabs() {
+        let mut a = app();
+        let k = two_tabs(&mut a, true);
+        let card = a.card(&k).unwrap();
+        assert_eq!(a.account_agent(card).unwrap().pane, "w1:p9");
+        press(&mut a, 's');
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["action"], "account-move");
+        assert_eq!(r["pane"], "w1:p9");
+        assert_eq!(r["conversation"], "c-claude");
+    }
+    #[test]
+    fn s_moves_the_agent_of_the_cards_own_tab() {
+        let mut a = app();
+        let k = two_tabs(&mut a, false);
+        for c in a.board.cards.iter_mut().filter(|c| c.key == k) {
+            c.own_tab = Some("w1:t2".into());
+        }
+        let card = a.card(&k).unwrap();
+        assert_eq!(a.move_agent(card).unwrap().pane, "w1:p9");
+    }
+    #[test]
+    fn s_never_guesses_among_agents_in_different_tabs() {
+        let mut a = app();
+        let k = two_tabs(&mut a, false);
+        let card = a.card(&k).unwrap();
+        assert!(a.move_agent(card).is_none());
+        press(&mut a, 's');
+        assert!(matches!(a.mode, Mode::Board));
+        let said = a.message().unwrap().0;
+        assert!(
+            said.contains("Codex in tab 1 and Claude Code in tab 2"),
+            "{said}"
+        );
+        assert!(said.contains("doesn't guess"), "{said}");
     }
     #[test]
     fn s_moves_the_agent_really_in_the_pane() {

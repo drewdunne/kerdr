@@ -122,7 +122,7 @@ fn step_word(what: &str, request: &Value) -> &'static str {
 /// Minutes in words, for a limit: "five minutes", "a minute", "90 seconds".
 fn how_long(d: Duration) -> String {
     let secs = d.as_secs();
-    if secs < 60 || secs % 60 != 0 {
+    if secs < 60 || !secs.is_multiple_of(60) {
         return format!("{secs} seconds");
     }
     match secs / 60 {
@@ -465,7 +465,9 @@ impl App {
                 format!("{doing} ({secs} s so far).")
             }
         } else {
-            format!("{doing} ({secs} s so far), so nothing else changes {reference} until it's done.")
+            format!(
+                "{doing} ({secs} s so far), so nothing else changes {reference} until it's done."
+            )
         };
         let goes_in = action == "enter" && (f.enter || f.request["action"] == "dispatch");
         self.say(text, Tone::Info);
@@ -665,7 +667,11 @@ mod tests {
             &mut app,
             machine,
             &request,
-            follow_reply(&id, "recover", "Bringing web back on its machine, then the work…"),
+            follow_reply(
+                &id,
+                "recover",
+                "Bringing web back on its machine, then the work…",
+            ),
         );
         // Its words, not the message meant for a Kerdr that doesn't follow.
         assert_eq!(
@@ -701,9 +707,16 @@ mod tests {
                    "id": id, "session": "web", "workspace": "w7", "label": "41-checkout"})
         ));
         assert!(app.follows.is_empty());
-        let open = app.open_after.clone().expect("it goes in, as on a reopen's answer");
+        let open = app
+            .open_after
+            .clone()
+            .expect("it goes in, as on a reopen's answer");
         assert_eq!(
-            (open.session.as_str(), open.workspace.as_str(), open.from.as_str()),
+            (
+                open.session.as_str(),
+                open.workspace.as_str(),
+                open.from.as_str()
+            ),
             ("web", "w7", key.as_str())
         );
         assert!(!app.failing());
@@ -731,8 +744,14 @@ mod tests {
         app.resolver.end_follow(n, false);
         assert_eq!(key_enter(&mut app), Action::None);
         let said = app.message().unwrap().0.to_string();
-        assert!(said.starts_with("Starting web on this machine, then the work ("), "{said}");
-        assert!(said.ends_with("Kerdr goes in when it's open; Esc stops waiting."), "{said}");
+        assert!(
+            said.starts_with("Starting web on this machine, then the work ("),
+            "{said}"
+        );
+        assert!(
+            said.ends_with("Kerdr goes in when it's open; Esc stops waiting."),
+            "{said}"
+        );
         assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
         // d, x and the rest wait for it too.
         assert_eq!(press(&mut app, 'x'), Action::None);
@@ -798,7 +817,12 @@ mod tests {
         let (key, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "recover", "Bringing web back…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back…"),
+        );
         poll(&mut app);
         progress(
             &mut app,
@@ -810,11 +834,16 @@ mod tests {
         let reference = app.card(&key).unwrap().reference.clone();
         assert_eq!(
             said,
-            format!("{reference} didn't reopen: herdr session web wouldn't start (its socket folder is full).")
+            format!(
+                "{reference} didn't reopen: herdr session web wouldn't start (its socket folder is full)."
+            )
         );
         assert_eq!(app.open_after, None);
         assert!(app.enter_when_open.is_none());
-        assert_ne!(status_shown(&app, &key).as_deref(), Some("Bringing web back…"));
+        assert_ne!(
+            status_shown(&app, &key).as_deref(),
+            Some("Bringing web back…")
+        );
     }
 
     #[test]
@@ -823,7 +852,12 @@ mod tests {
         let (key, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "move-in", "Moving it into herdr…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "move-in", "Moving it into herdr…"),
+        );
         poll(&mut app);
         progress(
             &mut app,
@@ -834,7 +868,9 @@ mod tests {
         let (said, tone) = app.message().unwrap();
         assert_eq!(tone, Tone::Warn);
         assert!(
-            said.starts_with(&format!("Kerdr lost track of {reference}'s move into herdr:")),
+            said.starts_with(&format!(
+                "Kerdr lost track of {reference}'s move into herdr:"
+            )),
             "{said}"
         );
         assert!(app.follows.is_empty());
@@ -846,9 +882,15 @@ mod tests {
         let (key, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web, then the work…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web, then the work…"),
+        );
         // Answers with no end, and its time is up.
-        app.follows[0].began = Instant::now() - Duration::from_secs(300) - MARGIN - Duration::from_secs(1);
+        app.follows[0].began =
+            Instant::now() - Duration::from_secs(300) - MARGIN - Duration::from_secs(1);
         poll(&mut app);
         assert!(progress(
             &mut app,
@@ -859,7 +901,10 @@ mod tests {
         assert_eq!(tone, Tone::Warn, "a warning, never a failure");
         assert!(!app.failing());
         assert!(said.contains("It may still be going on"), "{said}");
-        assert!(said.contains(&format!("{reference}'s card shows how it ends")), "{said}");
+        assert!(
+            said.contains(&format!("{reference}'s card shows how it ends")),
+            "{said}"
+        );
         assert!(app.follows.is_empty());
         assert!(app.enter_when_open.is_none());
     }
@@ -870,14 +915,24 @@ mod tests {
         let (_, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web…"),
+        );
         for n in 1..=POLL_SLOW_AFTER {
             poll(&mut app);
             assert!(!app.progress_answered(TOKEN, Err("ssh: connection reset".into())));
             assert_eq!(app.follows[0].misses, n);
         }
-        let wait = app.follows[0].next.saturating_duration_since(Instant::now());
-        assert!(wait > POLL_EVERY, "asked less often after {POLL_SLOW_AFTER} misses: {wait:?}");
+        let wait = app.follows[0]
+            .next
+            .saturating_duration_since(Instant::now());
+        assert!(
+            wait > POLL_EVERY,
+            "asked less often after {POLL_SLOW_AFTER} misses: {wait:?}"
+        );
         // Its machine stops answering altogether, and its time runs out: given up, as a warning.
         app.machines[machine].conn = Conn::Reconnecting {
             since: Local::now(),
@@ -898,7 +953,12 @@ mod tests {
         let (_, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "recover", "Bringing web back…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back…"),
+        );
         key(&mut app, KeyCode::Esc);
         assert!(app.message().unwrap().0.starts_with("Stopped waiting"));
         poll(&mut app);
@@ -917,7 +977,12 @@ mod tests {
         let (key, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "move-in", "Moving it into herdr…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "move-in", "Moving it into herdr…"),
+        );
         app.went_into(&key);
         poll(&mut app);
         progress(
@@ -933,8 +998,17 @@ mod tests {
         let (key, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "move-in", "Moving it into herdr…"));
-        assert_eq!(app.enter_when_open_due(), None, "nothing open yet: still waiting");
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "move-in", "Moving it into herdr…"),
+        );
+        assert_eq!(
+            app.enter_when_open_due(),
+            None,
+            "nothing open yet: still waiting"
+        );
         assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
         // The feed shows its workspace.
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
@@ -965,9 +1039,18 @@ mod tests {
                 col: app.board.cards[i].stage.index(),
                 key: Some(key.clone()),
             };
-            let action = if by_enter { key_enter(&mut app) } else { press(&mut app, 'd') };
+            let action = if by_enter {
+                key_enter(&mut app)
+            } else {
+                press(&mut app, 'd')
+            };
             let (machine, request) = sent(&mut app, action);
-            answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web, then the work…"));
+            answer(
+                &mut app,
+                machine,
+                &request,
+                follow_reply(&id, "start", "Starting web, then the work…"),
+            );
             poll(&mut app);
             progress(
                 &mut app,
@@ -977,8 +1060,14 @@ mod tests {
             if by_enter {
                 assert!(app.open_after.is_some(), "⏎ goes in");
             } else {
-                assert_eq!(app.open_after, None, "d starts it and leaves you where you are");
-                assert_eq!(app.message().unwrap().0, "Started in web. ⏎ on its card goes in.");
+                assert_eq!(
+                    app.open_after, None,
+                    "d starts it and leaves you where you are"
+                );
+                assert_eq!(
+                    app.message().unwrap().0,
+                    "Started in web. ⏎ on its card goes in."
+                );
             }
         }
     }
@@ -989,9 +1078,17 @@ mod tests {
         let (_, id) = closed_card(&mut app);
         let enter = key_enter(&mut app);
         let (machine, request) = sent(&mut app, enter);
-        answer(&mut app, machine, &request, follow_reply(&id, "start", "Starting web, then the work…"));
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "start", "Starting web, then the work…"),
+        );
         let said = app.still_running().unwrap();
-        assert!(said.contains("carries on there after Kerdr quits"), "{said}");
+        assert!(
+            said.contains("carries on there after Kerdr quits"),
+            "{said}"
+        );
         assert!(said.contains("Starting web, then the work"), "{said}");
     }
 

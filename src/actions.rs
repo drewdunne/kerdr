@@ -521,10 +521,18 @@ mod tests {
     fn a_progress_answer_may_leave_out_message_and_only_known_states_are_read() {
         let request = progress_request("f-0123456789abcdef0123");
         assert_eq!(deadline_for(&request), Duration::from_secs(20));
-        let r = answered(&request, r#"{"ok":true,"state":"running","say":"Waiting for ARK's restore…"}"#).unwrap();
+        let r = answered(
+            &request,
+            r#"{"ok":true,"state":"running","say":"Waiting for ARK's restore…"}"#,
+        )
+        .unwrap();
         assert_eq!(r.state.as_deref(), Some("running"));
         assert_eq!(r.say.as_deref(), Some("Waiting for ARK's restore…"));
-        let r = answered(&request, r#"{"state":"done","message":"Reopened.","workspace":"w4","session":"ARK"}"#).unwrap();
+        let r = answered(
+            &request,
+            r#"{"state":"done","message":"Reopened.","workspace":"w4","session":"ARK"}"#,
+        )
+        .unwrap();
         assert!(r.ok, "a done answer without ok is a success");
         assert_eq!(r.workspace.as_deref(), Some("w4"));
         let r = answered(&request, r#"{"ok":false,"state":"exploded","message":"?"}"#).unwrap();
