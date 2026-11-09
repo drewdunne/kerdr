@@ -524,6 +524,22 @@ impl App {
             .unwrap_or(0)
     }
 
+    /// What a card says of whose it is, on the owner split: its owner's code on all of Kerdr,
+    /// where the board mixes owners, and its team on an owner's All tab, where it mixes teams.
+    pub fn whose_tag(&self, card: &Card) -> Option<String> {
+        if !self.owner_split() || card.stage == Stage::Misc && card.owner == UNOWNED {
+            return None;
+        }
+        match self.scope() {
+            Scope::All => Some(self.owner_short(&card.owner)),
+            Scope::Owner(o) if o != UNOWNED => {
+                let t = card.team.as_deref()?;
+                Some(self.team_name(o, Some(t)))
+            }
+            _ => None,
+        }
+    }
+
     /// A card's lifecycle rail: Backlog, its list's stages (its own too, when the list lacks it),
     /// Done.
     pub fn rail(&self, card: &Card) -> Vec<Stage> {

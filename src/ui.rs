@@ -1406,11 +1406,45 @@ fn columns(f: &mut Frame, rect: Rect, app: &App) {
     };
     let banded = layout.banded();
     let folded = layout.bands.iter().filter(|b| b.folded).count() as u16;
-    let open = layout.bands.iter().filter(|b| !b.folded).count() as u16;
     let room = rect.height.saturating_sub(folded);
+    // Each open band asks for what its fullest column needs; when they don't all fit, each gets
+    // its share of the room, never less than a few cards' worth.
+    let wants: Vec<u16> = layout
+        .bands
+        .iter()
+        .map(|b| {
+            if b.folded {
+                return 1;
+            }
+            let most = band_cols(b).iter().map(|&c| cols[c].len()).max().unwrap_or(0) as u16;
+            u16::from(banded) + 2 + most.max(1) * 5 + 1
+        })
+        .collect();
+    let open_want: u16 = layout
+        .bands
+        .iter()
+        .zip(&wants)
+        .filter(|(b, _)| !b.folded)
+        .map(|(_, w)| *w)
+        .sum();
+    let heights: Vec<u16> = layout
+        .bands
+        .iter()
+        .zip(&wants)
+        .map(|(b, &w)| {
+            if b.folded {
+                1
+            } else if open_want <= room {
+                w
+            } else {
+                (u32::from(room) * u32::from(w) / u32::from(open_want.max(1))) as u16
+            }
+            .max(if b.folded { 1 } else { crate::stages::BAND_ROWS.min(room) })
+        })
+        .collect();
+    let last_open = layout.bands.iter().rposition(|b| !b.folded);
     let mut y = rect.y;
-    let mut left_open = open;
-    for band in &layout.bands {
+    for (bi, band) in layout.bands.iter().enumerate() {
         if y >= rect.bottom() {
             break;
         }
@@ -1425,13 +1459,19 @@ fn columns(f: &mut Frame, rect: Rect, app: &App) {
             y += 1;
             continue;
         }
-        // The last open band takes what's left over.
-        let h = if left_open <= 1 {
-            rect.bottom().saturating_sub(y)
+        // The last open band takes what's left over, less the folded bands below it.
+        let below = layout.bands[bi + 1..].iter().filter(|b| b.folded).count() as u16;
+        let open_below = layout.bands[bi + 1..].iter().filter(|b| !b.folded).count() as u16;
+        let h = if Some(bi) == last_open {
+            rect.bottom().saturating_sub(y + below)
         } else {
-            room / open.max(1)
+            // Leave the open bands below room for a card each.
+            heights[bi].min(
+                rect.bottom()
+                    .saturating_sub(y + below + open_below * crate::stages::BAND_ROWS),
+            )
+            .max(crate::stages::BAND_ROWS.min(rect.bottom().saturating_sub(y)))
         };
-        left_open = left_open.saturating_sub(1);
         let mut top = y;
         if banded {
             band_title(f.buffer_mut(), line, band, false);
@@ -1563,6 +1603,10 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
             mcolor = CYAN;
         }
         let marker = if holds.count > 0 { "▸" } else { "" };
+        let tag = app
+            .whose_tag(c)
+            .map(|t| format!(" {t}"))
+            .unwrap_or_default();
         let is_sel = Some(c.key.as_str()) == selected;
         let text_style = if is_sel {
             bold(FG)
@@ -1595,6 +1639,7 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
                 Span::styled(format!("{glyph} "), fg(gcolor)),
                 Span::styled(c.reference.clone(), text_style),
                 Span::styled(marker, fg(CYAN)),
+                Span::styled(tag, fg(CYAN)),
                 Span::styled(format!(" {}", c.title), text_style),
             ],
             vec![Span::styled(meta, fg(mcolor))],
@@ -1722,6 +1767,9 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         c.reference.clone(),
         bold(if cached { FG2 } else { FG }),
     )];
+    if let Some(tag) = app.whose_tag(c) {
+        head.push(Span::styled(format!(" {tag}"), fg(CYAN)));
+    }
     if c.priority == Priority::High {
         head.push(Span::styled(" ▲", fg(YELLOW)));
     }

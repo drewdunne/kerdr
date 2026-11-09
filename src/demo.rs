@@ -505,9 +505,51 @@ pub fn machines(away: bool) -> Vec<MachineState> {
             ws: None,
         }),
     ];
+    // Shop's marketing team works in stages of its own (intent 0595).
+    for (id, title, stage, attention) in [
+        ("54", "Spring sale email to past buyers", "execute", "running"),
+        ("55", "Landing page headline test", "test", "needs_you"),
+        ("56", "What the October newsletter taught us", "learn", "waiting"),
+    ] {
+        let mut c = card(C {
+            id,
+            title,
+            stage,
+            state: "active",
+            attention: Some(attention),
+            status: Some(if attention == "needs_you" {
+                "Waiting on you"
+            } else {
+                "Under way"
+            }),
+            session: "web",
+            machine: "laptop",
+            ws: None,
+        });
+        c.team = Some("marketing".into());
+        c.stage_list = Some("shop/marketing".into());
+        if id == "55" {
+            c.needs = Some("Pick the headline that won: both are in the report.".into());
+        }
+        cards.push(c);
+    }
     for c in cards.iter_mut() {
         c.reference = Some(format!("#{}", c.id));
         c.updated = Some(at(17, 11));
+        // Whose work it is: the shop's web app and the platform's API are tenants' work; the
+        // backups are the studio's own (intent 0595).
+        let session = c.home.as_ref().and_then(|h| h.session.clone()).unwrap_or_default();
+        c.organization = Some("studio".into());
+        match (c.id.as_str(), session.as_str()) {
+            ("38", _) => {}
+            (_, "web") => {
+                c.tenant = Some("shop".into());
+                if c.team.is_none() && !matches!(c.id.as_str(), "51" | "52") {
+                    c.team = Some("dev".into());
+                }
+            }
+            _ => c.tenant = Some("platform".into()),
+        }
         match c.id.as_str() {
             "41" => {
                 c.updated = Some(at(17, 11));
@@ -684,10 +726,20 @@ pub fn machines(away: bool) -> Vec<MachineState> {
              "usage":{"week":7,"week_at":"2026-10-28T01:48:00-05:00","seen":"2026-10-21T17:44:00-05:00"}}
         ])).unwrap();
         f.owners=serde_json::from_value(serde_json::json!([
-            {"id":"studio","kind":"organization","name":"Example Studio","code":"ARK","models":["ARK_C","KBZ_C","KBZ_X"],"own":true,"sessions":["default"]},
-            {"id":"shop","kind":"tenant","name":"Shop","code":"SHP","parent":"studio","models":["ARK_C","KBZ_C","KBZ_X"],"own":false,"sessions":["web","shop-bg"]},
-            {"id":"platform","kind":"tenant","name":"Platform","code":"PLT","parent":"studio","models":["KBZ_C","ARK_C"],"own":true,"sessions":["api","background"]}
+            {"id":"studio","kind":"organization","name":"Example Studio","code":"ARK","models":["ARK_C","KBZ_C","KBZ_X"],"own":true,"sessions":["default"],"agent_machine":"build-box"},
+            {"id":"shop","kind":"tenant","name":"Shop","code":"SHP","parent":"studio","models":["ARK_C","KBZ_C","KBZ_X"],"own":false,"sessions":["web","shop-bg"],"agent_machine":"laptop",
+             "teams":[{"id":"dev","name":"Dev","stages":"standard"},{"id":"marketing","name":"Marketing","stages":"shop/marketing"}]},
+            {"id":"platform","kind":"tenant","name":"Platform","code":"PLT","parent":"studio","models":["KBZ_C","ARK_C"],"own":true,"sessions":["api","background"],"agent_machine":"build-box"}
         ])).unwrap();
+        f.stage_lists = serde_json::from_value(serde_json::json!([
+            {"id":"standard","name":"Standard","owner":null,"rev":1,"stages":[
+                {"id":"plan","name":"Plan"},{"id":"design","name":"Design"},{"id":"build","name":"Build"},
+                {"id":"test","name":"Test"},{"id":"deploy","name":"Deploy"}]},
+            {"id":"shop/marketing","name":"Marketing","owner":"shop","rev":1,"stages":[
+                {"id":"plan","name":"Plan"},{"id":"test","name":"Test"},{"id":"execute","name":"Execute"},
+                {"id":"learn","name":"Learn"}]}
+        ])).unwrap();
+        f.create_fields = vec!["organization".into(), "tenant".into(), "project".into(), "team".into()];
         f.owners_source = Some("mock".into());
         f.machine_owner = Some("studio".into());
         f.starts_on = vec!["dispatch".into(), "reopen".into()];
