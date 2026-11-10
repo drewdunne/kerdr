@@ -562,12 +562,8 @@ impl App {
         answered: usize,
     ) -> Action {
         let id = form.request["id"].as_str().unwrap_or_default().to_string();
-        let card = self
-            .board
-            .cards
-            .iter()
-            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-            .cloned();
+        // Its own card, never another source's with the same number (Codex's review).
+        let card = self.intent_card(form.machine, &id, from.as_ref()).cloned();
         let Some(card) = card else {
             self.say(
                 format!(

@@ -2096,26 +2096,36 @@ impl App {
             "{} Send your new intent's words as they are, without it? n keeps them unsent, and {back}",
             said.join(" ")
         );
-        let machine = draft.machine;
-        self.send_without = Some(draft);
-        // He's typing other words, or answering something else: never asked over that, where a
-        // y or ⏎ meant for it would send these. Asked once he's back on the board (Codex's review).
+        self.send_without_count += 1;
+        let n = self.send_without_count;
+        self.send_without.push(crate::app::SendWithout {
+            n,
+            machine: draft.machine,
+            draft,
+            message,
+        });
+        // He's typing other words, or answering something else (another of these, say): never
+        // asked over that, where a y or ⏎ meant for it would send these. Asked once he's back on
+        // the board (Codex's review).
         if !self.enter_can_land_here() {
-            self.send_without_held = Some((machine, message));
             self.say(
                 "Your new intent's image didn't go in, so its words weren't sent; Kerdr asks about them once you're back on the board.",
                 Tone::Info,
             );
             return;
         }
-        self.ask_send_without_now(machine, message);
+        self.ask_send_without_now(n);
     }
 
-    /// The question itself, over the board.
-    pub(super) fn ask_send_without_now(&mut self, machine: usize, message: String) {
+    /// The question about these words, over the board: its answer is for them alone.
+    pub(super) fn ask_send_without_now(&mut self, n: u64) {
+        let Some(w) = self.send_without.iter().find(|w| w.n == n) else {
+            return;
+        };
+        let (machine, message) = (w.machine, w.message.clone());
         self.mode = Mode::Confirm {
             machine,
-            request: json!({ "action": crate::app::SEND_WITHOUT }),
+            request: json!({ "action": crate::app::SEND_WITHOUT, "n": n }),
             title: "Send without the image?".into(),
             message,
             back: Box::new(self.mode.clone()),
@@ -2128,12 +2138,13 @@ impl App {
         };
     }
 
-    /// The yes to ask_send_without: the words go, taken back from where they were kept, as long as
-    /// they're there unchanged.
-    fn send_without(&mut self) -> Action {
-        let Some(draft) = self.send_without.take() else {
+    /// The yes to ask_send_without: the words it asked about go, taken back from where they were
+    /// kept, as long as they're there unchanged.
+    fn send_without(&mut self, n: u64) -> Action {
+        let Some(at) = self.send_without.iter().position(|w| w.n == n) else {
             return Action::None;
         };
+        let draft = self.send_without.remove(at).draft;
         let kept = if self.draft == draft.words && self.draft_images == draft.images {
             self.draft.clear();
             self.draft_images.clear();
@@ -2250,10 +2261,11 @@ impl App {
                 }
                 // Kerdr's own question about words whose image didn't go in (K1-37).
                 if request["action"] == crate::app::SEND_WITHOUT {
+                    let n = request["n"].as_u64().unwrap_or_default();
                     match key.code {
                         KeyCode::Esc | KeyCode::Char('n' | 'q') => {
                             self.mode = *back;
-                            self.send_without = None;
+                            self.send_without.retain(|w| w.n != n);
                             self.say(
                                 "Your new intent's words are kept, unsent: c brings them back.",
                                 Tone::Info,
@@ -2261,7 +2273,7 @@ impl App {
                         }
                         KeyCode::Enter | KeyCode::Char('y') if !early => {
                             self.mode = *back;
-                            return Some(self.send_without());
+                            return Some(self.send_without(n));
                         }
                         _ => {}
                     }
@@ -3543,7 +3555,7 @@ impl App {
                             .is_some_and(|f| f.starts_on(request["action"].as_str().unwrap_or("")))
                     {
                         let account = request["account"].as_str().unwrap_or("list").to_string();
-                        if self.owe_after_update(&id, to, &account) {
+                        if self.owe_after_update(&id, machine, from.as_ref(), to, &account) {
                             self.say(
                                 format!(
                                     "{reference} lives on {name} now, whose backend can't start work on a chosen account yet: Kerdr is bringing its ark-sdlc up to date, then starts {reference} there. Esc on the board drops it."

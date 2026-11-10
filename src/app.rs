@@ -433,6 +433,16 @@ fn holds_peek(mode: &Mode) -> bool {
 /// The action of Kerdr's own question whether a new intent's words go without the image that
 /// didn't go in: never sent to a backend.
 pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
+
+/// Words whose image didn't go in, and the question about them: its number goes in the question's
+/// request, so its answer finds these words and no others (Codex's review).
+#[derive(Clone, Debug)]
+pub(crate) struct SendWithout {
+    pub n: u64,
+    pub machine: usize,
+    pub draft: Draft,
+    pub message: String,
+}
 /// Kerdr's own question after a saved list leaves running agents on other accounts: its yes
 /// moves them to the list, one at a time (intent 0591, B3-42).
 pub(crate) const MOVE_OFF_LIST: &str = "kerdr:move-off-list";
@@ -615,12 +625,14 @@ pub struct App {
     /// A new intent Enter sent while its image was still being read: the read's number and its
     /// words, sent once the image is in (intent 0445).
     pub send_after_load: Option<(u64, Draft)>,
-    /// A new intent whose image didn't go in, while Kerdr asks whether its words go without it
-    /// (intent 0591, K1-37). Its words are kept meanwhile where give_back put them.
-    pub(crate) send_without: Option<Draft>,
-    /// That question, held while he typed or answered something else: its machine and words,
-    /// asked once he's back on the board (Codex's review).
-    pub(crate) send_without_held: Option<(usize, String)>,
+    /// New intents whose image didn't go in, while Kerdr asks whether their words go without it
+    /// (intent 0591, K1-37), oldest first. Their words are kept meanwhile where give_back put
+    /// them. Each question is bound to its own words, so answering one never sends another's;
+    /// one that came while he typed or answered something else is asked once he's back on the
+    /// board (Codex's review).
+    pub(crate) send_without: Vec<SendWithout>,
+    /// The number the last of those got.
+    pub(crate) send_without_count: u64,
     /// How far the question box on screen is scrolled (Codex's review).
     pub question_view: QuestionView,
     /// The answer being handled is for a start or reopen whose workspace Andrew already went
@@ -741,6 +753,9 @@ pub struct App {
     /// The agents a saved list left on other accounts, moved to the list one at a time once he
     /// said yes (intent 0591, B3-42).
     pub off_list_moves: Option<account_controls::OffListMoves>,
+    /// What each account question needs beyond its words: the agent or card it came from, and
+    /// what follows once it's settled (Codex's review).
+    pub asked_about: Vec<account_controls::AskedAbout>,
     /// The number of the last request asking an old backend to update, so each answer finds the
     /// waits it was asked for.
     pub update_asks: u64,
@@ -794,8 +809,8 @@ impl App {
             submissions: vec![],
             returned: Default::default(),
             send_after_load: None,
-            send_without: None,
-            send_without_held: None,
+            send_without: Vec::new(),
+            send_without_count: 0,
             question_view: QuestionView::default(),
             answer_went_in: false,
             backlog_focus: None,
@@ -849,6 +864,7 @@ impl App {
             held_move_question: None,
             after_signin: None,
             off_list_moves: None,
+            asked_about: Vec::new(),
             update_asks: 0,
             follow_end: None,
             enter_sent: None,
@@ -1588,23 +1604,19 @@ impl App {
             self.action_from = from;
             return Action::Mutate { machine, request };
         }
-        // Words whose image didn't go in, asked about once he's back where no typing is taken.
-        if self.enter_can_land_here()
-            && let Some((machine, message)) = self.send_without_held.take()
-        {
-            // Only while they're still kept unsent: sent or thrown away meanwhile, there's no
-            // question left.
-            let kept = self.send_without.as_ref().is_some_and(|d| {
-                (self.draft == d.words && self.draft_images == d.images)
-                    || self
-                        .returned
+        // Words whose image didn't go in, asked about once he's back where no typing is taken:
+        // the oldest first, each on its own. Only while they're still kept unsent: sent or thrown
+        // away meanwhile, there's no question left.
+        if self.enter_can_land_here() && !self.send_without.is_empty() {
+            let (draft, draft_images, returned) = (&self.draft, &self.draft_images, &self.returned);
+            self.send_without.retain(|w| {
+                (*draft == w.draft.words && *draft_images == w.draft.images)
+                    || returned
                         .iter()
-                        .any(|r| r.words == d.words && r.images == d.images)
+                        .any(|r| r.words == w.draft.words && r.images == w.draft.images)
             });
-            if kept {
-                self.ask_send_without_now(machine, message);
-            } else {
-                self.send_without = None;
+            if let Some(n) = self.send_without.first().map(|w| w.n) {
+                self.ask_send_without_now(n);
             }
             return Action::None;
         }
@@ -4507,6 +4519,97 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_yes_to_a_question_whose_card_left_the_board_never_acts_on_another_sources_card() {
+        // Codex's review: the question was about source-a's #N; it left the board while he
+        // decided, and another source's card has the same number. Nothing is started, moved or
+        // selected for it.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let card = app.card(&key).unwrap().clone();
+        let mut asked_about = crate::model::CardSnapshot::of(&card);
+        asked_about.key = format!("source-a:{id}");
+        app.sel.key = None;
+        for request in [
+            serde_json::json!({"action":"dispatch","id":id,"account":"ARK_C","confirm":"t-1"}),
+            serde_json::json!({"action":"reopen","id":id,"confirm":"t-1"}),
+            serde_json::json!({"action":"close","id":id,"confirm":"t-1"}),
+        ] {
+            let action = app.ask_again(
+                card.machine_index,
+                request.clone(),
+                Some(asked_about.clone()),
+            );
+            assert_eq!(action, Action::None, "{request}");
+            assert!(matches!(app.mode, Mode::Board), "{request}: {:?}", app.mode);
+            assert_eq!(app.sel.key, None, "{request}");
+            let (said, tone) = app.message().unwrap();
+            assert!(said.contains("is gone from the board"), "{said}");
+            assert_eq!(tone, Tone::Warn);
+        }
+    }
+
+    #[test]
+    fn each_image_question_sends_its_own_words_never_a_later_one_s() {
+        // Codex's review: A's question is held while he types B; B goes with its image still
+        // being read, and A's question opens. B's image fails then: its question waits, the yes
+        // to A sends A's words, and B is asked next, its yes sending B's.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        use crate::images::Source;
+        let none = || crate::images::Loading {
+            images: vec![],
+            why: Some("The clipboard holds no image.".into()),
+        };
+        let type_in = |app: &mut App, words: &str| {
+            press(app, 'c');
+            for c in words.chars() {
+                press(app, c);
+            }
+        };
+        type_in(&mut app, "Words A");
+        let (a, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_in(&mut app, "Words B");
+        assert_eq!(app.images_loaded(a, none()), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Compose { .. }),
+            "asked over typing"
+        );
+        let (b, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.next_owed(), Action::None);
+        let Mode::Confirm {
+            request: asked_a, ..
+        } = app.mode.clone()
+        else {
+            panic!("A not asked: {:?}", app.mode)
+        };
+        assert_eq!(app.images_loaded(b, none()), Action::None);
+        assert!(
+            matches!(&app.mode, Mode::Confirm { request, .. } if *request == asked_a),
+            "B's question took A's place: {:?}",
+            app.mode
+        );
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("A's yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["words"], "Words A");
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "B not asked");
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("B's yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["words"], "Words B");
+    }
+
+    #[test]
     fn a_closed_workspace_on_work_with_a_conversation_on_record_reopens_it() {
         // Intent 0591, K3-02: neither under way nor done (shelved), but its conversation is on
         // record: reopened as for work under way, never "has closed since the board last read it".
@@ -4985,7 +5088,7 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Backlog { .. }), "{:?}", app.mode);
         assert!(app.message().unwrap().0.contains("kept, unsent"));
         assert_eq!(app.draft, "Again");
-        assert!(app.send_without.is_none());
+        assert!(app.send_without.is_empty());
     }
 
     /// Lets the question on screen take an answer now, as it does half a second after it appears.
@@ -5026,7 +5129,7 @@ pub(crate) mod tests {
         assert_eq!(request["action"], "create");
         assert_eq!(request["words"], "The dock");
         assert!(app.draft.is_empty(), "the words sent stayed in the box too");
-        assert!(app.send_without.is_none());
+        assert!(app.send_without.is_empty());
         // Kept in the queue behind words typed meanwhile, they're taken from there.
         app.mode = Mode::Board;
         press(&mut app, 'c');

@@ -89,6 +89,31 @@ pub(crate) fn answers_otherwise(request: &Value) -> bool {
 }
 
 impl App {
+    /// The card an intent's request was about: the one it was asked from, under its key, which is
+    /// its feed's source and number, so a move home or another machine's copy keeps it; with none,
+    /// the one the machine asked would give that key. Never another source's card with the same
+    /// number, which is other work (Codex's review).
+    pub(super) fn intent_card(
+        &self,
+        machine: usize,
+        id: &str,
+        from: Option<&CardSnapshot>,
+    ) -> Option<&Card> {
+        let key = match from {
+            Some(f) => f.key.clone(),
+            None => {
+                let source = self
+                    .machines
+                    .get(machine)
+                    .and_then(|m| m.feed.as_ref())
+                    .and_then(|f| f.source.clone())
+                    .unwrap_or_else(|| "feed".into());
+                format!("{source}:{id}")
+            }
+        };
+        self.card(&key)
+    }
+
     /// A question that came while you were somewhere else: it waits on its card rather than fail,
     /// said quietly once, and n takes you to it (intent 0591).
     pub(super) fn wait_on_card(
@@ -405,17 +430,7 @@ impl App {
             .and_then(|t| self.card(&t.key))
             .map(|c| c.reference.clone())
             .unwrap_or_else(|| self.reference_for(&id));
-        let now = target
-            .as_ref()
-            .and_then(|t| self.card(&t.key))
-            .cloned()
-            .or_else(|| {
-                self.board
-                    .cards
-                    .iter()
-                    .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-                    .cloned()
-            });
+        let now = self.intent_card(machine, &id, target.as_ref()).cloned();
         let Some(card) = now else {
             self.say(
                 format!(
@@ -439,8 +454,16 @@ impl App {
                     fields.remove(answer);
                 }
             }
+            // Where the card's record lives now, not where the first save went: it may have
+            // moved home meanwhile (Codex's review).
+            let Some(home) = self.home_machine(&card) else {
+                return Action::None;
+            };
+            if let Some(held) = self.edits.get_mut(&card.key) {
+                held.machine = home;
+            }
             self.say(format!("{changed}; asking again."), Tone::Info);
-            let action = self.emit_mutation(machine, again);
+            let action = self.emit_mutation(home, again);
             if matches!(action, Action::Mutate { .. }) {
                 self.action_from = Some(CardSnapshot::of(&card));
             }

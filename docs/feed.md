@@ -549,7 +549,9 @@ with its `confirm` token) may carry `"choices"`, the answers it offers besides y
 you suggest. Kerdr shows each choice under yes and no, one to a line, on its suggested key unless it's
 taken: `y`, `n`, `q`, `Enter`, `Esc`, `Tab` and another choice's key are, and a taken one gets the
 next free digit, 1 to 9. Picking one sends the original request again with the same `confirm`,
-`"choice": "<id>"` and no `override`, under a fresh `op`, since it's a new key press. A `message`
+`"choice": "<id>"` and no `override`, under a fresh `op`, since it's a new key press. Each answer
+carries only itself: a yes or a choice to a question that came back changed never brings along a
+choice given to the one before it. A `message`
 must still read as a yes-or-no question on its own: a Kerdr that doesn't know `choices` asks only
 that. A `choice` you didn't offer for that token is refused as a question that changed (below).
 ark-sdlc's backend offers, for example, `queue` and `shelve-oldest` at a session's usual limit and

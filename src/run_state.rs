@@ -578,14 +578,16 @@ impl App {
     /// A start on an account sent on to the machine an intent lives on now, whose backend can't
     /// take an account yet: owed until that machine's ark-sdlc is brought up to date (intent 0591).
     /// False when the card isn't on the board.
-    pub(super) fn owe_after_update(&mut self, id: &str, machine: usize, to: &str) -> bool {
-        let Some(key) = self
-            .board
-            .cards
-            .iter()
-            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-            .map(|c| c.key.clone())
-        else {
+    pub(super) fn owe_after_update(
+        &mut self,
+        id: &str,
+        asked: usize,
+        from: Option<&CardSnapshot>,
+        machine: usize,
+        to: &str,
+    ) -> bool {
+        // Its own card, never another source's with the same number (Codex's review).
+        let Some(key) = self.intent_card(asked, id, from).map(|c| c.key.clone()) else {
             return false;
         };
         let mut owed = OwedAccount::new(&key, to);
@@ -1963,6 +1965,48 @@ mod tests {
 
     /// Intent 0591, K1-105: s on an empty workspace with no intent starts a fresh agent there on
     /// the account picked, and goes in while you're still on it.
+    #[test]
+    fn a_fresh_agents_start_that_asks_first_still_goes_in_after_the_yes() {
+        // Codex's review: the start asks first; once its yes starts it while you're still on the
+        // workspace, Kerdr goes in, as it does when nothing was asked.
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        let question = json!({"ok":false,"confirmation":true,"confirm":"a-1","message":"ARK_C is past its usual limit. Start anyway?"});
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request.clone()),
+            Ok(crate::actions::parse_response(&question.to_string()).unwrap()),
+        );
+        let Mode::Accounts { screen, .. } = &mut a.mode else {
+            panic!("not asked: {:?} {:?}", a.mode, a.message())
+        };
+        let crate::app::account_controls::AccountScreen::Confirm { ready_at, .. } = screen else {
+            panic!("not asked: {screen:?}")
+        };
+        *ready_at = Instant::now() - Duration::from_secs(1);
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Char('y')) else {
+            panic!("the yes sent nothing: {:?}", a.message())
+        };
+        assert_eq!(request["confirm"], "a-1");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        let reply = json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."});
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+        let open = a.open_after.take().expect("didn't go in after the yes");
+        assert_eq!(open.workspace, workspace);
+        assert_eq!(open.from, k);
+    }
+
     #[test]
     fn s_on_an_empty_workspace_starts_a_fresh_agent_there_and_goes_in() {
         let mut a = app();

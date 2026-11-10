@@ -1963,6 +1963,58 @@ mod tests {
     }
 
     #[test]
+    fn a_yes_to_a_save_question_after_its_card_moved_home_goes_to_its_new_home() {
+        // Codex's review: the card moved to another machine while he decided. His words go
+        // again, as they were, to the machine its record lives on now, not the first one.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id) = (done.key.clone(), done.detail.as_ref().unwrap().id.clone());
+        select(&mut app, &key);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-4".into()),
+                message: "It's done. Save yours as a new intent made from it instead?".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        let other = (0..app.machines.len()).find(|&m| m != machine).unwrap();
+        let name = app.machines[other].name().to_string();
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(name),
+            session: Some("web".into()),
+        });
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'y')
+        else {
+            panic!("the yes sent nothing: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(to, other, "sent where its record no longer lives");
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["was"], "sha256:aa");
+        assert_eq!(app.edits.get(&key).map(|h| h.machine), Some(other));
+    }
+
+    #[test]
     fn e_goes_at_once_while_other_changes_run_and_waits_as_the_other_card_keys_do() {
         let mut app = app();
         let (key, id, reference) = waiting(&mut app);
