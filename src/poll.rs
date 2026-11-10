@@ -154,6 +154,10 @@ pub struct MachineData {
     /// was read: it's shown as of then, never as of this read (intent 0591). One not named here was
     /// read with this data.
     pub read_at: BTreeMap<String, DateTime<Local>>,
+    /// What herdr or the feed printed, as it printed it, where a read of it failed: for the error
+    /// log alone, never the board, whose words are Kerdr's own (intent 0591). Keyed as the board's
+    /// problems are: `feed`, `sessions`, `session <name>`.
+    pub said: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -171,6 +175,10 @@ pub struct Event {
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
         (Some(data), Some(mut old_data)) => {
+            // What the older read's failures printed stands where the newer's didn't say again.
+            for (what, printed) in std::mem::take(&mut old_data.said) {
+                data.said.entry(what).or_insert(printed);
+            }
             // When each of the older read's snapshots was read: with it, or earlier still.
             let old_read_at = std::mem::take(&mut old_data.read_at);
             let read_when = |session: &str| old_read_at.get(session).copied().unwrap_or(old.at);
@@ -725,21 +733,45 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
             version: herdr::version_string(v),
         }));
     }
+    // What herdr or the feed printed where a read failed: the error log's, never the board's.
+    let mut said = BTreeMap::new();
     // A list that can't be read is herdr's trouble, not the machine's, which has just answered.
     let (sessions, sessions_failed) =
         match herdr::parse_sessions(sections.sessions.as_deref().unwrap_or("")) {
             Ok(sessions) => (sessions, None),
-            Err(e) => (vec![], Some(sessions_trouble(&e))),
+            Err(e) => {
+                let (words, printed) = sessions_trouble(&e);
+                if let Some(printed) = printed {
+                    said.insert("sessions".to_string(), printed);
+                }
+                (vec![], Some(words))
+            }
         };
     let snapshots = sections
         .snapshots
         .into_iter()
-        .map(|(name, body)| (name, herdr::parse_snapshot(&body)))
+        .map(|(name, body)| {
+            let snapshot = herdr::parse_snapshot(&body).map_err(|e| {
+                let (words, printed) = snapshot_trouble(&e);
+                if let Some(printed) = printed {
+                    said.insert(format!("session {name}"), printed);
+                }
+                words
+            });
+            (name, snapshot)
+        })
         .collect();
     let feed = if feed_due {
         Some(match (sections.feed_error, sections.feed.as_deref()) {
             (Some(error), _) => Err(error),
-            (_, Some(body)) if !body.trim().is_empty() => feed::parse(body),
+            (_, Some(body)) if !body.trim().is_empty() => {
+                feed::parse_keeping(body).map_err(|unread| {
+                    if let Some(printed) = unread.printed {
+                        said.insert("feed".to_string(), printed);
+                    }
+                    unread.words
+                })
+            }
             _ => Err(FEED_EMPTY.to_string()),
         })
     } else {
@@ -756,27 +788,68 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         feed_failed_after: None,
         kept_snapshots: Default::default(),
         read_at: Default::default(),
+        said,
     })
 }
 
-/// Why herdr's list of sessions failed, in words for the board: herdr's, not the machine's.
-fn sessions_trouble(error: &str) -> String {
+/// How much of what herdr printed in place of an answer goes to the error log.
+const MOST_PRINTED: usize = 1024;
+
+/// What herdr printed, made short for the error log.
+fn printed(error: &str) -> String {
+    error.trim().chars().take(MOST_PRINTED).collect()
+}
+
+/// Why herdr's list of sessions failed, in words for the board: herdr's trouble, not the
+/// machine's, in Kerdr's own words, and what herdr printed, when it printed something, for the
+/// error log (intent 0591): its error codes and paths never reach the board.
+fn sessions_trouble(error: &str) -> (String, Option<String>) {
     let error = error.trim();
     if error.is_empty() || error == "herdr printed nothing" {
-        return "herdr printed nothing for its list of sessions".into();
+        return (
+            "herdr printed nothing for its list of sessions".into(),
+            None,
+        );
     }
     if error == SESSIONS_SILENT {
-        return "herdr is slow there: it didn't list its sessions in time".into();
+        return (
+            "herdr is slow there: it didn't list its sessions in time".into(),
+            None,
+        );
     }
-    let said: String = error.chars().take(160).collect();
-    let lower = said.to_lowercase();
+    let lower = error.to_lowercase();
     let setup =
         if lower.contains("version") || lower.contains("mismatch") || lower.contains("differ") {
             " On the machines screen (M), u runs herdr's own setup there."
         } else {
             ""
         };
-    format!("herdr answered its list of sessions with something Kerdr can't read: {said}.{setup}")
+    (
+        format!(
+            "herdr answered its list of sessions with something Kerdr can't read (what it printed is in Kerdr's error log).{setup}"
+        ),
+        Some(printed(error)),
+    )
+}
+
+/// Why a herdr session's snapshot failed, as sessions_trouble says it of the list: Kerdr's own
+/// words stay as they are, and anything herdr printed goes to the error log alone.
+fn snapshot_trouble(error: &str) -> (String, Option<String>) {
+    let error = error.trim();
+    if [
+        SESSION_SILENT,
+        "herdr printed nothing",
+        "herdr's snapshot couldn't be read",
+    ]
+    .contains(&error)
+    {
+        return (error.to_string(), None);
+    }
+    (
+        "herdr answered with something Kerdr can't read (what it printed is in Kerdr's error log)"
+            .into(),
+        Some(printed(error)),
+    )
 }
 
 fn collect(machine: &Machine, feed_due: bool, list_most: Duration) -> transport::Output {
@@ -1439,14 +1512,21 @@ esac
     fn what_herdr_says_of_its_list_of_sessions_is_herdr_s_trouble_in_plain_words() {
         assert_eq!(
             sessions_trouble("herdr printed nothing"),
-            "herdr printed nothing for its list of sessions"
+            (
+                "herdr printed nothing for its list of sessions".into(),
+                None
+            )
         );
         assert_eq!(
             sessions_trouble("Error: socket closed"),
-            "herdr answered its list of sessions with something Kerdr can't read: Error: socket closed."
+            (
+                "herdr answered its list of sessions with something Kerdr can't read (what it printed is in Kerdr's error log).".into(),
+                Some("Error: socket closed".into())
+            )
         );
         assert!(
             sessions_trouble("herdr client and server versions differ")
+                .0
                 .contains("u runs herdr's own setup")
         );
         // The list gets longer on the read after one that ran out of time, and only the list.
@@ -1455,6 +1535,74 @@ esac
         let list = script.find("session list").unwrap();
         let back = script.find("M=5\n").unwrap();
         assert!(back > list, "{script}");
+    }
+
+    #[test]
+    fn what_herdr_or_a_feed_printed_never_reaches_the_board_and_is_kept_for_the_log() {
+        // herdr's own error, codes and paths and all, for its list and for a session's snapshot,
+        // and a feed that printed a traceback in place of its cards.
+        let herdr_error = r#"{"id":"1","error":{"code":"ERR_SOCKET_GONE","message":"no socket at /run/user/1000/herdr/main.sock"}}"#;
+        let out = transport::Output {
+            stdout: format!(
+                "{MARK}host\nlab\n{MARK}version\nherdr 0.9.1\n{MARK}keys\nyes\n{MARK}sessions\n{herdr_error}\n{MARK}snapshot web\n{herdr_error}\n{MARK}feed\nTraceback (most recent call last):\n  File \"/home/x/bin/ark-cards\", line 9\nKeyError: 'state'\n{MARK}end\n"
+            ),
+            stderr: String::new(),
+            status: Some(0),
+            timed_out: false,
+            took: Duration::from_millis(5),
+        };
+        let Ok(data) = read(&Target::Local, &out, true) else {
+            panic!("a read herdr answered is a read");
+        };
+        let shown = [
+            data.sessions_failed.clone().unwrap(),
+            data.snapshots["web"].clone().unwrap_err(),
+            data.feed.clone().unwrap().unwrap_err(),
+        ];
+        for words in &shown {
+            for raw in [
+                "ERR_SOCKET_GONE",
+                "/run/user",
+                "Traceback",
+                "KeyError",
+                "/home/x",
+            ] {
+                assert!(!words.contains(raw), "{words}");
+            }
+            assert!(words.contains("Kerdr's error log"), "{words}");
+        }
+        assert!(data.said["sessions"].contains("ERR_SOCKET_GONE"));
+        assert!(data.said["session web"].contains("main.sock"));
+        assert!(data.said["feed"].contains("KeyError: 'state'"));
+        // Through a merge with a newer read that failed the same way, without saying it again.
+        let event = |data, at| Event {
+            machine: 0,
+            conn: live(),
+            data: Some(data),
+            at,
+        };
+        let inbox = Inbox::default();
+        inbox.put(event(data, Local::now()), Instant::now(), 0);
+        let mut quiet = MachineData {
+            sessions_failed: Some(
+                "herdr is slow there: it didn't list its sessions in time".into(),
+            ),
+            ..Default::default()
+        };
+        quiet
+            .snapshots
+            .insert("web".into(), Err(SESSION_SILENT.into()));
+        inbox.put(event(quiet, Local::now()), Instant::now(), 0);
+        let merged = inbox.take().pop().unwrap().data.unwrap();
+        assert!(merged.said["feed"].contains("KeyError"));
+        // A feed that says nothing failed: no words are made up.
+        assert_eq!(
+            feed::parse_keeping("").unwrap_err(),
+            feed::Unread {
+                words: "it printed no cards".into(),
+                printed: None
+            }
+        );
     }
 
     /// Whether this machine has a `timeout` command to test.

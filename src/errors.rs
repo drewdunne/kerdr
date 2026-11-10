@@ -253,22 +253,32 @@ impl App {
                 }
             }
         }
+        // What herdr or the feed printed, which the board's words leave out: kept with them, so
+        // a failure that keeps coming back can be found and told apart (intent 0591).
+        let now: Vec<(String, String, Option<String>)> = now
+            .into_iter()
+            .map(|(what, text)| {
+                let printed = m.said.get(&what).cloned();
+                (what, text, printed)
+            })
+            .collect();
         self.machine_problems
-            .retain(|(i, what), _| *i != machine || now.iter().any(|(w, _)| w == what));
+            .retain(|(i, what), _| *i != machine || now.iter().any(|(w, ..)| w == what));
         let mut new = vec![];
-        for (what, text) in now {
+        for (what, text, printed) in now {
             let key = (machine, what);
             if self.machine_problems.get(&key) != Some(&text) {
                 self.machine_problems.insert(key, text.clone());
-                new.push(text);
+                new.push((text, printed));
             }
         }
-        for text in new {
+        for (text, printed) in new {
             let entry = Entry {
                 source: "machine",
                 shown: "board",
                 machine: Some(name.clone()),
                 message: text,
+                answer: printed,
                 ..Default::default()
             };
             self.error_log.write(&entry, &self.typed_now(), &[]);
@@ -663,6 +673,62 @@ mod tests {
             app.machines[1].session_problem("web", later).as_deref(),
             Some(crate::poll::SESSION_SILENT)
         );
+    }
+
+    #[test]
+    fn what_a_feed_printed_in_place_of_cards_is_in_the_error_log_and_never_on_the_board() {
+        let (_dir, mut app, path) = board();
+        let printed = "Traceback (most recent call last):\n  File \"/home/x/bin/ark-cards\", line 9\nKeyError: 'state'";
+        let read = |at| {
+            let mut data = crate::poll::MachineData {
+                feed: Some(crate::feed::parse(printed)),
+                ..Default::default()
+            };
+            data.said.insert("feed".into(), printed.into());
+            Event {
+                machine: 1,
+                conn: Conn::Live {
+                    latency: Duration::from_millis(5),
+                },
+                data: Some(data),
+                at,
+            }
+        };
+        let now = Local::now();
+        for _ in 0..crate::poll::FEED_QUIET_READS {
+            app.apply(read(now));
+        }
+        // On the board: Kerdr's words. In the log: those, and what it printed.
+        let shown = app.machines[1].feed_problem(now).unwrap().to_string();
+        assert!(
+            !shown.contains("KeyError") && !shown.contains("/home/x"),
+            "{shown}"
+        );
+        let kept = lines(&path);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let message = kept[0]["message"].as_str().unwrap();
+        assert!(!message.contains("KeyError"), "{message}");
+        assert!(
+            kept[0]["answer"]
+                .as_str()
+                .unwrap()
+                .contains("KeyError: 'state'"),
+            "{:?}",
+            kept[0]
+        );
+        // Over: nothing of it is held on to.
+        app.apply(Event {
+            machine: 1,
+            conn: Conn::Live {
+                latency: Duration::from_millis(5),
+            },
+            data: Some(crate::poll::MachineData {
+                feed: Some(crate::feed::parse(r#"{"kerdr_feed":1}"#)),
+                ..Default::default()
+            }),
+            at: now,
+        });
+        assert!(app.machines[1].said.is_empty());
     }
 
     #[test]

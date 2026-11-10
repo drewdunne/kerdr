@@ -47,6 +47,9 @@ pub struct MachineState {
     /// read than the last (`last_ok`) because a newer read of it, or of herdr's list, failed. It's
     /// marked out of date, as of then (intent 0591).
     pub read_at: HashMap<String, DateTime<Local>>,
+    /// What herdr or the feed printed where a read that's still failing failed, keyed as
+    /// MachineData::said is: for the error log alone, never the board (intent 0591).
+    pub said: HashMap<String, String>,
 }
 
 impl MachineState {
@@ -73,6 +76,7 @@ impl MachineState {
             read_failing_since: HashMap::new(),
             sessions_failing: None,
             read_at: HashMap::new(),
+            said: HashMap::new(),
         }
     }
 
@@ -158,6 +162,8 @@ impl MachineState {
     /// workspace's report changed, then keeps the read. A feed it brings stands until the next; one
     /// it doesn't bring leaves the last in place. A session that didn't answer keeps what was known.
     pub fn take(&mut self, mut data: MachineData, at: DateTime<Local>) {
+        // What this read's failures printed, newest first; kept only while they go on failing.
+        self.said.extend(std::mem::take(&mut data.said));
         match data.feed.take() {
             Some(Ok(feed)) => {
                 let saying: HashSet<String> = feed.read_failures.iter().map(|f| f.key()).collect();
@@ -289,6 +295,16 @@ impl MachineState {
         for name in failing {
             self.session_failing_since.entry(name).or_insert(at);
         }
+        let (feed_failing, sessions_failing) =
+            (self.feed_error.is_some(), self.sessions_failing.is_some());
+        let sessions = &self.session_failing_since;
+        self.said.retain(|what, _| match what.as_str() {
+            "feed" => feed_failing,
+            "sessions" => sessions_failing,
+            what => what
+                .strip_prefix("session ")
+                .is_some_and(|s| sessions.contains_key(s)),
+        });
         self.data = Some(data);
         self.last_ok = Some(at);
     }
