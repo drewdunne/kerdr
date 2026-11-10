@@ -1178,8 +1178,9 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         .filter(|&i| rank(&app.machines[i].conn) < 9 && app.machines[i].conn.lasting(now))
         .collect();
     troubled.sort_by_key(|&i| rank(&app.machines[i].conn));
+    let reading = read_troubles(app);
     let Some(&i) = troubled.first() else {
-        return reading_banner(app);
+        return reading_banner(reading);
     };
     let m = &app.machines[i];
     let name = m.name();
@@ -1282,12 +1283,13 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         )],
         _ => return None,
     };
-    if troubled.len() > 1 {
-        left.push(Span::styled(
-            format!("   +{} more", troubled.len() - 1),
-            fg(DIM),
-        ));
-    }
+    // The rest, its machines' feed or herdr reads that keep failing too: named here, said on M.
+    let more: Vec<String> = troubled[1..]
+        .iter()
+        .map(|&j| app.machines[j].name())
+        .chain(reading.into_iter().map(|(name, ..)| name))
+        .collect();
+    left.extend(more_span(&more));
     let right = match &m.conn {
         Conn::HostKey { .. } | Conn::Auth { .. } => key_hints(&[("M", "then ⏎ answers it")]),
         Conn::HerdrMissing | Conn::HerdrTooOld { .. } => key_hints(&[("M", "then u sets it up")]),
@@ -1296,20 +1298,37 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
     Some((left, right))
 }
 
-/// With every machine answering: one line about a machine whose feed or herdr reads have kept
-/// failing past the quiet spell (intent 0591), said once, in plain words, the feed's own reason
-/// first. Its rows and cards are marked out of date meanwhile; this says why.
-fn reading_banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
+/// The machines that answer, but whose feed or herdr reads have kept failing past the quiet
+/// spell (intent 0591): each one's name, why in plain words (the feed's own reason first), and
+/// since when.
+fn read_troubles(app: &App) -> Vec<(String, String, chrono::DateTime<chrono::Local>)> {
     let now = app.now();
-    let troubled: Vec<(String, String, chrono::DateTime<chrono::Local>)> = app
-        .machines
+    app.machines
         .iter()
         .filter(|m| m.is_shown() && m.conn.is_live())
         .filter_map(|m| {
             let (why, since) = m.lasting_problem(now)?;
             Some((m.name(), why, since))
         })
-        .collect();
+        .collect()
+}
+
+/// "+2 more: laptop, mac" for the banner, naming the other machines in trouble; nothing for none.
+fn more_span(more: &[String]) -> Option<Span<'static>> {
+    (!more.is_empty()).then(|| {
+        Span::styled(
+            format!("   +{} more: {}", more.len(), more.join(", ")),
+            fg(DIM),
+        )
+    })
+}
+
+/// With every machine answering: one line about the first whose feed or herdr reads have kept
+/// failing past the quiet spell (intent 0591), said once, in plain words, the feed's own reason
+/// first. Its rows and cards are marked out of date meanwhile; this says why.
+fn reading_banner(
+    troubled: Vec<(String, String, chrono::DateTime<chrono::Local>)>,
+) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
     let (name, why, since) = troubled.first()?;
     let mut left = vec![
         Span::styled(format!("● {name}: {why}"), bold(YELLOW)),
@@ -1321,12 +1340,11 @@ fn reading_banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)>
             fg(DIM),
         ),
     ];
-    if troubled.len() > 1 {
-        left.push(Span::styled(
-            format!("   +{} more", troubled.len() - 1),
-            fg(DIM),
-        ));
-    }
+    let more: Vec<String> = troubled[1..]
+        .iter()
+        .map(|(name, ..)| name.clone())
+        .collect();
+    left.extend(more_span(&more));
     Some((left, key_hints(&[("M", "machines")])))
 }
 
@@ -4161,11 +4179,12 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
             lines
         }
         Conn::Connecting => vec!["Reaching it for the first time.".into()],
-        Conn::Reconnecting { since, attempt, retry_at, detail } => vec![
+        // Why, in Kerdr's words: SSH's own stay in the error log (intent 0591).
+        Conn::Reconnecting { since, attempt, retry_at, .. } => vec![
             format!(
-                "Lost the connection {} ago ({}). Trying again in {}s (try {}). The wait grows to 15 seconds.",
+                "Lost the connection {} ago{}. Trying again in {}s (try {}). The wait grows to 15 seconds.",
                 ago(*since, now),
-                detail,
+                m.conn.cause().map(|c| format!(" ({c})")).unwrap_or_default(),
                 (*retry_at - now).num_seconds().max(0),
                 attempt + 1
             ),
@@ -4174,16 +4193,21 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
                 as_of.map(|t| format!(", as they were at {t}")).unwrap_or_default()
             ),
         ],
-        Conn::Unreachable { since, retry_at, detail } => vec![
-            format!("No answer since {} ({detail}): asleep, off, or off the network.", clock(*since)),
+        Conn::Unreachable { since, retry_at, .. } => vec![
+            format!(
+                "No answer since {}{}: asleep, off, or off the network.",
+                clock(*since),
+                m.conn.cause().map(|c| format!(" ({c})")).unwrap_or_default()
+            ),
             format!("Kerdr tries again in {}s, then every 15 seconds; r tries now. ⏎ and d on its cards wait for it, then carry on.", (*retry_at - now).num_seconds().max(0)),
         ],
+        // What SSH says of the key is kept as it said it: you compare it to approve it.
         Conn::HostKey { detail } => vec![
             format!("SSH asked whether to trust this machine's host key ({detail})."),
             "Kerdr never answers that for you: ⏎ runs ssh here, so you can check the key and answer it yourself.".into(),
         ],
-        Conn::Auth { detail } => vec![
-            format!("SSH wants a password, a passphrase or another key ({detail})."),
+        Conn::Auth { .. } => vec![
+            "SSH wants a password, a passphrase or another key (what it said is in Kerdr's error log).".into(),
             "⏎ runs ssh here so you can answer it. For a key with a passphrase, ssh-add keeps it answered.".into(),
         ],
         Conn::HerdrMissing => vec![
@@ -5379,6 +5403,103 @@ mod tests {
             screen.contains(&format!("{name}: its card feed failed: it printed nothing")),
             "{screen}"
         );
+    }
+
+    #[test]
+    fn a_read_failure_that_lasts_is_named_beside_another_machine_s_connection_trouble() {
+        // One machine waits for its host key to be approved while another's feed has failed for
+        // 45 s: the first is the warning, and the second is still named (Codex's look).
+        let mut a = all_answering(false);
+        let gpu = a.machine_index("gpu-rig").unwrap();
+        a.machines[gpu].conn = Conn::HostKey {
+            detail: "Host key verification failed.".into(),
+        };
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        assert_ne!(i, gpu);
+        let name = a.machines[i].name();
+        let now = a.now();
+        let feed_failing = |a: &mut App, reads: u32, secs: i64| {
+            let m = &mut a.machines[i];
+            m.feed_error = Some(crate::poll::FEED_EMPTY.into());
+            m.feed_failures = reads;
+            m.feed_failing_since = Some(now - chrono::Duration::seconds(secs));
+        };
+        feed_failing(&mut a, 3, 45);
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains("gpu-rig needs you"), "{screen}");
+        assert!(screen.contains(&format!("+1 more: {name}")), "{screen}");
+        // A moment's failure isn't named, as it isn't said anywhere yet.
+        feed_failing(&mut a, 1, 5);
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains("gpu-rig needs you"), "{screen}");
+        assert!(!screen.contains("more:"), "{screen}");
+        // Two machines with read trouble alone: the first said, the other named.
+        let mut a = all_answering(false);
+        for (k, m) in a
+            .machines
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, m)| m.is_shown())
+        {
+            m.feed_error = Some(crate::poll::FEED_EMPTY.into());
+            m.feed_failures = 3;
+            m.feed_failing_since = Some(now - chrono::Duration::seconds(45 + k as i64));
+        }
+        let shown = a.machines.iter().filter(|m| m.is_shown()).count();
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("+{} more: ", shown - 1)),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_machines_screen_says_why_in_kerdr_s_words_and_keeps_a_host_key_as_ssh_said_it() {
+        let mut a = all_answering(true);
+        let i = a.machine_index("build-box").unwrap();
+        let now = a.now();
+        let said = |a: &App| machine_explain(a, i).join(" ");
+        let raw = "ssh: connect to host build-box port 22: No route to host";
+        a.machines[i].conn = Conn::Reconnecting {
+            since: now - chrono::Duration::seconds(40),
+            attempt: 2,
+            retry_at: now + chrono::Duration::seconds(8),
+            detail: raw.into(),
+        };
+        let text = said(&a);
+        assert!(text.contains("ago (there's no route to it)."), "{text}");
+        assert!(!text.contains("No route to host"), "{text}");
+        a.machines[i].conn = Conn::Unreachable {
+            since: now - chrono::Duration::minutes(3),
+            retry_at: now + chrono::Duration::seconds(10),
+            detail: raw.into(),
+        };
+        let text = said(&a);
+        assert!(text.contains("(there's no route to it): asleep"), "{text}");
+        assert!(!text.contains("No route to host"), "{text}");
+        // What SSH says that Kerdr doesn't know: none of it, and no empty brackets.
+        a.machines[i].conn = Conn::Reconnecting {
+            since: now - chrono::Duration::seconds(40),
+            attempt: 2,
+            retry_at: now + chrono::Duration::seconds(8),
+            detail: "mux_client_request_session: session request failed".into(),
+        };
+        let text = said(&a);
+        assert!(!text.contains("mux_client"), "{text}");
+        assert!(!text.contains("()"), "{text}");
+        assert!(text.contains("ago. Trying again"), "{text}");
+        a.machines[i].conn = Conn::Auth {
+            detail: "drew@build-box: Permission denied (publickey,password).".into(),
+        };
+        let text = said(&a);
+        assert!(!text.contains("Permission denied"), "{text}");
+        assert!(text.contains("Kerdr's error log"), "{text}");
+        // A host key's details stay exactly as SSH gave them: you compare them to approve it.
+        let key =
+            "The ECDSA host key for build-box has changed: SHA256:2fQ0mY0sVb5rQe9x8kFjT1LhW7cZ";
+        a.machines[i].conn = Conn::HostKey { detail: key.into() };
+        let text = said(&a);
+        assert!(text.contains(key), "{text}");
     }
 
     #[test]

@@ -509,8 +509,11 @@ reads in a row) does it say why, once, in plain words, and only then is it kept 
 It's said on the line under the board's header: for a dropped machine, the cause in Kerdr's words
 (never SSH's own) and how many of its cards on the board are dimmed; for a machine that answers but
 whose feed or herdr reads keep failing, the feed's own reason from `read_failures` when it gives
-one, else what Kerdr found. What can't pass by itself, like SSH wanting a key or a password, is said
-at once.
+one, else what Kerdr found. That line is about one machine, a connection's trouble first; any other
+machine in trouble of either kind is named after it ("+1 more: laptop"), and the machines screen
+(M) says why for each, in Kerdr's words too, except a host key's details, which are kept as SSH gave
+them so you can compare them. What can't pass by itself, like SSH wanting a key or a password, is
+said at once.
 
 A failed feed read is read again at once, once in a run of failures. Give a plain reason when you
 know one, in `read_failures` (above), which Kerdr shows when it has lasted. A feed that printed
