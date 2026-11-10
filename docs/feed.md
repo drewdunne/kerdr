@@ -565,8 +565,9 @@ when that still makes sense ("#41 was set aside meanwhile; asking again."), and 
 **A question waits on its card.** A question that comes back while you're elsewhere (in another view,
 or inside a workspace) isn't put over what you're doing: its card shows yellow, as needing you, with
 "asks you: start it?" (or what it asks); `n` goes to it, and the key that asked (`Enter` too, for a
-start or a reopen) opens the question there, shown whole, however long. It's never shown as a red
-"didn't start".
+start or a reopen) opens the question there, shown whole, however long: one longer than the screen
+scrolls (PgDn, PgUp), and `Enter` or another answer shows the rest of it before it answers. It's
+never shown as a red "didn't start".
 
 **Mixed versions.** A backend without `"steps"` gets the requests Kerdr 0.33.0 sent, plus the ones
 above that Kerdr changes for every backend, and Kerdr refuses the rest itself as it did. A backend
