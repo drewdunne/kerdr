@@ -41,8 +41,11 @@ pub struct AfterSignin {
 
 /// What an account question needs beyond its words, kept apart from the screen it's asked on, so
 /// a yes given over the board, a question that changed, a sign-in on the way, n or Esc never loses
-/// it (Codex's review): the agent or card it came from, and what follows once it's settled. One
-/// for each question, found by its machine and its request without any answer's fields.
+/// it (Codex's review): the agent or card it came from, what follows once it's settled, and the
+/// question itself while it's held for him. One for each question, found by its machine and its
+/// request without any answer's fields. It's settled when its question is done with: n or Esc on
+/// it, the answer to its yes (unless that asks again or waits on a sign-in), or its sign-in left;
+/// never because something else covers it on screen (Codex's third look).
 #[derive(Clone, Debug)]
 pub struct AskedAbout {
     pub machine: usize,
@@ -57,6 +60,10 @@ pub struct AskedAbout {
     /// The owner whose waiting sessions move once a saved list's question is settled, yes or no:
     /// "move waiting sessions" was ticked.
     pub then_waiting: Option<String>,
+    /// The question, its token in its request, while it waits for him to be back where it can't
+    /// take keys meant for something else. Held ones are asked in the order they came, each its
+    /// own: a second never replaces or drops the first (Codex's third look).
+    pub held: Option<Box<AccountScreen>>,
 }
 
 /// What waits on a sign-in, in words: the step that goes on once it's done, and what's said when
@@ -108,6 +115,9 @@ pub struct OffListMoves {
     pub kept: Vec<String>,
     /// Each one that didn't move, and why, as a sentence.
     pub failed: Vec<String>,
+    /// Each one whose answer was lost, so nobody can tell whether it moved, as a sentence: never
+    /// counted as moved or as not moved (Codex's third look).
+    pub unknown: Vec<String>,
 }
 
 /// How one of those moves ended.
@@ -116,6 +126,8 @@ enum OffListEnd {
     Later,
     Kept,
     Failed(String),
+    /// Its answer was lost: it may have moved.
+    Unknown(String),
 }
 
 impl OffListMoves {
@@ -131,6 +143,11 @@ impl OffListMoves {
                 "{} didn't move: {}.",
                 capitalized(&agent.name),
                 sentence_part(&why)
+            )),
+            OffListEnd::Unknown(why) => self.unknown.push(format!(
+                "Kerdr can't tell whether {} moved: {}. The accounts screen (A) shows where it is.",
+                agent.name,
+                sentence_part(lost_why(&why))
             )),
         }
     }
@@ -155,7 +172,7 @@ impl OffListMoves {
             (true, false) => format!(": {}.", later()),
             (false, false) => format!(": {} now, and {}.", and_list(&self.moved), later()),
         };
-        for failed in &self.failed {
+        for failed in self.failed.iter().chain(&self.unknown) {
             said += &format!(" {failed}");
         }
         if !self.kept.is_empty() {
@@ -174,7 +191,7 @@ impl OffListMoves {
                 one(stopped.len(), "wasn't", "weren't")
             );
         }
-        let tone = if !self.failed.is_empty() {
+        let tone = if !self.failed.is_empty() || !self.unknown.is_empty() {
             Tone::Warn
         } else if done == self.total {
             Tone::Good
@@ -183,6 +200,15 @@ impl OffListMoves {
         };
         (said, tone)
     }
+}
+
+/// Why an answer was lost, without the transport's own "can't tell whether it happened" and where
+/// to look, which the summary says in its own words.
+fn lost_why(error: &str) -> &str {
+    error
+        .split_once(crate::actions::UNKNOWN)
+        .map_or(error, |(why, _)| why)
+        .trim_end_matches([' ', ';', ',', '.'])
 }
 
 /// Words that start a sentence: their first letter a capital.
@@ -1452,6 +1478,12 @@ impl App {
             return self.push_account_screen(question);
         };
         let reference = target.reference.clone();
+        let (machine, request) = match &question {
+            AccountScreen::Confirm {
+                machine, request, ..
+            } => (*machine, request.clone()),
+            _ => return,
+        };
         match self.move_now(target) {
             MoveNow::Same(_) | MoveNow::AccountChanged(_) => {
                 let mut question = question;
@@ -1460,18 +1492,25 @@ impl App {
                 }
                 self.push_account_screen(question);
             }
-            MoveNow::NewConversation(_) => self.say(
-                format!(
-                    "{reference}'s move asked you something, but its pane runs another conversation now, so the question no longer fits; s on its card offers the move for this one."
-                ),
-                Tone::Info,
-            ),
-            MoveNow::Gone => self.say(
-                format!(
-                    "{reference}'s move asked you something, but its agent isn't running any more, so nothing moved; s on its card starts it on an account."
-                ),
-                Tone::Info,
-            ),
+            // A question that no longer fits is done with (Codex's third look).
+            MoveNow::NewConversation(_) => {
+                self.settle_question(machine, &request);
+                self.say(
+                    format!(
+                        "{reference}'s move asked you something, but its pane runs another conversation now, so the question no longer fits; s on its card offers the move for this one."
+                    ),
+                    Tone::Info,
+                );
+            }
+            MoveNow::Gone => {
+                self.settle_question(machine, &request);
+                self.say(
+                    format!(
+                        "{reference}'s move asked you something, but its agent isn't running any more, so nothing moved; s on its card starts it on an account."
+                    ),
+                    Tone::Info,
+                );
+            }
         }
     }
 
@@ -1579,8 +1618,8 @@ impl App {
         };
         if visible || self.enter_can_land_here() {
             self.push_account_screen(question);
-        } else if self.held_move_question.is_none() {
-            self.held_move_question = Some(question);
+        } else {
+            self.hold_question(question);
         }
     }
 
@@ -1643,25 +1682,36 @@ impl App {
         self.off_list_next();
     }
 
-    /// Whether this request, or a question about it, is still on its way, asked, held, or waiting on
-    /// its sign-in: compared without the fields an answer adds.
-    fn still_asking(&self, machine: usize, asked: &Value) -> bool {
+    /// Whether this request, or a question about it, is still anywhere: on its way, queued, held,
+    /// waiting on its sign-in, or on screen at any depth, covered by another screen or not (Codex's
+    /// third look). Compared without the fields an answer adds.
+    fn question_anywhere(&self, machine: usize, asked: &Value) -> bool {
         let this = |m: usize, request: &Value| m == machine && move_asked(request) == *asked;
         let on_screen = |screen: &AccountScreen| matches!(screen, AccountScreen::Confirm { machine, request, .. } if this(*machine, request));
-        self.account_pending
-            .as_ref()
-            .is_some_and(|p| this(p.machine, &p.request))
+        let mut shown = false;
+        let mut mode = &self.mode;
+        while let Mode::Accounts { screen, back } = mode {
+            shown |= on_screen(screen);
+            mode = back;
+        }
+        shown
+            || self
+                .account_pending
+                .as_ref()
+                .is_some_and(|p| this(p.machine, &p.request))
             || self.account_queue.iter().any(|(m, r)| this(*m, r))
             || self
                 .after_signin
                 .as_ref()
                 .is_some_and(|a| this(a.machine, &a.request))
-            || self.held_move_question.as_ref().is_some_and(on_screen)
-            || matches!(&self.mode, Mode::Accounts { screen, .. } if on_screen(screen))
+            || self
+                .asked_about
+                .iter()
+                .any(|k| k.machine == machine && k.asked == *asked && k.held.is_some())
     }
 
     /// Keeps what an account question needs beyond its words, merged into what's kept for it
-    /// already (Codex's review).
+    /// already (Codex's review). Said to go on: an answer that keeps it doesn't settle it.
     pub(crate) fn keep_asked(
         &mut self,
         machine: usize,
@@ -1671,6 +1721,7 @@ impl App {
         then_waiting: Option<String>,
     ) {
         let asked = move_asked(request);
+        self.asked_now.push((machine, asked.clone()));
         if let Some(kept) = self
             .asked_about
             .iter_mut()
@@ -1688,6 +1739,7 @@ impl App {
                 target,
                 from,
                 then_waiting,
+                held: None,
             });
         }
     }
@@ -1700,53 +1752,106 @@ impl App {
             .find(|k| k.machine == machine && k.asked == asked)
     }
 
-    /// Account questions that are settled (answered and their answer back, or left with n or Esc):
-    /// what follows them happens, and nothing more is kept for them (Codex's review).
-    fn settle_asked(&mut self) {
-        let mut settled = vec![];
-        let mut i = 0;
-        while i < self.asked_about.len() {
-            if self.still_asking(self.asked_about[i].machine, &self.asked_about[i].asked) {
-                i += 1;
-            } else {
-                settled.push(self.asked_about.remove(i));
-            }
+    /// An account question held until he's back where it can't take keys meant for something
+    /// else: kept with its own record, after any held before it, never in place of one (Codex's
+    /// third look).
+    pub(crate) fn hold_question(&mut self, question: AccountScreen) {
+        let AccountScreen::Confirm {
+            machine, request, ..
+        } = &question
+        else {
+            return;
+        };
+        let (machine, asked) = (*machine, move_asked(request));
+        self.asked_now.push((machine, asked.clone()));
+        let mut kept = match self
+            .asked_about
+            .iter()
+            .position(|k| k.machine == machine && k.asked == asked)
+        {
+            Some(i) => self.asked_about.remove(i),
+            None => AskedAbout {
+                machine,
+                asked,
+                target: None,
+                from: None,
+                then_waiting: None,
+                held: None,
+            },
+        };
+        kept.held = Some(Box::new(question));
+        self.asked_about.push(kept);
+    }
+
+    /// The card the account request on its way is for, when it's on the board: a move's agent's,
+    /// a fresh start's workspace. Shown as being tried again while it's sent again by itself
+    /// (intent 0591).
+    pub(crate) fn account_card_in_flight(&self) -> Option<String> {
+        let p = self.account_pending.as_ref()?;
+        let key = match &p.screen {
+            Some(AccountScreen::Move { target, .. }) => Some(target.key.clone()),
+            _ => self.asked_for(p.machine, &p.request).and_then(|k| {
+                k.from
+                    .as_ref()
+                    .map(|f| f.key.clone())
+                    .or_else(|| k.target.as_ref().map(|t| t.key.clone()))
+            }),
+        }?;
+        self.card(&key).is_some().then_some(key)
+    }
+
+    /// The question held longest, taken to be asked now. Its record stays while it holds what the
+    /// question's answer needs.
+    pub(crate) fn take_held_question(&mut self) -> Option<AccountScreen> {
+        let i = self.asked_about.iter().position(|k| k.held.is_some())?;
+        let question = self.asked_about[i].held.take()?;
+        let kept = &self.asked_about[i];
+        if kept.target.is_none() && kept.from.is_none() && kept.then_waiting.is_none() {
+            self.asked_about.remove(i);
         }
-        for kept in settled {
-            if let Some(owner) = kept.then_waiting {
-                self.queue_waiting_moves(&owner);
-            }
+        Some(*question)
+    }
+
+    /// The questions held for him, in the order they'll be asked.
+    pub fn held_questions(&self) -> impl Iterator<Item = &AccountScreen> {
+        self.asked_about.iter().filter_map(|k| k.held.as_deref())
+    }
+
+    /// The question about this request is done with (n or Esc on it, its answer, or its sign-in
+    /// left): what follows it happens, and nothing more is kept for it (Codex's third look).
+    fn settle_question(&mut self, machine: usize, request: &Value) {
+        let asked = move_asked(request);
+        let Some(i) = self
+            .asked_about
+            .iter()
+            .position(|k| k.machine == machine && k.asked == asked)
+        else {
+            return;
+        };
+        let kept = self.asked_about.remove(i);
+        if let Some(owner) = kept.then_waiting {
+            self.queue_waiting_moves(&owner);
         }
     }
 
-    /// Moves to the list he stopped: the one going now isn't on its way, asked, held or waiting on
-    /// its sign-in any more (Esc on its question, or leaving its sign-in), so the rest aren't sent,
-    /// and what came of them is said (intent 0591, B3-42).
-    fn off_list_left(&mut self) {
-        let Some(moves) = &self.off_list_moves else {
-            return;
-        };
-        let Some(agent) = &moves.current else {
-            return;
-        };
-        let this = |machine: usize, request: &Value| {
-            machine == moves.machine && move_asked(request) == agent.request
-        };
-        let asked = |screen: &AccountScreen| matches!(screen, AccountScreen::Confirm { machine, request, .. } if this(*machine, request));
-        let going = self
-            .account_pending
-            .as_ref()
-            .is_some_and(|p| this(p.machine, &p.request))
-            || self.account_queue.iter().any(|(m, r)| this(*m, r))
-            || self
-                .after_signin
-                .as_ref()
-                .is_some_and(|a| this(a.machine, &a.request))
-            || self.held_move_question.as_ref().is_some_and(asked)
-            || matches!(&self.mode, Mode::Accounts { screen, .. } if asked(screen));
-        if going {
-            return;
+    /// A question dropped without an answer (its screen gone from under it some other way than n,
+    /// Esc or y): settled as if left, so nothing is kept for it. A covered question is still on
+    /// screen, and held ones wait for him.
+    fn settle_dropped(&mut self) {
+        let dropped: Vec<(usize, Value)> = self
+            .asked_about
+            .iter()
+            .filter(|k| k.held.is_none() && !self.question_anywhere(k.machine, &k.asked))
+            .map(|k| (k.machine, k.asked.clone()))
+            .collect();
+        for (machine, asked) in dropped {
+            self.settle_question(machine, &asked);
         }
+    }
+
+    /// Moves to the list he stopped: Esc on the one going now, or leaving its sign-in. The rest
+    /// aren't sent, and what came of them is said (intent 0591, B3-42).
+    fn off_list_stop(&mut self) {
         let Some(mut moves) = self.off_list_moves.take() else {
             return;
         };
@@ -1759,6 +1864,21 @@ impl App {
             .collect();
         let (said, tone) = moves.summary(&stopped);
         self.say(said, tone);
+    }
+
+    /// The same, for a move to the list whose question is nowhere any more without his n, Esc or
+    /// an answer (its screen gone from under it some other way): the rest aren't sent.
+    fn off_list_left(&mut self) {
+        let Some(moves) = &self.off_list_moves else {
+            return;
+        };
+        let Some(agent) = &moves.current else {
+            return;
+        };
+        if self.question_anywhere(moves.machine, &agent.request) {
+            return;
+        }
+        self.off_list_stop();
     }
 
     /// After a sign-in's answer: once the sign-in a move waits on is done on its machine, the
@@ -1832,6 +1952,14 @@ impl App {
             ),
             Tone::Info,
         );
+        // Its question is done with; a move to the list stops the rest (Codex's third look).
+        self.settle_question(after.machine, &after.request);
+        if self
+            .off_list_current(after.machine, &after.request)
+            .is_some()
+        {
+            self.off_list_stop();
+        }
     }
 
     /// The move picker's agent, as it is now, in place (intent 0591, K2-13).
@@ -1845,7 +1973,7 @@ impl App {
         }
     }
 
-    fn send_account(&mut self, machine: usize, request: Value) -> Action {
+    pub(crate) fn send_account(&mut self, machine: usize, request: Value) -> Action {
         if !self.can_write(machine) {
             if request["action"] == "account-signin"
                 && let Mode::Accounts {
@@ -1861,14 +1989,8 @@ impl App {
             }
             return Action::None;
         }
-        // What the request's question came from goes with it, however it's sent: its yes, or its
-        // resend after a sign-in (Codex's review).
-        if let Some(from) = self
-            .asked_for(machine, &request)
-            .and_then(|k| k.from.clone())
-        {
-            self.action_from = Some(from);
-        }
+        // What the request came from is kept in its record, found by the request when its answer
+        // comes, never in a slot another answer could take (Codex's third look).
         self.account_pending = Some(Pending {
             machine,
             request: crate::actions::request_metadata(&request),
@@ -2058,6 +2180,17 @@ impl App {
                 ));
             }
             self.mode = *back;
+            // Esc on a question leaves it: it's settled, and a move to the list stops the rest
+            // (Codex's third look).
+            if let AccountScreen::Confirm {
+                machine, request, ..
+            } = &screen
+            {
+                self.settle_question(*machine, request);
+                if self.off_list_current(*machine, request).is_some() {
+                    self.off_list_stop();
+                }
+            }
             return Action::None;
         }
         // Keep sign-in input responsive while a background poll finishes.
@@ -2827,8 +2960,10 @@ impl App {
             } => match key.code {
                 KeyCode::Char('n') => {
                     self.mode = *back;
+                    let (machine, request) = (*machine, pending.clone());
+                    self.settle_question(machine, &request);
                     // One of the moves to the list: this one stays, and the next is asked.
-                    if self.off_list_current(*machine, pending).is_some() {
+                    if self.off_list_current(machine, &request).is_some() {
                         self.off_list_ended(OffListEnd::Kept);
                     }
                     return Action::None;
@@ -2857,6 +2992,7 @@ impl App {
                     if pending["action"] == crate::app::MOVE_OFF_LIST {
                         let (machine, request) = (*machine, pending.clone());
                         self.mode = *back;
+                        self.settle_question(machine, &request);
                         self.start_off_list(machine, &request);
                         return Action::None;
                     }
@@ -2898,6 +3034,8 @@ impl App {
                         // for Enter again (intent 0591, K2-13).
                         Some((reference, MoveNow::NewConversation(agent))) => {
                             self.mode = *back;
+                            let (machine, request) = (*machine, pending.clone());
+                            self.settle_question(machine, &request);
                             self.retarget_picker(agent);
                             let picker = matches!(
                                 self.mode,
@@ -2921,6 +3059,8 @@ impl App {
                         }
                         Some((reference, MoveNow::Gone)) => {
                             self.mode = *back;
+                            let (machine, request) = (*machine, pending.clone());
+                            self.settle_question(machine, &request);
                             self.say(
                                 format!(
                                     "{reference}'s agent isn't running any more, so nothing moved; s on its card starts it on an account."
@@ -3009,7 +3149,7 @@ impl App {
     pub fn account_tick(&mut self) -> Action {
         self.drop_left_signin();
         self.off_list_left();
-        self.settle_asked();
+        self.settle_dropped();
         if self.busy {
             return Action::None;
         }
@@ -3177,22 +3317,22 @@ impl App {
             };
             if self.enter_can_land_here() {
                 self.push_account_screen(question);
-            } else if self.held_move_question.is_none() {
-                self.held_move_question = Some(question);
+            } else {
+                // Held with any others, each asked in turn (Codex's third look).
+                self.hold_question(question);
                 self.say(
                     format!(
                         "{name}'s move to the list asks you something first; it's asked once you're back on the board."
                     ),
                     Tone::Info,
                 );
-            } else {
-                self.off_list_ended(OffListEnd::Failed(
-                    "its move asks you something, and s on its card asks it again".into(),
-                ));
             }
             return;
         }
         let how = match &result {
+            // Its answer was lost: it may have moved, so it's said as not known, never as not
+            // moved (Codex's third look).
+            Err(e) if crate::actions::result_unknown(e) => OffListEnd::Unknown(e.clone()),
             Err(e) => OffListEnd::Failed(account_error(&request, e)),
             Ok(r) if r.ok && r.state.as_deref() == Some("queued") => OffListEnd::Later,
             Ok(r) if r.ok => OffListEnd::Moved,
@@ -3212,19 +3352,39 @@ impl App {
         self.off_list_ended(how);
     }
 
+    /// An account request's answer. Its question, if it had one, is settled by it, unless the
+    /// answer asks again, is held for him, or waits on a sign-in (Codex's third look).
     fn account_answer(&mut self, machine: usize, request: Value, result: Result<Response, String>) {
-        // The answer's request carries the op Kerdr gave it as it went (intent 0591).
-        let pending = self.account_pending.take().filter(|p| {
+        let asked = move_asked(&request);
+        self.asked_now.clear();
+        self.answer_account(machine, request, result);
+        let goes_on = self
+            .asked_now
+            .iter()
+            .any(|(m, a)| *m == machine && *a == asked);
+        self.asked_now.clear();
+        if !goes_on {
+            self.settle_question(machine, &asked);
+        }
+    }
+
+    fn answer_account(&mut self, machine: usize, request: Value, result: Result<Response, String>) {
+        // The request this answers, matched before anything is taken: another request's answer
+        // leaves what's kept for this one where it is (Codex's third look). The answer's request
+        // carries the op Kerdr gave it as it went (intent 0591).
+        let pending = self.account_pending.take_if(|p| {
             p.machine == machine
                 && crate::actions::without_op(&p.request)
                     == crate::actions::without_op(&crate::actions::request_metadata(&request))
         });
-        // A fresh agent's start (intent 0591, K1-105): the card it was asked on, for going in.
+        // A fresh agent's start or a resume (intent 0591, K1-105, K1-03): the card it was asked
+        // on, for going in, from its own record.
         let start_from = if matches!(
             request["action"].as_str(),
             Some("account-start" | crate::app::resume::RESUME)
         ) {
-            self.action_from.take()
+            self.asked_for(machine, &request)
+                .and_then(|k| k.from.clone())
         } else {
             None
         };
@@ -3733,7 +3893,7 @@ impl App {
             if visible || self.enter_can_land_here() {
                 self.push_account_screen(question);
             } else {
-                self.held_move_question = Some(question);
+                self.hold_question(question);
                 self.say(
                     "An account change asks you something first; it's asked once you're back on the board.",
                     Tone::Info,
@@ -3768,7 +3928,7 @@ impl App {
                 if self.enter_can_land_here() {
                     self.ask_held_move(question);
                 } else {
-                    self.held_move_question = Some(question);
+                    self.hold_question(question);
                     self.say(
                         format!(
                             "{reference}'s move asks you something first; it's asked once you're back on the board."
@@ -3901,22 +4061,9 @@ impl App {
                         self.account_queue.push_back((machine, request));
                     }
                 }
-                Some(AccountScreen::Models {
-                    owner,
-                    move_waiting,
-                    ..
-                }) if action == "account-models" => {
-                    if move_waiting {
-                        self.queue_waiting_moves(&owner.id);
-                    }
+                Some(AccountScreen::Models { .. }) if action == "account-models" => {
                     if let Mode::Accounts { back, .. } = self.mode.clone() {
                         self.mode = *back;
-                    }
-                    if move_waiting
-                        && self.account_queue.is_empty()
-                        && !self.account_batch_messages.is_empty()
-                    {
-                        return;
                     }
                 }
                 Some(AccountScreen::Rename { .. }) => {
@@ -3930,6 +4077,22 @@ impl App {
                     }
                 }
                 _ => {}
+            }
+        }
+        // A list saved with "move waiting sessions" ticked: they move now, from what was saved
+        // with its request, whether or not its screen is still up (Codex's third look). One
+        // kept with a question it brought moves when that's settled instead.
+        if action == "account-models"
+            && response.ok
+            && !response.confirmation
+            && let Some(owner) = then_waiting.filter(|_| {
+                self.asked_for(machine, &request)
+                    .is_none_or(|k| k.then_waiting.is_none())
+            })
+        {
+            self.queue_waiting_moves(&owner);
+            if self.account_queue.is_empty() && !self.account_batch_messages.is_empty() {
+                return;
             }
         }
         // A list saved with running agents left on other accounts: asked once whether to move them
@@ -5486,7 +5649,7 @@ mod tests {
             json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
         );
         assert!(matches!(a.mode, Mode::Compose { .. }));
-        assert!(a.held_move_question.is_some());
+        assert_eq!(a.held_questions().count(), 1);
         assert!(a.message().unwrap().0.contains("asks you something first"));
         assert_eq!(a.account_owed(), Action::None);
         assert!(matches!(a.mode, Mode::Compose { .. }), "asked over typing");
@@ -6057,10 +6220,12 @@ mod tests {
             json!({"ok":true,"message":"saved","off_list":[off_agent("w91:p1","c-1","ARK_C",Some("0041"))]}),
         );
         assert!(matches!(a.mode, Mode::Compose { .. }));
-        assert!(a.held_move_question.is_some());
+        assert_eq!(a.held_questions().count(), 1);
         key(&mut a, KeyCode::Esc);
         // Its half second ran out while it was held.
-        if let Some(AccountScreen::Confirm { ready_at, .. }) = &mut a.held_move_question {
+        if let Some(AccountScreen::Confirm { ready_at, .. }) =
+            a.asked_about.iter_mut().find_map(|k| k.held.as_deref_mut())
+        {
             *ready_at = Instant::now() - Duration::from_secs(1);
         }
         a.account_owed();
@@ -8228,7 +8393,7 @@ mod tests {
         assert!(matches!(a.mode, Mode::Compose { .. }));
         complete(&mut a, action, question);
         assert!(matches!(a.mode, Mode::Compose { .. }));
-        assert!(a.held_move_question.is_some());
+        assert_eq!(a.held_questions().count(), 1);
         key(&mut a, KeyCode::Esc);
         a.account_owed();
         assert!(matches!(
@@ -8369,5 +8534,194 @@ mod tests {
         let (_, choices) = where_screen(&a);
         assert_eq!(choices[0].machines, vec![0]);
         assert!(a.after_signin.is_none());
+    }
+
+    // Codex's third look at piece K: the account side's questions, each kept as its own record.
+
+    fn question(token: &str, words: &str) -> Response {
+        crate::actions::parse_response(
+            &json!({"ok":false,"confirmation":true,"confirm":token,"message":words}).to_string(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn two_account_questions_that_come_while_he_types_are_each_asked_in_turn() {
+        // A second question held while he types never replaces the first, nor is dropped.
+        let mut a = app();
+        press(&mut a, 'c');
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        let save = json!({"action":"account-models","owner":"studio","models":["KBZ_C"]});
+        let remove = json!({"action":"account-remove","code":"ARK_C"});
+        a.finish_action(
+            0,
+            crate::actions::with_op(save.clone()),
+            Ok(question(
+                "q-1",
+                "2 agents here are left off it. Save anyway?",
+            )),
+        );
+        a.finish_action(
+            0,
+            crate::actions::with_op(remove.clone()),
+            Ok(question(
+                "q-2",
+                "That's this machine's own sign-in. Remove it?",
+            )),
+        );
+        assert!(matches!(a.mode, Mode::Compose { .. }), "asked over typing");
+        key(&mut a, KeyCode::Esc);
+        // The first, then once that's answered, the second.
+        a.account_owed();
+        let (request, message) = asked(&a);
+        assert_eq!(message, "2 agents here are left off it. Save anyway?");
+        assert_eq!(request["confirm"], "q-1");
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'n'), Action::None);
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        a.account_owed();
+        let (request, message) = asked(&a);
+        assert_eq!(message, "That's this machine's own sign-in. Remove it?");
+        assert_eq!(request["confirm"], "q-2");
+        settle(&mut a);
+        let (_, yes) = sent(press(&mut a, 'y'));
+        let mut expected = remove;
+        expected["confirm"] = json!("q-2");
+        assert_eq!(yes, expected);
+    }
+
+    #[test]
+    fn another_requests_answer_coming_first_leaves_a_move_what_it_was_asked_from() {
+        // A reply to something else, before the move's own: the move's picker is still found
+        // for its question, never "open the move picker again".
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        let action = key(&mut a, KeyCode::Enter);
+        a.busy = true;
+        key(&mut a, KeyCode::Esc);
+        a.finish_action(
+            0,
+            crate::actions::with_op(json!({"action":"account-test","code":"KBZ_C"})),
+            Ok(Response {
+                ok: true,
+                message: "KBZ_C works here.".into(),
+                ..Default::default()
+            }),
+        );
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                request, target, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("not asked: {:?} {:?}", a.mode, a.message())
+        };
+        assert_eq!(request["confirm"], "ticket");
+        assert!(target.as_ref().is_some_and(|t| t.reference == "#44"));
+    }
+
+    #[test]
+    fn a_ticked_save_moves_waiting_sessions_even_when_he_left_before_its_answer() {
+        // "Move waiting sessions" ticked, Esc before the save's ok: they still move, with or
+        // without agents it left elsewhere.
+        for off_list in [
+            json!(null),
+            json!([off_agent("w91:p1", "c-1", "ARK_C", Some("0041"))]),
+        ] {
+            let mut a = app();
+            let owner = a.account_feed(0).unwrap().owners[0].clone();
+            a.push_account_screen(AccountScreen::Models {
+                machine: 0,
+                models: vec!["KBZ_C".into()],
+                owner,
+                sel: 0,
+                move_waiting: true,
+            });
+            let action = key(&mut a, KeyCode::Enter);
+            a.busy = true;
+            key(&mut a, KeyCode::Esc);
+            assert!(a.account_queue.is_empty());
+            complete(
+                &mut a,
+                action,
+                json!({"ok":true,"message":"saved","off_list":off_list}),
+            );
+            assert_eq!(
+                a.account_queue.front(),
+                Some(&(0, json!({"action":"account-move-waiting","owner":"studio"}))),
+                "{off_list}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_move_to_the_list_whose_answer_was_lost_is_said_as_not_known_never_as_not_moved() {
+        let mut a = app();
+        save_list_leaving(
+            &mut a,
+            json!([
+                off_agent("w91:p1", "c-1", "ARK_C", Some("0041")),
+                off_agent("w92:p1", "c-2", "ARK_C", Some("0052")),
+            ]),
+        );
+        settle(&mut a);
+        press(&mut a, 'y');
+        let (machine, first) = sent(a.account_tick());
+        a.finish_action(
+            machine,
+            crate::actions::with_op(first),
+            Err("the connection to laptop dropped before its answer came; Kerdr can't tell whether it happened, and its card shows how it stands.".into()),
+        );
+        let second = a.account_tick();
+        complete(
+            &mut a,
+            second,
+            json!({"ok":true,"message":"#52 moved to KBZ_C."}),
+        );
+        assert!(a.off_list_moves.is_none());
+        assert_eq!(
+            a.message().unwrap(),
+            (
+                "1 of 2 moved to the list: #52. Kerdr can't tell whether #41 moved: the connection to laptop dropped before its answer came. The accounts screen (A) shows where it is.",
+                Tone::Warn
+            )
+        );
+    }
+
+    #[test]
+    fn a_move_sent_again_by_itself_says_so_on_its_card_until_its_answer() {
+        // A move's answer lost, or refused with `retry`: sent again by itself with its op (the
+        // transport's own), its card saying so quietly meanwhile (intent 0591).
+        let mut a = app();
+        pick(&mut a);
+        let card = a.selected_for_control().unwrap().key.clone();
+        press(&mut a, 's');
+        let action = key(&mut a, KeyCode::Enter);
+        let (machine, request) = sent(action.clone());
+        a.busy = true;
+        a.busy_label = a.working_on(&request);
+        a.resending(
+            None,
+            machine,
+            &crate::actions::Resend::Lost {
+                wait: Duration::from_secs(5),
+                error: "no answer came".into(),
+                attempt: 1,
+            },
+        );
+        assert_eq!(a.account_retrying.as_deref(), Some(card.as_str()));
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"state":"queued","account":"ARK_C","message":"moving to ARK_C"}),
+        );
+        assert_eq!(a.account_retrying, None);
     }
 }

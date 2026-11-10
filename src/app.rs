@@ -749,9 +749,6 @@ pub struct App {
     pub pending_go: Option<(String, Option<String>)>,
     /// Accounts picked with s that their cards are still owed, one for each card (intent 0591).
     pub owed_accounts: Vec<run_state::OwedAccount>,
-    /// A move's question that came after its picker closed: asked once you're back on the board or
-    /// a list, never over typing (intent 0591, K2-27).
-    pub held_move_question: Option<account_controls::AccountScreen>,
     /// A move waiting on its account's sign-in on that machine: sent again by itself, as a new
     /// request, once that sign-in is done; dropped if he leaves it (intent 0591, B3-10).
     pub after_signin: Option<account_controls::AfterSignin>,
@@ -761,6 +758,12 @@ pub struct App {
     /// What each account question needs beyond its words: the agent or card it came from, and
     /// what follows once it's settled (Codex's review).
     pub asked_about: Vec<account_controls::AskedAbout>,
+    /// The account questions the answer being read keeps going (asked again, held, or waiting on
+    /// a sign-in): any other it answers is settled once it's read (Codex's third look).
+    pub asked_now: Vec<(usize, serde_json::Value)>,
+    /// The card whose account request is being sent again by itself, with the same op: it says
+    /// "Trying again…" until the answer comes (intent 0591).
+    pub account_retrying: Option<String>,
     /// The number of the last request asking an old backend to update, so each answer finds the
     /// waits it was asked for.
     pub update_asks: u64,
@@ -866,10 +869,11 @@ impl App {
             accounts_wait: None,
             pending_go: None,
             owed_accounts: Vec::new(),
-            held_move_question: None,
             after_signin: None,
             off_list_moves: None,
             asked_about: Vec::new(),
+            asked_now: Vec::new(),
+            account_retrying: None,
             update_asks: 0,
             follow_end: None,
             enter_sent: None,

@@ -1885,6 +1885,71 @@ printf '%s' '{{"ok":true,"message":"Marked #41 done."}}'
 
     #[cfg(unix)]
     #[test]
+    fn an_account_start_or_resume_answered_retry_is_sent_again_with_its_op_and_done_once() {
+        // Account requests that change something follow `retry` by themselves too (intent 0591):
+        // the same op, quietly, and the backend starts it once.
+        for request in [
+            json!({"action":"account-start","session":"web","workspace":"w7","to":"ARK_C"}),
+            json!({"action":"account-resume","session":"web","conversation":"c-0123","label":"scratch"}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = quote(dir.path().to_str().unwrap());
+            let command = fixture(
+                dir.path(),
+                &format!(
+                    r##"req=$(cat)
+printf '%s\n' "$req" >> {d}/requests.log
+if [ "$(wc -l < {d}/requests.log)" -lt 2 ]; then
+  printf '%s' '{{"ok":false,"retry":3,"message":"herdr in web is slow to answer; nothing started yet."}}'
+  exit 0
+fi
+echo started >> {d}/done.log
+printf '%s' '{{"ok":true,"session":"web","workspace":"w9","label":"scratch","tab":"t9","message":"Started it in scratch."}}'
+"##
+                ),
+                "",
+            );
+            let request = with_op(request);
+            let (answered, told, waits) = resent(&command, &request, true, Duration::from_secs(20));
+            let r = answered.result.unwrap();
+            assert!(r.ok && r.workspace.as_deref() == Some("w9"), "{r:?}");
+            assert_eq!(waits, [Duration::from_secs(3)]);
+            assert!(
+                matches!(&told[..], [Resend::Retry { message, .. }] if message.contains("slow to answer")),
+                "{told:?}"
+            );
+            let sent = lines(dir.path(), "requests.log");
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0], sent[1], "the same request, the same op");
+            assert!(sent[0].contains(request["op"].as_str().unwrap()));
+            assert_eq!(lines(dir.path(), "done.log").len(), 1, "started twice");
+        }
+        // A lost answer to one is sent again too, with its op, to a backend that keeps ops.
+        let resume = with_op(
+            json!({"action":"account-resume","session":"web","conversation":"c-0123","label":"scratch"}),
+        );
+        let (answered, told, sends) = over_ssh(
+            &resume,
+            true,
+            vec![
+                timed_out(),
+                output(
+                    0,
+                    r#"{"ok":true,"repeat":true,"session":"web","workspace":"w9","label":"scratch","message":"Resumed it in scratch."}"#,
+                    "",
+                ),
+            ],
+        );
+        assert!(answered.result.unwrap().ok);
+        assert_eq!(sends, 2);
+        assert!(
+            matches!(&told[..], [Resend::Lost { attempt: 1, .. }]),
+            "{told:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn retries_stop_after_two_minutes_and_the_last_refusal_is_shown_as_it_is() {
         let dir = tempfile::tempdir().unwrap();
         let d = quote(dir.path().to_str().unwrap());

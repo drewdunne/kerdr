@@ -2759,8 +2759,16 @@ impl App {
                     self.rebuild();
                 }
             }
-            None if self.busy && !self.busy_label.ends_with(RETRYING_TAIL) => {
-                self.busy_label = format!("{}{RETRYING_TAIL}", self.busy_label);
+            None if self.busy => {
+                if !self.busy_label.ends_with(RETRYING_TAIL) {
+                    self.busy_label = format!("{}{RETRYING_TAIL}", self.busy_label);
+                }
+                // Its card, when it has one on the board, says so too, as a change's does.
+                if self.account_retrying.is_none()
+                    && let Some(key) = self.account_card_in_flight()
+                {
+                    self.account_retrying = Some(key);
+                }
             }
             None => {}
         }
@@ -3475,6 +3483,8 @@ impl App {
             self.busy_id = None;
             self.busy_since = None;
             self.busy_label.clear();
+            // Answered at last: no longer being sent again (intent 0591).
+            self.account_retrying = None;
             self.finish_account_action(machine, request, result);
             return;
         }

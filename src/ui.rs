@@ -2053,6 +2053,10 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         // A question waits on it for you: it says so, as asking you, never as a failure (intent
         // 0591).
         (line.to_string(), YELLOW)
+    } else if app.account_retrying.as_deref() == Some(c.key.as_str()) {
+        // Its account request is being sent again by itself, with the same op: quietly, as a
+        // change's card says it (intent 0591).
+        ("trying again…".to_string(), BLUE)
     } else if let Some(outside) = c.outside_herdr().filter(|_| !cached) {
         (format!("outside herdr · {}", outside.short()), CYAN)
     } else if c.no_agent() && !cached {
@@ -4768,15 +4772,22 @@ fn misc_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             f.buffer_mut().set_style(rect, Style::default().bg(SEL));
         }
         let color = attention_color(c.attention);
+        // Its account request being sent again by itself: said quietly, as a list row says a
+        // change's (intent 0591).
+        let (glyph, label, color) = if app.account_retrying.as_deref() == Some(c.key.as_str()) {
+            ("◐", "trying again…", BLUE)
+        } else {
+            (c.attention.glyph(), c.attention.label(), color)
+        };
         put_lr(
             f.buffer_mut(),
             rect,
             y,
             vec![
-                Span::styled(format!(" {} ", c.attention.glyph()), fg(color)),
+                Span::styled(format!(" {glyph} "), fg(color)),
                 Span::styled(c.title.clone(), bold(FG)),
             ],
-            vec![Span::styled(c.attention.label(), fg(color))],
+            vec![Span::styled(label, fg(color))],
         );
         let mut place = format!(
             "   {} › {} › {}",

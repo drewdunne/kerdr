@@ -1183,6 +1183,11 @@ No credential or token belongs in the feed.
 
 These use the existing JSON-on-stdin adapter and `ok`/`message` response. Account actions run
 on the selected account’s machine; a move runs on the agent’s machine, not its record’s home.
+Each one carries an `op` and follows `retry` and a lost answer as any change does (see
+[Asking again](#asking-again-op-and-retry)): to a backend whose feed lists `"op"`, Kerdr sends it again by
+itself with the same `op`, saying "trying again…" quietly on the busy line and on its card when it has
+one (a move's card, a fresh agent's workspace). So a `retry` refusal's `message` needn't say what to
+press; it's shown only if the two minutes run out.
 Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
@@ -1249,7 +1254,8 @@ Other account actions may ask too (`account-models` with agents left on accounts
 sign-in, `account-start`, `account-resume`): `{"ok":false,"confirmation":"<question>","confirm":"<token>","yes":"…",
 "no":"…","message":"<question>"}`. Kerdr asks it in the same box, over the screen it was asked from or,
 when you've gone on to type something, once you're back on the board; `y` sends the same request
-again with `confirm`. `message` must read on its own, since an older Kerdr shows only that. A model
+again with `confirm`. Several that come while you're elsewhere are each kept, with what their answers
+need, and asked one after another in the order they came; none replaces another. `message` must read on its own, since an older Kerdr shows only that. A model
 list counts as saved when its question comes, so its screen closes and the list shows at once.
 
 A saved list's `ok` answer names each running agent on that machine it leaves on an account that
@@ -1260,7 +1266,8 @@ card, else `#` and its intent, else its account and session. Its `y` sends
 each one's answer, its question (asked in the same box, named, and answered before the next is
 sent), or its sign-in comes first. `n` on one of those questions leaves that agent and goes on;
 `Esc` on any of them, or leaving its sign-in, stops the rest. Once they've all been asked, or he
-stopped, Kerdr says how many moved and which didn't, and why. An entry without a `pane` is passed
+stopped, Kerdr says how many moved and which didn't, and why. One whose answer was lost is said as
+not known ("Kerdr can't tell whether #41 moved: …"), never as moved or not moved. An entry without a `pane` is passed
 over. A backend that doesn't send `off_list` asks nothing more, and its `message` should say how to
 move them, since an older Kerdr shows only that.
 

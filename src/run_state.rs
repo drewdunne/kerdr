@@ -544,11 +544,13 @@ impl App {
         if !self.can_write(card.machine_index) {
             return Action::None;
         }
-        self.action_from = Some(CardSnapshot::of(&card));
-        Action::Mutate {
-            machine: card.machine_index,
-            request: json!({"action":"account-start","session":session,"workspace":workspace,"to":to}),
-        }
+        // The card it's asked on goes in its own record, which its answer finds by the request,
+        // through a question or a sign-in (Codex's third look).
+        let machine = card.machine_index;
+        let request =
+            json!({"action":"account-start","session":session,"workspace":workspace,"to":to});
+        self.keep_asked(machine, &request, None, Some(CardSnapshot::of(&card)), None);
+        self.send_account(machine, request)
     }
 
     /// The running agent at this card moved to the account picked for it, as the move picker sends
@@ -622,8 +624,9 @@ impl App {
         if !self.enter_can_land_here() {
             return Action::None;
         }
-        // A move's question held while you were elsewhere: asked now (intent 0591, K2-27).
-        if let Some(question) = self.held_move_question.take() {
+        // An account question held while you were elsewhere: asked now, the one held longest first,
+        // the rest each in turn once you're back (intent 0591, K2-27; Codex's third look).
+        if let Some(question) = self.take_held_question() {
             self.ask_held_move(question);
             return Action::None;
         }
@@ -2058,6 +2061,131 @@ mod tests {
                 .starts_with("Nothing started: ARK_C isn't signed in"),
             "{:?}",
             a.message()
+        );
+    }
+
+    /// A bare workspace's s, its picker's first account, and the start that sends: its card and
+    /// what was sent.
+    fn fresh_start(a: &mut App) -> (Card, usize, Value) {
+        let k = bare_workspace(a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(a, &k);
+        a.s_on_card(card.clone());
+        let Action::Mutate { machine, request } = key(a, KeyCode::Enter) else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        (card, machine, request)
+    }
+
+    fn answer_with(a: &mut App, machine: usize, request: Value, reply: Value) {
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+
+    fn ready(a: &mut App) {
+        if let Mode::Accounts {
+            screen: AccountScreen::Confirm { ready_at, .. },
+            ..
+        } = &mut a.mode
+        {
+            *ready_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
+    #[test]
+    fn a_fresh_agents_start_question_covered_by_another_still_goes_in_after_its_yes() {
+        // Codex's third look: another account question asked over the start's, answered, and
+        // the start's yes still goes in once it starts. Nothing settles a question because
+        // something else covers it on screen.
+        let mut a = app();
+        let (card, machine, request) = fresh_start(&mut a);
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"confirmation":true,"confirm":"a-1","message":"ARK_C is past its usual limit. Start anyway?"}),
+        );
+        // Another question over it: here a sign-in's removal, as any account question would be.
+        a.push_account_screen(AccountScreen::Confirm {
+            machine,
+            request: json!({"action":"account-remove","code":"KBZ_C","confirm":"r-1"}),
+            message: "That's this machine's own sign-in. Remove it?".into(),
+            yes: "remove".into(),
+            no: "keep it".into(),
+            target: None,
+            ready_at: Instant::now(),
+            choices: vec![],
+        });
+        assert_eq!(a.account_tick(), Action::None);
+        assert_eq!(press(&mut a, 'n'), Action::None);
+        assert_eq!(a.account_tick(), Action::None);
+        // Back on the start's question.
+        ready(&mut a);
+        let Action::Mutate { machine, request } = press(&mut a, 'y') else {
+            panic!(
+                "the start's yes sent nothing: {:?} {:?}",
+                a.mode,
+                a.message()
+            )
+        };
+        assert_eq!(request["action"], "account-start");
+        assert_eq!(request["confirm"], "a-1");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        let open = a.open_after.take().expect("didn't go in after the yes");
+        assert_eq!(open.from, card.key);
+        assert!(a.asked_about.is_empty(), "kept after it was settled");
+    }
+
+    #[test]
+    fn a_fresh_agents_start_sent_again_after_retry_says_so_on_its_card_and_goes_in_once_started() {
+        // The start answered `retry`: Kerdr sends it again by itself with the same op (the
+        // transport's own, tested in actions.rs), and meanwhile its card and the busy line say
+        // so quietly, never a warning. Its answer then goes in, as any start's does.
+        let mut a = app();
+        let (card, machine, request) = fresh_start(&mut a);
+        a.busy = true;
+        a.busy_label = a.working_on(&request);
+        a.resending(
+            None,
+            machine,
+            &crate::actions::Resend::Retry {
+                wait: Duration::from_secs(3),
+                message: "herdr in web isn't answering yet; Kerdr asks again shortly.".into(),
+            },
+        );
+        assert_eq!(a.busy_label, "Starting a fresh agent… trying again…");
+        assert_eq!(a.account_retrying.as_deref(), Some(card.key.as_str()));
+        assert!(a.message().is_none_or(|(_, tone)| tone != Tone::Warn));
+        // On its card, in the list of workspaces with no intent, besides the busy line.
+        a.mode = Mode::Misc { sel: 0 };
+        let shown = crate::ui::tests_render(&a, 200, 60);
+        let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            shown.contains(&format!("◐ {} trying again…", card.title)),
+            "{shown}"
+        );
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        assert_eq!(a.account_retrying, None);
+        assert_eq!(
+            a.open_after.take().expect("didn't go in").tab.as_deref(),
+            Some("t9")
         );
     }
 
