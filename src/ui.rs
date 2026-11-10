@@ -1650,7 +1650,8 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     for (row, &i) in items.iter().enumerate().skip(start).take(visible) {
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
-        let (mut glyph, mut gcolor, mut meta, mut mcolor) = list_glyph(c, now);
+        let (mut glyph, mut gcolor, mut meta, mut mcolor) =
+            list_glyph(c, now, body.width as usize / 2);
         if app.starts_when_written(&c.key) {
             meta = "starts once written up".into();
         }
@@ -1732,9 +1733,39 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     }
 }
 
+/// The most of a write-up's reason any card shows: a few words, as the feed promises.
+const WRITE_UP_WHY_MOST: usize = 60;
+
+/// Why a card's write-up failed, in its feed's words on one line and cut to fit; None when the
+/// feed doesn't say, as older feeds don't (intent 0591).
+fn write_up_why(c: &Card) -> Option<String> {
+    let why = c.detail.as_ref()?.intake_why.as_deref()?;
+    let why: String = why
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect();
+    (!why.is_empty()).then(|| trunc(&why, WRITE_UP_WHY_MOST))
+}
+
+/// What a list row says of a card whose write-up failed, in at most `room` columns when it gives
+/// a reason: without room for any of that, the plain words, which never shrink.
+fn not_written_up(c: &Card, room: usize) -> String {
+    const PLAIN: &str = "not written up";
+    match write_up_why(c) {
+        // ": ", and at least one character of it before the "…".
+        Some(why) if room >= width(PLAIN) + 4 => trunc(&format!("{PLAIN}: {why}"), room),
+        _ => PLAIN.into(),
+    }
+}
+
+/// A list row's glyph, and its note on the right, which takes at most `room` columns.
 fn list_glyph(
     c: &Card,
     now: chrono::DateTime<chrono::Local>,
+    room: usize,
 ) -> (
     &'static str,
     ratatui::style::Color,
@@ -1770,7 +1801,7 @@ fn list_glyph(
         // A new intent still being saved (intent 0445).
         _ if c.intake() == Some(crate::resolve::SAVING) => ("◐", BLUE, "saving…".into(), BLUE),
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
-        _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
+        _ if c.intake() == Some("failed") => ("✎", YELLOW, not_written_up(c, room), YELLOW),
         // Not started, but waiting on you all the same: questions asked before it starts.
         _ if c.needs_you() && !c.dismissed() => (
             Attention::NeedsYou.glyph(),
@@ -2180,9 +2211,12 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             Stage::Backlog if c.intake() == Some("pending") => {
                 "✎ being written up from your words; d starts it once that's done".into()
             }
-            Stage::Backlog if c.intake() == Some("failed") => {
-                "✎ not written up: the agent that starts it writes it up".into()
-            }
+            Stage::Backlog if c.intake() == Some("failed") => match write_up_why(c) {
+                Some(why) => {
+                    format!("✎ not written up ({why}): the agent that starts it writes it up")
+                }
+                None => "✎ not written up: the agent that starts it writes it up".into(),
+            },
             Stage::Backlog => "not started".into(),
             Stage::Maintain => "closed".into(),
             _ => "no workspace open".into(),
@@ -4796,7 +4830,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     for (k, &i) in items.iter().enumerate() {
         let c = &app.board.cards[i];
         let place = order.iter().position(|&j| j == i).unwrap_or(k) + 1;
-        let (glyph, gc, meta, meta_color) = list_glyph(c, now);
+        let (glyph, gc, meta, meta_color) = list_glyph(c, now, list.width as usize / 2);
         let age = c
             .stale_days
             .map(|days| {
@@ -4947,8 +4981,11 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             }
             Some("failed") => {
                 out.push(Line::raw(""));
+                let why = write_up_why(c)
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default();
                 out.extend(wrapped(
-                    "✎ No agent could write this up, so it keeps your words and their first ones as its title. The agent that starts it writes it up.",
+                    &format!("✎ No agent could write this up{why}, so it keeps your words and their first ones as its title. The agent that starts it writes it up."),
                     w,
                     fg(YELLOW),
                     None,
@@ -5145,6 +5182,77 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_write_up_says_why_when_its_feed_does_and_looks_as_before_when_it_doesnt() {
+        let a = demo(false);
+        let now = a.now();
+        let key = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Backlog && !c.dismissed())
+            .unwrap()
+            .key
+            .clone();
+        let mut a = a;
+        // The backlog's own screen, where a row has room to spare.
+        a.mode = Mode::Backlog { sel: 0 };
+        let set = |a: &mut App, intake: &str, why: Option<&str>| {
+            for c in a.board.cards.iter_mut().filter(|c| c.key == key) {
+                let d = c.detail.as_mut().unwrap();
+                d.intake = Some(intake.into());
+                d.intake_why = why.map(str::to_string);
+            }
+            a.board.cards.iter().find(|c| c.key == key).unwrap().clone()
+        };
+        // A feed that doesn't say: exactly as before, whatever the room.
+        let c = set(&mut a, "failed", None);
+        for room in [0, 17, 30, usize::MAX] {
+            let row = list_glyph(&c, now, room);
+            assert_eq!(
+                (row.0, row.1, row.2.as_str(), row.3),
+                ("✎", YELLOW, "not written up", YELLOW)
+            );
+        }
+        let screen = crate::ui::tests_render(&a, 200, 50);
+        assert!(screen.contains("not written up"), "{screen}");
+        assert!(!screen.contains("not written up:"), "{screen}");
+        // One that does: its words, in the same colours.
+        let c = set(&mut a, "failed", Some("no account was free"));
+        let row = list_glyph(&c, now, usize::MAX);
+        assert_eq!(
+            (row.0, row.1, row.2.as_str(), row.3),
+            ("✎", YELLOW, "not written up: no account was free", YELLOW)
+        );
+        let screen = crate::ui::tests_render(&a, 200, 50);
+        assert!(
+            screen.contains("not written up: no account was free"),
+            "{screen}"
+        );
+        // Cut to the room there is; with no room for any of it, the plain words.
+        let cut = list_glyph(&c, now, 24).2;
+        assert_eq!(cut, "not written up: no acco…");
+        assert_eq!(width(&cut), 24);
+        assert_eq!(list_glyph(&c, now, 17).2, "not written up");
+        // However long a feed makes it, a row never gets more than a few words.
+        let long = "x".repeat(500);
+        let c = set(&mut a, "failed", Some(&long));
+        let row = list_glyph(&c, now, usize::MAX).2;
+        assert_eq!(width(&row), width("not written up: ") + WRITE_UP_WHY_MOST);
+        assert!(row.ends_with('…'), "{row}");
+        // One line, and blank is no reason at all.
+        let c = set(&mut a, "failed", Some(" no account\nwas\tfree "));
+        assert_eq!(
+            list_glyph(&c, now, usize::MAX).2,
+            "not written up: no account was free"
+        );
+        let c = set(&mut a, "failed", Some("  \n "));
+        assert_eq!(list_glyph(&c, now, usize::MAX).2, "not written up");
+        // Only a failed write-up says it.
+        let c = set(&mut a, "pending", Some("no account was free"));
+        assert_eq!(list_glyph(&c, now, usize::MAX).2, "writing it up");
+    }
+
+    #[test]
     fn a_backlog_row_waiting_on_you_says_so_in_yellow() {
         let a = demo(false);
         let mut c = a
@@ -5154,10 +5262,10 @@ mod tests {
             .find(|c| c.stage == Stage::Backlog && !c.dismissed())
             .unwrap()
             .clone();
-        let quiet = list_glyph(&c, a.now());
+        let quiet = list_glyph(&c, a.now(), usize::MAX);
         assert_ne!(quiet.2, "needs you");
         c.attention = Attention::NeedsYou;
-        let (glyph, color, meta, mcolor) = list_glyph(&c, a.now());
+        let (glyph, color, meta, mcolor) = list_glyph(&c, a.now(), usize::MAX);
         assert_eq!(
             (glyph, color, meta.as_str(), mcolor),
             ("●", YELLOW, "needs you", YELLOW)
@@ -6880,11 +6988,11 @@ mod tests {
             .cloned()
             .expect("a done card in the demo");
         done.detail.as_mut().unwrap().status = Some("Reopening…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "reopening");
+        assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "reopening");
         done.detail.as_mut().unwrap().status = Some("Starting…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "starting up");
+        assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "starting up");
         done.detail.as_mut().unwrap().status = Some("Starting on arknet-one…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "starting up");
+        assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "starting up");
     }
 
     /// Intent 0455: a current account shows on the top bar, even when its usage doesn't fit, and on

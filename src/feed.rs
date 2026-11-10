@@ -251,6 +251,10 @@ pub struct FeedCard {
     /// when none could; absent once it's written up.
     #[serde(default)]
     pub intake: Option<String>,
+    /// With `intake: failed`: why, in a few plain words ("no account was free"); absent on older
+    /// feeds (intent 0591).
+    #[serde(default)]
+    pub intake_why: Option<String>,
     /// The submission Kerdr sent the words with, while the record is still being written up from
     /// them: the card shown while they were saved gives way to this one (intent 0445).
     #[serde(default)]
@@ -504,6 +508,21 @@ pub fn parse(text: &str) -> Result<Feed, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_s_write_up_reason_is_optional() {
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[
+                {"id":"1","title":"a","intake":"failed","intake_why":"no account was free"},
+                {"id":"2","title":"b","intake":"failed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            feed.cards[0].intake_why.as_deref(),
+            Some("no account was free")
+        );
+        assert_eq!(feed.cards[1].intake_why, None);
+    }
 
     #[test]
     fn a_feed_says_what_it_takes_and_what_it_could_not_read() {
