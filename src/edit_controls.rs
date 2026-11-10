@@ -601,6 +601,31 @@ impl App {
                     } else {
                         ""
                     };
+                    // Emptied, it most likely isn't wanted: asked whether to set it aside, never
+                    // saved empty (intent 0591, K1-91). Anything else is as it was.
+                    let card = self
+                        .card(key)
+                        .filter(|c| waiting_work(c) && self.actions_on())
+                        .cloned();
+                    if let Some(card) = card {
+                        self.editor_trouble(&run, &reference);
+                        self.mode = Mode::Confirm {
+                            machine: held.machine,
+                            request: json!({"action": "dismiss", "id": held.id}),
+                            title: format!("Won't do {reference}?"),
+                            message: format!(
+                                "You emptied {reference}'s text. An item's text can't be empty, so nothing was saved. Set {reference} aside in Won't do instead? Its record keeps where it was, and u brings it back; no leaves it as it was.{kept}"
+                            ),
+                            back: Box::new(self.mode.clone()),
+                            target: Some(Box::new(CardSnapshot::of(&card))),
+                            queue: false,
+                            ready_at: Some(Instant::now() + Duration::from_millis(500)),
+                            plain: true,
+                            choices: vec![],
+                            enter_queues: false,
+                        };
+                        return Action::None;
+                    }
                     self.fail(format!(
                         "An item's text can't be empty; {reference} is as it was.{kept}{note}"
                     ));
@@ -1872,9 +1897,24 @@ mod tests {
         assert!(app.edits.is_empty());
         assert_eq!(app.resolver.unanswered(), 0, "nothing was sent");
         opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        // Emptied: nothing is saved, and it asks whether to set it aside instead (intent 0591,
+        // K1-91); no leaves it as it was.
         assert_eq!(app.edit_ended(&key, wrote("")), Action::None);
-        assert!(said(&app).contains("can't be empty"), "{}", said(&app));
-        seen(&mut app);
+        let Mode::Confirm {
+            title,
+            message,
+            request,
+            ..
+        } = &app.mode
+        else {
+            panic!("an emptied text asked nothing: {}", said(&app))
+        };
+        assert!(title.starts_with("Won't do"), "{title}");
+        assert!(message.contains("can't be empty"), "{message}");
+        assert_eq!(request, &json!({"action": "dismiss", "id": id}));
+        assert_eq!(app.resolver.unanswered(), 0, "nothing was sent");
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!matches!(app.mode, Mode::Confirm { .. }));
         // A cancel forgets an unsaved version too.
         let sent = saves(&mut app, &key, wrote("Mine."));
         answer(&mut app, &sent, refused("No."));
@@ -1882,14 +1922,13 @@ mod tests {
         assert!(app.edits[&key].mine.is_some());
         press(&mut app, 'e');
         assert_eq!(app.edit_open.take().as_deref(), Some(key.as_str()));
-        // Emptied, it keeps his version, and says so where it can't be missed.
+        // Emptied, it keeps his version, and says so in its question.
         assert_eq!(app.edit_ended(&key, wrote("")), Action::None);
-        assert!(
-            said(&app).contains("e opens your last version"),
-            "{}",
-            said(&app)
-        );
-        seen(&mut app);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("an emptied text asked nothing: {}", said(&app))
+        };
+        assert!(message.contains("e opens your last version"), "{message}");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
         app.edit_ended(&key, cancelled());
         assert!(app.edits.is_empty());
