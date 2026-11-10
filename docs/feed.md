@@ -953,8 +953,48 @@ there's nothing to start. It sends, to the workspace's own machine:
 program and answers as a reopen does: `ok`, with `session`, `workspace`, `label` and `tab` (the new
 tab), and a `message` such as "Started a new Claude Code agent in scratch on ARK_C." Kerdr goes in,
 landing on that tab, while you're still on the workspace; otherwise it shows the message and says ⏎
-goes in. A question it asks is asked as other account actions' are (below). A backend should start
-nothing where something is running in the workspace already.
+goes in. A question it asks is asked as other account actions' are (below). An account that isn't
+signed in on that machine answers `"sign_in": true` with `code`, as a move's does (below): the box
+that signs it in opens, and once it's done the start goes again by itself, as a new request; leaving
+the box says nothing started. A backend should start nothing where something is running in the
+workspace already.
+
+### A workspace with no intent that closed
+
+A workspace with no intent drops off the board once it closes, and with it the only way back to its
+agent's conversation. So Kerdr offers to resume that conversation in a new workspace of the same
+session: when ⏎ finds the workspace closed (on its card, or once a machine that was away comes back),
+and when `s` finds its agent gone. It offers it only where the board knew exactly one conversation in
+that workspace and the machine's feed lists `account-resume` in `starts_on`; otherwise those keys say
+what they said before. It never resumes on its own, since a workspace may have closed because its
+agent wrapped up: it asks first, in the account question box, led by what happened ("w7 has closed
+since the board last read it. Resume its Claude Code conversation in a new workspace in web? …"), with
+yes "resume it" and no "leave it". Its yes sends, to that machine:
+
+```json
+{"action":"account-resume","session":"web","conversation":"c-0123","label":"scratch","to":"ARK_C"}
+```
+
+`label` is the closed workspace's name, which the new one takes. `to` is the account `s` picked; with
+none (⏎, or `s`'s "follow its owner's list"), the backend resumes it on the owner's list. The backend
+checks first that the conversation isn't running anywhere else. It answers `ok` with `session`,
+`workspace`, `label` and, for a new tab, `tab`, both when it resumed it and when it found it open
+already. Kerdr goes in while you're still on the board with nothing typed, since the card is gone;
+otherwise it shows the message and says ⏎ on its card goes in. A question (`confirmation` with
+`confirm`, and perhaps `choices`) is asked as other account actions' are, and a `sign_in` answer as a
+move's is: the box opens, and the resume goes again once that account is signed in. A refusal shows in
+its own words.
+
+`s` on such a card sends `account-move` as for any agent. When the agent turns out not to be running
+on that machine, a backend may say so plainly:
+
+```json
+{"ok":false,"not_running":true,"why":"gone","message":"That agent isn't running any more, so nothing moved."}
+```
+
+For a workspace with no intent whose conversation it knows, Kerdr then asks to resume it on the
+account picked, as above, led by that message. The picker does the same when the board already shows
+the agent gone by the time an account is picked. Other `why` values, and other cards, show the message.
 
 ## Agents reporting for themselves
 
@@ -1155,6 +1195,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-remove` | `code` | removes after Kerdr’s local confirmation |
 | `account-current` | `to` (a code), or `clear: true` | makes it the current account for every machine, or clears it; answers `message` and `current` (the field above, as this machine sees it now, or null); with `"sign_in": true` and `code` when that account isn't signed in on this machine (below) |
 | `account-start` | `session`, `workspace`, `to` (code or `list`) | a fresh agent in a new tab of that workspace: see [An empty workspace](#an-empty-workspace) |
+| `account-resume` | `session`, `conversation`, `label`, optional `to` (a code; none for the owner's list) | that conversation resumed in a new workspace of the session: see [A workspace with no intent that closed](#a-workspace-with-no-intent-that-closed) |
 
 `c` on the accounts screen sends `account-current` with `to`, and `C` sends it with `clear`, to
 the machine being viewed, whatever its feed last said (the backend answers if it was already
@@ -1205,7 +1246,7 @@ for example: `{"id":"after-job","key":"j","label":"move it when the job ends"}`.
 
 Other account actions may ask too (`account-models` with agents left on accounts off the list,
 `account-add` for a code that exists as the other kind, `account-remove` for a machine's own saved
-sign-in, `account-start`): `{"ok":false,"confirmation":"<question>","confirm":"<token>","yes":"…",
+sign-in, `account-start`, `account-resume`): `{"ok":false,"confirmation":"<question>","confirm":"<token>","yes":"…",
 "no":"…","message":"<question>"}`. Kerdr asks it in the same box, over the screen it was asked from or,
 when you've gone on to type something, once you're back on the board; `y` sends the same request
 again with `confirm`. `message` must read on its own, since an older Kerdr shows only that. A model
@@ -1230,7 +1271,8 @@ after `account-test`, and once that sign-in is done it closes it and sends the s
 itself, as a new request (a fresh `op`). A sign-in that fails keeps the move while `r` can try again;
 leaving the box drops it, and Kerdr says nothing moved. `account-current` answers `ok` with
 `"sign_in": true` and `code` the same way when the account it set isn't signed in here: the same box
-opens, and nothing is sent again after. An older Kerdr shows the message alone.
+opens, and nothing is sent again after. `account-start` and `account-resume` answer the same way as
+a move, and go again once it's signed in. An older Kerdr shows the message alone.
 
 ### Signing in
 

@@ -27,6 +27,8 @@ pub mod follow;
 pub mod inside;
 #[path = "kickoff_controls.rs"]
 pub mod kickoff_controls;
+#[path = "resume.rs"]
+pub mod resume;
 #[path = "run_state.rs"]
 pub mod run_state;
 #[path = "view_controls.rs"]
@@ -564,6 +566,9 @@ pub struct PendingJump {
     /// A workspace no card claims, or one a reopen's answer named, by machine, session and id, in
     /// place of a card, with the tab to land on when one was named (a child's new tab).
     pub bare: Option<(usize, String, String, Option<String>)>,
+    /// A bare workspace's conversation, as the board saw it when ⏎ began to wait: offered to
+    /// resume if the workspace has closed by the time its machine answers (intent 0591, K1-03).
+    pub resume: Option<resume::BareResume>,
 }
 
 /// How long ⏎ waits for a herdr session that didn't answer its last read before saying it's still
@@ -1663,6 +1668,7 @@ impl App {
             machine: card.machine.clone(),
             stuck: None,
             bare: None,
+            resume: self.bare_resume_of(card),
         });
     }
 
@@ -1679,12 +1685,16 @@ impl App {
         bare: Option<(String, String, Option<String>)>,
     ) {
         let name = self.machines[machine].name();
+        let resume = key
+            .and_then(|k| self.card(k))
+            .and_then(|c| self.bare_resume_of(c));
         self.pending_jump = Some(PendingJump {
             key: key.unwrap_or_default().to_string(),
             workspace: what.to_string(),
             machine: name.clone(),
             stuck: Some((session.to_string(), Instant::now())),
             bare: bare.map(|(s, id, tab)| (machine, s, id, tab)),
+            resume,
         });
         self.say(
             format!(
@@ -1765,6 +1775,17 @@ impl App {
                 ),
                 Tone::Warn,
             );
+            return None;
+        }
+        // A bare workspace whose conversation the board knew: offered to resume, never resumed on
+        // its own, since it may have closed because its agent wrapped (intent 0591, K1-03).
+        let said = format!(
+            "{} closed while {} was away.",
+            pending.workspace, pending.machine
+        );
+        if let Some(resume) = &pending.resume
+            && self.offer_resume(resume, None, &said)
+        {
             return None;
         }
         self.say(
@@ -1969,6 +1990,10 @@ impl App {
             return self.by_enter(action);
         }
         // What's left can't be started or reopened from here: say why, plainly (intent 0591).
+        // A bare workspace gone, its conversation known: offered to resume (intent 0591, K1-08).
+        if card.detail.is_none() && self.offer_resume_closed(&card) {
+            return Action::None;
+        }
         let reference = &card.reference;
         let msg = if card.detail.is_none() {
             format!(
@@ -4503,6 +4528,7 @@ pub(crate) mod tests {
             machine: "gone-box".into(),
             stuck: None,
             bare: None,
+            resume: None,
         };
         app.pending_jump = Some(pending(key.clone()));
         app.mode = Mode::Board;
@@ -7316,6 +7342,7 @@ pub(crate) mod tests {
             machine: app.card(&key).unwrap().machine.clone(),
             stuck: None,
             bare: None,
+            resume: None,
         };
         app.pending_jump = Some(pending(&app));
         assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));

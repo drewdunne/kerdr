@@ -1053,6 +1053,8 @@ impl App {
                 "Signing in…".into()
             } else if request["action"] == "account-start" {
                 "Starting a fresh agent…".into()
+            } else if request["action"] == crate::app::resume::RESUME {
+                "Resuming its conversation…".into()
             } else {
                 "Updating accounts…".into()
             };

@@ -59,6 +59,16 @@ pub struct AskedAbout {
     pub then_waiting: Option<String>,
 }
 
+/// What waits on a sign-in, in words: the step that goes on once it's done, and what's said when
+/// it's left (Round 2b).
+fn waiting_on_signin(request: &Value) -> (&'static str, &'static str) {
+    match request["action"].as_str() {
+        Some("account-start") => ("start", "Nothing started"),
+        Some(crate::app::resume::RESUME) => ("resume", "Nothing was resumed"),
+        _ => ("move", "Nothing moved"),
+    }
+}
+
 /// A request to ask again with a backend's new token: without any earlier answer's fields (its
 /// op, choice, override, queue or token), so the answer given to the new question is the only one
 /// it carries (Codex's review).
@@ -1652,7 +1662,7 @@ impl App {
 
     /// Keeps what an account question needs beyond its words, merged into what's kept for it
     /// already (Codex's review).
-    fn keep_asked(
+    pub(crate) fn keep_asked(
         &mut self,
         machine: usize,
         request: &Value,
@@ -1777,9 +1787,10 @@ impl App {
         self.mode = (**back).clone();
         self.say(
             format!(
-                "{} is signed in on {}, so the move goes on.",
+                "{} is signed in on {}, so the {} goes on.",
                 after.code,
-                self.machines[after.machine].name()
+                self.machines[after.machine].name(),
+                waiting_on_signin(&after.request).0
             ),
             Tone::Info,
         );
@@ -1811,7 +1822,8 @@ impl App {
         };
         self.say(
             format!(
-                "Nothing moved: {} isn't signed in on {}.",
+                "{}: {} isn't signed in on {}.",
+                waiting_on_signin(&after.request).1,
                 after.code,
                 self.machines
                     .get(after.machine)
@@ -1848,6 +1860,14 @@ impl App {
                         .into();
             }
             return Action::None;
+        }
+        // What the request's question came from goes with it, however it's sent: its yes, or its
+        // resend after a sign-in (Codex's review).
+        if let Some(from) = self
+            .asked_for(machine, &request)
+            .and_then(|k| k.from.clone())
+        {
+            self.action_from = Some(from);
         }
         self.account_pending = Some(Pending {
             machine,
@@ -2382,6 +2402,18 @@ impl App {
                             return Action::None;
                         }
                         MoveNow::Gone => {
+                            self.mode = *back;
+                            // A bare workspace's agent, its conversation known: offered to resume
+                            // in a new workspace on the account picked (Round 2b, K1-08).
+                            let said = format!(
+                                "{}'s agent isn't running any more, so there's nothing to move.",
+                                target.reference
+                            );
+                            if let Some(resume) = self.bare_resume_of_target(target)
+                                && self.offer_resume(&resume, to_now.as_deref(), &said)
+                            {
+                                return Action::None;
+                            }
                             self.say(
                                 format!(
                                     "{}'s agent isn't running any more, so there's nothing to move; s on its card starts it on an account.",
@@ -2389,7 +2421,6 @@ impl App {
                                 ),
                                 Tone::Info,
                             );
-                            self.mode = *back;
                             return Action::None;
                         }
                         // Its conversation may have become known since: the move names it.
@@ -2856,13 +2887,9 @@ impl App {
                             self.mode = *back;
                             if let Some((mi, r)) = request {
                                 // What the question came from goes with its yes: the agent a
-                                // question it brings is about, the card a start goes into.
+                                // question it brings is about, and (in send_account) the card a
+                                // start goes into.
                                 self.keep_asked(mi, &r, target, None, None);
-                                if let Some(from) =
-                                    self.asked_for(mi, &r).and_then(|k| k.from.clone())
-                                {
-                                    self.action_from = Some(from);
-                                }
                                 return self.send_account(mi, r);
                             }
                             return Action::None;
@@ -3193,7 +3220,10 @@ impl App {
                     == crate::actions::without_op(&crate::actions::request_metadata(&request))
         });
         // A fresh agent's start (intent 0591, K1-105): the card it was asked on, for going in.
-        let start_from = if request["action"] == "account-start" {
+        let start_from = if matches!(
+            request["action"].as_str(),
+            Some("account-start" | crate::app::resume::RESUME)
+        ) {
             self.action_from.take()
         } else {
             None
@@ -3620,6 +3650,56 @@ impl App {
             }
             return;
         }
+        // A conversation resumed in a new workspace, or found open already: gone into, as ⏎ asked,
+        // while you're where going in can't take keys meant for something else; otherwise said,
+        // with how to go in (intent 0591, K1-03, K1-08, K3-03).
+        if action == crate::app::resume::RESUME
+            && response.ok
+            && !response.confirmation
+            && let (Some(session), Some(workspace)) =
+                (response.session.clone(), response.workspace.clone())
+        {
+            match start_from.filter(|_| self.enter_can_land_here()) {
+                Some(from) => {
+                    self.open_after = Some(crate::app::OpenAfter {
+                        machine,
+                        label: response.label.clone().unwrap_or_else(|| workspace.clone()),
+                        session,
+                        workspace,
+                        tab: response.tab.clone(),
+                        from: from.key,
+                    });
+                }
+                None => {
+                    let message = if response.message.contains('⏎') {
+                        response.message.clone()
+                    } else {
+                        format!("{} ⏎ on its card goes in.", response.message.trim_end())
+                    };
+                    self.say(message, Tone::Good);
+                }
+            }
+            return;
+        }
+        // A move whose agent turned out to run nowhere on that machine now, picked on a bare
+        // workspace whose conversation is known: offered to resume it in a new workspace there on
+        // the account picked, to a backend that can (intent 0591, K1-08).
+        if action == "account-move"
+            && !response.ok
+            && response.not_running
+            && response.why.as_deref() == Some("gone")
+            && let Some(resume) = move_target
+                .as_deref()
+                .and_then(|t| self.bare_resume_of_target(t))
+            && (visible || self.enter_can_land_here())
+        {
+            if visible && let Mode::Accounts { back, .. } = self.mode.clone() {
+                self.mode = *back;
+            }
+            if self.offer_resume(&resume, request["to"].as_str(), &response.message) {
+                return;
+            }
+        }
         // Another account action's question (a list saved with agents left elsewhere, an account
         // that exists as the other kind, a machine's own sign-in to remove): asked as a move's is,
         // its yes the same request with its token (intent 0591). Over the screen it was asked
@@ -3862,19 +3942,25 @@ impl App {
         // that signs it in opens, and a move goes on by itself once that's done (intent 0591,
         // B3-10, B3-40). Only where it can't take typing.
         if response.sign_in
-            && matches!(action, "account-move" | "account-current")
+            && matches!(
+                action,
+                "account-move" | "account-current" | "account-start" | crate::app::resume::RESUME
+            )
             && (visible || self.enter_can_land_here())
             && let Some(code) = response.code.clone().filter(|c| !c.is_empty())
         {
-            self.after_signin = (action == "account-move" && !response.ok).then(|| AfterSignin {
+            // A move, a fresh agent's start or a resume goes again by itself once it's signed in
+            // (intent 0591, B3-10, Round 2b).
+            let again = action != "account-current" && !response.ok;
+            self.after_signin = again.then(|| AfterSignin {
                 machine,
                 code: code.clone(),
                 request: crate::actions::without_op(&request),
             });
-            // The agent it moves, past the picker it may have been asked in: a question the move
-            // brings once it goes again is asked for it at once (Codex's review).
-            if action == "account-move" && !response.ok {
-                self.keep_asked(machine, &request, move_target.clone(), None, None);
+            // What it was for, past the screen it may have been asked from: the agent a move's
+            // question is asked for, the card a start or resume goes into (Codex's review).
+            if again {
+                self.keep_asked(machine, &request, move_target.clone(), start_from, None);
             }
             let label = format!("Sign {code} in on {}", self.machines[machine].name());
             self.push_account_screen(AccountScreen::Where {
@@ -3995,6 +4081,7 @@ fn account_error(request: &Value, error: &str) -> String {
         "account-test" => format!("Testing {}", code("code")),
         "account-current" => "Setting the current account".into(),
         "account-models" => "Saving the model list".into(),
+        crate::app::resume::RESUME => "Resuming that conversation".into(),
         "account-start" => match code("to").as_str() {
             "list" => "Starting an agent on its owner's list".into(),
             to => format!("Starting an agent on {to}"),

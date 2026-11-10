@@ -1179,6 +1179,12 @@ fn confirm_title(
             app.providers(machine).program_label(&a.runs)
         );
     }
+    if request["action"] == crate::app::resume::RESUME {
+        return format!(
+            "Resume {}?",
+            request["label"].as_str().unwrap_or("its conversation")
+        );
+    }
     "Account change".into()
 }
 

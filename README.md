@@ -230,7 +230,9 @@ its conversation, without touching the session's other agents or its owner's lis
 `S` edits. On a card with no agent running, `s` asks which account and starts it there: a fresh
 start for work nobody started, as `d` does, or a reopen that resumes its conversation, as `Enter`
 does. On a workspace with no intent and nothing running, `s` starts a fresh agent there, in a new
-tab, on the account you pick, and goes in. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
+tab, on the account you pick, and goes in. When a workspace with no intent has closed since the board
+last read it, `⏎` or `s` on its card asks to resume its agent's conversation in a new workspace of that session, and goes in once it's
+open. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
 
 Each key does what it means whatever state its card is in. `d` on work that has started does what
 `⏎` does, and `X` on a card with nothing running asks to set it aside. With a backend that does each

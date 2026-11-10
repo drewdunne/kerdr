@@ -1966,6 +1966,102 @@ mod tests {
     /// Intent 0591, K1-105: s on an empty workspace with no intent starts a fresh agent there on
     /// the account picked, and goes in while you're still on it.
     #[test]
+    fn a_fresh_agents_start_whose_account_isnt_signed_in_signs_it_in_then_starts_and_goes_in() {
+        // Round 2b: the start's account isn't signed in on that machine. The box that signs it
+        // in opens, the start goes again by itself once it's done, and Kerdr goes in.
+        let answer = |a: &mut App, action: Action, reply: Value| {
+            let Action::Mutate { machine, request } = action else {
+                panic!("nothing sent: {action:?} {:?}", a.message())
+            };
+            a.finish_action(
+                machine,
+                crate::actions::with_op(request),
+                Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+            );
+        };
+        let needs = json!({"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C needs signing in on this machine first: A, then Enter on ARK_C signs it in, and s starts it then; nothing started"});
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let first = key(&mut a, KeyCode::Enter);
+        let Action::Mutate { request: asked, .. } = first.clone() else {
+            panic!("nothing sent")
+        };
+        answer(&mut a, first, needs.clone());
+        assert!(
+            matches!(
+                a.mode,
+                Mode::Accounts {
+                    screen: crate::app::account_controls::AccountScreen::Where { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            a.mode
+        );
+        let start = key(&mut a, KeyCode::Enter);
+        answer(
+            &mut a,
+            start,
+            json!({"ok":true,"message":"Authorize in your browser.","status":"waiting","url":"https://example.com/authorize?state=example","ticket":"login-ticket","needs_code":true}),
+        );
+        if let Mode::Accounts {
+            screen: crate::app::account_controls::AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now();
+        }
+        let poll = a.account_tick();
+        answer(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"done","message":"ARK_C is signed in."}),
+        );
+        assert!(
+            a.message().unwrap().0.contains("so the start goes on"),
+            "{:?}",
+            a.message()
+        );
+        let again = a.account_tick();
+        let Action::Mutate { request, .. } = &again else {
+            panic!("the start didn't go again: {:?}", a.message())
+        };
+        assert_eq!(*request, asked, "the same start, as a new request");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        answer(
+            &mut a,
+            again,
+            json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        assert_eq!(
+            a.open_after.take().expect("didn't go in").tab.as_deref(),
+            Some("t9")
+        );
+        // Leaving the box drops it, said as a start.
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card);
+        let first = key(&mut a, KeyCode::Enter);
+        answer(&mut a, first, needs);
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .starts_with("Nothing started: ARK_C isn't signed in"),
+            "{:?}",
+            a.message()
+        );
+    }
+
+    #[test]
     fn a_fresh_agents_start_that_asks_first_still_goes_in_after_the_yes() {
         // Codex's review: the start asks first; once its yes starts it while you're still on the
         // workspace, Kerdr goes in, as it does when nothing was asked.

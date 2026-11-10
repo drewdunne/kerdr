@@ -122,6 +122,21 @@ pub struct Response {
     /// on it, each moved to the list by an `account-move` with `"to": "list"` (intent 0591, B3-42).
     #[serde(default, deserialize_with = "off_list")]
     pub off_list: Vec<OffList>,
+    /// With a refused move: its agent wasn't running, and `why` says how ("gone": it runs nowhere
+    /// on that machine now) (intent 0591, B3-05).
+    #[serde(default)]
+    pub not_running: bool,
+    #[serde(default, deserialize_with = "plain_word")]
+    pub why: Option<String>,
+}
+
+/// A short word as a backend gives it; anything else is none, never a failed answer.
+fn plain_word<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .filter(|w| !w.is_empty() && w.len() <= 40)
+        .map(str::to_string))
 }
 
 /// A running agent a saved list leaves on another account (intent 0591, B3-42): what an

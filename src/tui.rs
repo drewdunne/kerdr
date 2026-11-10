@@ -1448,7 +1448,13 @@ fn jump_cards(
                         Action::Mutate { machine, request } => {
                             start_action(app, bg.answers, bg.runner, machine, request)
                         }
-                        _ => app.say(closed(&card.workspace_name()), Tone::Warn),
+                        // A bare workspace whose conversation the board knew: asked whether to
+                        // resume it, where its backend can (intent 0591, K3-03).
+                        _ => {
+                            if !app.offer_resume_closed(&card) {
+                                app.say(closed(&card.workspace_name()), Tone::Warn)
+                            }
+                        }
                     }
                 }
                 return;
