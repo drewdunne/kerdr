@@ -1219,6 +1219,11 @@ Each one carries an `op` and follows `retry` and a lost answer as any change doe
 itself with the same `op`, saying "trying again…" quietly on the busy line and on its card when it has
 one (a move's card, a fresh agent's workspace). So a `retry` refusal's `message` needn't say what to
 press; it's shown only if the two minutes run out.
+Kerdr sends one account request at a time: one asked for while another is on its way, including a
+move Kerdr makes by itself, waits its turn with what it was asked from, and each answer is matched
+to its own request. What an answer brings (a question, the box that signs an account in, an offer
+to resume a conversation) is shown over the screen it was asked from, or held with its request when
+you've gone on to type something and shown once you're back on the board, never dropped.
 Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |

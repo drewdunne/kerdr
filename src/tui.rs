@@ -960,7 +960,10 @@ fn start_action(
         run_ready(app, runner);
         return;
     }
+    // One at a time: one made some other way while another is on its way waits its turn, never
+    // dropped (Codex's fourth look). Kerdr's own are made by send_account, which keeps them so.
     if app.busy {
+        app.account_queue.push_back((machine, request));
         return;
     }
     let Some(command) = app.cfg.actions.command.clone() else {

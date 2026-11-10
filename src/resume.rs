@@ -111,6 +111,19 @@ impl App {
     /// Whether it asked: a backend that doesn't resume, or a machine that can't take it, asks
     /// nothing, and the caller says what it always said.
     pub fn offer_resume(&mut self, resume: &BareResume, to: Option<&str>, said: &str) -> bool {
+        self.offer_resume_when(resume, to, said, true)
+    }
+
+    /// The same, asked now or, when `now` is false (it came while he typed), held with what it
+    /// would resume and asked once he's back where it can't take keys meant for something else
+    /// (Codex's fourth look).
+    pub fn offer_resume_when(
+        &mut self,
+        resume: &BareResume,
+        to: Option<&str>,
+        said: &str,
+        now: bool,
+    ) -> bool {
         if !self.resumes_on(resume.machine) || !self.machines[resume.machine].conn.is_live() {
             return false;
         }
@@ -145,7 +158,7 @@ impl App {
             dismissed: false,
         };
         self.keep_asked(resume.machine, &request, None, Some(gone), None);
-        self.push_account_screen(AccountScreen::Confirm {
+        let question = AccountScreen::Confirm {
             machine: resume.machine,
             request,
             message,
@@ -154,7 +167,19 @@ impl App {
             target: None,
             ready_at: Instant::now() + Duration::from_millis(500),
             choices: vec![],
-        });
+        };
+        if now {
+            self.push_account_screen(question);
+        } else {
+            self.hold_question(question);
+            self.say(
+                format!(
+                    "{} Kerdr offers to resume it once you're back on the board.",
+                    said.trim_end()
+                ),
+                Tone::Info,
+            );
+        }
         true
     }
 }
@@ -381,6 +406,62 @@ mod tests {
         closes(&mut a, &card);
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
         assert_eq!(asked(&a).0["action"], "account-resume");
+    }
+
+    #[test]
+    fn a_resume_offer_that_comes_while_he_types_is_made_once_he_is_back_even_with_its_card_gone() {
+        // Codex's fourth look: the move's answer finds its agent gone while he's typing a new
+        // intent. The offer isn't put over his typing, nor dropped: it waits with the
+        // conversation it would resume, and is made once he's back, though the card has gone.
+        let mut a = app();
+        let card = bare(&mut a, true);
+        a.sel = Selection {
+            col: a.col_of(&card),
+            key: Some(card.key.clone()),
+        };
+        a.s_on_card(card.clone());
+        let action = key(&mut a, KeyCode::Enter);
+        key(&mut a, KeyCode::Esc);
+        key(&mut a, KeyCode::Char('c'));
+        assert!(matches!(a.mode, Mode::Compose { .. }), "{:?}", a.mode);
+        answer(
+            &mut a,
+            action,
+            json!({"ok":false,"not_running":true,"why":"gone","message":"The conversation you picked isn't running anywhere on this machine now, so nothing moved."}),
+        );
+        assert!(matches!(a.mode, Mode::Compose { .. }), "{:?}", a.mode);
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .ends_with("Kerdr offers to resume it once you're back on the board."),
+            "{:?}",
+            a.message()
+        );
+        closes(&mut a, &card);
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_owed(), Action::None);
+        let (request, _) = asked(&a);
+        assert_eq!(request["action"], "account-resume");
+        assert_eq!(request["conversation"], "c-0123");
+        settle(&mut a);
+        let Action::Mutate { request: sent, .. } = key(&mut a, KeyCode::Char('y')) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(sent, request);
+        // Resumed: gone into as ⏎ meant, from what was kept with the offer.
+        answer(
+            &mut a,
+            Action::Mutate {
+                machine: card.machine_index,
+                request: sent,
+            },
+            opened(&card),
+        );
+        assert_eq!(
+            a.open_after.take().map(|o| o.workspace).as_deref(),
+            Some("w77")
+        );
     }
 
     #[test]

@@ -62,8 +62,12 @@ pub struct AskedAbout {
     pub then_waiting: Option<String>,
     /// The question, its token in its request, while it waits for him to be back where it can't
     /// take keys meant for something else. Held ones are asked in the order they came, each its
-    /// own: a second never replaces or drops the first (Codex's third look).
+    /// own: a second never replaces or drops the first (Codex's third look). Any screen an answer
+    /// brings is held the same way: a sign-in's, or an offer to resume (Codex's fourth look).
     pub held: Option<Box<AccountScreen>>,
+    /// A held sign-in's request that goes again once it's signed in, waiting with it until it's
+    /// shown.
+    pub signin: Option<AfterSignin>,
 }
 
 /// What waits on a sign-in, in words: the step that goes on once it's done, and what's said when
@@ -1701,6 +1705,10 @@ impl App {
                 .is_some_and(|p| this(p.machine, &p.request))
             || self.account_queue.iter().any(|(m, r)| this(*m, r))
             || self
+                .account_later
+                .iter()
+                .any(|(p, _)| this(p.machine, &p.request))
+            || self
                 .after_signin
                 .as_ref()
                 .is_some_and(|a| this(a.machine, &a.request))
@@ -1740,6 +1748,7 @@ impl App {
                 from,
                 then_waiting,
                 held: None,
+                signin: None,
             });
         }
     }
@@ -1762,7 +1771,22 @@ impl App {
         else {
             return;
         };
-        let (machine, asked) = (*machine, move_asked(request));
+        let (machine, request) = (*machine, request.clone());
+        self.hold_screen(machine, &request, question, None);
+    }
+
+    /// Any screen an account request's answer brings (a question, a sign-in, an offer to resume),
+    /// held with that request's record until he's back where it can't take keys meant for
+    /// something else, after any held before it, with the request a sign-in sends again once it's
+    /// done (Codex's fourth look).
+    fn hold_screen(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        screen: AccountScreen,
+        signin: Option<AfterSignin>,
+    ) {
+        let asked = move_asked(request);
         self.asked_now.push((machine, asked.clone()));
         let mut kept = match self
             .asked_about
@@ -1777,10 +1801,34 @@ impl App {
                 from: None,
                 then_waiting: None,
                 held: None,
+                signin: None,
             },
         };
-        kept.held = Some(Box::new(question));
+        kept.held = Some(Box::new(screen));
+        kept.signin = signin;
         self.asked_about.push(kept);
+    }
+
+    /// Shows what an answer brought now, where he is, or holds it until he's back where it can't
+    /// take keys meant for something else: never dropped for not being in sight (Codex's fourth
+    /// look). Whether it's shown now.
+    fn show_or_hold(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        screen: AccountScreen,
+        signin: Option<AfterSignin>,
+        visible: bool,
+    ) -> bool {
+        if visible || self.enter_can_land_here() {
+            if signin.is_some() {
+                self.after_signin = signin;
+            }
+            self.push_account_screen(screen);
+            return true;
+        }
+        self.hold_screen(machine, request, screen, signin);
+        false
     }
 
     /// The card the account request on its way is for, when it's on the board: a move's agent's,
@@ -1803,8 +1851,16 @@ impl App {
     /// The question held longest, taken to be asked now. Its record stays while it holds what the
     /// question's answer needs.
     pub(crate) fn take_held_question(&mut self) -> Option<AccountScreen> {
-        let i = self.asked_about.iter().position(|k| k.held.is_some())?;
+        // A sign-in waits while another's request waits on its own (there's one at a time).
+        let busy_signin = self.after_signin.is_some();
+        let i = self
+            .asked_about
+            .iter()
+            .position(|k| k.held.is_some() && !(busy_signin && k.signin.is_some()))?;
         let question = self.asked_about[i].held.take()?;
+        if let Some(after) = self.asked_about[i].signin.take() {
+            self.after_signin = Some(after);
+        }
         let kept = &self.asked_about[i];
         if kept.target.is_none() && kept.from.is_none() && kept.then_waiting.is_none() {
             self.asked_about.remove(i);
@@ -1973,6 +2029,10 @@ impl App {
         }
     }
 
+    /// Every account request is made here (Codex's fourth look). What it's asked from is kept with
+    /// it as it's made: the screen it came from, and for a move from the picker its agent, in the
+    /// move's own record. One made while another is on its way waits its turn with all of that,
+    /// and is never sent over the one on its way.
     pub(crate) fn send_account(&mut self, machine: usize, request: Value) -> Action {
         if !self.can_write(machine) {
             if request["action"] == "account-signin"
@@ -1991,7 +2051,7 @@ impl App {
         }
         // What the request came from is kept in its record, found by the request when its answer
         // comes, never in a slot another answer could take (Codex's third look).
-        self.account_pending = Some(Pending {
+        let origin = Pending {
             machine,
             request: crate::actions::request_metadata(&request),
             screen: match &self.mode {
@@ -2006,8 +2066,40 @@ impl App {
                 }
                 _ => None,
             },
-        });
+        };
+        if request["action"] == "account-move"
+            && let Some(AccountScreen::Move { target, .. }) = &origin.screen
+            && request["pane"].as_str() == Some(target.agent.pane.as_str())
+        {
+            let target = target.clone();
+            self.keep_asked(machine, &request, Some(target), None, None);
+        }
+        if self.busy {
+            self.account_later.push_back((origin, request));
+            return Action::None;
+        }
+        self.account_pending = Some(origin);
         Action::Mutate { machine, request }
+    }
+
+    /// Whether this request waits its turn behind the one on its way.
+    fn account_waits(&self, machine: usize, request: &Value) -> bool {
+        let request = crate::actions::request_metadata(request);
+        self.account_later
+            .iter()
+            .any(|(p, _)| p.machine == machine && p.request == request)
+    }
+
+    /// Whether an account reply is the answer to the request on its way: matched before anything
+    /// about that request is touched (its busy line, its "trying again", what it was asked from),
+    /// so another request's answer coming first leaves it all as it was (Codex's fourth look).
+    /// With none known to be on its way, it's taken as that one's, as before.
+    pub(crate) fn account_reply_is_ours(&self, machine: usize, request: &Value) -> bool {
+        self.account_pending.as_ref().is_none_or(|p| {
+            p.machine == machine
+                && crate::actions::without_op(&p.request)
+                    == crate::actions::without_op(&crate::actions::request_metadata(request))
+        })
     }
 
     fn begin_signin(
@@ -2049,8 +2141,9 @@ impl App {
         };
         let request = signin.start();
         self.push_account_screen(AccountScreen::Signin(Box::new(signin)));
-        let action = self.send_account(machine, request);
+        let action = self.send_account(machine, request.clone());
         if action == Action::None
+            && !self.account_waits(machine, &request)
             && let Mode::Accounts {
                 screen: AccountScreen::Signin(s),
                 ..
@@ -3226,6 +3319,16 @@ impl App {
             }
             return action;
         }
+        // Asked for while another was on its way: sent now, with what it was asked from (Codex's
+        // fourth look).
+        if let Some((origin, request)) = self.account_later.pop_front() {
+            let machine = origin.machine;
+            if !self.can_write(machine) {
+                return Action::None;
+            }
+            self.account_pending = Some(origin);
+            return Action::Mutate { machine, request };
+        }
         // The code to type ran out with the page unused: a new one, by itself, once (intent 0591).
         let now = self.now();
         if let Mode::Accounts {
@@ -3851,12 +3954,14 @@ impl App {
             && let Some(resume) = move_target
                 .as_deref()
                 .and_then(|t| self.bare_resume_of_target(t))
-            && (visible || self.enter_can_land_here())
         {
             if visible && let Mode::Accounts { back, .. } = self.mode.clone() {
                 self.mode = *back;
             }
-            if self.offer_resume(&resume, request["to"].as_str(), &response.message) {
+            // Over typing, it's held with what it would resume, and offered once he's back: never
+            // lost for not being in sight, even once that card has gone (Codex's fourth look).
+            let now = visible || self.enter_can_land_here();
+            if self.offer_resume_when(&resume, request["to"].as_str(), &response.message, now) {
                 return;
             }
         }
@@ -4101,21 +4206,23 @@ impl App {
             let agents = response.off_list.clone();
             self.ask_off_list(machine, &request, &agents, visible);
         }
+        // What's said last, when the box an answer brings waits until he's back.
+        let mut held_said = None;
         // The account a move or the current account needs isn't signed in on that machine: the box
         // that signs it in opens, and a move goes on by itself once that's done (intent 0591,
-        // B3-10, B3-40). Only where it can't take typing.
+        // B3-10, B3-40). Only where it can't take typing: over typing it's held, with the request
+        // that goes again, and opens once he's back (Codex's fourth look).
         if response.sign_in
             && matches!(
                 action,
                 "account-move" | "account-current" | "account-start" | crate::app::resume::RESUME
             )
-            && (visible || self.enter_can_land_here())
             && let Some(code) = response.code.clone().filter(|c| !c.is_empty())
         {
             // A move, a fresh agent's start or a resume goes again by itself once it's signed in
             // (intent 0591, B3-10, Round 2b).
             let again = action != "account-current" && !response.ok;
-            self.after_signin = again.then(|| AfterSignin {
+            let after = again.then(|| AfterSignin {
                 machine,
                 code: code.clone(),
                 request: crate::actions::without_op(&request),
@@ -4126,7 +4233,7 @@ impl App {
                 self.keep_asked(machine, &request, move_target.clone(), start_from, None);
             }
             let label = format!("Sign {code} in on {}", self.machines[machine].name());
-            self.push_account_screen(AccountScreen::Where {
+            let screen = AccountScreen::Where {
                 code,
                 copy: None,
                 message: response.message.clone(),
@@ -4135,10 +4242,14 @@ impl App {
                     machines: vec![machine],
                 }],
                 sel: 0,
-            });
+            };
+            if !self.show_or_hold(machine, &request, screen, after, visible) {
+                held_said = Some("Its sign-in opens once you're back on the board.");
+            }
         }
         // The test found it isn't signed in: the box that signs it in opens over the list, and
-        // nothing starts until ⏎ (intent 0591).
+        // nothing starts until ⏎ (intent 0591). Only there: nothing he asked to change waits on it,
+        // and its message says how to sign in, so it never opens over what he's gone on to.
         if action == "account-test"
             && !response.ok
             && response.sign_in
@@ -4150,7 +4261,7 @@ impl App {
                 Some((c.id.clone(), c.name().to_string()))
             });
             let label = format!("Sign {code} in on {}", self.machines[machine].name());
-            self.push_account_screen(AccountScreen::Where {
+            let screen = AccountScreen::Where {
                 code: code.to_string(),
                 copy,
                 message: response.message.clone(),
@@ -4159,7 +4270,8 @@ impl App {
                     machines: vec![machine],
                 }],
                 sel: 0,
-            });
+            };
+            self.push_account_screen(screen);
         }
         // Done is the success colour; done already, or done with something still to come, is
         // news; not done is a warning (intent 0591). Sign-ins say `status`, moves `state`.
@@ -4177,6 +4289,10 @@ impl App {
         let message = match left {
             Some(left) => format!("{} {left}", response.message),
             None => response.message,
+        };
+        let message = match held_said {
+            Some(held) => format!("{} {held}", message.trim_end()),
+            None => message,
         };
         let tone = if !response.ok {
             Tone::Warn
@@ -8625,6 +8741,77 @@ mod tests {
         };
         assert_eq!(request["confirm"], "ticket");
         assert!(target.as_ref().is_some_and(|t| t.reference == "#44"));
+    }
+
+    #[test]
+    fn another_requests_answer_leaves_the_one_on_its_way_and_what_comes_next_waits_its_turn() {
+        // Codex's fourth look: a reply to something else, then a send, before the move's own
+        // reply. The move stays on its way (busy, "trying again", what it was asked from), what
+        // comes next waits its turn, and the move's question is still about its agent.
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        let action = key(&mut a, KeyCode::Enter);
+        // As start_action sends it.
+        a.busy = true;
+        a.account_retrying = a.account_card_in_flight();
+        assert!(a.account_retrying.is_some());
+        key(&mut a, KeyCode::Esc);
+        a.finish_action(
+            0,
+            crate::actions::with_op(json!({"action":"account-test","code":"KBZ_C"})),
+            Ok(Response {
+                ok: true,
+                message: "KBZ_C works here.".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(a.busy, "the move is still on its way");
+        assert!(
+            a.account_retrying.is_some(),
+            "and still said to be tried again"
+        );
+        // What comes next waits: a follow-up the tick would send, and a request made now.
+        a.account_queue
+            .push_back((0, json!({"action":"account-current","to":"KBZ_C"})));
+        assert_eq!(a.account_tick(), Action::None);
+        assert_eq!(
+            a.send_account(0, json!({"action":"account-test","code":"ARK_C"})),
+            Action::None
+        );
+        assert_eq!(a.account_later.len(), 1);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                request, target, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("not asked: {:?} {:?}", a.mode, a.message())
+        };
+        assert_eq!(request["confirm"], "ticket");
+        assert!(target.as_ref().is_some_and(|t| t.reference == "#44"));
+        assert!(!a.busy && a.account_retrying.is_none());
+        // Then each goes in its turn, the one made while it waited with what it was asked from.
+        let (_, next) = sent(a.account_tick());
+        assert_eq!(next["action"], "account-current");
+        a.finish_action(
+            0,
+            crate::actions::with_op(next),
+            Ok(Response {
+                ok: true,
+                message: "KBZ_C is current.".into(),
+                ..Default::default()
+            }),
+        );
+        let (_, last) = sent(a.account_tick());
+        assert_eq!(last, json!({"action":"account-test","code":"ARK_C"}));
+        assert!(a.account_later.is_empty());
     }
 
     #[test]

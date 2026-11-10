@@ -3504,12 +3504,18 @@ impl App {
             .as_str()
             .is_some_and(|a| a.starts_with("account-"))
         {
-            self.busy = false;
-            self.busy_id = None;
-            self.busy_since = None;
-            self.busy_label.clear();
-            // Answered at last: no longer being sent again (intent 0591).
-            self.account_retrying = None;
+            // Matched to the request on its way before anything about it is touched: another
+            // request's answer coming first leaves it on its way, its "trying again" and what it
+            // was asked from as they were, and what waits its turn still waits (Codex's fourth
+            // look).
+            if self.account_reply_is_ours(machine, &request) {
+                self.busy = false;
+                self.busy_id = None;
+                self.busy_since = None;
+                self.busy_label.clear();
+                // Answered at last: no longer being sent again (intent 0591).
+                self.account_retrying = None;
+            }
             self.finish_account_action(machine, request, result);
             return;
         }

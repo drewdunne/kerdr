@@ -721,7 +721,13 @@ pub struct App {
     pub account_batch_failed: bool,
     /// Machines `R` couldn't bring up to date, still being tried, and when (intent 0591).
     pub refresh_behind: Option<(Instant, Vec<usize>)>,
+    /// The account request on its way, with what it was asked from: one at a time. A reply is
+    /// matched to it before anything about it is touched (intent 0591, Codex's fourth look).
     pub account_pending: Option<account_controls::Pending>,
+    /// Account requests made while another was on its way, each with what it was asked from, sent
+    /// in turn once that one has its answer: never sent over it, never dropped (Codex's fourth
+    /// look).
+    pub account_later: std::collections::VecDeque<(account_controls::Pending, serde_json::Value)>,
     /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
     /// your version until a save of it succeeds.
     pub edits: std::collections::HashMap<String, edit_controls::Held>,
@@ -862,6 +868,7 @@ impl App {
             account_batch_failed: false,
             refresh_behind: None,
             account_pending: None,
+            account_later: Default::default(),
             edits: Default::default(),
             edit_flights: vec![],
             edit_open: None,

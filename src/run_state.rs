@@ -554,7 +554,10 @@ impl App {
     }
 
     /// The running agent at this card moved to the account picked for it, as the move picker sends
-    /// it. Nothing when it's on that account already.
+    /// it. Nothing when it's on that account already. Made as every account request is, with the
+    /// agent it's for kept in its record from the start, so a question it brings, a question that
+    /// changes after his yes, or a sign-in it waits on is still about that agent (Codex's fourth
+    /// look).
     fn move_to_account(&mut self, card: &Card, agent: &AccountAgent, to: &str) -> Action {
         if to != "list" && agent.account == to {
             self.say(
@@ -571,10 +574,16 @@ impl App {
             ),
             Tone::Info,
         );
-        Action::Mutate {
-            machine: card.machine_index,
-            request: json!({"action":"account-move","pane":agent.pane,"session":agent.session,"conversation":agent.conversation,"to":to}),
-        }
+        let machine = card.machine_index;
+        let request = json!({"action":"account-move","pane":agent.pane,"session":agent.session,"conversation":agent.conversation,"to":to});
+        let target = MoveTarget {
+            machine,
+            key: card.key.clone(),
+            reference: card.reference.clone(),
+            agent: agent.clone(),
+        };
+        self.keep_asked(machine, &request, Some(Box::new(target)), None, None);
+        self.send_account(machine, request)
     }
 
     /// A start on an account sent on to the machine an intent lives on now, whose backend can't
@@ -1968,6 +1977,170 @@ mod tests {
 
     /// Intent 0591, K1-105: s on an empty workspace with no intent starts a fresh agent there on
     /// the account picked, and goes in while you're still on it.
+    #[test]
+    fn a_starts_sign_in_that_comes_while_he_types_opens_once_he_is_back_and_the_start_goes_on() {
+        // Codex's fourth look: he starts typing a new intent while the start is on its way. Its
+        // sign-in isn't put over his typing, nor dropped: it opens once he's back, and the start
+        // goes again once it's signed in, going in as it would have.
+        let mut a = app();
+        let (card, machine, asked) = fresh_start(&mut a);
+        press(&mut a, 'c');
+        assert!(matches!(a.mode, Mode::Compose { .. }), "{:?}", a.mode);
+        answer_with(
+            &mut a,
+            machine,
+            asked.clone(),
+            json!({"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C needs signing in on this machine first; nothing started"}),
+        );
+        assert!(matches!(a.mode, Mode::Compose { .. }), "{:?}", a.mode);
+        assert_eq!(a.held_questions().count(), 1);
+        assert!(a.after_signin.is_none());
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .ends_with("Its sign-in opens once you're back on the board."),
+            "{:?}",
+            a.message()
+        );
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_owed(), Action::None);
+        assert!(
+            matches!(
+                a.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::Where { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            a.mode
+        );
+        assert_eq!(a.account_tick(), Action::None, "kept while its box is up");
+        assert_eq!(
+            a.after_signin.as_ref().map(|s| s.request.clone()),
+            Some(asked.clone())
+        );
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = key(&mut a, KeyCode::Enter)
+        else {
+            panic!("no sign-in")
+        };
+        answer_with(
+            &mut a,
+            m,
+            request,
+            json!({"ok":true,"message":"Authorize in your browser.","status":"waiting","url":"https://example.com/authorize?state=example","ticket":"login-ticket","needs_code":true}),
+        );
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now();
+        }
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = a.account_tick()
+        else {
+            panic!("no poll")
+        };
+        answer_with(
+            &mut a,
+            m,
+            request,
+            json!({"ok":true,"status":"done","message":"ARK_C is signed in."}),
+        );
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = a.account_tick()
+        else {
+            panic!("the start didn't go again: {:?}", a.message())
+        };
+        assert_eq!(request, asked);
+        answer_with(
+            &mut a,
+            m,
+            request,
+            json!({"ok":true,"session":card.session,"workspace":card.workspace_id,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        assert_eq!(
+            a.open_after.take().expect("didn't go in").tab.as_deref(),
+            Some("t9")
+        );
+    }
+
+    #[test]
+    fn an_automatic_moves_question_that_changes_after_his_yes_is_asked_again_about_its_agent() {
+        // Codex's fourth look: a move Kerdr makes by itself (an account owed to a card whose agent
+        // now runs) keeps its agent from the start, so its question, and the new question its yes
+        // brings, are each asked about that agent, never "open the move picker again".
+        let mut a = app();
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#44")
+            .unwrap()
+            .clone();
+        let RunState::Running(agent) = a.run_state(&card) else {
+            panic!("#44 has no running agent")
+        };
+        let to = if agent.account == "ARK_C" {
+            "KBZ_C"
+        } else {
+            "ARK_C"
+        };
+        select(&mut a, &card.key);
+        assert!(a.owe_move(&card.key, to));
+        let Action::Mutate { machine, request } = a.account_owed() else {
+            panic!("nothing moved: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "account-move");
+        let asked_about = |a: &App| match &a.mode {
+            Mode::Accounts {
+                screen:
+                    AccountScreen::Confirm {
+                        request, target, ..
+                    },
+                ..
+            } => (
+                request["confirm"].as_str().unwrap_or_default().to_string(),
+                target.as_ref().map(|t| t.reference.clone()),
+            ),
+            _ => panic!("not asked: {:?} {:?}", a.mode, a.message()),
+        };
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"confirmation":true,"confirm":"m-1","message":"#44's agent is mid-step. Move it when it stops?"}),
+        );
+        assert_eq!(
+            asked_about(&a),
+            ("m-1".to_string(), Some("#44".to_string()))
+        );
+        ready(&mut a);
+        let Action::Mutate { machine, request } = press(&mut a, 'y') else {
+            panic!("the yes sent nothing: {:?}", a.message())
+        };
+        assert_eq!(request["confirm"], "m-1");
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"confirmation":true,"confirm":"m-2","message":"#44's agent is at a question now. Move it once that's answered?"}),
+        );
+        assert_eq!(
+            asked_about(&a),
+            ("m-2".to_string(), Some("#44".to_string()))
+        );
+    }
+
     #[test]
     fn a_fresh_agents_start_whose_account_isnt_signed_in_signs_it_in_then_starts_and_goes_in() {
         // Round 2b: the start's account isn't signed in on that machine. The box that signs it
