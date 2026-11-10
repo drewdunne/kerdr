@@ -229,7 +229,8 @@ tab, for a child running in its parent's workspace), and sets the work aside in 
 its conversation, without touching the session's other agents or its owner's list, which is what
 `S` edits. On a card with no agent running, `s` asks which account and starts it there: a fresh
 start for work nobody started, as `d` does, or a reopen that resumes its conversation, as `Enter`
-does. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
+does. On a workspace with no intent and nothing running, `s` starts a fresh agent there, in a new
+tab, on the account you pick, and goes in. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
 
 Each key does what it means whatever state its card is in. `d` on work that has started does what
 `⏎` does, and `X` on a card with nothing running asks to set it aside. With a backend that does each
@@ -416,7 +417,10 @@ already running stay where they are; `s` on a card moves one.
 
 `s` opens the selected agent’s move picker. Choosing an account sends the request to that
 agent’s machine and session. If its backend asks about a step or background job in progress,
-a separate question appears. A confirmation applies only to that same conversation.
+a separate question appears, with any other answers its backend offers ("move it when the job ends")
+listed beside yes and no. A confirmation applies only to that same conversation. When the account
+isn't signed in on that machine, the box that signs it in opens, and the move goes on by itself once
+it's signed in.
 An agent the feed has no record of yet can be moved too, if its program is one the machine's
 accounts run: Kerdr sends its pane with an empty `conversation`, and the backend takes the
 conversation from herdr and records it. The backend owns fallback and resuming: same program,

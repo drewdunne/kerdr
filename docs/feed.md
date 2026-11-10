@@ -935,6 +935,24 @@ how it is now: an agent that started on it meanwhile is moved there (`account-mo
 starts differently now is started that way, and when that account can't take it now, the picker
 opens again with the accounts that can.
 
+### An empty workspace
+
+`s` on a workspace with no intent and no agent running starts a fresh agent there, in a new tab, on
+the account you pick, since there's no conversation to resume (intent 0591). Kerdr offers it only to
+a machine whose feed lists `account-start` in `starts_on`; on any other, `s` says, as before, that
+there's nothing to start. It sends, to the workspace's own machine:
+
+```json
+{"action":"account-start","session":"web","workspace":"w7","to":"ARK_C"}
+```
+
+`to` is an account code, or `list` for its owner's list. The backend starts that account's own
+program and answers as a reopen does: `ok`, with `session`, `workspace`, `label` and `tab` (the new
+tab), and a `message` such as "Started a new Claude Code agent in scratch on ARK_C." Kerdr goes in,
+landing on that tab, while you're still on the workspace; otherwise it shows the message and says ⏎
+goes in. A question it asks is asked as other account actions' are (below). A backend should start
+nothing where something is running in the workspace already.
+
 ## Agents reporting for themselves
 
 Agents can report status from inside their herdr pane. Without a feed record claiming the
@@ -1132,7 +1150,8 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
 | `account-test` | `code`, optional `copy` | status and message; a failure with `"sign_in": true` opens the box that signs it in, and nothing starts until `Enter` |
 | `account-remove` | `code` | removes after Kerdr’s local confirmation |
-| `account-current` | `to` (a code), or `clear: true` | makes it the current account for every machine, or clears it; answers `message` and `current` (the field above, as this machine sees it now, or null) |
+| `account-current` | `to` (a code), or `clear: true` | makes it the current account for every machine, or clears it; answers `message` and `current` (the field above, as this machine sees it now, or null); with `"sign_in": true` and `code` when that account isn't signed in on this machine (below) |
+| `account-start` | `session`, `workspace`, `to` (code or `list`) | a fresh agent in a new tab of that workspace: see [An empty workspace](#an-empty-workspace) |
 
 `c` on the accounts screen sends `account-current` with `to`, and `C` sends it with `clear`, to
 the machine being viewed, whatever its feed last said (the backend answers if it was already
@@ -1174,6 +1193,29 @@ reopen's answer: it follows it, and goes in when it's done while you're still on
 question that start asks names the intent (`id`) or its `session`, which a move's question never
 does: its token is the backend's own continuation, and `y` sends the same `account-move` with it
 as `confirm`, even once the board shows the agent gone, since the question is about the start.
+
+A question may offer other answers besides yes and no, as card actions' do: `choices`, each with
+`id`, `key` and `label` (see [Each key's step first](#each-keys-step-first-and-questions-with-choices)).
+Kerdr lists them one to a line in the question box, on the suggested key unless it's taken, and a
+pick sends the same request again with `confirm` and `"choice": "<id>"`, never `override`. A move's,
+for example: `{"id":"after-job","key":"j","label":"move it when the job ends"}`.
+
+Other account actions may ask too (`account-models` with agents left on accounts off the list,
+`account-add` for a code that exists as the other kind, `account-remove` for a machine's own saved
+sign-in, `account-start`): `{"ok":false,"confirmation":"<question>","confirm":"<token>","yes":"…",
+"no":"…","message":"<question>"}`. Kerdr asks it in the same box, over the screen it was asked from or,
+when you've gone on to type something, once you're back on the board; `y` sends the same request
+again with `confirm`. `message` must read on its own, since an older Kerdr shows only that. A model
+list counts as saved when its question comes, so its screen closes and the list shows at once.
+
+When a move's account isn't signed in on the machine (or has no token there), the backend answers
+`{"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C isn't signed in on lab: sign it in, and
+the move goes on once you have."}`. Kerdr opens the box that signs that code in on that machine, as
+after `account-test`, and once that sign-in is done it closes it and sends the same move again by
+itself, as a new request (a fresh `op`). A sign-in that fails keeps the move while `r` can try again;
+leaving the box drops it, and Kerdr says nothing moved. `account-current` answers `ok` with
+`"sign_in": true` and `code` the same way when the account it set isn't signed in here: the same box
+opens, and nothing is sent again after. An older Kerdr shows the message alone.
 
 ### Signing in
 
