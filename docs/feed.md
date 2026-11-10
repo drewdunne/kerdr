@@ -104,7 +104,7 @@ know rather than guessing.
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
-| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"` and `"steps"`. See [Asking again](#asking-again-op-and-retry) and [Each key's step first](#each-keys-step-first-and-questions-with-choices). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
+| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"`, `"steps"`, `"cancel-backlog"` and `"cancel-workspace"`. See [Asking again](#asking-again-op-and-retry), [Each key's step first](#each-keys-step-first-and-questions-with-choices) and [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
 | `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)); until they're gone, and from the first read that names them, that session's workspaces are marked out of date, dim on the board, and a card with no workspace says "workspace not known" instead of "no workspace open". Entries of any other shape are ignored: a `session` on a `feed` or `herdr` entry, a `session` entry with none, or a `part` Kerdr doesn't know. An entry whose `why` is empty gets Kerdr's own words. |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
@@ -582,6 +582,30 @@ never shown as a red "didn't start".
 above that Kerdr changes for every backend, and Kerdr refuses the rest itself as it did. A backend
 that never sends `choices` gets yes and no only. A Kerdr from before this reads a question's
 `message`, ignores `choices`, and refuses itself what a `"steps"` backend would do.
+
+### Two more stops: `cancel-backlog` and `cancel-workspace`
+
+Each is sent only to a backend whose feed lists it in `supports`. Any other gets what Kerdr 0.33.0
+said instead, and is never sent the request: an older backend would read the first as `X` and set the
+card aside in Won't do.
+
+- **`"cancel-backlog"`: Esc on a start that had already begun.** Esc on the board drops a start that
+  waits for its write-up; when the start had begun a moment before, Kerdr asks "#41 had already begun
+  starting. Stop it once its workspace opens, and put it back in the backlog?" (yes: stop it and put
+  it back; no: let it start). After the yes, once the start answers that it started, Kerdr sends
+  `{"action":"cancel","id":"0041","to":"backlog","session":"web","workspace":"w9","tab":"w9:t1"}` to
+  the machine that answered the start, with the `session`, `workspace` and `tab` that answer named
+  (none when it named none). Stop its agent as `X` would, and put the record back in the backlog, not
+  in Won't do; with nothing of it running any more, just put it back. Kerdr says your `message`. A
+  start that answered with a question started nothing, so Kerdr neither asks it nor sends the stop; a
+  followed start is stopped once it ends. The question is asked only while you're on the board, a list
+  or a card, never over typing; otherwise Kerdr says it carries on, as before.
+- **`"cancel-workspace"`: `X` on a workspace with no intent.** Kerdr asks "Stop its Claude Code agent
+  (idle) and close workspace notes (web)?", then sends `{"action":"cancel","session":"web","workspace":"w5"}`
+  with no `id` to the machine the workspace runs on. Stop everything running there and close it; refuse
+  in plain words one an intent's work is in. Kerdr says your `message`. A question you ask goes as any
+  other, with its `confirm` token, and its yes with `override`. When the workspace closed, or an intent
+  took it, while you decided, Kerdr says so and sends nothing.
 
 ## A quiet board
 

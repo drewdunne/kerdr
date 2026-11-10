@@ -433,6 +433,9 @@ impl App {
         request: Value,
         target: Option<CardSnapshot>,
     ) -> Action {
+        if crate::app::cancels::is_bare_cancel(&request) {
+            return self.bare_cancel_again(machine, &request);
+        }
         let id = request["id"].as_str().unwrap_or_default().to_string();
         let reference = target
             .as_ref()

@@ -1351,12 +1351,10 @@ impl App {
             );
             return Action::None;
         };
+        // A workspace with no intent: closed, after its question, by a backend that can (intent
+        // 0591, K1-27).
         let Some(detail) = &card.detail else {
-            self.say(
-                "This workspace has no intent, so X has no work to cancel; close the workspace in herdr instead.",
-                Tone::Info,
-            );
-            return Action::None;
+            return self.bare_cancel(&card);
         };
         if self.still_saving(&card) || self.still_changing(&card, "cancel") {
             return Action::None;
@@ -1449,20 +1447,7 @@ impl App {
             .workspace_label
             .clone()
             .unwrap_or_else(|| workspace.clone());
-        let what = match card.agents.as_slice() {
-            [] => "whatever runs there".to_string(),
-            [a] => format!(
-                "its {} agent{}",
-                self.providers(machine).program_label(&a.agent),
-                match a.status.as_str() {
-                    "working" => " (mid-step)",
-                    "blocked" => " (at a question)",
-                    "idle" | "done" => " (idle)",
-                    _ => "",
-                }
-            ),
-            agents => format!("its {} agents", agents.len()),
-        };
+        let what = self.stops_what(&card, machine);
         let closes = if card.tab_id.is_some() {
             format!("its tab in {place} ({session}), leaving the rest of that workspace running")
         } else {
@@ -2281,6 +2266,21 @@ impl App {
                     }
                     return Some(Action::None);
                 }
+                // Kerdr's own question whether to stop a start Esc came too late for (K1-44).
+                if request["action"] == crate::app::cancels::STOP_START {
+                    let yes = match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => false,
+                        KeyCode::Enter | KeyCode::Char('y') if !early => true,
+                        _ => return Some(Action::None),
+                    };
+                    self.mode = *back;
+                    return Some(self.stop_start_answered(
+                        machine,
+                        &request,
+                        target.map(|t| *t),
+                        yes,
+                    ));
+                }
                 if early
                     && (matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w'))
                         || chosen.is_some())
@@ -2488,6 +2488,13 @@ impl App {
                 .map(|c| c.key.clone())
         });
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
+        // A workspace with no intent shows nothing until it closes: said meanwhile (K1-27).
+        if crate::app::cancels::is_bare_cancel(&request)
+            && let Some(card) = key.as_deref().and_then(|k| self.card(k))
+        {
+            let said = format!("Closing {}…", card.workspace_name());
+            self.say(said, Tone::Info);
+        }
         let shows = effect.is_some();
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
         let asking = (!shows).then(|| self.asking_line(&request)).flatten();
@@ -2675,6 +2682,14 @@ impl App {
             "dispatch" => Effect::Starting,
             "reopen" => Effect::Reopening,
             "close" => Effect::Close,
+            // A stop back to the backlog, or a workspace with no intent closed: nothing Kerdr shows
+            // ahead of its answer (intent 0591, K1-44, K1-27).
+            "cancel"
+                if crate::app::cancels::is_stop_start(request)
+                    || crate::app::cancels::is_bare_cancel(request) =>
+            {
+                return None;
+            }
             // X on done work stops its agent and leaves it done (intent 0591, K1-29): it never
             // shows in Won't do meanwhile. Work in Won't do is there already.
             "cancel"
@@ -3238,7 +3253,8 @@ impl App {
     /// from now, and one Esc dropped a moment too late says it carries on (review of intent 0445).
     pub fn job_started(&mut self, n: u64) {
         let started = self.resolver.started(n);
-        if started.too_late {
+        // To a backend that can put it back in the backlog, asked instead (intent 0591, K1-44).
+        if started.too_late && !self.ask_stop_start(n) {
             let reference = self
                 .resolver
                 .job(n)
@@ -3285,6 +3301,9 @@ impl App {
             let what = match job.request["action"].as_str() {
                 Some("close") => "Marking it done",
                 Some("dismiss") => "Setting it aside",
+                Some("cancel") if crate::app::cancels::is_stop_start(&job.request) => {
+                    "Putting it back in the backlog: stopping its agent"
+                }
                 Some("cancel") => "Setting it aside: stopping its agent",
                 Some("restore") => "Bringing it back",
                 Some("refresh") => "Saving that you still want it",
@@ -3429,6 +3448,9 @@ impl App {
             "reopen" => format!("{reference} didn't reopen"),
             "close" => format!("{reference} wasn't marked done"),
             "dismiss" => format!("{reference} wasn't set aside"),
+            "cancel" if crate::app::cancels::is_stop_start(request) => {
+                format!("{reference}'s start wasn't stopped")
+            }
             "cancel" => format!("{reference} wasn't cancelled"),
             "restore" => format!("{reference} wasn't brought back"),
             "refresh" => format!("{reference} wasn't refreshed"),
@@ -3454,6 +3476,9 @@ impl App {
             "reopen" => format!("Reopening {reference}"),
             "close" => format!("Marking {reference} done"),
             "dismiss" => format!("Setting {reference} aside"),
+            "cancel" if crate::app::cancels::is_stop_start(request) => {
+                format!("Stopping {reference}'s start")
+            }
             "cancel" => format!("Cancelling {reference}"),
             "restore" => format!("Bringing {reference} back"),
             "refresh" => format!("Refreshing {reference}"),
@@ -3493,6 +3518,10 @@ impl App {
             return self.create_answered(machine, &request, result);
         }
         let from = self.action_from.take();
+        // X on a workspace with no intent (intent 0591, K1-27).
+        if crate::app::cancels::is_bare_cancel(&request) {
+            return self.bare_cancel_answered(machine, request, result, from);
+        }
         let id = request["id"].as_str().map(str::to_string);
         // Only this answer's own resend: another record's, still on its way, stays guarded.
         let was_resent = match self
@@ -3615,6 +3644,10 @@ impl App {
         }
         if request["action"] == "kickoff" {
             return self.finish_kickoff_check(machine, &request, result);
+        }
+        // A start he asked to stop once it started (intent 0591, K1-44).
+        if self.stop_if_started(machine, &request, &result, &from) {
+            return;
         }
         // Answered with `follow`: its words are on its card and the message line already, and its
         // end is taken as this request's answer when it comes (intent 0591, follow.rs). Its
@@ -3779,6 +3812,10 @@ impl App {
                             note = Some(message.clone());
                         }
                     }
+                }
+                // A start stopped and put back in the backlog says so (intent 0591, K1-44).
+                if crate::app::cancels::is_stop_start(&request) && response.ok {
+                    note = Some(message.clone());
                 }
                 // Answers kept on leaving the Kickoff Questions box: how many are left.
                 if request["action"] == "answer" && response.ok {
@@ -4020,6 +4057,9 @@ impl App {
         request: &Value,
         target: Option<&CardSnapshot>,
     ) -> bool {
+        if crate::app::cancels::is_bare_cancel(request) {
+            return self.bare_cancel_applies(machine, request, target);
+        }
         let Some(id) = request["id"].as_str() else {
             return false;
         };

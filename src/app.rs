@@ -15,6 +15,8 @@ use crate::poll::{Conn, Event};
 pub mod account_controls;
 #[path = "asking.rs"]
 pub mod asking;
+#[path = "cancels.rs"]
+pub mod cancels;
 #[path = "controls.rs"]
 mod controls;
 #[path = "edit_controls.rs"]
@@ -689,6 +691,9 @@ pub struct App {
     /// Kickoff answers its backend gave back because their questions changed while he answered,
     /// by its record's number: filled in on the next box d opens (intent 0591, B1-108).
     pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
+    /// Starts Esc came too late for, which he asked to stop once their workspace opens and put
+    /// back in the backlog, by record number (intent 0591, K1-44).
+    pub stop_after_start: std::collections::HashSet<String>,
     /// The tokens of questions answered from the box, whose copy in the feed is out of date until
     /// its next read: d doesn't open them again from there (intent 0491).
     pub kickoff_sent: std::collections::HashSet<String>,
@@ -840,6 +845,7 @@ impl App {
             moved_home: vec![],
             kickoff_kept: Default::default(),
             kickoff_prefill: Default::default(),
+            stop_after_start: Default::default(),
             kickoff_sent: Default::default(),
             kickoff_checks: 0,
             answered_at: None,
