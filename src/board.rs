@@ -130,8 +130,8 @@ impl MachineState {
 
     /// Whether what the board shows of this session's workspaces is out of date: its feed says
     /// herdr, or this session, wasn't read, or Kerdr's own read of herdr's list or of this session
-    /// failed and an earlier one stands. Marked quietly, at once; words wait until it lasts (intent
-    /// 0591).
+    /// failed, whether an earlier one stands or there's none yet (a first read), or what's shown
+    /// is from an earlier read. Marked quietly, at once; words wait until it lasts (intent 0591).
     pub fn workspaces_stale(&self, session: Option<&str>) -> bool {
         let feed_says = self.feed.as_ref().is_some_and(|feed| {
             feed.read_failures.iter().any(|f| {
@@ -141,7 +141,9 @@ impl MachineState {
         });
         feed_says
             || self.sessions_failing.is_some()
-            || session.is_some_and(|s| self.read_at.contains_key(s))
+            || session.is_some_and(|s| {
+                self.read_at.contains_key(s) || self.session_failing_since.contains_key(s)
+            })
     }
 
     /// When the snapshot shown for this session was read, when that's earlier than the machine's
@@ -189,32 +191,78 @@ impl MachineState {
         // with, and the board's own, from when the board took it (intent 0591).
         let mut read_at: HashMap<String, DateTime<Local>> =
             std::mem::take(&mut data.read_at).into_iter().collect();
+        // Sessions whose snapshot here is one the board took in before, shown again: what it
+        // says of its agents is known already. A snapshot a merge brought (read_at too) is news.
+        let mut replayed: HashSet<String> = HashSet::new();
         // herdr's list of sessions couldn't be read this time: the last list and what it showed
         // stand, as for a session that didn't answer (intent 0591).
         match data.sessions_failed.take() {
             Some(why) => {
                 let since = self.sessions_failing.take().map_or(at, |(_, since)| since);
                 self.sessions_failing = Some((why, since));
-                // A read merged after a good one brings that one's list instead.
-                if let Some(last) = self.data.as_ref().filter(|_| data.sessions.is_empty()) {
+                // A read merged after a good one brings that one's list instead, an empty one
+                // too; otherwise the board's own stands.
+                if let Some(last) = self
+                    .data
+                    .as_ref()
+                    .filter(|_| data.sessions_read_at.is_none())
+                {
                     data.sessions = last.sessions.clone();
                     data.snapshots = last.snapshots.clone();
                     for session in data.snapshots.keys() {
                         read_at.insert(session.clone(), self.shown_as_of(session, at));
+                        replayed.insert(session.clone());
                     }
                 }
             }
             None => self.sessions_failing = None,
         }
+        // A session that didn't answer stays on the board as it last was, and only its row says
+        // so: its workspaces would otherwise go, as if they'd closed (intent 0491).
+        let last = self.data.take();
+        let last = last.as_ref().map(|d| &d.snapshots);
+        self.snapshot_errors.clear();
+        let mut kept = std::mem::take(&mut data.kept_snapshots);
+        for (session, snap) in &mut data.snapshots {
+            if !snap.is_err() {
+                continue;
+            }
+            // Newest first: a good read merged into this one, else the one the board has.
+            let (good, as_of, again) = match kept.remove(session) {
+                Some(good) => (
+                    Some(good),
+                    read_at.get(session).copied().unwrap_or(at),
+                    false,
+                ),
+                None => (
+                    last.and_then(|l| l.get(session))
+                        .and_then(|s| s.as_ref().ok().cloned()),
+                    self.shown_as_of(session, at),
+                    true,
+                ),
+            };
+            if let Some(good) = good {
+                let Err(why) = std::mem::replace(snap, Ok(good)) else {
+                    continue;
+                };
+                self.snapshot_errors.insert(session.clone(), why);
+                read_at.insert(session.clone(), as_of);
+                if again {
+                    replayed.insert(session.clone());
+                }
+            }
+        }
         let mut stopped = HashMap::new();
         let mut reported = HashMap::new();
         for (session, snap) in &data.snapshots {
-            // One shown from an earlier read says what its agents did then, not now: what was
-            // known of them stands, its times unchanged.
+            // One the board shows again says what its agents did then, not now: what was known of
+            // them stands, its times unchanged. One a merge brought from an earlier read says
+            // what they did then, which is news: taken in as of when it was read.
             let snap = match snap {
-                Ok(snap) if !read_at.contains_key(session) => Ok(snap),
+                Ok(snap) if !replayed.contains(session) => Ok(snap),
                 _ => Err(()),
             };
+            let seen = read_at.get(session).copied().unwrap_or(at);
             let Ok(snap) = snap else {
                 stopped.extend(
                     self.stopped
@@ -235,7 +283,7 @@ impl MachineState {
                 // Only a stop herdr is sure of: a status it doesn't know (or none) proves nothing,
                 // and keeps what was known.
                 if matches!(a.agent_status.as_deref(), Some("idle" | "done" | "blocked")) {
-                    stopped.insert(key, at);
+                    stopped.insert(key, seen);
                 } else if let Some(t) = self.stopped.get(&key) {
                     stopped.insert(key, *t);
                 }
@@ -245,7 +293,7 @@ impl MachineState {
                     let key = (session.clone(), w.workspace_id.clone());
                     let since = match self.reported.get(&key) {
                         Some((old, t)) if old == v => *t,
-                        _ => at,
+                        _ => seen,
                     };
                     reported.insert(key, (v.clone(), since));
                 }
@@ -253,33 +301,6 @@ impl MachineState {
         }
         self.stopped = stopped;
         self.reported = reported;
-        // A session that didn't answer stays on the board as it last was, and only its row says
-        // so: its workspaces would otherwise go, as if they'd closed (intent 0491).
-        let last = self.data.take();
-        let last = last.as_ref().map(|d| &d.snapshots);
-        self.snapshot_errors.clear();
-        let mut kept = std::mem::take(&mut data.kept_snapshots);
-        for (session, snap) in &mut data.snapshots {
-            if !snap.is_err() {
-                continue;
-            }
-            // Newest first: a good read merged into this one, else the one the board has.
-            let (good, as_of) = match kept.remove(session) {
-                Some(good) => (Some(good), read_at.get(session).copied().unwrap_or(at)),
-                None => (
-                    last.and_then(|l| l.get(session))
-                        .and_then(|s| s.as_ref().ok().cloned()),
-                    self.shown_as_of(session, at),
-                ),
-            };
-            if let Some(good) = good {
-                let Err(why) = std::mem::replace(snap, Ok(good)) else {
-                    continue;
-                };
-                self.snapshot_errors.insert(session.clone(), why);
-                read_at.insert(session.clone(), as_of);
-            }
-        }
         read_at.retain(|session, _| matches!(data.snapshots.get(session), Some(Ok(_))));
         self.read_at = read_at;
         // Since when each failing session has failed: it's said only once that lasts.
@@ -1684,6 +1705,171 @@ mod tests {
         // Shown as it was when that good read was made, and marked so.
         assert_eq!(m.read_as_of("web"), Some(t1));
         assert!(w9.unwrap().cached);
+    }
+
+    #[test]
+    fn a_good_empty_list_of_sessions_stands_through_failed_list_reads_merged_after_it() {
+        // Read while the board was away: herdr listed no sessions (its last one stopped), then its
+        // list failed, once or twice. The board mustn't bring back the session it showed before
+        // (intent 0591).
+        let machine = Machine {
+            name: "m".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let failed = || crate::poll::MachineData {
+            sessions_failed: Some("herdr printed nothing for its list of sessions".into()),
+            ..Default::default()
+        };
+        for failures in [1, 2] {
+            let mut m = live(
+                machine.clone(),
+                vec![(
+                    "web",
+                    Snapshot {
+                        workspaces: vec![ws("w1", "1-open")],
+                        ..Default::default()
+                    },
+                )],
+                None,
+            );
+            let empty = live(machine.clone(), vec![], None).data.unwrap();
+            let t1 = Local::now() - chrono::Duration::seconds(6);
+            let event = |data, at| crate::poll::Event {
+                machine: 0,
+                conn: m.conn.clone(),
+                data: Some(data),
+                at,
+            };
+            let inbox = crate::poll::Inbox::default();
+            let reader = inbox.next_reader(0);
+            let now = std::time::Instant::now();
+            inbox.put(event(empty, t1), now, reader);
+            for n in 1..=failures {
+                inbox.put(
+                    event(failed(), t1 + chrono::Duration::seconds(2 * n)),
+                    now,
+                    reader,
+                );
+            }
+            let mut merged = inbox.take();
+            assert_eq!(merged.len(), 1);
+            let merged = merged.remove(0);
+            m.take(merged.data.unwrap(), merged.at);
+            let board = build(std::slice::from_ref(&m), &Config::default());
+            assert!(
+                board.workspaces.is_empty() && board.sessions.is_empty(),
+                "a session gone in the newest good list came back after {failures} failed reads"
+            );
+            // The list still failing is said once it lasts, as ever.
+            assert!(m.sessions_failing.is_some());
+        }
+    }
+
+    #[test]
+    fn a_good_snapshot_merged_before_a_failed_read_is_taken_in_as_of_when_it_was_read() {
+        // Read while the board was away: the agent in w1 stopped (it asked you something), and
+        // then a read failed, of herdr's list or of the session. What that good read saw is news,
+        // as of when it was read, so its next start of work is known as your answer (intent 0591).
+        let machine = Machine {
+            name: "m".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let snapshot = |status: &str| Snapshot {
+            workspaces: vec![ws("w1", "1-open")],
+            agents: vec![agent("w1", status)],
+            ..Default::default()
+        };
+        let pane = ("web".to_string(), "w1:p1".to_string());
+        let list_failed = || crate::poll::MachineData {
+            sessions_failed: Some("herdr printed nothing for its list of sessions".into()),
+            ..Default::default()
+        };
+        let sessions = live(machine.clone(), vec![("web", snapshot("idle"))], None)
+            .data
+            .unwrap()
+            .sessions;
+        let session_failed = || {
+            let mut data = live(machine.clone(), vec![], None).data.unwrap();
+            data.sessions = sessions.clone();
+            data.snapshots
+                .insert("web".into(), Err(crate::poll::SESSION_SILENT.into()));
+            data
+        };
+        for (what, then_failed) in [
+            ("its list", list_failed()),
+            ("the session", session_failed()),
+        ] {
+            let mut m = live(machine.clone(), vec![("web", snapshot("working"))], None);
+            assert!(!m.stopped.contains_key(&pane));
+            let good = live(machine.clone(), vec![("web", snapshot("idle"))], None)
+                .data
+                .unwrap();
+            let t1 = Local::now() - chrono::Duration::seconds(4);
+            let event = |data, at| crate::poll::Event {
+                machine: 0,
+                conn: m.conn.clone(),
+                data: Some(data),
+                at,
+            };
+            let inbox = crate::poll::Inbox::default();
+            let reader = inbox.next_reader(0);
+            let now = std::time::Instant::now();
+            inbox.put(event(good, t1), now, reader);
+            inbox.put(
+                event(then_failed, t1 + chrono::Duration::seconds(2)),
+                now,
+                reader,
+            );
+            let mut merged = inbox.take();
+            assert_eq!(merged.len(), 1);
+            let merged = merged.remove(0);
+            m.take(merged.data.unwrap(), merged.at);
+            assert_eq!(
+                m.stopped.get(&pane).copied(),
+                Some(t1),
+                "what the good read saw was lost when {what} failed after it"
+            );
+            // It's still shown as of that read, and marked so.
+            assert_eq!(m.read_as_of("web"), Some(t1));
+            assert!(m.workspaces_stale(Some("web")));
+        }
+    }
+
+    #[test]
+    fn a_session_whose_first_read_failed_is_marked_out_of_date() {
+        // Kerdr's first read: the machine and its list answer, but one session's snapshot fails.
+        // There's nothing earlier to show, and it mustn't look current, as if no workspace were
+        // open there (intent 0591).
+        let machine = Machine {
+            name: "m".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let mut m = MachineState::new(machine.clone());
+        m.conn = Conn::Live {
+            latency: Default::default(),
+        };
+        let mut first = live(machine.clone(), vec![("web", Snapshot::default())], None)
+            .data
+            .unwrap();
+        first
+            .snapshots
+            .insert("web".into(), Err(crate::poll::SESSION_SILENT.into()));
+        m.take(first, Local::now());
+        assert!(m.workspaces_stale(Some("web")));
+        let board = build(std::slice::from_ref(&m), &Config::default());
+        let row = board.sessions.iter().find(|s| s.session == "web").unwrap();
+        assert!(row.cached);
+        // Quietly: words wait until it lasts.
+        assert_eq!(row.error, None);
     }
 
     #[test]

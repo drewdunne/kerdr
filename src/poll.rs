@@ -154,6 +154,11 @@ pub struct MachineData {
     /// was read: it's shown as of then, never as of this read (intent 0591). One not named here was
     /// read with this data.
     pub read_at: BTreeMap<String, DateTime<Local>>,
+    /// When the list of sessions here was read, for one an earlier read brought into a merge
+    /// because a newer read of herdr's list failed: it's that read's list, an empty one too, and
+    /// the board shows it rather than its own older one (intent 0591). None: read with this data,
+    /// or not read at all (`sessions_failed`).
+    pub sessions_read_at: Option<DateTime<Local>>,
     /// What herdr or the feed printed, as it printed it, where a read of it failed: for the error
     /// log alone, never the board, whose words are Kerdr's own (intent 0591). Keyed as the board's
     /// problems are: `feed`, `sessions`, `session <name>`.
@@ -183,12 +188,14 @@ fn replace(old: Event, mut new: Event) -> Event {
             let old_read_at = std::mem::take(&mut old_data.read_at);
             let read_when = |session: &str| old_read_at.get(session).copied().unwrap_or(old.at);
             // The newer read has no list of sessions where the older had one, good or carried on
-            // from a good one before it: that list stands, through any number of failures, as of
-            // when it was read (intent 0591).
-            let old_has_list = old_data.sessions_failed.is_none() || !old_data.sessions.is_empty();
-            if data.sessions_failed.is_some() && data.sessions.is_empty() && old_has_list {
+            // from a good one before it: that list stands, an empty one too, through any number of
+            // failures, as of when it was read (intent 0591).
+            let old_has_list =
+                old_data.sessions_failed.is_none() || old_data.sessions_read_at.is_some();
+            if data.sessions_failed.is_some() && data.sessions_read_at.is_none() && old_has_list {
                 data.sessions = old_data.sessions.clone();
                 data.snapshots = old_data.snapshots.clone();
+                data.sessions_read_at = Some(old_data.sessions_read_at.unwrap_or(old.at));
                 for session in data.snapshots.keys() {
                     data.read_at.insert(session.clone(), read_when(session));
                 }
@@ -788,6 +795,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         feed_failed_after: None,
         kept_snapshots: Default::default(),
         read_at: Default::default(),
+        sessions_read_at: None,
         said,
     })
 }

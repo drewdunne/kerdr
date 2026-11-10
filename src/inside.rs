@@ -819,6 +819,7 @@ mod tests {
             feed_failed_after: None,
             kept_snapshots: Default::default(),
             read_at: Default::default(),
+            sessions_read_at: None,
             said: Default::default(),
         });
         m.feed = Some(Feed {

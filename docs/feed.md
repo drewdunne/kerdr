@@ -518,7 +518,10 @@ When herdr answers but can't list its sessions, that's herdr's trouble rather th
 dropping: the machine stays live with its last list, and the list gets 10 seconds rather than 5 on
 the next read if it ran out of time. While herdr's list, or one session's own read, keeps failing,
 the rows and workspaces shown from the last good read are marked out of date from the first failure,
-as of when that read was made; R says which machine's sessions it couldn't bring up to date.
+as of when that read was made; R says which machine's sessions it couldn't bring up to date. A
+session whose read failed before any good one (Kerdr's first read of it) is marked out of date too,
+and its cards say "workspace not known", never "no workspace open". The newest good list stands
+through failed reads after it, an empty one too: a session gone from it stays gone.
 
 ## Starting work nobody started
 
