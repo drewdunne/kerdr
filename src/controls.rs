@@ -3626,7 +3626,27 @@ impl App {
                 // Kerdr doesn't take you in as if it had been (intent 0580).
                 let unchanged = response.ok && response.account_unchanged;
                 if unchanged {
-                    message.push_str(" ⏎ on its card goes in.");
+                    // What he picked still holds: the agent running it moves to that account once
+                    // Kerdr sees it, as s on a running card does (intent 0591, K1-126).
+                    let to = request["account"].as_str().filter(|a| *a != "list");
+                    let key = from.as_ref().map(|f| f.key.clone()).or_else(|| {
+                        let id = request["id"].as_str()?;
+                        self.board
+                            .cards
+                            .iter()
+                            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+                            .map(|c| c.key.clone())
+                    });
+                    match (to, key) {
+                        (Some(to), Some(key)) if self.owe_move(&key, to) => {
+                            let reference =
+                                self.reference_for(request["id"].as_str().unwrap_or_default());
+                            message = format!(
+                                "{reference}'s agent was running already, so it wasn't restarted: Kerdr moves it to {to} once it sees it, keeping its conversation. ⏎ on its card goes in."
+                            );
+                        }
+                        _ => message.push_str(" ⏎ on its card goes in."),
+                    }
                     note = Some(message.clone());
                 }
                 // A reopen takes you in only while you're still on its card; otherwise it says so.

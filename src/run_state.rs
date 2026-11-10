@@ -107,6 +107,9 @@ pub struct OwedAccount {
     /// failure said why, and nothing starts.
     pub restore: bool,
     pub restore_sent: bool,
+    /// Its start found its agent running already, so nothing restarted on the account picked: that
+    /// agent moves to it once Kerdr sees it, and nothing is started again (intent 0591, K1-126).
+    pub moving: bool,
 }
 
 impl OwedAccount {
@@ -120,6 +123,7 @@ impl OwedAccount {
             failed: None,
             restore: false,
             restore_sent: false,
+            moving: false,
         }
     }
 }
@@ -545,6 +549,19 @@ impl App {
         true
     }
 
+    /// A start on an account that found the card's agent running already, so nothing restarted:
+    /// that agent moves to the account picked once Kerdr sees it, as s on a running card does
+    /// (intent 0591, K1-126). False when the card isn't on the board.
+    pub(super) fn owe_move(&mut self, key: &str, to: &str) -> bool {
+        if self.card(key).is_none() {
+            return false;
+        }
+        let mut owed = OwedAccount::new(key, to);
+        owed.moving = true;
+        self.owe(owed);
+        true
+    }
+
     /// An account owed to a card, in place of one owed to it before; others' stay owed.
     fn owe(&mut self, owed: OwedAccount) {
         self.owed_accounts.retain(|o| o.key != owed.key);
@@ -671,6 +688,25 @@ impl App {
                 return given_up(self, "it never came to where it could start");
             }
             return Owed::Wait;
+        }
+        // Running already: only ever moved, never started again.
+        if owed.moving {
+            return match self.run_state(&card) {
+                RunState::Running(agent) => {
+                    Owed::Done(self.move_to_account(&card, &agent, &owed.to))
+                }
+                _ if self.owed_accounts[i].since.elapsed() > APPLY_WAIT => {
+                    self.say(
+                        format!(
+                            "{reference} wasn't moved to {}: Kerdr hasn't seen its agent running. s on its card moves it once it shows.",
+                            account_words(&owed.to)
+                        ),
+                        Tone::Warn,
+                    );
+                    Owed::Drop
+                }
+                _ => Owed::Wait,
+            };
         }
         // 3. Started on that account, or the agent running it now moved there.
         match self.run_state(&card) {
@@ -1788,7 +1824,46 @@ mod tests {
             json!({"ok":true,"message":"#1 is open already, in web. Its agent was running already, so it stays on its own account, not ARK_C: s on its card moves it.","session":"web","workspace":"w9","account_unchanged":true}),
         );
         assert_eq!(a.open_after, None);
-        assert!(a.message().unwrap().0.contains("not ARK_C"));
+        // What he picked still holds: its agent moves to it once Kerdr sees it (intent 0591,
+        // K1-126), and nothing is started again meanwhile.
+        let said = a.message().unwrap().0.to_string();
+        assert!(said.contains("wasn't restarted"), "{said}");
+        assert!(said.contains("moves it to ARK_C once it sees it"), "{said}");
+        assert_eq!(a.owed_accounts.len(), 1);
+        assert!(a.owed_accounts[0].moving);
+        assert_eq!(a.account_owed(), Action::None);
+        // Its agent shows: it moves.
+        let other = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#44")
+            .unwrap()
+            .clone();
+        let card = a.board.cards.iter_mut().find(|c| c.key == k).unwrap();
+        card.workspace_id = other.workspace_id;
+        card.session = other.session;
+        card.agents = other.agents;
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("nothing moved: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "account-move");
+        assert_eq!(request["to"], "ARK_C");
+        assert!(a.owed_accounts.is_empty());
+    }
+
+    #[test]
+    fn a_move_owed_to_an_agent_never_seen_gives_up_without_starting_anything() {
+        let mut a = app();
+        let k = closed_card(&mut a);
+        assert!(a.owe_move(&k, "ARK_C"));
+        assert_eq!(a.account_owed(), Action::None);
+        a.owed_accounts[0].since -= APPLY_WAIT + Duration::from_secs(1);
+        assert_eq!(a.account_owed(), Action::None);
+        let (said, tone) = a.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(said.contains("wasn't moved to ARK_C"), "{said}");
+        assert!(a.owed_accounts.is_empty());
     }
 
     #[test]
