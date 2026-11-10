@@ -575,6 +575,11 @@ impl App {
         if !self.enter_can_land_here() {
             return Action::None;
         }
+        // A move's question held while you were elsewhere: asked now (intent 0591, K2-27).
+        if let Some(question) = self.held_move_question.take() {
+            self.ask_held_move(question);
+            return Action::None;
+        }
         let mut i = 0;
         while i < self.owed_accounts.len() {
             match self.owed_step(i) {

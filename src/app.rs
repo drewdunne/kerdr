@@ -680,6 +680,9 @@ pub struct App {
     pub pending_go: Option<(String, Option<String>)>,
     /// Accounts picked with s that their cards are still owed, one for each card (intent 0591).
     pub owed_accounts: Vec<run_state::OwedAccount>,
+    /// A move's question that came after its picker closed: asked once you're back on the board or
+    /// a list, never over typing (intent 0591, K2-27).
+    pub held_move_question: Option<account_controls::AccountScreen>,
     /// The number of the last request asking an old backend to update, so each answer finds the
     /// waits it was asked for.
     pub update_asks: u64,
@@ -783,6 +786,7 @@ impl App {
             accounts_wait: None,
             pending_go: None,
             owed_accounts: Vec::new(),
+            held_move_question: None,
             update_asks: 0,
             follow_end: None,
             enter_sent: None,

@@ -31,6 +31,18 @@ pub struct MoveTarget {
     pub agent: AccountAgent,
 }
 
+/// How the agent a move was chosen for stands now (intent 0591, K2-13, K2-64).
+enum MoveNow {
+    /// As it was, or the same agent now that its conversation is known.
+    Same(AccountAgent),
+    /// The same conversation, on another account than when it was chosen.
+    AccountChanged(AccountAgent),
+    /// Its pane runs another conversation.
+    NewConversation(AccountAgent),
+    /// No agent of it is running.
+    Gone,
+}
+
 #[derive(Clone, Debug)]
 pub struct Signin {
     pub deferred: Option<KeyCode>,
@@ -1193,6 +1205,72 @@ impl App {
             })
     }
 
+    /// How the agent a move was chosen for stands now.
+    fn move_now(&self, target: &MoveTarget) -> MoveNow {
+        let Some(now) = self
+            .card(&target.key)
+            .filter(|c| c.machine_index == target.machine)
+            .and_then(|c| self.move_agent(c))
+        else {
+            return MoveNow::Gone;
+        };
+        if self.target_answerable(target) {
+            MoveNow::Same(now)
+        } else if now.pane == target.agent.pane
+            && now.session == target.agent.session
+            && now.conversation == target.agent.conversation
+        {
+            MoveNow::AccountChanged(now)
+        } else {
+            MoveNow::NewConversation(now)
+        }
+    }
+
+    /// A move's question held while you were elsewhere, asked once you're back where it can't
+    /// take keys meant for something else, for the agent as it is now (intent 0591, K2-27).
+    pub(crate) fn ask_held_move(&mut self, question: AccountScreen) {
+        let AccountScreen::Confirm {
+            target: Some(target),
+            ..
+        } = &question
+        else {
+            return self.push_account_screen(question);
+        };
+        let reference = target.reference.clone();
+        match self.move_now(target) {
+            MoveNow::Same(_) | MoveNow::AccountChanged(_) => {
+                let mut question = question;
+                if let AccountScreen::Confirm { ready_at, .. } = &mut question {
+                    *ready_at = Instant::now() + Duration::from_millis(500);
+                }
+                self.push_account_screen(question);
+            }
+            MoveNow::NewConversation(_) => self.say(
+                format!(
+                    "{reference}'s move asked you something, but its pane runs another conversation now, so the question no longer fits; s on its card offers the move for this one."
+                ),
+                Tone::Info,
+            ),
+            MoveNow::Gone => self.say(
+                format!(
+                    "{reference}'s move asked you something, but its agent isn't running any more, so nothing moved; s on its card starts it on an account."
+                ),
+                Tone::Info,
+            ),
+        }
+    }
+
+    /// The move picker's agent, as it is now, in place (intent 0591, K2-13).
+    fn retarget_picker(&mut self, agent: AccountAgent) {
+        if let Mode::Accounts {
+            screen: AccountScreen::Move { target, .. },
+            ..
+        } = &mut self.mode
+        {
+            target.agent = agent;
+        }
+    }
+
     fn send_account(&mut self, machine: usize, request: Value) -> Action {
         if !self.can_write(machine) {
             if request["action"] == "account-signin"
@@ -1703,6 +1781,58 @@ impl App {
                 }
                 KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
                 KeyCode::Enter => {
+                    // The agent changed while he chose (intent 0591, K2-13): the same conversation
+                    // on another account still moves where he picked; another conversation in its
+                    // pane is shown in the picker, for Enter again; none running ends it.
+                    let to_now = choices.get(*sel).cloned();
+                    match self.move_now(target) {
+                        MoveNow::AccountChanged(now) => {
+                            if to_now.as_deref() == Some(now.account.as_str()) {
+                                self.say(
+                                    format!(
+                                        "{}'s agent is on {} already: it moved there while you chose.",
+                                        target.reference, now.account
+                                    ),
+                                    Tone::Info,
+                                );
+                                self.mode = *back;
+                                return Action::None;
+                            }
+                            self.say(
+                                format!(
+                                    "{}'s agent is on {} now; moving it where you picked.",
+                                    target.reference, now.account
+                                ),
+                                Tone::Info,
+                            );
+                            target.agent = now;
+                        }
+                        MoveNow::NewConversation(now) => {
+                            self.say(
+                                format!(
+                                    "{} changed while you chose: its pane runs a new conversation now, shown here. ⏎ moves this one.",
+                                    target.reference
+                                ),
+                                Tone::Info,
+                            );
+                            target.agent = now;
+                            self.mode = Mode::Accounts { screen, back };
+                            return Action::None;
+                        }
+                        MoveNow::Gone => {
+                            self.say(
+                                format!(
+                                    "{}'s agent isn't running any more, so there's nothing to move; s on its card starts it on an account.",
+                                    target.reference
+                                ),
+                                Tone::Info,
+                            );
+                            self.mode = *back;
+                            return Action::None;
+                        }
+                        // Its conversation may have become known since: the move names it.
+                        MoveNow::Same(now) => target.agent = now,
+                    }
                     if self.target_current(target) {
                         if let Some(to) = choices.get(*sel) {
                             if let Some(stays) = self.held_to(target.machine, &target.agent, to) {
@@ -2105,21 +2235,56 @@ impl App {
                     return Action::None;
                 }
                 KeyCode::Char('y') if Instant::now() >= *ready_at => {
-                    if target.as_ref().is_none_or(|t| self.target_answerable(t)) {
-                        // A yes is a new request: never the question's op (intent 0591).
-                        request = Some((*machine, crate::actions::without_op(pending)));
-                        self.mode = *back;
-                        if let Some((mi, r)) = request {
-                            return self.send_account(mi, r);
+                    let now = target
+                        .as_ref()
+                        .map(|t| (t.reference.clone(), self.move_now(t)));
+                    match now {
+                        // The same agent, or the same conversation on another account: its backend
+                        // checks its token and asks again if that changed what it asked.
+                        None | Some((_, MoveNow::Same(_) | MoveNow::AccountChanged(_))) => {
+                            // A yes is a new request: never the question's op (intent 0591).
+                            request = Some((*machine, crate::actions::without_op(pending)));
+                            self.mode = *back;
+                            if let Some((mi, r)) = request {
+                                return self.send_account(mi, r);
+                            }
+                            return Action::None;
                         }
-                        return Action::None;
-                    } else {
-                        self.say(
-                            "That conversation changed. Open the move picker again.",
-                            Tone::Warn,
-                        );
-                        self.mode = *back;
-                        return Action::None;
+                        // Another conversation: the picker, when it's under the question, shows it
+                        // for Enter again (intent 0591, K2-13).
+                        Some((reference, MoveNow::NewConversation(agent))) => {
+                            self.mode = *back;
+                            self.retarget_picker(agent);
+                            let picker = matches!(
+                                self.mode,
+                                Mode::Accounts {
+                                    screen: AccountScreen::Move { .. },
+                                    ..
+                                }
+                            );
+                            let next = if picker {
+                                "⏎ moves this one."
+                            } else {
+                                "s on its card offers the move for this one."
+                            };
+                            self.say(
+                                format!(
+                                    "{reference} changed while you decided: its pane runs a new conversation now, so nothing moved. {next}"
+                                ),
+                                Tone::Info,
+                            );
+                            return Action::None;
+                        }
+                        Some((reference, MoveNow::Gone)) => {
+                            self.mode = *back;
+                            self.say(
+                                format!(
+                                    "{reference}'s agent isn't running any more, so nothing moved; s on its card starts it on an account."
+                                ),
+                                Tone::Info,
+                            );
+                            return Action::None;
+                        }
                     }
                 }
                 _ => {}
@@ -2698,6 +2863,39 @@ impl App {
             }
         }
         if action == "account-move" && response.confirmation && !visible {
+            // He left the picker before its question came: it's asked once he's back on the board
+            // or a list, for the agent as it is then, never over typing (intent 0591, K2-27).
+            if let (Some(token), Some(AccountScreen::Move { target, .. })) = (
+                response.confirm.clone(),
+                pending.as_ref().and_then(|p| p.screen.clone()),
+            ) && request["confirm"].as_str() != Some(token.as_str())
+            {
+                let starts = response.id.is_some() || response.session.is_some();
+                let reference = target.reference.clone();
+                let mut request = request;
+                request["confirm"] = json!(token);
+                let question = AccountScreen::Confirm {
+                    machine,
+                    request,
+                    message: response.message,
+                    yes: response.yes.unwrap_or_else(|| "move when it stops".into()),
+                    no: response.no.unwrap_or_else(|| "leave it".into()),
+                    target: (!starts).then_some(target),
+                    ready_at: Instant::now() + Duration::from_millis(500),
+                };
+                if self.enter_can_land_here() {
+                    self.ask_held_move(question);
+                } else {
+                    self.held_move_question = Some(question);
+                    self.say(
+                        format!(
+                            "{reference}'s move asks you something first; it's asked once you're back on the board."
+                        ),
+                        Tone::Info,
+                    );
+                }
+                return;
+            }
             self.say(
                 "That move needs confirmation. Open the move picker again to review it.",
                 Tone::Warn,
@@ -2726,7 +2924,42 @@ impl App {
                 // about that start, not the agent: its yes isn't refused once the board shows the
                 // agent gone (intent 0591).
                 let starts = response.id.is_some() || response.session.is_some();
-                if starts || self.target_answerable(&target) {
+                // The agent changed while the question came (intent 0591, K2-64): the same
+                // conversation on another account is still asked about; another conversation is
+                // shown in the picker for Enter again; none running ends it. Never a question
+                // left on screen that can't be answered.
+                let now = (!starts).then(|| self.move_now(&target));
+                let target = match now {
+                    Some(MoveNow::AccountChanged(agent)) => {
+                        Box::new(MoveTarget { agent, ..*target })
+                    }
+                    Some(MoveNow::NewConversation(agent)) => {
+                        self.retarget_picker(agent);
+                        self.say(
+                            format!(
+                                "{} changed while you chose: its pane runs a new conversation now, shown here. ⏎ moves this one.",
+                                target.reference
+                            ),
+                            Tone::Info,
+                        );
+                        return;
+                    }
+                    Some(MoveNow::Gone) => {
+                        if let Mode::Accounts { back, .. } = self.mode.clone() {
+                            self.mode = *back;
+                        }
+                        self.say(
+                            format!(
+                                "{}'s agent isn't running any more, so nothing moved; s on its card starts it on an account.",
+                                target.reference
+                            ),
+                            Tone::Info,
+                        );
+                        return;
+                    }
+                    _ => target,
+                };
+                {
                     let mut request = request;
                     request["confirm"] = json!(token);
                     self.push_account_screen(AccountScreen::Confirm {
@@ -3972,7 +4205,12 @@ mod tests {
         set_conversation(&mut a, "c-another");
         settle(&mut a);
         assert_eq!(press(&mut a, 'y'), Action::None);
-        assert!(a.message().unwrap().0.contains("conversation changed"));
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .contains("runs a new conversation now, so nothing moved")
+        );
     }
 
     /// Codex's review: Esc on the picker while its move is on its way, and the backend starts the
@@ -4027,7 +4265,23 @@ mod tests {
             .unwrap()
             .conversation = "replacement".into();
         assert_eq!(press(&mut a, 'y'), Action::None);
-        assert!(a.message().unwrap().0.contains("conversation changed"));
+        // Intent 0591, K2-13: the picker under the question now shows the new conversation, and
+        // Enter there moves it.
+        let said = a.message().unwrap().0.to_string();
+        assert!(
+            said.contains("runs a new conversation now, so nothing moved. ⏎ moves this one."),
+            "{said}"
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Move { target, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("the picker isn't open: {:?}", a.mode)
+        };
+        assert_eq!(target.agent.conversation, "replacement");
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["conversation"], "replacement");
     }
     #[test]
     fn s_moves_an_agent_with_no_recorded_account() {
@@ -4076,7 +4330,101 @@ mod tests {
         press(&mut a, 's');
         set_conversation(&mut a, "c-two");
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
-        assert!(a.message().unwrap().0.contains("conversation changed"));
+        // Intent 0591, K2-13: shown in the picker, for Enter again.
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .contains("runs a new conversation now, shown here. ⏎ moves this one.")
+        );
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["conversation"], "c-two");
+    }
+
+    #[test]
+    fn a_moves_question_for_a_conversation_gone_from_its_pane_is_never_left_unanswerable() {
+        // Intent 0591, K2-64: the question came for the conversation he picked, but its pane
+        // runs another now: the picker shows that one for Enter again, rather than a warning
+        // with no y or n.
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        let action = key(&mut a, KeyCode::Enter);
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|a| a.session == "api" && a.pane == "w1:p1")
+            .unwrap()
+            .conversation = "replacement".into();
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Move { target, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("the picker isn't open: {:?}", a.mode)
+        };
+        assert_eq!(target.agent.conversation, "replacement");
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .contains("shown here. ⏎ moves this one.")
+        );
+    }
+
+    #[test]
+    fn a_move_chosen_as_its_agent_changed_account_still_goes_where_picked() {
+        // Intent 0591, K2-13: the same conversation on another account moves where he picked.
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        let Mode::Accounts {
+            screen: AccountScreen::Move { choices, sel, .. },
+            ..
+        } = &mut a.mode
+        else {
+            panic!("{:?}", a.mode)
+        };
+        *sel = choices.iter().position(|c| c == "KBZ_X").unwrap();
+        let agent = a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .iter_mut()
+            .find(|a| a.session == "api" && a.pane == "w1:p1")
+            .unwrap();
+        assert_ne!(agent.account, "ARK_C");
+        agent.account = "ARK_C".into();
+        let (_, r) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(r["action"], "account-move");
+        assert_eq!(r["to"], "KBZ_X");
+        assert!(a.message().unwrap().0.contains("is on ARK_C now"));
+        // Gone meanwhile: nothing to move, and the picker closes.
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .agents
+            .retain(|a| !(a.session == "api" && a.pane == "w1:p1"));
+        let key44 = a.sel.key.clone().unwrap();
+        for c in a.board.cards.iter_mut().filter(|c| c.key == key44) {
+            c.agents.clear();
+        }
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert!(a.message().unwrap().0.contains("isn't running any more"));
+        assert!(!matches!(a.mode, Mode::Accounts { .. }));
     }
     #[test]
     fn s_says_why_when_a_card_has_no_agent_its_accounts_run() {
@@ -4167,7 +4515,9 @@ mod tests {
         assert!(screen.contains("y hand it over"), "{screen}");
     }
     #[test]
-    fn escaping_a_move_ignores_its_late_question() {
+    fn a_moves_question_after_its_picker_closed_is_asked_where_it_cant_take_typing() {
+        // Intent 0591, K2-27: on the board it's asked at once; while he types it waits until he's
+        // back, and is asked then.
         let mut a = app();
         pick(&mut a);
         press(&mut a, 's');
@@ -4179,7 +4529,43 @@ mod tests {
             action,
             json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
         );
-        assert!(matches!(a.mode, Mode::Board));
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm { request, .. },
+            back,
+        } = &a.mode
+        else {
+            panic!("the question wasn't asked: {:?} {:?}", a.mode, a.message())
+        };
+        assert_eq!(request["confirm"], "ticket");
+        assert!(matches!(**back, Mode::Board));
+        // While typing a new intent: held, and asked once he's back.
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        let action = key(&mut a, KeyCode::Enter);
+        a.busy = true;
+        key(&mut a, KeyCode::Esc);
+        press(&mut a, 'c');
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
+        );
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        assert!(a.held_move_question.is_some());
+        assert!(a.message().unwrap().0.contains("asks you something first"));
+        assert_eq!(a.account_owed(), Action::None);
+        assert!(matches!(a.mode, Mode::Compose { .. }), "asked over typing");
+        key(&mut a, KeyCode::Esc);
+        a.account_owed();
+        assert!(matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Confirm { .. },
+                ..
+            }
+        ));
     }
     #[test]
     fn s_uses_the_viewed_session_not_the_selected_card() {
