@@ -402,7 +402,10 @@ viewed session’s list as a draft (with no session chosen with `[ ]`, the selec
 owner's list: its session's, its home session's, else its tenant's or organization's), each line naming its provider, so the list reads as a
 provider order: whatever is first and ready is what new work runs. Reorder, optionally tick
 “move waiting sessions,” then save.
-The tick sends a separate move request to every reachable configured feed machine.
+The tick sends a separate move request to every reachable configured feed machine. When the saved
+list leaves running agents on accounts that aren't on it, Kerdr asks once whether to move them to
+it now; `y` moves them one at a time, asking each one's own question first, `n` on one of those
+leaves that one, and `Esc` stops the rest, saying how many moved and which didn't.
 
 A **current account** puts one account ahead of every owner's list, on every machine: new
 sessions start on it wherever it's ready, and on their lists where it's out or has no sign-in.

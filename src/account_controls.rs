@@ -39,6 +39,162 @@ pub struct AfterSignin {
     pub request: Value,
 }
 
+/// One running agent a saved list left on another account: how it's named, and the move that
+/// puts it on the list (intent 0591, B3-42).
+#[derive(Clone, Debug, PartialEq)]
+pub struct OffAgent {
+    pub name: String,
+    pub request: Value,
+}
+
+/// The moves to the list he said yes to, after a saved list left running agents on other
+/// accounts: one at a time, each one's question asked before the next is sent; Esc on any of them
+/// stops the rest (intent 0591, B3-42).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OffListMoves {
+    pub machine: usize,
+    pub total: usize,
+    /// Not sent yet, in the backend's order.
+    pub left: std::collections::VecDeque<OffAgent>,
+    /// Sent: its answer, its question or its sign-in still to come.
+    pub current: Option<OffAgent>,
+    pub moved: Vec<String>,
+    /// Moving as soon as they can: when they next stop, or once a job ends.
+    pub later: Vec<String>,
+    /// Left where they were by his n.
+    pub kept: Vec<String>,
+    /// Each one that didn't move, and why, as a sentence.
+    pub failed: Vec<String>,
+}
+
+/// How one of those moves ended.
+enum OffListEnd {
+    Moved,
+    Later,
+    Kept,
+    Failed(String),
+}
+
+impl OffListMoves {
+    fn end(&mut self, how: OffListEnd) {
+        let Some(agent) = self.current.take() else {
+            return;
+        };
+        match how {
+            OffListEnd::Moved => self.moved.push(agent.name),
+            OffListEnd::Later => self.later.push(agent.name),
+            OffListEnd::Kept => self.kept.push(agent.name),
+            OffListEnd::Failed(why) => self.failed.push(format!(
+                "{} didn't move: {}.",
+                capitalized(&agent.name),
+                sentence_part(&why)
+            )),
+        }
+    }
+
+    /// What's said once they've all been asked, or he stopped: how many moved, and which didn't.
+    fn summary(&self, stopped: &[String]) -> (String, Tone) {
+        let one = |n: usize, single: &'static str, many: &'static str| {
+            if n == 1 { single } else { many }
+        };
+        let done = self.moved.len() + self.later.len();
+        let mut said = format!("{done} of {} moved to the list", self.total);
+        let later = || {
+            format!(
+                "{} as soon as {} can",
+                and_list(&self.later),
+                one(self.later.len(), "it", "they")
+            )
+        };
+        said += &match (self.moved.is_empty(), self.later.is_empty()) {
+            (true, true) => ".".to_string(),
+            (false, true) => format!(": {}.", and_list(&self.moved)),
+            (true, false) => format!(": {}.", later()),
+            (false, false) => format!(": {} now, and {}.", and_list(&self.moved), later()),
+        };
+        for failed in &self.failed {
+            said += &format!(" {failed}");
+        }
+        if !self.kept.is_empty() {
+            let n = self.kept.len();
+            said += &format!(
+                " {} stayed where {} {}, as you said.",
+                capitalized(&and_list(&self.kept)),
+                one(n, "it", "they"),
+                one(n, "was", "were")
+            );
+        }
+        if !stopped.is_empty() {
+            said += &format!(
+                " You stopped there, so {} {} moved.",
+                and_list(stopped),
+                one(stopped.len(), "wasn't", "weren't")
+            );
+        }
+        let tone = if !self.failed.is_empty() {
+            Tone::Warn
+        } else if done == self.total {
+            Tone::Good
+        } else {
+            Tone::Info
+        };
+        (said, tone)
+    }
+}
+
+/// Words that start a sentence: their first letter a capital.
+fn capitalized(words: &str) -> String {
+    let mut chars = words.chars();
+    chars
+        .next()
+        .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+
+/// A backend's sentence as part of another: its full stop dropped, and its first letter lowered
+/// unless the first word is a name ("ARK_C", "#41", "Kerdr").
+fn sentence_part(said: &str) -> String {
+    let said = said.trim().trim_end_matches('.').trim_end();
+    let first = said.split_whitespace().next().unwrap_or_default();
+    let mut letters = first.chars();
+    let plain_word = letters.next().is_some_and(char::is_uppercase)
+        && letters.clone().count() > 0
+        && letters.all(char::is_lowercase)
+        && first != "Kerdr";
+    if !plain_word {
+        return said.to_string();
+    }
+    let mut chars = said.chars();
+    chars
+        .next()
+        .map(|c| c.to_lowercase().collect::<String>() + chars.as_str())
+        .unwrap_or_default()
+}
+
+/// A move to the list, as Kerdr sends it for one agent a saved list left elsewhere (intent 0591,
+/// B3-42).
+fn off_list_request(agent: &crate::actions::OffList) -> Value {
+    let mut request = json!({"action":"account-move","pane":agent.pane,"to":"list"});
+    if !agent.session.is_empty() {
+        request["session"] = json!(agent.session);
+    }
+    if !agent.conversation.is_empty() {
+        request["conversation"] = json!(agent.conversation);
+    }
+    request
+}
+
+/// A move as it was asked for, without what its question's answers add: the same move, whichever
+/// answer, token or op it went with.
+fn move_asked(request: &Value) -> Value {
+    let mut request = crate::actions::without_op(request);
+    if let Some(fields) = request.as_object_mut() {
+        fields.remove("confirm");
+        fields.remove("choice");
+    }
+    request
+}
+
 /// How the agent a move was chosen for stands now (intent 0591, K2-13, K2-64).
 enum MoveNow {
     /// As it was, or the same agent now that its conversation is known.
@@ -1249,6 +1405,11 @@ impl App {
             ..
         } = &question
         else {
+            // Asked now, not when it came: a key pressed as it opens never answers it.
+            let mut question = question;
+            if let AccountScreen::Confirm { ready_at, .. } = &mut question {
+                *ready_at = Instant::now() + Duration::from_millis(500);
+            }
             return self.push_account_screen(question);
         };
         let reference = target.reference.clone();
@@ -1273,6 +1434,216 @@ impl App {
                 Tone::Info,
             ),
         }
+    }
+
+    /// The name a saved list's left-out agent goes by: its card's, else its intent's, else the
+    /// account it's on and where (intent 0591, B3-42).
+    fn off_list_name(&self, machine: usize, agent: &crate::actions::OffList) -> String {
+        let on_card = |c: &&Card| {
+            c.machine_index == machine
+                && (agent.session.is_empty() || c.session.as_deref() == Some(&agent.session))
+                && c.agents.iter().any(|a| a.pane_id == agent.pane)
+        };
+        if let Some(card) = self
+            .board
+            .cards
+            .iter()
+            .filter(on_card)
+            .find(|c| c.detail.is_some())
+            .or_else(|| self.board.cards.iter().find(on_card))
+        {
+            return card.reference.clone();
+        }
+        if let Some(n) = agent
+            .intent
+            .as_deref()
+            .map(|i| i.trim_start_matches('0'))
+            .filter(|n| !n.is_empty())
+        {
+            return format!("#{n}");
+        }
+        let on = if agent.account.is_empty() {
+            "an agent".to_string()
+        } else {
+            format!("the agent on {}", agent.account)
+        };
+        if agent.session.is_empty() {
+            on
+        } else {
+            format!("{on} in {}", agent.session)
+        }
+    }
+
+    /// A list saved with running agents left on accounts that aren't on it: asked once whether to
+    /// move them to it now, where an answer can't take keys meant for something else (intent
+    /// 0591, B3-42). A backend that doesn't list them asks nothing, as before.
+    fn ask_off_list(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        agents: &[crate::actions::OffList],
+        visible: bool,
+    ) {
+        if agents.is_empty() || self.off_list_moves.is_some() {
+            return;
+        }
+        let id = request["owner"].as_str().unwrap_or_default();
+        let owner = self
+            .account_feed(machine)
+            .and_then(|f| f.owners.iter().find(|o| o.id == id))
+            .map(|o| o.name.clone())
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| id.to_string());
+        let named: Vec<OffAgent> = agents
+            .iter()
+            .map(|a| OffAgent {
+                name: self.off_list_name(machine, a),
+                request: off_list_request(a),
+            })
+            .collect();
+        let names: Vec<String> = named.iter().map(|a| a.name.clone()).collect();
+        let mut accounts: Vec<String> = agents
+            .iter()
+            .map(|a| a.account.clone())
+            .filter(|a| !a.is_empty())
+            .collect();
+        accounts.sort();
+        accounts.dedup();
+        let one = named.len() == 1;
+        let on = match accounts.len() {
+            0 => "on an account that isn't on it".to_string(),
+            1 => format!("on {}, which isn't on it", accounts[0]),
+            _ => format!("on {}, which aren't on it", and_list(&accounts)),
+        };
+        let message = format!(
+            "{owner}'s list is saved. On {}, {} {} still running {on}. Move {} to the list now?",
+            self.machines[machine].name(),
+            and_list(&names),
+            if one { "is" } else { "are" },
+            if one { "it" } else { "them" },
+        );
+        let question = AccountScreen::Confirm {
+            machine,
+            request: json!({
+                "action": crate::app::MOVE_OFF_LIST,
+                "agents": named
+                    .iter()
+                    .map(|a| json!({"name": a.name, "request": a.request}))
+                    .collect::<Vec<_>>(),
+            }),
+            message,
+            yes: if one { "move it" } else { "move them" }.into(),
+            no: if one { "leave it" } else { "leave them" }.into(),
+            target: None,
+            ready_at: Instant::now() + Duration::from_millis(500),
+            choices: vec![],
+        };
+        if visible || self.enter_can_land_here() {
+            self.push_account_screen(question);
+        } else if self.held_move_question.is_none() {
+            self.held_move_question = Some(question);
+        }
+    }
+
+    /// His yes to moving them: the first move goes, and each next one once the one before has
+    /// its answer (intent 0591, B3-42).
+    fn start_off_list(&mut self, machine: usize, request: &Value) {
+        let left: std::collections::VecDeque<OffAgent> = request["agents"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|a| {
+                Some(OffAgent {
+                    name: a["name"].as_str()?.to_string(),
+                    request: a["request"].clone(),
+                })
+            })
+            .collect();
+        if left.is_empty() {
+            return;
+        }
+        self.off_list_moves = Some(OffListMoves {
+            machine,
+            total: left.len(),
+            left,
+            ..OffListMoves::default()
+        });
+        self.off_list_next();
+    }
+
+    /// The next move to the list, or, with none left, what came of them all.
+    fn off_list_next(&mut self) {
+        let Some(moves) = self.off_list_moves.as_mut() else {
+            return;
+        };
+        if let Some(next) = moves.left.pop_front() {
+            self.account_queue
+                .push_back((moves.machine, next.request.clone()));
+            moves.current = Some(next);
+            return;
+        }
+        if let Some(moves) = self.off_list_moves.take() {
+            let (said, tone) = moves.summary(&[]);
+            self.say(said, tone);
+        }
+    }
+
+    /// The name of the agent this request moves, when it's the move to the list going now.
+    fn off_list_current(&self, machine: usize, request: &Value) -> Option<String> {
+        let moves = self.off_list_moves.as_ref()?;
+        let agent = moves.current.as_ref()?;
+        (moves.machine == machine && move_asked(request) == agent.request)
+            .then(|| agent.name.clone())
+    }
+
+    /// The move going now, ended this way, and the next one sent.
+    fn off_list_ended(&mut self, how: OffListEnd) {
+        if let Some(moves) = self.off_list_moves.as_mut() {
+            moves.end(how);
+        }
+        self.off_list_next();
+    }
+
+    /// Moves to the list he stopped: the one going now isn't on its way, asked, held or waiting on
+    /// its sign-in any more (Esc on its question, or leaving its sign-in), so the rest aren't sent,
+    /// and what came of them is said (intent 0591, B3-42).
+    fn off_list_left(&mut self) {
+        let Some(moves) = &self.off_list_moves else {
+            return;
+        };
+        let Some(agent) = &moves.current else {
+            return;
+        };
+        let this = |machine: usize, request: &Value| {
+            machine == moves.machine && move_asked(request) == agent.request
+        };
+        let asked = |screen: &AccountScreen| matches!(screen, AccountScreen::Confirm { machine, request, .. } if this(*machine, request));
+        let going = self
+            .account_pending
+            .as_ref()
+            .is_some_and(|p| this(p.machine, &p.request))
+            || self.account_queue.iter().any(|(m, r)| this(*m, r))
+            || self
+                .after_signin
+                .as_ref()
+                .is_some_and(|a| this(a.machine, &a.request))
+            || self.held_move_question.as_ref().is_some_and(asked)
+            || matches!(&self.mode, Mode::Accounts { screen, .. } if asked(screen));
+        if going {
+            return;
+        }
+        let Some(mut moves) = self.off_list_moves.take() else {
+            return;
+        };
+        let stopped: Vec<String> = moves
+            .current
+            .take()
+            .into_iter()
+            .chain(moves.left.drain(..))
+            .map(|a| a.name)
+            .collect();
+        let (said, tone) = moves.summary(&stopped);
+        self.say(said, tone);
     }
 
     /// After a sign-in's answer: once the sign-in a move waits on is done on its machine, the
@@ -2321,6 +2692,10 @@ impl App {
             } => match key.code {
                 KeyCode::Char('n') => {
                     self.mode = *back;
+                    // One of the moves to the list: this one stays, and the next is asked.
+                    if self.off_list_current(*machine, pending).is_some() {
+                        self.off_list_ended(OffListEnd::Kept);
+                    }
                     return Action::None;
                 }
                 // Longer than the screen holds, it scrolls (Codex's review).
@@ -2343,6 +2718,13 @@ impl App {
                         && (c == 'y'
                             || crate::actions::choice_keys(choices).contains(&Some(c))) =>
                 {
+                    // Kerdr's own question: its yes moves them to the list, one at a time.
+                    if pending["action"] == crate::app::MOVE_OFF_LIST {
+                        let (machine, request) = (*machine, pending.clone());
+                        self.mode = *back;
+                        self.start_off_list(machine, &request);
+                        return Action::None;
+                    }
                     let chosen = choices
                         .iter()
                         .zip(crate::actions::choice_keys(choices))
@@ -2486,6 +2868,7 @@ impl App {
     /// Called by the event loop; only polls a visible sign-in, never retries an unknown write.
     pub fn account_tick(&mut self) -> Action {
         self.drop_left_signin();
+        self.off_list_left();
         if self.busy {
             return Action::None;
         }
@@ -2533,6 +2916,11 @@ impl App {
                 continue;
             }
             let action = self.send_account(mi, request.clone());
+            // A move to the list that can't go now: said with the others, and the next one goes.
+            if action == Action::None && self.off_list_current(mi, &request).is_some() {
+                let away = format!("{} isn't answering", self.machines[mi].name());
+                self.off_list_ended(OffListEnd::Failed(away));
+            }
             if action == Action::None && request["action"] == "account-move-waiting" {
                 self.account_batch_messages.push(format!(
                     "{}: disconnected, not moved",
@@ -2608,6 +2996,83 @@ impl App {
         request: Value,
         result: Result<Response, String>,
     ) {
+        let Some(name) = self.off_list_current(machine, &request) else {
+            return self.account_answer(machine, request, result);
+        };
+        // One of the moves to the list he said yes to (intent 0591, B3-42). Its question is asked
+        // now, named, and answered before the next move is sent.
+        if let Ok(response) = &result
+            && response.confirmation
+        {
+            self.account_pending.take_if(|p| {
+                p.machine == machine
+                    && crate::actions::without_op(&p.request)
+                        == crate::actions::without_op(&crate::actions::request_metadata(&request))
+            });
+            let Some(token) = response
+                .confirm
+                .clone()
+                .filter(|t| request["confirm"].as_str() != Some(t.as_str()))
+            else {
+                return self.off_list_ended(OffListEnd::Failed(
+                    "its backend asked the same question again after your yes".into(),
+                ));
+            };
+            let mut request = crate::actions::without_op(&request);
+            request["confirm"] = json!(token);
+            let message = if response.message.contains(&name) {
+                response.message.clone()
+            } else {
+                format!("{name}: {}", response.message)
+            };
+            let question = AccountScreen::Confirm {
+                machine,
+                request,
+                message,
+                yes: response.yes.clone().unwrap_or_else(|| "move it".into()),
+                no: response.no.clone().unwrap_or_else(|| "leave it".into()),
+                target: None,
+                ready_at: Instant::now() + Duration::from_millis(500),
+                choices: response.choices.clone(),
+            };
+            if self.enter_can_land_here() {
+                self.push_account_screen(question);
+            } else if self.held_move_question.is_none() {
+                self.held_move_question = Some(question);
+                self.say(
+                    format!(
+                        "{name}'s move to the list asks you something first; it's asked once you're back on the board."
+                    ),
+                    Tone::Info,
+                );
+            } else {
+                self.off_list_ended(OffListEnd::Failed(
+                    "its move asks you something, and s on its card asks it again".into(),
+                ));
+            }
+            return;
+        }
+        let how = match &result {
+            Err(e) => OffListEnd::Failed(account_error(&request, e)),
+            Ok(r) if r.ok && r.state.as_deref() == Some("queued") => OffListEnd::Later,
+            Ok(r) if r.ok => OffListEnd::Moved,
+            Ok(r) => OffListEnd::Failed(r.message.clone()),
+        };
+        let asked = move_asked(&request);
+        self.account_answer(machine, request, result);
+        // Its account isn't signed in there: the move goes again by itself once it is, and the
+        // next waits for that.
+        if self
+            .after_signin
+            .as_ref()
+            .is_some_and(|a| a.machine == machine && move_asked(&a.request) == asked)
+        {
+            return;
+        }
+        self.off_list_ended(how);
+    }
+
+    fn account_answer(&mut self, machine: usize, request: Value, result: Result<Response, String>) {
         // The answer's request carries the op Kerdr gave it as it went (intent 0591).
         let pending = self.account_pending.take().filter(|p| {
             p.machine == machine
@@ -3256,6 +3721,12 @@ impl App {
                 _ => {}
             }
         }
+        // A list saved with running agents left on other accounts: asked once whether to move them
+        // to it now (intent 0591, B3-42).
+        if action == "account-models" && response.ok && !response.off_list.is_empty() {
+            let agents = response.off_list.clone();
+            self.ask_off_list(machine, &request, &agents, visible);
+        }
         // The account a move or the current account needs isn't signed in on that machine: the box
         // that signs it in opens, and a move goes on by itself once that's done (intent 0591,
         // B3-10, B3-40). Only where it can't take typing.
@@ -3376,7 +3847,10 @@ fn fresh_signin_words(message: &str) -> String {
 fn account_error(request: &Value, error: &str) -> String {
     let code = |field: &str| request[field].as_str().unwrap_or("the account").to_string();
     let what = match request["action"].as_str().unwrap_or_default() {
-        "account-move" => format!("Moving the agent to {}", code("to")),
+        "account-move" => match code("to").as_str() {
+            "list" => "Moving the agent to its owner's list".into(),
+            to => format!("Moving the agent to {to}"),
+        },
         "account-move-waiting" => "Moving the waiting agents".into(),
         "account-signin" => format!("Signing {} in", code("code")),
         "account-add" => format!("Adding {}", code("code")),
@@ -4959,6 +5433,273 @@ mod tests {
         assert!(a.account_queue.is_empty());
     }
 
+    /// Intent 0591, B3-42: a saved list's agents left on other accounts.
+    fn save_list_leaving(a: &mut App, off_list: Value) {
+        let owner = a.account_feed(0).unwrap().owners[0].clone();
+        a.push_account_screen(AccountScreen::Models {
+            machine: 0,
+            models: vec!["KBZ_C".into()],
+            owner,
+            sel: 0,
+            move_waiting: false,
+        });
+        let action = key(a, KeyCode::Enter);
+        complete(
+            a,
+            action,
+            json!({"ok":true,"message":"studio: KBZ_C. 3 running agents here are still on ARK_C; s on their cards moves them","off_list":off_list}),
+        );
+    }
+    fn off_agent(pane: &str, conversation: &str, account: &str, intent: Option<&str>) -> Value {
+        let mut agent =
+            json!({"pane":pane,"session":"web","conversation":conversation,"account":account});
+        if let Some(n) = intent {
+            agent["intent"] = json!(n);
+        }
+        agent
+    }
+    fn to_list(pane: &str, conversation: &str) -> Value {
+        json!({"action":"account-move","pane":pane,"session":"web","conversation":conversation,"to":"list"})
+    }
+    fn asked(a: &App) -> (Value, String) {
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                request, message, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("nothing asked: {:?} {:?}", a.mode, a.message())
+        };
+        (request.clone(), message.clone())
+    }
+    #[test]
+    fn a_saved_list_that_leaves_agents_elsewhere_asks_once_and_moves_each_to_the_list_in_turn() {
+        let mut a = app();
+        save_list_leaving(
+            &mut a,
+            json!([
+                off_agent("w91:p1", "c-1", "ARK_C", Some("0041")),
+                off_agent("w92:p1", "c-2", "ARK_C", Some("0052")),
+                {"session":"web","conversation":"no-pane"},
+                off_agent("w93:p2", "c-3", "KBZ_X", None),
+            ]),
+        );
+        // Asked once, naming each, nothing sent yet.
+        let (_, message) = asked(&a);
+        assert_eq!(
+            message,
+            "Example Studio's list is saved. On laptop, #41, #52 and the agent on KBZ_X in web are still running on ARK_C and KBZ_X, which aren't on it. Move them to the list now?"
+        );
+        assert!(a.account_queue.is_empty());
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(matches!(a.mode, Mode::Board));
+        // The first move, alone.
+        let first = a.account_tick();
+        assert_eq!(sent(first.clone()).1, to_list("w91:p1", "c-1"));
+        assert!(
+            a.account_queue.is_empty(),
+            "sent before the first was answered"
+        );
+        complete(
+            &mut a,
+            first,
+            json!({"ok":true,"message":"#41 moved to KBZ_C."}),
+        );
+        // The second asks: its question comes, named, and the third waits for its answer.
+        let second = a.account_tick();
+        assert_eq!(sent(second.clone()).1, to_list("w92:p1", "c-2"));
+        complete(
+            &mut a,
+            second,
+            json!({"ok":false,"message":"It has a background job running. Move it anyway?","confirmation":true,"confirm":"t-2","yes":"move it anyway","no":"leave it","choices":[{"id":"after-job","key":"j","label":"move it when the job ends"}]}),
+        );
+        let (request, message) = asked(&a);
+        assert_eq!(request["confirm"], "t-2");
+        assert_eq!(
+            message,
+            "#52: It has a background job running. Move it anyway?"
+        );
+        assert_eq!(
+            a.account_tick(),
+            Action::None,
+            "the next went before this was answered"
+        );
+        settle(&mut a);
+        let (machine, r) = sent(press(&mut a, 'j'));
+        assert_eq!(machine, 0);
+        let mut expected = to_list("w92:p1", "c-2");
+        expected["confirm"] = json!("t-2");
+        expected["choice"] = json!("after-job");
+        assert_eq!(r, expected);
+        complete(
+            &mut a,
+            Action::Mutate {
+                machine,
+                request: r,
+            },
+            json!({"ok":true,"state":"queued","message":"#52 moves to KBZ_C once its job ends."}),
+        );
+        // The third is refused: said with the rest once it's the last.
+        let third = a.account_tick();
+        assert_eq!(sent(third.clone()).1, to_list("w93:p2", "c-3"));
+        complete(
+            &mut a,
+            third,
+            json!({"ok":false,"message":"Its agent isn't running now, so nothing moved."}),
+        );
+        assert!(a.off_list_moves.is_none());
+        assert_eq!(a.account_tick(), Action::None);
+        assert_eq!(
+            a.message().unwrap(),
+            (
+                "2 of 3 moved to the list: #41 now, and #52 as soon as it can. The agent on KBZ_X in web didn't move: its agent isn't running now, so nothing moved.",
+                Tone::Warn
+            )
+        );
+    }
+    #[test]
+    fn n_on_one_move_to_the_list_goes_on_to_the_next_and_esc_stops_the_rest() {
+        let mut a = app();
+        save_list_leaving(
+            &mut a,
+            json!([
+                off_agent("w91:p1", "c-1", "ARK_C", Some("0041")),
+                off_agent("w92:p1", "c-2", "ARK_C", Some("0052")),
+                off_agent("w93:p1", "c-3", "ARK_C", Some("0060")),
+            ]),
+        );
+        settle(&mut a);
+        press(&mut a, 'y');
+        let question = json!({"ok":false,"message":"#41 is mid-step. Move it when it next stops?","confirmation":true,"confirm":"t-1"});
+        let first = a.account_tick();
+        complete(&mut a, first, question);
+        assert_eq!(asked(&a).1, "#41 is mid-step. Move it when it next stops?");
+        settle(&mut a);
+        // n: this one stays, and the next goes.
+        assert_eq!(press(&mut a, 'n'), Action::None);
+        let second = a.account_tick();
+        assert_eq!(sent(second.clone()).1, to_list("w92:p1", "c-2"));
+        complete(
+            &mut a,
+            second,
+            json!({"ok":true,"message":"#52 moved to KBZ_C."}),
+        );
+        let third = a.account_tick();
+        complete(
+            &mut a,
+            third,
+            json!({"ok":false,"message":"#60 is mid-step. Move it when it next stops?","confirmation":true,"confirm":"t-3"}),
+        );
+        // Esc: nothing more is sent, and what came of them is said.
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.off_list_moves.is_none());
+        assert_eq!(
+            a.message().unwrap(),
+            (
+                "1 of 3 moved to the list: #52. #41 stayed where it was, as you said. You stopped there, so #60 wasn't moved.",
+                Tone::Info
+            )
+        );
+    }
+    #[test]
+    fn a_move_to_the_list_waits_on_its_sign_in_and_leaving_that_stops_the_rest() {
+        let mut a = app();
+        save_list_leaving(
+            &mut a,
+            json!([
+                off_agent("w91:p1", "c-1", "ARK_C", Some("0041")),
+                off_agent("w92:p1", "c-2", "ARK_C", Some("0052")),
+            ]),
+        );
+        settle(&mut a);
+        press(&mut a, 'y');
+        let first = a.account_tick();
+        complete(
+            &mut a,
+            first,
+            json!({"ok":false,"sign_in":true,"code":"KBZ_C","message":"A, then Enter on KBZ_C signs it in, and s moves it then; nothing moved"}),
+        );
+        // The box that signs it in, and the next move waits for it.
+        assert!(matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Where { .. },
+                ..
+            }
+        ));
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.off_list_moves.is_some());
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.off_list_moves.is_none());
+        assert_eq!(
+            a.message().unwrap().0,
+            "0 of 2 moved to the list. You stopped there, so #41 and #52 weren't moved."
+        );
+    }
+    #[test]
+    fn a_saved_list_asks_nothing_more_without_agents_off_it_and_a_held_question_waits_its_half_second()
+     {
+        // An older backend, or none left elsewhere: as before.
+        for off_list in [
+            json!(null),
+            json!([]),
+            json!([{"session":"web"}]),
+            json!("x"),
+        ] {
+            let mut a = app();
+            save_list_leaving(&mut a, off_list.clone());
+            assert!(matches!(a.mode, Mode::Board), "{off_list}: {:?}", a.mode);
+            assert!(a.account_queue.is_empty());
+            assert!(a.message().unwrap().0.starts_with("studio: KBZ_C."));
+        }
+        // Answered while he types: held, and asked once he's back, never answered by a key
+        // pressed as it opens.
+        let mut a = app();
+        let owner = a.account_feed(0).unwrap().owners[0].clone();
+        a.push_account_screen(AccountScreen::Models {
+            machine: 0,
+            models: vec!["KBZ_C".into()],
+            owner,
+            sel: 0,
+            move_waiting: false,
+        });
+        let action = key(&mut a, KeyCode::Enter);
+        a.busy = true;
+        key(&mut a, KeyCode::Esc);
+        press(&mut a, 'c');
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"saved","off_list":[off_agent("w91:p1","c-1","ARK_C",Some("0041"))]}),
+        );
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        assert!(a.held_move_question.is_some());
+        key(&mut a, KeyCode::Esc);
+        // Its half second ran out while it was held.
+        if let Some(AccountScreen::Confirm { ready_at, .. }) = &mut a.held_move_question {
+            *ready_at = Instant::now() - Duration::from_secs(1);
+        }
+        a.account_owed();
+        assert!(asked(&a).1.ends_with("Move it to the list now?"));
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(
+            a.off_list_moves.is_none(),
+            "answered by a key pressed as it opened"
+        );
+        // A move to the list that failed is named in words.
+        assert!(
+            account_error(
+                &json!({"action":"account-move","to":"list"}),
+                "no answer came"
+            )
+            .starts_with("Moving the agent to its owner's list")
+        );
+    }
     #[test]
     fn s_upper_saved_unchanged_points_to_s_on_a_card_when_an_agent_could_move() {
         // F-0294: Andrew pressed S to move one running agent, and "Model list unchanged" alone

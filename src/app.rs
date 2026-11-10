@@ -433,6 +433,9 @@ fn holds_peek(mode: &Mode) -> bool {
 /// The action of Kerdr's own question whether a new intent's words go without the image that
 /// didn't go in: never sent to a backend.
 pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
+/// Kerdr's own question after a saved list leaves running agents on other accounts: its yes
+/// moves them to the list, one at a time (intent 0591, B3-42).
+pub(crate) const MOVE_OFF_LIST: &str = "kerdr:move-off-list";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
@@ -735,6 +738,9 @@ pub struct App {
     /// A move waiting on its account's sign-in on that machine: sent again by itself, as a new
     /// request, once that sign-in is done; dropped if he leaves it (intent 0591, B3-10).
     pub after_signin: Option<account_controls::AfterSignin>,
+    /// The agents a saved list left on other accounts, moved to the list one at a time once he
+    /// said yes (intent 0591, B3-42).
+    pub off_list_moves: Option<account_controls::OffListMoves>,
     /// The number of the last request asking an old backend to update, so each answer finds the
     /// waits it was asked for.
     pub update_asks: u64,
@@ -842,6 +848,7 @@ impl App {
             owed_accounts: Vec::new(),
             held_move_question: None,
             after_signin: None,
+            off_list_moves: None,
             update_asks: 0,
             follow_end: None,
             enter_sent: None,

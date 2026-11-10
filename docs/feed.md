@@ -1146,7 +1146,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | Action | Request fields | Result |
 |---|---|---|
 | `account-move` | `pane`, `session`, `conversation` (empty for an agent the feed doesn't list), `to` (code or `list`), optional `confirm` | queued, stale, the question below, or the answer of a start made instead (below) |
-| `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
+| `account-models` | `owner`, `models` array; or `inherit: true` | saves the list; with `off_list` when it leaves running agents on accounts not on it (below) |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
 | `account-test` | `code`, optional `copy` | status and message; a failure with `"sign_in": true` opens the box that signs it in, and nothing starts until `Enter` |
@@ -1208,6 +1208,18 @@ sign-in, `account-start`): `{"ok":false,"confirmation":"<question>","confirm":"<
 when you've gone on to type something, once you're back on the board; `y` sends the same request
 again with `confirm`. `message` must read on its own, since an older Kerdr shows only that. A model
 list counts as saved when its question comes, so its screen closes and the list shows at once.
+
+A saved list's `ok` answer names each running agent on that machine it leaves on an account that
+isn't on it, in `off_list`: `[{"conversation","pane","session","account","intent"?}]` (`intent` only
+for one that works an intent). Kerdr asks once, "Move them to the list now?", naming each by its
+card, else `#` and its intent, else its account and session. Its `y` sends
+`{"action":"account-move","pane","session","conversation","to":"list"}` for each, one at a time:
+each one's answer, its question (asked in the same box, named, and answered before the next is
+sent), or its sign-in comes first. `n` on one of those questions leaves that agent and goes on;
+`Esc` on any of them, or leaving its sign-in, stops the rest. Once they've all been asked, or he
+stopped, Kerdr says how many moved and which didn't, and why. An entry without a `pane` is passed
+over. A backend that doesn't send `off_list` asks nothing more, and its `message` should say how to
+move them, since an older Kerdr shows only that.
 
 When a move's account isn't signed in on the machine (or has no token there), the backend answers
 `{"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C isn't signed in on lab: sign it in, and

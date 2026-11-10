@@ -118,6 +118,48 @@ pub struct Response {
     /// with `choice` and the question's `confirm` (intent 0591, release 3).
     #[serde(default, deserialize_with = "choices")]
     pub choices: Vec<Choice>,
+    /// With a saved list (`account-models`): the running agents it leaves on accounts that aren't
+    /// on it, each moved to the list by an `account-move` with `"to": "list"` (intent 0591, B3-42).
+    #[serde(default, deserialize_with = "off_list")]
+    pub off_list: Vec<OffList>,
+}
+
+/// A running agent a saved list leaves on another account (intent 0591, B3-42): what an
+/// `account-move` names it by, the account it's on, and the intent it works when there is one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OffList {
+    pub pane: String,
+    pub session: String,
+    pub conversation: String,
+    pub account: String,
+    pub intent: Option<String>,
+}
+
+/// `off_list` as a backend gives it: each entry naming its pane, in its order; anything else (not
+/// a list, an entry with no pane, a field of another shape) is passed over, never a failed answer.
+fn off_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<OffList>, D::Error> {
+    let value = Value::deserialize(d)?;
+    let text = |v: &Value, field: &str| {
+        v[field]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+            .map(str::to_string)
+    };
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            Some(OffList {
+                pane: text(v, "pane")?,
+                session: text(v, "session").unwrap_or_default(),
+                conversation: text(v, "conversation").unwrap_or_default(),
+                account: text(v, "account").unwrap_or_default(),
+                intent: text(v, "intent"),
+            })
+        })
+        .collect())
 }
 
 /// One answer a question offers beyond yes and no (intent 0591): "queue it", "shelve the oldest",
