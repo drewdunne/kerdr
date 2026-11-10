@@ -7303,20 +7303,38 @@ pub(crate) mod tests {
                 ..Default::default()
             })
         };
-        let mut app = demo_app();
-        app.cfg.actions.command = Some("test-adapter".into());
-        let (_, id) = closed_workspace_card(&mut app);
-        reopen_by_enter(&mut app);
-        let n = app
-            .resolver
-            .unanswered_for("reopen", Some(id.as_str()))
-            .unwrap();
-        let mut yes = app.resolver.job_request(n).unwrap().clone();
-        let op = yes["op"].clone();
-        yes["override"] = serde_json::json!(true);
-        yes["confirm"] = serde_json::json!("not-a-token");
-        yes["queue"] = serde_json::json!(true);
-        app.finish_job(n, yes, refused());
+        let yes_refused = |keeps_ops: bool| {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            if keeps_ops {
+                app.machines[0].feed.as_mut().unwrap().supports = vec!["op".into()];
+            }
+            let (_, id) = closed_workspace_card(&mut app);
+            reopen_by_enter(&mut app);
+            let n = app
+                .resolver
+                .unanswered_for("reopen", Some(id.as_str()))
+                .unwrap();
+            let mut yes = app.resolver.job_request(n).unwrap().clone();
+            let op = yes["op"].clone();
+            yes["override"] = serde_json::json!(true);
+            yes["confirm"] = serde_json::json!("not-a-token");
+            yes["queue"] = serde_json::json!(true);
+            app.finish_job(n, yes, refused());
+            (app, id, op)
+        };
+        // A backend whose feed doesn't say it keeps ops is sent nothing by itself: the refusal is
+        // said, and the next key press asks again.
+        let (app, id, _) = yes_refused(false);
+        assert!(app.resend.is_empty());
+        assert!(
+            app.resolver
+                .unanswered_for("reopen", Some(id.as_str()))
+                .is_none()
+        );
+        assert!(last_said(&app).unwrap().0.contains("couldn't be matched"));
+
+        let (mut app, id, op) = yes_refused(true);
         // The same job goes again, as a new ask: no answer of the old question, and its own op.
         let n = app
             .resolver

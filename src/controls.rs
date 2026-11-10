@@ -3241,12 +3241,16 @@ impl App {
         }
         // Its yes couldn't be matched to the question (a Kerdr and backend that disagree): nothing
         // started, so the question is asked afresh rather than dropped. Only a yes does this, so
-        // it can't go round by itself (intent 0591).
+        // it can't go round by itself (intent 0591). Only to a backend whose feed says it keeps
+        // ops, as every request sent by itself: a released backend's refusal can't be shown to
+        // come before anything changed (a followed worker can start a session, then refuse), so
+        // there it's only said, and the next key press asks again.
         if let Ok(response) = &result
             && !response.ok
             && response.message.contains(YES_NOT_MATCHED)
             && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
             && (request["override"] == true || request.get("confirm").is_some())
+            && self.resends_to(machine)
         {
             let mut again = request;
             if let Some(fields) = again.as_object_mut() {
