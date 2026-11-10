@@ -3271,6 +3271,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
         Some("dispatch") => "start anyway",
         Some("reopen") => "go ahead",
         Some("cancel") => "stop it",
+        Some(crate::app::SEND_WITHOUT) => "send without it",
         _ => "yes",
     };
     let mut keys: Vec<(String, String)> = vec![];
@@ -3294,6 +3295,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
     // On X's question, "cancel" would read as the yes (intent 0321).
     let no = match q.action {
         Some("cancel") => "keep it running",
+        Some(crate::app::SEND_WITHOUT) => "keep them unsent",
         _ if !q.choices.is_empty() => "leave it",
         _ => "cancel",
     };

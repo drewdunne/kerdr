@@ -2056,17 +2056,9 @@ impl App {
                 let said = attach_into(&mut draft, loading, Some(self.image_at));
                 if said.iter().any(|s| !s.starts_with("Attached")) {
                     // Not everything read went in (none found, the box full, too many or too
-                    // big): not sent, words and what did go in kept, and why said.
-                    let into_box = self.give_back(draft.words, draft.images, draft.came_back);
-                    let back = if into_box {
-                        "c opens it again with your words."
-                    } else {
-                        "Its words are kept, and c brings them back once the box is empty."
-                    };
-                    self.fail(format!(
-                        "Your new intent wasn't sent: {} {back}",
-                        said.join(" ")
-                    ));
+                    // big). His words may be about it, so whether they go without it is his
+                    // call (intent 0591, K1-37).
+                    self.ask_send_without(draft, &said);
                     return Action::None;
                 }
                 return self.send_draft(draft);
@@ -2075,6 +2067,70 @@ impl App {
         }
         self.attach_images_at(loading, Some(self.image_at));
         Action::None
+    }
+
+    /// Asks whether a new intent's words go without the image that didn't go in. They're given
+    /// back at once, with what did go in, so nothing is lost whatever becomes of the question; a
+    /// yes takes them out again and sends them.
+    fn ask_send_without(&mut self, draft: Draft, said: &[String]) {
+        let into_box = self.give_back(
+            draft.words.clone(),
+            draft.images.clone(),
+            draft.came_back.clone(),
+        );
+        let back = if into_box {
+            "c opens them again."
+        } else {
+            "c brings them back once the box is empty."
+        };
+        self.mode = Mode::Confirm {
+            machine: draft.machine,
+            request: json!({ "action": crate::app::SEND_WITHOUT }),
+            title: "Send without the image?".into(),
+            message: format!(
+                "{} Send your new intent's words as they are, without it? n keeps them unsent, and {back}",
+                said.join(" ")
+            ),
+            back: Box::new(self.mode.clone()),
+            target: None,
+            queue: false,
+            ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+        self.send_without = Some(draft);
+    }
+
+    /// The yes to ask_send_without: the words go, taken back from where they were kept, as long as
+    /// they're there unchanged.
+    fn send_without(&mut self) -> Action {
+        let Some(draft) = self.send_without.take() else {
+            return Action::None;
+        };
+        let kept = if self.draft == draft.words && self.draft_images == draft.images {
+            self.draft.clear();
+            self.draft_images.clear();
+            self.draft_came_back = None;
+            true
+        } else if let Some(i) = self
+            .returned
+            .iter()
+            .position(|r| r.words == draft.words && r.images == draft.images)
+        {
+            self.returned.remove(i);
+            true
+        } else {
+            false
+        };
+        if !kept {
+            self.say(
+                "Nothing was sent: your words have moved since, and c brings them back.",
+                Tone::Info,
+            );
+            return Action::None;
+        }
+        self.send_draft(draft)
     }
 
     /// Puts images read from the clipboard or a pasted path into the new-intent box, each as
@@ -2143,6 +2199,25 @@ impl App {
                 // A question that just appeared, or a key held down, never answers it.
                 let early = key.kind == KeyEventKind::Repeat
                     || ready_at.is_some_and(|at| Instant::now() < at);
+                // Kerdr's own question about words whose image didn't go in (K1-37).
+                if request["action"] == crate::app::SEND_WITHOUT {
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            self.send_without = None;
+                            self.say(
+                                "Your new intent's words are kept, unsent: c brings them back.",
+                                Tone::Info,
+                            );
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            return Some(self.send_without());
+                        }
+                        _ => {}
+                    }
+                    return Some(Action::None);
+                }
                 if early
                     && (matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w'))
                         || chosen.is_some())

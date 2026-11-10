@@ -430,6 +430,10 @@ fn holds_peek(mode: &Mode) -> bool {
     }
 }
 
+/// The action of Kerdr's own question whether a new intent's words go without the image that
+/// didn't go in: never sent to a backend.
+pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Mutate {
@@ -564,6 +568,9 @@ pub struct App {
     /// A new intent Enter sent while its image was still being read: the read's number and its
     /// words, sent once the image is in (intent 0445).
     pub send_after_load: Option<(u64, Draft)>,
+    /// A new intent whose image didn't go in, while Kerdr asks whether its words go without it
+    /// (intent 0591, K1-37). Its words are kept meanwhile where give_back put them.
+    pub(crate) send_without: Option<Draft>,
     /// The answer being handled is for a start or reopen whose workspace Andrew already went
     /// into himself (intent 0445).
     answer_went_in: bool,
@@ -726,6 +733,7 @@ impl App {
             submissions: vec![],
             returned: Default::default(),
             send_after_load: None,
+            send_without: None,
             answer_went_in: false,
             backlog_focus: None,
             view_search: None,
@@ -4874,10 +4882,100 @@ pub(crate) mod tests {
             why: Some("The clipboard holds no image.".into()),
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
-        let (said, tone) = app.message().unwrap();
-        assert_eq!(tone, Tone::Fail);
-        assert!(said.contains("c opens it again with your words"), "{said}");
+        // Whether they go without it is his call (intent 0591, K1-37); they're kept meanwhile.
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert_eq!(title, "Send without the image?");
+        assert!(
+            message.contains("The clipboard holds no image."),
+            "{message}"
+        );
+        assert!(message.contains("c opens them again"), "{message}");
         assert_eq!(app.draft, "Again");
+        answer_now(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Backlog { .. }), "{:?}", app.mode);
+        assert!(app.message().unwrap().0.contains("kept, unsent"));
+        assert_eq!(app.draft, "Again");
+        assert!(app.send_without.is_none());
+    }
+
+    /// Lets the question on screen take an answer now, as it does half a second after it appears.
+    fn answer_now(app: &mut App) {
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+    }
+
+    #[test]
+    fn words_whose_image_didn_t_go_in_go_without_it_on_a_yes() {
+        // Intent 0591, K1-37: the image couldn't be read; a yes sends the words as they are,
+        // taken back from the box they were kept in, and not too soon.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        use crate::images::Source;
+        app.draft = "The dock".into();
+        press(&mut app, 'c');
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let none = crate::images::Loading {
+            images: vec![],
+            why: Some("The clipboard holds no image.".into()),
+        };
+        assert_eq!(app.images_loaded(id, none), Action::None);
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::None,
+            "a y typed before the question was seen answered it"
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("the yes didn't send the words: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "create");
+        assert_eq!(request["words"], "The dock");
+        assert!(app.draft.is_empty(), "the words sent stayed in the box too");
+        assert!(app.send_without.is_none());
+        // Kept in the queue behind words typed meanwhile, they're taken from there.
+        app.mode = Mode::Board;
+        press(&mut app, 'c');
+        for c in "Fix the NAS".chars() {
+            press(&mut app, c);
+        }
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        press(&mut app, 'c');
+        for c in "Other".chars() {
+            press(&mut app, c);
+        }
+        let none = crate::images::Loading {
+            images: vec![],
+            why: Some("The clipboard holds no image.".into()),
+        };
+        assert_eq!(app.images_loaded(id, none), Action::None);
+        let Mode::Confirm { message, back, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert!(message.contains("once the box is empty"), "{message}");
+        assert!(matches!(**back, Mode::Compose { .. }));
+        assert_eq!(app.returned.len(), 1);
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send the words")
+        };
+        assert_eq!(request["words"], "Fix the NAS");
+        assert!(app.returned.is_empty());
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Other"),
+            "{:?}",
+            app.mode
+        );
     }
 
     fn a_png() -> crate::images::Loaded {
@@ -4989,9 +5087,12 @@ pub(crate) mod tests {
             why: None,
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
-        let (said, tone) = app.message().unwrap();
-        assert_eq!(tone, Tone::Fail);
-        assert!(said.contains("The box is full"), "{said}");
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert!(message.contains("The box is full"), "{message}");
+        assert_eq!(app.draft, full);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.draft, full);
         // One image in and one that couldn't be read: not sent either.
         app.draft = "The dock".into();
@@ -5004,7 +5105,10 @@ pub(crate) mod tests {
             why: Some("photo.heic isn't an image Kerdr can send.".into()),
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
-        assert!(app.message().unwrap().0.contains("photo.heic"));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert!(message.contains("photo.heic"), "{message}");
         assert_eq!(app.draft, "The dock [Image #1] ");
         assert_eq!(app.draft_images.len(), 1);
     }
