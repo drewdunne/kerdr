@@ -231,6 +231,14 @@ its conversation, without touching the session's other agents or its owner's lis
 start for work nobody started, as `d` does, or a reopen that resumes its conversation, as `Enter`
 does. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
 
+Each key does what it means whatever state its card is in. `d` on work that has started does what
+`⏎` does, and `X` on a card with nothing running asks to set it aside. With a backend that does each
+key's step first, `d` on work in Won't do brings it back and starts it, `C` and `x` on work an agent
+is at ask before they stop it, and `e` edits started or done work too. A question offers the answers
+that move things on beside yes and no (queue it, say, or ask the agent to wrap up). One that comes
+back while you're elsewhere waits on its card, yellow, saying what it asks, and `n` goes to it. See
+[docs/feed.md](docs/feed.md#each-keys-step-first-and-questions-with-choices).
+
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
 `M` lists every machine and every state it can be in: live, connecting, reconnecting, can't
@@ -280,8 +288,8 @@ peek alike:
   written up, or a new intent's card still being saved, says so instead. When a save can't land (a refusal, a change made meanwhile, no
   answer), the card goes back as it was, the red **Not done** box says so, and Kerdr keeps your
   version: the next `e` opens it, with any newer text below it. Once the item has started, `e`
-  still opens your version so you can copy it, and sends nothing; so does a machine that isn't
-  answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
+  still opens your version so you can copy it, and sends nothing, unless its backend does each
+  key's step first, which edits it where it is; so does a machine that isn't answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
   `q` says first when quitting would lose a version only Kerdr keeps, and a second `q` quits. An editor that opens a window of
   its own needs its waiting form, such as `code --wait`: without it Kerdr doesn't start it, and
   says which flag to add.
