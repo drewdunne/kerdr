@@ -1176,18 +1176,7 @@ fn filters(buf: &mut Buffer, rect: Rect, app: &App) {
 /// One line about the machine in the most trouble, the way the design's banner reads.
 fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
     let now = app.now();
-    let rank = |c: &Conn| match c {
-        Conn::HostKey { .. } | Conn::Auth { .. } => 0,
-        Conn::Reconnecting { .. } => 1,
-        Conn::Unreachable { .. } => 2,
-        Conn::HerdrTooOld { .. } | Conn::HerdrMissing => 3,
-        _ => 9,
-    };
-    // A drop shows here only once it lasts; its tab is marked meanwhile (intent 0591).
-    let mut troubled: Vec<usize> = (0..app.machines.len())
-        .filter(|&i| rank(&app.machines[i].conn) < 9 && app.machines[i].conn.lasting(now))
-        .collect();
-    troubled.sort_by_key(|&i| rank(&app.machines[i].conn));
+    let troubled = app.troubled_machines();
     let reading = read_troubles(app);
     let Some(&i) = troubled.first() else {
         return reading_banner(reading);
@@ -4218,6 +4207,12 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
     let m = &app.machines[i];
     let now = app.now();
     let as_of = m.last_ok.map(clock);
+    // This machine, hidden: off the board, still read (intent 0591, K1-10).
+    if m.machine.hidden && !matches!(m.conn, Conn::Hidden) {
+        return vec![
+            "You hid its cards with x. Kerdr still reads it, for its accounts and the actions it runs; x shows them again.".into(),
+        ];
+    }
     match &m.conn {
         Conn::Live { latency } => {
             let mut lines = vec![format!(
@@ -4556,9 +4551,10 @@ fn machines_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             Conn::HostKey { .. } | Conn::Auth { .. } => hints.insert(0, ("⏎", "answer it here")),
             Conn::HerdrMissing | Conn::HerdrTooOld { .. } => hints.insert(0, ("u", "set up herdr")),
             Conn::Hidden => hints = vec![("x", "show it again")],
+            _ if m.machine.hidden => hints = vec![("x", "show its cards again")],
             _ => hints.insert(0, ("⏎", "its board")),
         }
-        if !m.machine.is_local() && !matches!(m.conn, Conn::Hidden) {
+        if !m.machine.hidden && !matches!(m.conn, Conn::Hidden) {
             hints.push(("x", "hide"));
         }
         lines.push(Line::from(fit(key_hints(&hints), w)));

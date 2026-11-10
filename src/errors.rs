@@ -223,7 +223,9 @@ impl App {
         // quiet here as on the board.
         let at = self.now();
         let mut now: Vec<(String, String)> = vec![];
-        if let Some(problem) = conn_problem(&m.conn, &name).filter(|_| m.conn.lasting(at)) {
+        if let Some(problem) =
+            conn_problem(&m.conn, &name, m.machine.is_local()).filter(|_| m.conn.lasting(at))
+        {
             now.push(("conn".into(), problem));
         }
         if let Some(e) = m.feed_problem(at) {
@@ -305,7 +307,7 @@ fn kickoff_drafts(mode: &Mode) -> Vec<&str> {
 }
 
 /// What the board shows wrong with a machine's connection, if anything.
-fn conn_problem(conn: &Conn, name: &str) -> Option<String> {
+fn conn_problem(conn: &Conn, name: &str, local: bool) -> Option<String> {
     match conn {
         Conn::Connecting | Conn::Live { .. } | Conn::Hidden => None,
         Conn::Reconnecting { detail, .. } => {
@@ -318,8 +320,20 @@ fn conn_problem(conn: &Conn, name: &str) -> Option<String> {
         Conn::Auth { detail } => Some(format!(
             "SSH wants a password or another key for {name}: {detail}. On the machines screen (M), ⏎ on it lets you type it."
         )),
+        // What sets it up, from the machine the banner names (intent 0591, K1-120, K1-121):
+        // herdr's own setup there asks before it changes anything.
+        Conn::HerdrMissing if !local => Some(format!(
+            "{name} has no herdr. M then u runs herdr's own setup there, which asks before it installs anything."
+        )),
+        Conn::HerdrTooOld { version } if !local => Some(format!(
+            "{name}'s herdr {version} is too old for Kerdr, which needs {} or newer. M then u runs herdr's own setup there, which asks before it updates or restarts anything.",
+            crate::herdr::version_string(crate::herdr::MIN_VERSION)
+        )),
         Conn::HerdrMissing => Some(format!("{name} has no herdr.")),
-        Conn::HerdrTooOld { version } => Some(format!("{name}'s herdr {version} is too old.")),
+        Conn::HerdrTooOld { version } => Some(format!(
+            "{name}'s herdr {version} is too old for Kerdr, which needs {} or newer.",
+            crate::herdr::version_string(crate::herdr::MIN_VERSION)
+        )),
     }
 }
 

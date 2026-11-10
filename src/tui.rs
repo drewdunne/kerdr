@@ -666,6 +666,32 @@ fn event_loop(
             Action::ToggleHidden(i) => {
                 let name = app.machines[i].name();
                 let mut state = State::load();
+                if app.machines[i].machine.is_local() {
+                    // This machine: its cards leave the board or come back, and it's read all
+                    // along, for its accounts and the actions it runs (intent 0591, K1-10).
+                    let machine_name = app.machines[i].machine.name.clone();
+                    if app.machines[i].machine.hidden {
+                        state.hidden.retain(|h| {
+                            !h.eq_ignore_ascii_case(&name) && !h.eq_ignore_ascii_case(&machine_name)
+                        });
+                        app.machines[i].machine.hidden = false;
+                        app.say(format!("Showing {name}'s cards again."), Tone::Info);
+                    } else {
+                        state.hidden.push(machine_name);
+                        app.machines[i].machine.hidden = true;
+                        app.say(
+                            format!(
+                                "Hid {name}'s cards. Kerdr still reads it, for its accounts and the actions it runs; x in machines shows them again."
+                            ),
+                            Tone::Info,
+                        );
+                    }
+                    if !app.demo {
+                        state.save();
+                    }
+                    app.rebuild();
+                    continue;
+                }
                 if matches!(app.machines[i].conn, Conn::Hidden) {
                     state.hidden.retain(|h| {
                         !h.eq_ignore_ascii_case(&name)

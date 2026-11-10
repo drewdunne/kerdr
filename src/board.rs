@@ -54,7 +54,8 @@ pub struct MachineState {
 
 impl MachineState {
     pub fn new(machine: Machine) -> MachineState {
-        let conn = if machine.hidden {
+        // This machine is read even when hidden: only its cards leave the board (on_board).
+        let conn = if machine.hidden && !machine.is_local() {
             Conn::Hidden
         } else {
             Conn::Connecting
@@ -428,6 +429,12 @@ impl MachineState {
         !matches!(self.conn, Conn::Hidden)
     }
 
+    /// Whether its cards and sessions are on the board. This machine hidden with x leaves the
+    /// board but is still read, for its accounts and the actions it runs (intent 0591, K1-10).
+    pub fn on_board(&self) -> bool {
+        self.is_shown() && !self.machine.hidden
+    }
+
     /// Set when the board's data for this machine isn't fresh.
     pub fn cached_at(&self) -> Option<DateTime<Local>> {
         if self.conn.is_live() {
@@ -515,7 +522,7 @@ impl<'a> WsRef<'a> {
 fn workspaces<'a>(machines: &'a [MachineState], cfg: &Config) -> Vec<WsRef<'a>> {
     let mut out = Vec::new();
     for (mi, m) in machines.iter().enumerate() {
-        if !m.is_shown() {
+        if !m.on_board() {
             continue;
         }
         let Some(data) = &m.data else { continue };
@@ -742,14 +749,14 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     let shown = || {
         machines
             .iter()
-            .filter(|m| m.is_shown())
+            .filter(|m| m.on_board())
             .filter_map(|m| m.feed.as_ref())
     };
     let owners = crate::owners::merge(shown());
     let lists = crate::stages::merge(shown());
     let mut chosen: BTreeMap<String, (usize, &FeedCard, &Feed)> = BTreeMap::new();
     for (mi, m) in machines.iter().enumerate() {
-        if !m.is_shown() {
+        if !m.on_board() {
             continue;
         }
         let Some(feed) = &m.feed else { continue };
@@ -837,7 +844,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
             .and_then(|h| {
                 machines
                     .iter()
-                    .position(|m| m.is_shown() && m.answers_to(h))
+                    .position(|m| m.on_board() && m.answers_to(h))
             });
         let (mut ws, mut tab, mut own_tab) = (None, None, None);
         if let Some(fw) = &fc.workspace
@@ -1130,7 +1137,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
     let mut sessions = Vec::new();
     let mut machine_order = Vec::new();
     for (mi, m) in machines.iter().enumerate() {
-        if !m.is_shown() {
+        if !m.on_board() {
             continue;
         }
         let name = m.name();

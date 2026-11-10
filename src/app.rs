@@ -2194,7 +2194,7 @@ impl App {
             }
             KeyCode::Char('b') => self.enter_backlog(false),
             KeyCode::Char('D') => self.enter_done(),
-            KeyCode::Char('M') => self.mode = Mode::Machines { sel: 0 },
+            KeyCode::Char('M') => self.open_machines(),
             KeyCode::Char('r') => {
                 let target = self
                     .selected()
@@ -2644,6 +2644,36 @@ impl App {
         (0..self.machines.len()).collect()
     }
 
+    /// The machines the banner speaks of, the one in the most trouble first: one that needs you
+    /// (SSH asks something), then one dropping or away, then one whose herdr needs setting up. A
+    /// drop counts only once it lasts; its tab is marked meanwhile (intent 0591).
+    pub fn troubled_machines(&self) -> Vec<usize> {
+        let now = self.now();
+        let rank = |c: &Conn| match c {
+            Conn::HostKey { .. } | Conn::Auth { .. } => 0,
+            Conn::Reconnecting { .. } => 1,
+            Conn::Unreachable { .. } => 2,
+            Conn::HerdrTooOld { .. } | Conn::HerdrMissing => 3,
+            _ => 9,
+        };
+        let mut troubled: Vec<usize> = (0..self.machines.len())
+            .filter(|&i| rank(&self.machines[i].conn) < 9 && self.machines[i].conn.lasting(now))
+            .collect();
+        troubled.sort_by_key(|&i| rank(&self.machines[i].conn));
+        troubled
+    }
+
+    /// M: the machines screen, on the machine the banner names, so its ⏎ or u is the next key
+    /// (intent 0591, K3-38 to K3-41).
+    pub(crate) fn open_machines(&mut self) {
+        let sel = self
+            .troubled_machines()
+            .first()
+            .and_then(|&i| self.machine_rows().iter().position(|&r| r == i))
+            .unwrap_or(0);
+        self.mode = Mode::Machines { sel };
+    }
+
     fn machines_key(&mut self, key: KeyEvent, sel: usize) -> Action {
         let rows = self.machine_rows();
         let n = rows.len().max(1);
@@ -2662,13 +2692,9 @@ impl App {
             }
             KeyCode::Char('r') => return Action::Retry(Some(i)),
             KeyCode::Char('R') => return Action::Retry(None),
-            KeyCode::Char('x') => {
-                if self.machines[i].machine.is_local() {
-                    self.say("This machine can't be hidden.", Tone::Info);
-                } else {
-                    return Action::ToggleHidden(i);
-                }
-            }
+            // This machine too: only its cards leave the board, and it's still read for its
+            // accounts and the actions it runs (intent 0591, K1-10).
+            KeyCode::Char('x') => return Action::ToggleHidden(i),
             KeyCode::Char('u') => {
                 if self.machines[i].machine.is_local() {
                     self.say("Update herdr here with: herdr update", Tone::Info);
@@ -2684,6 +2710,7 @@ impl App {
                         return Action::Setup(i);
                     }
                     Conn::Hidden => return Action::ToggleHidden(i),
+                    _ if m.machine.hidden => return Action::ToggleHidden(i),
                     _ => {
                         let scope = Scope::Machine(m.name());
                         self.choose_scope(scope);
@@ -9866,5 +9893,65 @@ pub(crate) mod tests {
             request,
             serde_json::json!({"action": "cancel", "id": id, "session": "web", "workspace": "w9"})
         );
+    }
+
+    #[test]
+    fn m_opens_the_machines_screen_on_the_machine_the_banner_names() {
+        // Intent 0591, K3-38 to K3-41: its ⏎ or u is the next key, with no hunting for it.
+        let mut app = demo_app();
+        let last = app.machines.len() - 1;
+        for m in &mut app.machines {
+            if m.conn.needs_you() {
+                m.conn = crate::poll::Conn::Live {
+                    latency: Duration::from_millis(9),
+                };
+            }
+        }
+        app.machines[last].conn = crate::poll::Conn::HostKey {
+            detail: "the host key changed".into(),
+        };
+        assert_eq!(app.troubled_machines().first(), Some(&last));
+        press(&mut app, 'M');
+        let Mode::Machines { sel } = app.mode else {
+            panic!("not the machines screen: {:?}", app.mode)
+        };
+        assert_eq!(app.machine_rows()[sel], last);
+        assert_eq!(enter(&mut app), Action::Answer(last));
+    }
+
+    #[test]
+    fn this_machine_hidden_leaves_the_board_and_is_still_read() {
+        // Intent 0591, K1-10: x hides this machine's cards too, and Kerdr keeps reading it for
+        // its accounts and the actions it runs.
+        let mut app = demo_app();
+        let local = app
+            .machines
+            .iter()
+            .position(|m| m.machine.is_local())
+            .expect("this machine in the demo");
+        app.mode = Mode::Machines { sel: local };
+        assert_eq!(press(&mut app, 'x'), Action::ToggleHidden(local));
+        let had = app
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.machine_index == local)
+            .count();
+        assert!(had > 0, "the demo shows this machine's cards");
+        app.machines[local].machine.hidden = true;
+        app.rebuild();
+        assert!(app.machines[local].is_shown(), "still read");
+        assert!(!app.machines[local].on_board());
+        assert_eq!(
+            app.board
+                .cards
+                .iter()
+                .filter(|c| c.machine_index == local)
+                .count(),
+            0
+        );
+        // ⏎ on its row shows its cards again.
+        app.mode = Mode::Machines { sel: local };
+        assert_eq!(enter(&mut app), Action::ToggleHidden(local));
     }
 }

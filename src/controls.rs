@@ -1692,7 +1692,7 @@ impl App {
             KeyCode::Char('f') => self.enter_filter(),
             KeyCode::Char('F') => self.clear_filters(),
             KeyCode::Char('a') => self.cycle_provider(),
-            KeyCode::Char('M') => self.mode = Mode::Machines { sel: 0 },
+            KeyCode::Char('M') => self.open_machines(),
             KeyCode::Char('?') => {
                 self.mode = Mode::Keys {
                     filter: String::new(),
