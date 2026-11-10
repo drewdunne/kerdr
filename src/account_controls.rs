@@ -327,6 +327,15 @@ pub struct Pending {
     pub screen: Option<AccountScreen>,
 }
 
+/// Names as a sentence lists them: "A", "A and B", "A, B and C".
+fn and_list(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 impl App {
     fn queue_waiting_moves(&mut self, owner: &str) {
         self.account_batch_messages.clear();
@@ -382,6 +391,78 @@ impl App {
     }
     pub fn account_feed(&self, machine: usize) -> Option<&Feed> {
         self.machines.get(machine)?.feed.as_ref()
+    }
+
+    /// x's question on an account says what removing it leaves behind (intent 0591, K2-12): the
+    /// owners' lists it comes off, whether it was the current account, and the other machines
+    /// where Kerdr sees a sign-in of it saved, since only this machine's is forgotten.
+    fn remove_question(&self, machine: usize, code: &str, name: &str) -> String {
+        let mut said = format!("Remove {code} ({name})?");
+        let Some(feed) = self.account_feed(machine) else {
+            return said;
+        };
+        let lists: Vec<String> = feed
+            .owners
+            .iter()
+            .filter(|o| (o.own || o.parent.is_none()) && o.models.iter().any(|m| m == code))
+            .map(|o| format!("{}'s", o.name))
+            .collect();
+        if !lists.is_empty() {
+            let s = if lists.len() == 1 { "" } else { "s" };
+            said.push_str(&format!(
+                " It comes off {} model list{s}.",
+                and_list(&lists)
+            ));
+        }
+        if feed
+            .current
+            .as_ref()
+            .and_then(|c| c.as_ref())
+            .is_some_and(|c| c.account == code)
+        {
+            said.push_str(" It's the current account, so each owner's list chooses again.");
+        }
+        let others: Vec<String> = (0..self.machines.len())
+            .filter(|&m| m != machine)
+            .filter(|&m| {
+                self.account_feed(m).is_some_and(|f| {
+                    f.accounts
+                        .iter()
+                        .any(|a| a.code == code && a.copies.iter().any(|c| c.stored))
+                })
+            })
+            .map(|m| self.machines[m].name())
+            .collect();
+        if !others.is_empty() {
+            said.push_str(&format!(
+                " Only this machine's saved sign-in goes: it stays signed in on {}.",
+                and_list(&others)
+            ));
+        }
+        said
+    }
+
+    /// Backspace's question on a tenant's own list shows that list, so it could be typed back,
+    /// and the one it would follow instead (intent 0591, K2-14).
+    fn follow_question(&self, machine: usize, owner: &crate::accounts::Owner) -> String {
+        let mut said = format!(
+            "Make {} follow its organization's model list? Its own list goes: {}.",
+            owner.name,
+            owner.models.join(" → ")
+        );
+        if let Some(org) = self.account_feed(machine).and_then(|f| {
+            f.owners
+                .iter()
+                .find(|o| Some(&o.id) == owner.parent.as_ref())
+        }) && !org.models.is_empty()
+        {
+            said.push_str(&format!(
+                " It would follow {}'s: {}.",
+                org.name,
+                org.models.join(" → ")
+            ));
+        }
+        said
     }
 
     /// An account's usage: the freshest reading of it in any machine's feed, whichever machine
@@ -1533,7 +1614,9 @@ impl App {
                                             return Action::None;
                                         }
                                         KeyCode::Char('x') => {
-                                            self.push_account_screen(AccountScreen::Confirm { machine:*machine, request:json!({"action":"account-remove","code":code}), message:format!("Remove {} ({})?",a.code,a.name), yes:"remove".into(), no:"keep it".into(), target:None, ready_at:Instant::now()+Duration::from_millis(500) });
+                                            let message =
+                                                self.remove_question(*machine, &a.code, &a.name);
+                                            self.push_account_screen(AccountScreen::Confirm { machine:*machine, request:json!({"action":"account-remove","code":code}), message, yes:"remove".into(), no:"keep it".into(), target:None, ready_at:Instant::now()+Duration::from_millis(500) });
                                             return Action::None;
                                         }
                                         _ => {}
@@ -1673,71 +1756,70 @@ impl App {
                 models,
                 sel,
                 move_waiting,
-            } => {
-                match key.code {
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        *sel = (*sel + 1).min(models.len().saturating_sub(1))
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
-                    KeyCode::Char('J') if *sel + 1 < models.len() => {
-                        models.swap(*sel, *sel + 1);
-                        *sel += 1;
-                    }
-                    KeyCode::Char('K') if *sel > 0 && *sel < models.len() => {
-                        models.swap(*sel, *sel - 1);
-                        *sel -= 1;
-                    }
-                    KeyCode::Char('d') if models.len() > 1 && *sel < models.len() => {
-                        models.remove(*sel);
-                        *sel = (*sel).min(models.len() - 1);
-                    }
-                    KeyCode::Char(' ') => *move_waiting = !*move_waiting,
-                    KeyCode::Char('a') => {
-                        let choices = self
-                            .account_feed(*machine)
-                            .into_iter()
-                            .flat_map(|f| &f.accounts)
-                            .filter(|a| !models.contains(&a.code))
-                            .map(|a| a.code.clone())
-                            .collect();
-                        self.push_account_screen(AccountScreen::AddModel {
-                            machine: *machine,
-                            choices,
-                            sel: 0,
-                        });
-                        return Action::None;
-                    }
-                    KeyCode::Backspace if owner.parent.is_some() && owner.own => {
-                        self.push_account_screen(AccountScreen::Confirm {
+            } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = (*sel + 1).min(models.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Char('J') if *sel + 1 < models.len() => {
+                    models.swap(*sel, *sel + 1);
+                    *sel += 1;
+                }
+                KeyCode::Char('K') if *sel > 0 && *sel < models.len() => {
+                    models.swap(*sel, *sel - 1);
+                    *sel -= 1;
+                }
+                KeyCode::Char('d') if models.len() > 1 && *sel < models.len() => {
+                    models.remove(*sel);
+                    *sel = (*sel).min(models.len() - 1);
+                }
+                KeyCode::Char(' ') => *move_waiting = !*move_waiting,
+                KeyCode::Char('a') => {
+                    let choices = self
+                        .account_feed(*machine)
+                        .into_iter()
+                        .flat_map(|f| &f.accounts)
+                        .filter(|a| !models.contains(&a.code))
+                        .map(|a| a.code.clone())
+                        .collect();
+                    self.push_account_screen(AccountScreen::AddModel {
+                        machine: *machine,
+                        choices,
+                        sel: 0,
+                    });
+                    return Action::None;
+                }
+                KeyCode::Backspace if owner.parent.is_some() && owner.own => {
+                    self.push_account_screen(AccountScreen::Confirm {
                         machine: *machine,
                         request: json!({"action":"account-models","owner":owner.id,"inherit":true}),
-                        message: format!("Make {} follow its organization's model list?", owner.name),
-                        yes: "follow organization".into(), no: "keep this list".into(), target: None,
+                        message: self.follow_question(*machine, owner),
+                        yes: "follow organization".into(),
+                        no: "keep this list".into(),
+                        target: None,
                         ready_at: Instant::now() + Duration::from_millis(500),
                     });
+                    return Action::None;
+                }
+                KeyCode::Enter if !models.is_empty() => {
+                    if *models == owner.models && (owner.own || owner.parent.is_none()) {
+                        let said = self.unchanged_list_said(*machine, owner);
+                        self.say(said, Tone::Info);
+                        if *move_waiting {
+                            self.queue_waiting_moves(&owner.id);
+                        }
+                        self.mode = *back;
                         return Action::None;
                     }
-                    KeyCode::Enter if !models.is_empty() => {
-                        if *models == owner.models && (owner.own || owner.parent.is_none()) {
-                            let said = self.unchanged_list_said(*machine, owner);
-                            self.say(said, Tone::Info);
-                            if *move_waiting {
-                                self.queue_waiting_moves(&owner.id);
-                            }
-                            self.mode = *back;
-                            return Action::None;
-                        }
-                        let value =
-                            if *models == owner.models && !owner.own && owner.parent.is_some() {
-                                json!({"action":"account-models","owner":owner.id,"inherit":true})
-                            } else {
-                                json!({"action":"account-models","owner":owner.id,"models":models})
-                            };
-                        request = Some((*machine, value));
-                    }
-                    _ => {}
+                    let value = if *models == owner.models && !owner.own && owner.parent.is_some() {
+                        json!({"action":"account-models","owner":owner.id,"inherit":true})
+                    } else {
+                        json!({"action":"account-models","owner":owner.id,"models":models})
+                    };
+                    request = Some((*machine, value));
                 }
-            }
+                _ => {}
+            },
             AccountScreen::AddModel { choices, sel, .. } => match key.code {
                 KeyCode::Down | KeyCode::Char('j') => {
                     *sel = (*sel + 1).min(choices.len().saturating_sub(1))
@@ -4205,6 +4287,108 @@ mod tests {
         open(&mut a, &owner);
         key(&mut a, KeyCode::Enter);
         assert_eq!(a.message().unwrap().0, "Model list unchanged.");
+    }
+
+    #[test]
+    fn removing_an_account_says_what_it_leaves_behind() {
+        // Intent 0591, K2-12: the lists it comes off, that it was current, and where else a
+        // sign-in of it stays saved.
+        let mut a = app();
+        let (code, name) = {
+            let acct = &a.account_feed(0).unwrap().accounts[0];
+            (acct.code.clone(), acct.name.clone())
+        };
+        let owner = {
+            let f = a.machines[0].feed.as_mut().unwrap();
+            for o in f.owners.iter_mut() {
+                o.models.retain(|m| m != &code);
+            }
+            f.owners[0].own = true;
+            f.owners[0].models.push(code.clone());
+            f.current = Some(Some(crate::accounts::Current {
+                account: code.clone(),
+                ..Default::default()
+            }));
+            f.owners[0].name.clone()
+        };
+        let other = a.machines[1].name();
+        {
+            let f = a.machines[1].feed.as_mut().unwrap();
+            f.accounts.retain(|x| x.code != code);
+            f.accounts.push(crate::accounts::Account {
+                code: code.clone(),
+                copies: vec![crate::accounts::AccountCopy {
+                    stored: true,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            });
+        }
+        for m in 2..a.machines.len() {
+            if let Some(f) = a.machines[m].feed.as_mut() {
+                f.accounts.retain(|x| x.code != code);
+            }
+        }
+        assert_eq!(
+            a.remove_question(0, &code, &name),
+            format!(
+                "Remove {code} ({name})? It comes off {owner}'s model list. It's the current account, so each owner's list chooses again. Only this machine's saved sign-in goes: it stays signed in on {other}."
+            )
+        );
+        // With none of those, only the question.
+        {
+            let f = a.machines[0].feed.as_mut().unwrap();
+            f.owners[0].models.retain(|m| m != &code);
+            f.current = None;
+        }
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .accounts
+            .retain(|x| x.code != code);
+        assert_eq!(
+            a.remove_question(0, &code, &name),
+            format!("Remove {code} ({name})?")
+        );
+    }
+
+    #[test]
+    fn following_the_organization_shows_the_list_it_drops() {
+        // Intent 0591, K2-14: the tenant's own list is in the question, so it could be typed back.
+        let a = app();
+        let feed = a.account_feed(0).unwrap();
+        let mut owner = feed
+            .owners
+            .iter()
+            .find(|o| o.parent.is_some())
+            .expect("a tenant in the demo")
+            .clone();
+        owner.own = true;
+        owner.models = vec!["ARK_C".into(), "KBZ_C".into()];
+        let org = feed
+            .owners
+            .iter()
+            .find(|o| Some(&o.id) == owner.parent.as_ref())
+            .unwrap();
+        let said = a.follow_question(0, &owner);
+        assert!(
+            said.starts_with(&format!(
+                "Make {} follow its organization's model list? Its own list goes: ARK_C → KBZ_C.",
+                owner.name
+            )),
+            "{said}"
+        );
+        if !org.models.is_empty() {
+            assert!(
+                said.ends_with(&format!(
+                    " It would follow {}'s: {}.",
+                    org.name,
+                    org.models.join(" → ")
+                )),
+                "{said}"
+            );
+        }
     }
 
     #[test]
