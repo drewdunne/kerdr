@@ -150,6 +150,10 @@ pub struct MachineData {
     pub feed_failed_after: Option<String>,
     /// The same for a session: its last good snapshot, where a later read in the merge failed.
     pub kept_snapshots: BTreeMap<String, Snapshot>,
+    /// When each snapshot here, or in `kept_snapshots`, that an earlier read brought into a merge
+    /// was read: it's shown as of then, never as of this read (intent 0591). One not named here was
+    /// read with this data.
+    pub read_at: BTreeMap<String, DateTime<Local>>,
 }
 
 #[derive(Debug)]
@@ -166,12 +170,20 @@ pub struct Event {
 /// so the board ends up where applying both in turn would have left it.
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
-        (Some(data), Some(old_data)) => {
-            // The newer read has no list of sessions where the older had one: the older's stands
-            // (intent 0591).
-            if data.sessions_failed.is_some() && old_data.sessions_failed.is_none() {
+        (Some(data), Some(mut old_data)) => {
+            // When each of the older read's snapshots was read: with it, or earlier still.
+            let old_read_at = std::mem::take(&mut old_data.read_at);
+            let read_when = |session: &str| old_read_at.get(session).copied().unwrap_or(old.at);
+            // The newer read has no list of sessions where the older had one, good or carried on
+            // from a good one before it: that list stands, through any number of failures, as of
+            // when it was read (intent 0591).
+            let old_has_list = old_data.sessions_failed.is_none() || !old_data.sessions.is_empty();
+            if data.sessions_failed.is_some() && data.sessions.is_empty() && old_has_list {
                 data.sessions = old_data.sessions.clone();
                 data.snapshots = old_data.snapshots.clone();
+                for session in data.snapshots.keys() {
+                    data.read_at.insert(session.clone(), read_when(session));
+                }
             }
             // A session that failed after a good read stays as that read left it, not as the
             // board last showed it (intent 0491).
@@ -186,6 +198,7 @@ fn replace(old: Event, mut new: Event) -> Event {
             );
             for (session, snap) in good {
                 if failed(data, &session) {
+                    data.read_at.insert(session.clone(), read_when(&session));
                     data.kept_snapshots.insert(session, snap);
                 }
             }
@@ -742,6 +755,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         sessions_failed,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
+        read_at: Default::default(),
     })
 }
 

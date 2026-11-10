@@ -512,7 +512,9 @@ nothing, was cut off by the 12-second limit, or was cut off partway says so in t
 
 When herdr answers but can't list its sessions, that's herdr's trouble rather than the machine
 dropping: the machine stays live with its last list, and the list gets 10 seconds rather than 5 on
-the next read if it ran out of time.
+the next read if it ran out of time. While herdr's list, or one session's own read, keeps failing,
+the rows and workspaces shown from the last good read are marked out of date from the first failure,
+as of when that read was made; R says which machine's sessions it couldn't bring up to date.
 
 ## Starting work nobody started
 

@@ -1006,6 +1006,10 @@ impl App {
             let failed = !m.conn.is_live() || (fed.contains(&i) && m.feed_error.is_some());
             if failed {
                 missed.push(whys[i].clone());
+            } else if fed.contains(&i) && m.sessions_failing.is_some() {
+                // Its cards are new, but herdr's list of sessions, and so its workspaces, are as
+                // they last were (intent 0591).
+                missed.push(format!("{}'s herdr sessions", m.name()));
             } else if fed.contains(&i) && !m.snapshot_errors.is_empty() {
                 // Its cards are new, but a stuck session's workspaces are as they last were.
                 let mut sessions: Vec<&str> =
@@ -3250,6 +3254,20 @@ pub(crate) mod tests {
             .insert("web".into(), crate::poll::SESSION_SILENT.into());
         app.settle_refresh(&[0]);
         let said = format!("Up to date, except {name}'s web.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_never_calls_a_list_of_sessions_kept_from_before_up_to_date() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        let name = app.machines[0].name();
+        app.machines[0].sessions_failing = Some((
+            "herdr printed nothing for its list of sessions".into(),
+            chrono::Local::now(),
+        ));
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {name}'s herdr sessions.");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
     }
 

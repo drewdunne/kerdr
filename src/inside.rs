@@ -818,6 +818,7 @@ mod tests {
             sessions_failed: None,
             feed_failed_after: None,
             kept_snapshots: Default::default(),
+            read_at: Default::default(),
         });
         m.feed = Some(Feed {
             kerdr_feed: 1,
