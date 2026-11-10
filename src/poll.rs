@@ -70,13 +70,26 @@ impl Conn {
     /// Why it isn't answering, in a few words, for `R` (intent 0591): "SSH timed out, still
     /// trying". None when it is, or when nothing keeps it from answering that Kerdr can name.
     pub fn briefly(&self) -> Option<String> {
-        let detail = match self {
-            Conn::Reconnecting { detail, .. } | Conn::Unreachable { detail, .. } => detail,
+        match self {
+            Conn::Reconnecting { .. } | Conn::Unreachable { .. } => {}
             Conn::HostKey { .. } | Conn::Auth { .. } => return Some("SSH needs you".into()),
             _ => return None,
+        }
+        Some(format!(
+            "{}, still trying",
+            self.cause().unwrap_or("no answer")
+        ))
+    }
+
+    /// Why a dropped or unreachable machine isn't answering, in Kerdr's words, when SSH's own
+    /// says something Kerdr knows: never SSH's text itself, which stays off the board (intent
+    /// 0591). None: nothing it knows, or not a drop.
+    pub fn cause(&self) -> Option<&'static str> {
+        let (Conn::Reconnecting { detail, .. } | Conn::Unreachable { detail, .. }) = self else {
+            return None;
         };
         let d = detail.to_lowercase();
-        let what = if d.contains("timed out") {
+        Some(if d.contains("timed out") {
             "SSH timed out"
         } else if d.contains("refused") {
             "its connection was refused"
@@ -87,9 +100,8 @@ impl Conn {
         } else if d.contains("broken pipe") || d.contains("reset") || d.contains("dropped") {
             "the connection dropped"
         } else {
-            "no answer"
-        };
-        Some(format!("{what}, still trying"))
+            return None;
+        })
     }
 
     pub fn needs_you(&self) -> bool {

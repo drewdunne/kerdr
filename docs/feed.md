@@ -506,7 +506,11 @@ A read that fails once says nothing. While a machine has dropped, or a feed or a
 failing, the board keeps its last good state: that machine's cards dimmed with the time they were
 read, and its tab marked with how old they are. Only when it lasts (past 30 seconds, or three feed
 reads in a row) does it say why, once, in plain words, and only then is it kept in the error log.
-What can't pass by itself, like SSH wanting a key or a password, is said at once.
+It's said on the line under the board's header: for a dropped machine, the cause in Kerdr's words
+(never SSH's own) and how many of its cards on the board are dimmed; for a machine that answers but
+whose feed or herdr reads keep failing, the feed's own reason from `read_failures` when it gives
+one, else what Kerdr found. What can't pass by itself, like SSH wanting a key or a password, is said
+at once.
 
 A failed feed read is read again at once, once in a run of failures. Give a plain reason when you
 know one, in `read_failures` (above), which Kerdr shows when it has lasted. A feed that printed

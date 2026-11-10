@@ -152,6 +152,47 @@ impl MachineState {
         self.read_at.get(session).copied()
     }
 
+    /// What's wrong with reading this machine that has lasted, in plain words, for the board to
+    /// say once (intent 0591), and since when. The feed's own reason first, when it gives one;
+    /// then its failure to give cards at all; then Kerdr's own reads of herdr: its list, then a
+    /// session. None while nothing has lasted.
+    pub fn lasting_problem(&self, now: DateTime<Local>) -> Option<(String, DateTime<Local>)> {
+        let lasting = self.read_failures_lasting(now);
+        let feed_says = ["herdr", "feed", "session"]
+            .iter()
+            .find_map(|part| lasting.iter().find(|f| f.part == *part));
+        if let Some(f) = feed_says {
+            let since = self
+                .read_failing_since
+                .get(&f.key())
+                .copied()
+                .unwrap_or(now);
+            let why = match (f.part.as_str(), f.session.as_deref()) {
+                ("session", Some(s)) => format!("herdr session {s}: {}", f.why),
+                ("feed", _) => format!("its card feed: {}", f.why),
+                _ => f.why.clone(),
+            };
+            return Some((why, since));
+        }
+        if let Some(e) = self.feed_problem(now) {
+            let since = self.feed_failing_since.unwrap_or(now);
+            return Some((format!("its card feed failed: {e}"), since));
+        }
+        if let Some(why) = self.sessions_problem(now) {
+            let since = self.sessions_failing.as_ref().map_or(now, |(_, t)| *t);
+            return Some((why.to_string(), since));
+        }
+        let mut sessions: Vec<&String> = self.session_failing_since.keys().collect();
+        sessions.sort();
+        sessions.into_iter().find_map(|s| {
+            let e = self.session_problem(s, now)?;
+            Some((
+                format!("herdr session {s}: {e}"),
+                self.session_failing_since[s],
+            ))
+        })
+    }
+
     /// Why herdr's list of sessions can't be read, once that has lasted QUIET_FOR seconds.
     pub fn sessions_problem(&self, now: DateTime<Local>) -> Option<&str> {
         self.sessions_failing

@@ -1178,16 +1178,17 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         .filter(|&i| rank(&app.machines[i].conn) < 9 && app.machines[i].conn.lasting(now))
         .collect();
     troubled.sort_by_key(|&i| rank(&app.machines[i].conn));
-    let &i = troubled.first()?;
+    let Some(&i) = troubled.first() else {
+        return reading_banner(app);
+    };
     let m = &app.machines[i];
     let name = m.name();
+    // Every card of it the board shows, whatever its column: all of them are dimmed.
     let cards = app
         .board
         .cards
         .iter()
-        .filter(|c| {
-            c.machine == name && !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc)
-        })
+        .filter(|c| c.machine == name && app.card_visible(c))
         .count();
     let as_of = m.last_ok.map(clock);
     let color = conn_color(&m.conn);
@@ -1200,7 +1201,11 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         } => {
             let mut v = vec![
                 Span::styled(
-                    format!("⟳ {name} dropped {} ago", ago(*since, now)),
+                    format!(
+                        "⟳ {name} dropped {} ago: {}",
+                        ago(*since, now),
+                        m.conn.cause().unwrap_or("it can't be reached")
+                    ),
                     bold(color),
                 ),
                 Span::styled(
@@ -1214,16 +1219,18 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
             ];
             if let Some(t) = as_of {
                 v.push(Span::styled(
-                    format!("   its {cards} cards are dimmed, as they were at {t}"),
+                    match cards {
+                        0 => format!("   its cards are as they were at {t}"),
+                        1 => format!("   its 1 card is dimmed, as it was at {t}"),
+                        n => format!("   its {n} cards are dimmed, as they were at {t}"),
+                    },
                     fg(DIM),
                 ));
             }
             v
         }
         Conn::Unreachable {
-            since,
-            retry_at,
-            detail,
+            since, retry_at, ..
         } => {
             let mut v = vec![
                 Span::styled(format!("○ can't reach {name}"), bold(FG2)),
@@ -1231,7 +1238,7 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
                     format!(
                         "   no answer since {} ({})",
                         clock(*since),
-                        trunc(detail, 40)
+                        m.conn.cause().unwrap_or("it doesn't answer")
                     ),
                     fg(FG),
                 ),
@@ -1287,6 +1294,40 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         _ => key_hints(&[("r", "retry now"), ("M", "machines")]),
     };
     Some((left, right))
+}
+
+/// With every machine answering: one line about a machine whose feed or herdr reads have kept
+/// failing past the quiet spell (intent 0591), said once, in plain words, the feed's own reason
+/// first. Its rows and cards are marked out of date meanwhile; this says why.
+fn reading_banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
+    let now = app.now();
+    let troubled: Vec<(String, String, chrono::DateTime<chrono::Local>)> = app
+        .machines
+        .iter()
+        .filter(|m| m.is_shown() && m.conn.is_live())
+        .filter_map(|m| {
+            let (why, since) = m.lasting_problem(now)?;
+            Some((m.name(), why, since))
+        })
+        .collect();
+    let (name, why, since) = troubled.first()?;
+    let mut left = vec![
+        Span::styled(format!("● {name}: {why}"), bold(YELLOW)),
+        Span::styled(
+            format!(
+                "   since {}; what's shown of it is from its last good read",
+                clock(*since)
+            ),
+            fg(DIM),
+        ),
+    ];
+    if troubled.len() > 1 {
+        left.push(Span::styled(
+            format!("   +{} more", troubled.len() - 1),
+            fg(DIM),
+        ));
+    }
+    Some((left, key_hints(&[("M", "machines")])))
 }
 
 fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
@@ -4090,23 +4131,35 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
     let now = app.now();
     let as_of = m.last_ok.map(clock);
     match &m.conn {
-        Conn::Live { latency } => vec![
-            format!(
+        Conn::Live { latency } => {
+            let mut lines = vec![format!(
                 "Answering. Read every {}s{}; the last read took {} ms.",
                 if m.machine.is_local() { app.cfg.machines.local_every } else { app.cfg.machines.remote_every },
                 if m.machine.is_local() { "" } else { " over SSH" },
                 latency.as_millis()
-            ),
-            match (&m.machine.feed, m.feed_problem(now).or(m.sessions_problem(now))) {
+            )];
+            // Its feed, and herdr as Kerdr reads it, each in its own words: a herdr read that
+            // keeps failing is never called the feed's failure, and the feed's reason comes first
+            // (intent 0591).
+            let feed_says: Vec<&str> = m.read_failures_lasting(now).iter().map(|f| f.why.as_str()).collect();
+            lines.push(match (&m.machine.feed, m.feed_problem(now)) {
                 (Some(_), Some(e)) => format!("Its card feed failed ({e}), so it shows the last cards it sent, with herdr's live view."),
-                (Some(cmd), None) if !m.read_failures_lasting(now).is_empty() => format!(
-                    "Cards come from its feed ({cmd}), which says: {}.",
-                    m.read_failures_lasting(now).iter().map(|f| f.why.as_str()).collect::<Vec<_>>().join("; ")
-                ),
+                (Some(cmd), None) if !feed_says.is_empty() => {
+                    format!("Cards come from its feed ({cmd}), which says: {}.", feed_says.join("; "))
+                }
                 (Some(cmd), None) => format!("Cards come from its feed: {cmd}"),
                 (None, _) => "No card feed: every herdr workspace with an agent is a card.".into(),
-            },
-        ],
+            });
+            if feed_says.is_empty()
+                && let Some(why) = m.sessions_problem(now)
+            {
+                lines.push(format!(
+                    "Kerdr's own read of herdr there: {}. Its last list of sessions stands, marked out of date.",
+                    why.trim_end_matches('.')
+                ));
+            }
+            lines
+        }
         Conn::Connecting => vec!["Reaching it for the first time.".into()],
         Conn::Reconnecting { since, attempt, retry_at, detail } => vec![
             format!(
@@ -5243,6 +5296,138 @@ mod tests {
             back: Box::new(Mode::Board),
         };
         rendered(a, 176, 44)
+    }
+
+    /// The demo with every machine answering, but for the ones a test puts in trouble.
+    fn all_answering(away: bool) -> App {
+        let mut a = demo(away);
+        for m in a.machines.iter_mut() {
+            if m.is_shown() && !matches!(m.conn, Conn::Reconnecting { .. }) {
+                m.conn = Conn::Live {
+                    latency: Default::default(),
+                };
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn a_read_failure_that_lasts_is_said_once_on_the_board_in_plain_words() {
+        let mut a = all_answering(false);
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        let name = a.machines[i].name();
+        let now = a.now();
+        let reason = "herdr on this machine didn't answer within a few seconds";
+        // herdr fails every call: the feed says so, and Kerdr's own read of its list fails too.
+        let herdr_failing = |a: &mut App, secs: i64| {
+            let since = now - chrono::Duration::seconds(secs);
+            let m = &mut a.machines[i];
+            let feed = m.feed.as_mut().unwrap();
+            feed.read_failures =
+                serde_json::from_value(serde_json::json!([{"part":"herdr","why":reason}])).unwrap();
+            let key = feed.read_failures[0].key();
+            m.read_failing_since = [(key, since)].into_iter().collect();
+            m.sessions_failing = Some((
+                "herdr answered its list of sessions with something Kerdr can't read (what it printed is in Kerdr's error log).".into(),
+                since,
+            ));
+        };
+        // A few seconds of it: the board stays quiet, its rows only marked.
+        herdr_failing(&mut a, 10);
+        let screen = rendered(&a, 200, 44);
+        assert!(!screen.contains(reason), "{screen}");
+        // Past the quiet spell: said once, in the feed's words, never herdr's or as the feed's
+        // own failure.
+        herdr_failing(&mut a, 45);
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains(&format!("{name}: {reason}")), "{screen}");
+        assert_eq!(screen.matches(reason).count(), 1, "{screen}");
+        assert!(!screen.contains("can't read"), "{screen}");
+        assert!(!screen.contains("feed failed"), "{screen}");
+        // M's detail too: the feed's reason, and no feed failure.
+        let explained = machine_explain(&a, i).join(" ");
+        assert!(explained.contains(reason), "{explained}");
+        assert!(!explained.contains("feed failed"), "{explained}");
+        // Without the feed's reason, Kerdr's own words for herdr's list, still not the feed's.
+        a.machines[i].feed.as_mut().unwrap().read_failures.clear();
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("{name}: herdr answered its list of sessions")),
+            "{screen}"
+        );
+        let explained = machine_explain(&a, i).join(" ");
+        assert!(!explained.contains("feed failed"), "{explained}");
+        assert!(
+            explained.contains("Kerdr's own read of herdr"),
+            "{explained}"
+        );
+
+        // The feed prints nothing: quiet for one read, said once it lasts.
+        let mut a = all_answering(false);
+        let feed_failing = |a: &mut App, reads: u32, secs: i64| {
+            let m = &mut a.machines[i];
+            m.feed_error = Some(crate::poll::FEED_EMPTY.into());
+            m.feed_failures = reads;
+            m.feed_failing_since = Some(now - chrono::Duration::seconds(secs));
+        };
+        feed_failing(&mut a, 1, 5);
+        let screen = rendered(&a, 200, 44);
+        assert!(!screen.contains(crate::poll::FEED_EMPTY), "{screen}");
+        feed_failing(&mut a, 3, 42);
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("{name}: its card feed failed: it printed nothing")),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_dropped_machine_s_banner_counts_every_card_it_dims_and_says_why_in_plain_words() {
+        let mut a = all_answering(true);
+        let i = a.machine_index("build-box").unwrap();
+        let raw = "ssh: connect to host build-box port 22: No route to host";
+        if let Conn::Reconnecting { detail, .. } = &mut a.machines[i].conn {
+            *detail = raw.into();
+        }
+        // Backlog cards of its own, as on the run that found it: dimmed like the rest.
+        let backlog: Vec<usize> = (0..a.board.cards.len())
+            .filter(|&k| a.board.cards[k].stage == Stage::Backlog)
+            .take(3)
+            .collect();
+        assert_eq!(backlog.len(), 3);
+        for k in backlog {
+            let c = &mut a.board.cards[k];
+            c.machine = "build-box".into();
+            c.machine_index = i;
+        }
+        let shown = a
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.machine == "build-box" && a.card_visible(c))
+            .count();
+        assert!(shown >= 3);
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("its {shown} cards are dimmed")),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("build-box dropped 40s ago: there's no route to it"),
+            "{screen}"
+        );
+        assert!(!screen.contains("No route to host"), "{screen}");
+        // Past two minutes it can't be reached: its cause in the same words, never SSH's.
+        let now = a.now();
+        a.machines[i].conn = Conn::Unreachable {
+            since: now - chrono::Duration::minutes(3),
+            retry_at: now + chrono::Duration::seconds(10),
+            detail: raw.into(),
+        };
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains("can't reach build-box"), "{screen}");
+        assert!(screen.contains("(there's no route to it)"), "{screen}");
+        assert!(!screen.contains("No route to host"), "{screen}");
     }
 
     #[test]
