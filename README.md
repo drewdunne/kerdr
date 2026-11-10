@@ -605,7 +605,9 @@ kerdr demo
 ```
 
 `kerdr doctor` checks every machine: whether Kerdr can reach it, which herdr it runs, whether
-its feed works, and whether Kerdr's keys are in its herdr config.
+its feed works, and whether Kerdr's keys are in its herdr config. `kerdr doctor --fix` adds the keys
+where this machine's config lacks them and reloads each running session's config; on another
+machine, run it there.
 
 ## Configure
 

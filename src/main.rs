@@ -12,6 +12,7 @@ use kerdr::herdr_keys;
 use kerdr::poll::{self, Conn};
 use kerdr::report::{self, Report};
 use kerdr::state::State;
+use kerdr::transport;
 
 /// An opinionated kanban cockpit for driving herdr sessions.
 #[derive(Parser)]
@@ -62,7 +63,12 @@ enum Cmd {
         config: Option<PathBuf>,
     },
     /// Check every machine: reachable, which herdr, its feed, and whether Kerdr's keys are in.
-    Doctor,
+    Doctor {
+        /// Add Kerdr's keys to this machine's herdr config where they're missing, and reload
+        /// each running session's config to pick them up.
+        #[arg(long)]
+        fix: bool,
+    },
     /// Print the board once, as JSON.
     Cards,
 }
@@ -92,7 +98,7 @@ fn main() -> ExitCode {
         })
         .map_err(anyhow::Error::msg),
         Some(Cmd::HerdrKeys { install, config }) => herdr_keys_cmd(install, config),
-        Some(Cmd::Doctor) => doctor(),
+        Some(Cmd::Doctor { fix }) => doctor(fix),
         Some(Cmd::Cards) => cards(),
     };
     match result {
@@ -172,7 +178,8 @@ fn read_all(cfg: &Config) -> Vec<MachineState> {
         .map(|s| {
             let m = s.machine.clone();
             thread::spawn(move || {
-                if m.hidden {
+                // This machine is read even when its cards are hidden (intent 0591).
+                if m.hidden && !m.is_local() {
                     (Conn::Hidden, None)
                 } else {
                     poll::read_once(&m)
@@ -190,7 +197,7 @@ fn read_all(cfg: &Config) -> Vec<MachineState> {
     states
 }
 
-fn doctor() -> anyhow::Result<()> {
+fn doctor(fix: bool) -> anyhow::Result<()> {
     let cfg = load_config()?;
     println!(
         "Kerdr {} on {}",
@@ -273,14 +280,25 @@ fn doctor() -> anyhow::Result<()> {
         }
         if s.conn.is_live() {
             let has = s.data.as_ref().is_some_and(|d| d.keys);
-            println!(
-                "  Kerdr's keys in herdr's config: {}",
-                if has {
-                    "yes"
-                } else {
-                    "no (kerdr herdr-keys --install, on that machine)"
+            if !has && fix && s.machine.is_local() {
+                // The same install as kerdr herdr-keys --install, then each running session
+                // reloads its config to pick them up (intent 0591, K3-71).
+                println!("  Kerdr's keys in herdr's config: no; adding them");
+                if !fix_keys_here(s) {
+                    all_ok = false;
                 }
-            );
+            } else {
+                println!(
+                    "  Kerdr's keys in herdr's config: {}",
+                    if has {
+                        "yes"
+                    } else if s.machine.is_local() {
+                        "no (kerdr doctor --fix adds them)"
+                    } else {
+                        "no (kerdr doctor --fix, on that machine)"
+                    }
+                );
+            }
         }
     }
     let board = board::build(&states, &cfg);
@@ -302,6 +320,52 @@ fn doctor() -> anyhow::Result<()> {
     } else {
         Err(anyhow::anyhow!("some machines need attention (above)"))
     }
+}
+
+/// Adds Kerdr's keys to this machine's herdr config and reloads each running session's config,
+/// saying what it did. Whether it all went.
+fn fix_keys_here(s: &MachineState) -> bool {
+    let path = herdr_keys::herdr_config_path();
+    match herdr_keys::install(&path) {
+        Ok(true) => println!("    added Kerdr's two keys to {}", path.display()),
+        Ok(false) => println!("    Kerdr's keys are already in {}", path.display()),
+        Err(e) => {
+            println!("    couldn't add them: {e}");
+            return false;
+        }
+    }
+    let running: Vec<&str> = s
+        .data
+        .as_ref()
+        .map(|d| {
+            d.sessions
+                .iter()
+                .filter(|x| x.running)
+                .map(|x| x.name.as_str())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut ok = true;
+    for name in running {
+        let out = transport::run_herdr(
+            &transport::Target::Local,
+            &s.machine.herdr,
+            &["--session", name, "server", "reload-config"],
+            std::time::Duration::from_secs(10),
+        );
+        if out.ok() {
+            println!("    session {name} reloaded its config");
+        } else {
+            ok = false;
+            let why = if out.timed_out {
+                "it didn't answer within 10 seconds".to_string()
+            } else {
+                format!("exit {:?}: {}", out.status, out.stderr.trim())
+            };
+            println!("    session {name} didn't reload its config ({why})");
+        }
+    }
+    ok
 }
 
 fn cards() -> anyhow::Result<()> {
