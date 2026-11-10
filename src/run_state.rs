@@ -281,6 +281,30 @@ impl App {
             .collect()
     }
 
+    /// The program this agent has to stay on, in words, when `code` runs another: None for an
+    /// account it may move to, and for a feed that doesn't say (intent 0591).
+    pub fn held_to(
+        &self,
+        machine: usize,
+        agent: &crate::accounts::AccountAgent,
+        code: &str,
+    ) -> Option<String> {
+        if agent.programs.is_empty() {
+            return None;
+        }
+        let runs = self.account_runs(machine, self.account(machine, code)?);
+        if runs.is_empty() || runs.iter().any(|p| agent.programs.contains(p)) {
+            return None;
+        }
+        let providers = self.providers(machine);
+        let stays: Vec<String> = agent
+            .programs
+            .iter()
+            .map(|p| providers.program_label(p))
+            .collect();
+        Some(stays.join(" or "))
+    }
+
     /// `s` on a card: the picker its state calls for, or why there's none.
     pub(super) fn s_on_card(&mut self, card: Card) {
         // Work Kerdr follows (a start, a move into herdr) is left alone until it ends: its worker may

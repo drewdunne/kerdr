@@ -103,6 +103,21 @@ pub struct Response {
     /// On a sign-in that stopped: a fresh one is what's wanted, its login having ended by itself.
     #[serde(default)]
     pub again: bool,
+    /// On a sign-in that stopped: a newer sign-in of the same account took its place, which isn't
+    /// a failure (intent 0591).
+    #[serde(default)]
+    pub replaced: bool,
+    /// On a failed test: the sign-in is what's wrong, so the way to fix it can open (intent 0591).
+    #[serde(default)]
+    pub sign_in: bool,
+}
+
+impl Response {
+    /// A sign-in still going, its link or the browser step yet to come. `starting` is a slow
+    /// program that hasn't given its link yet (intent 0591).
+    pub fn signin_under_way(&self) -> bool {
+        matches!(self.status.as_deref(), Some("waiting" | "starting"))
+    }
 }
 
 /// `retry` as a backend gives it: whole or fractional seconds, rounded up; anything else is none.

@@ -97,6 +97,7 @@ know rather than guessing.
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
 | `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. A `d` waiting for a write-up that then fails goes ahead with the words as they are, and says so. |
 | `intake_why` | Optional, with `intake: "failed"`: why, in a few plain words ("no account was free"). Kerdr shows it after "not written up" on the card, cut to fit; without it the card says just that. |
+| `open_in` | Optional, when the intent is open in more than one workspace: every `"<session>/<workspace id>"`, since two agents may be at it. Kerdr says so in the card's facts. |
 | `item_text`, `item_was` | Optional, together. A backlog item's whole text as an `edit` read answers it, and the `was` that read would give, so `e` opens your editor at once with no read. Kerdr then sends no read at all, and the save's `was` is what checks it. Leave them out for a record whose text you wouldn't hand over, and for a copy from a machine that isn't the record's home, since a save goes there. Without them `e` reads first, as below. |
 | `submission` | The `submission` a `create` request carried, for a record it made. Kerdr's card for new words, shown while they're saved, gives way to the card carrying it as soon as any machine's feed shows one, even before the request answers. Optional. |
 | `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
@@ -104,7 +105,7 @@ know rather than guessing.
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
 | `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"` and `"follow"`. See [Asking again](#asking-again-op-and-retry). A feed with no `supports`, or one without `"op"`, is never sent a request again after an answer that was lost. |
-| `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)). Entries of any other shape are ignored. |
+| `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)); until they're gone, and from the first read that names them, that session's workspaces are marked out of date, dim on the board, and a card with no workspace says "workspace not known" instead of "no workspace open". Entries of any other shape are ignored. |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
 ## Owners, teams and stage lists
@@ -1006,7 +1007,9 @@ Cards join their herdr agents to the feed’s agents by **machine, session, and 
 child cards that name a tab. `how` is `list`, `manual`, `next`, `found`, `current` (started on the current account), or `handed_over`. An agent's
 `program` is what it runs (one of a provider's `programs`). `handed_from` marks an agent that
 took over from another program: the account and program before, the conversation left there,
-`why` (`usage_limit`, `sign_in`, `manual`, or anything else, shown as words) and `at`. Its card
+`why` (`usage_limit`, `sign_in`, `manual`, or anything else, shown as words) and `at`. `programs`, optional, is
+the programs something holds the agent to, its safety settings working only there: the move picker dims
+every account that runs another, with the reason, and `Enter` on one sends nothing. Its card
 shows `⇄` beside its code, and its peek says from which account and program, why and when. A usage wait
 suppresses the ordinary “turn ended” attention for that card. Conversation IDs bind a move
 and its confirmation; backend checks must also reject stale generations and enforce authorization.
@@ -1026,7 +1029,7 @@ Model lists and account metadata have one canonical writer owned by the backend.
 | `account-models` | `owner`, `models` array; or `inherit: true` | saves the list |
 | `account-move-waiting` | `owner` | moves waiting sessions on this machine |
 | `account-add` | `code`, `name`, `provider`, `kind` (one of that provider's `kinds`), optional `fields` object | adds, or renames the existing code |
-| `account-test` | `code`, optional `copy` | status and message |
+| `account-test` | `code`, optional `copy` | status and message; a failure with `"sign_in": true` opens the box that signs it in, and nothing starts until `Enter` |
 | `account-remove` | `code` | removes after Kerdr’s local confirmation |
 | `account-current` | `to` (a code), or `clear: true` | makes it the current account for every machine, or clears it; answers `message` and `current` (the field above, as this machine sees it now, or null) |
 
@@ -1119,15 +1122,21 @@ Continue on that same machine:
 {"action":"account-signin","ticket":"opaque-ticket","step":"cancel"}
 ```
 
-Responses have `status: "waiting"`, `"done"`, or `"failed"`; cancel answers `"cancelled"` with
-`ok: true`, including an already finished or unknown valid ticket. A new start cancels an
+Responses have `status: "waiting"`, `"starting"`, `"done"`, or `"failed"`; cancel answers `"cancelled"` with
+`ok: true`, including an already finished or unknown valid ticket. `"starting"` is a sign-in whose program
+hasn't given its link yet: a `start` answers it with the `ticket` and no `url`, Kerdr treats it as
+`"waiting"` and goes on polling, and the poll that has the link answers with `url` (and `needs_code`,
+`user_code` and `expires`, as a `start` would). An older Kerdr calls `"starting"` a failure, so answer it
+only to a Kerdr you know takes it. A new start cancels an
 unfinished sign-in for that code and copy on that machine only; another copy's sign-in carries on. A failed finish may report an account identity mismatch,
 which Kerdr shows without advancing to another machine. Kerdr polls every two seconds
 while the dialog remains open, pauses while a page code is being entered, and stops on unknown results.
 A retry cancels any known previous ticket before starting another, and goes on to start whether or
 not that cancel worked, since a start replaces an unfinished sign-in. A `failed` answer with
 `"again": true`, or one with `retry` whose retries have run out, means the sign-in ended by itself:
-Kerdr starts a fresh one in its place, once, and says so. Every other failure stops, for `r`. Escape cancels a known ticket;
+Kerdr starts a fresh one in its place, once, says so and shows its link without opening the browser.
+Every other failure stops, for `r`. A stopped sign-in with `"replaced": true` is one a newer sign-in of the same
+account and copy took over: Kerdr draws it neutrally, says `message`, and `r` takes it back. Escape cancels a known ticket;
 a ticket returned after Escape is also cancelled, without opening a browser. After `done`,
 adding an account proceeds to the next selected machine with a **new** start and ticket.
 A `paste` step instead sends `code` and a `token` string (and `copy`, when pasting for one),

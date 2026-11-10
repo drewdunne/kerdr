@@ -255,6 +255,10 @@ pub struct FeedCard {
     /// feeds (intent 0591).
     #[serde(default)]
     pub intake_why: Option<String>,
+    /// Every `<session>/<workspace id>` the intent is open in here, when that's more than one,
+    /// since two agents may be at it (intent 0591).
+    #[serde(default, deserialize_with = "crate::accounts::null_default")]
+    pub open_in: Vec<String>,
     /// The submission Kerdr sent the words with, while the record is still being written up from
     /// them: the card shown while they were saved gives way to this one (intent 0445).
     #[serde(default)]

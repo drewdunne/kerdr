@@ -1039,6 +1039,14 @@ impl App {
 
     /// A machine by name, and why it's behind when that's known: "arknet-one (SSH timed out,
     /// still trying)" (intent 0591).
+    /// Whether its machine's feed says herdr wasn't read for this card, so "no workspace" is
+    /// only a guess (intent 0591).
+    pub fn workspaces_stale(&self, c: &Card) -> bool {
+        self.machines
+            .get(c.machine_index)
+            .is_some_and(|m| m.workspaces_stale(c.session.as_deref()))
+    }
+
     fn machine_why(&self, i: usize) -> String {
         let m = &self.machines[i];
         let why = m.conn.briefly().or_else(|| {
@@ -7266,6 +7274,53 @@ pub(crate) mod tests {
         let request = reopen_by_enter(&mut app);
         reply_to(&mut app, 0, request, reopen_reply("web", true, false, ""));
         assert_eq!(app.open_after.take().unwrap().tab, None);
+    }
+
+    #[test]
+    fn a_yes_that_cant_be_matched_to_its_question_asks_the_question_afresh() {
+        let refused = || {
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "Kerdr's yes couldn't be matched to the question it answered, so nothing started; ask again.".into(),
+                ..Default::default()
+            })
+        };
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id) = closed_workspace_card(&mut app);
+        reopen_by_enter(&mut app);
+        let n = app
+            .resolver
+            .unanswered_for("reopen", Some(id.as_str()))
+            .unwrap();
+        let mut yes = app.resolver.job_request(n).unwrap().clone();
+        let op = yes["op"].clone();
+        yes["override"] = serde_json::json!(true);
+        yes["confirm"] = serde_json::json!("not-a-token");
+        yes["queue"] = serde_json::json!(true);
+        app.finish_job(n, yes, refused());
+        // The same job goes again, as a new ask: no answer of the old question, and its own op.
+        let n = app
+            .resolver
+            .unanswered_for("reopen", Some(id.as_str()))
+            .unwrap();
+        let again = app.resolver.job_request(n).unwrap().clone();
+        assert_eq!(again["action"], "reopen");
+        assert_eq!(again["id"], serde_json::json!(id));
+        for answer in ["override", "confirm", "queue"] {
+            assert!(again.get(answer).is_none(), "{again}");
+        }
+        assert!(again["op"].is_string() && again["op"] != op, "{again}");
+        assert!(last_said(&app).unwrap().0.contains("Asking it again"));
+
+        // Not a yes: only said, so it can't go round by itself.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        reply_to(&mut app, 0, request, refused());
+        assert!(app.resend.is_empty());
+        assert!(last_said(&app).unwrap().0.contains("couldn't be matched"));
     }
 
     #[test]

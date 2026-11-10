@@ -1736,6 +1736,34 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
 /// The most of a write-up's reason any card shows: a few words, as the feed promises.
 const WRITE_UP_WHY_MOST: usize = 60;
 
+/// What a card says of an intent open in more than one workspace, from its feed's `open_in`: two
+/// agents may be at it. None for one place or none, as older feeds say (intent 0591).
+fn open_in_line(c: &Card) -> Option<String> {
+    const NAMED_MOST: usize = 3;
+    let places = &c.detail.as_ref()?.open_in;
+    if places.len() < 2 {
+        return None;
+    }
+    let mut named: Vec<String> = places
+        .iter()
+        .take(NAMED_MOST)
+        .map(|p| {
+            trunc(
+                &p.chars().filter(|ch| !ch.is_control()).collect::<String>(),
+                40,
+            )
+        })
+        .collect();
+    if places.len() > NAMED_MOST {
+        named.push(format!("{} more", places.len() - NAMED_MOST));
+    }
+    Some(format!(
+        "open in {} workspaces ({}), so two agents may be at it",
+        places.len(),
+        named.join(", ")
+    ))
+}
+
 /// Why a card's write-up failed, in its feed's words on one line and cut to fit; None when the
 /// feed doesn't say, as older feeds don't (intent 0591).
 fn write_up_why(c: &Card) -> Option<String> {
@@ -2219,6 +2247,7 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             },
             Stage::Backlog => "not started".into(),
             Stage::Maintain => "closed".into(),
+            _ if app.workspaces_stale(c) => "workspace not known: herdr didn't answer".into(),
             _ => "no workspace open".into(),
         });
     }
@@ -2231,6 +2260,9 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             _ => "status unknown",
         };
         facts.push(format!("{} {what}", a.agent));
+    }
+    if let Some(line) = open_in_line(c) {
+        facts.push(line);
     }
     if let Some(t) = c.cached_at {
         facts.push(format!("as last seen at {}", clock(t)));
@@ -5179,6 +5211,127 @@ mod tests {
         a.fixed_now = Some(crate::demo::now());
         a.rebuild();
         a
+    }
+
+    /// A Build card with no workspace, on machine `i`, as a read after the last rebuild left it.
+    fn card_with_no_workspace(a: &mut App, i: usize) -> String {
+        let card = a
+            .board
+            .cards
+            .iter_mut()
+            .find(|c| c.stage == Stage::Build && c.detail.is_some())
+            .unwrap();
+        card.machine_index = i;
+        card.workspace_id = None;
+        card.session = None;
+        card.key.clone()
+    }
+
+    fn peek_at(a: &mut App, key: &str) -> String {
+        let c = a.board.cards.iter().find(|c| c.key == key).unwrap();
+        a.sel = crate::app::Selection {
+            col: c.stage.index(),
+            key: Some(c.key.clone()),
+        };
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        rendered(a, 176, 44)
+    }
+
+    #[test]
+    fn a_feed_that_couldnt_read_herdr_marks_its_workspaces_stale_quietly() {
+        let mut a = demo(false);
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        let name = a.machines[i].name();
+        let rows = |a: &App| {
+            a.board
+                .sessions
+                .iter()
+                .filter(|r| r.machine == name)
+                .map(|r| (r.session.clone(), r.cached, r.error.clone()))
+                .collect::<Vec<_>>()
+        };
+        // Its feed says nothing failed: exactly as before.
+        assert!(rows(&a).iter().all(|(_, cached, _)| !cached));
+        let key = card_with_no_workspace(&mut a, i);
+        assert!(peek_at(&mut a, &key).contains("no workspace open"));
+        let c = a.card(&key).unwrap().clone();
+        assert_eq!(
+            crate::ui::card_ui::place_for_test(&a, &c).0,
+            "no workspace open"
+        );
+
+        let failing = |a: &mut App, list: serde_json::Value| {
+            a.machines[i].feed.as_mut().unwrap().read_failures =
+                serde_json::from_value(list).unwrap();
+            a.mode = Mode::Board;
+            a.rebuild();
+        };
+        // herdr itself: every session's workspaces, marked at once, and no words until it lasts.
+        failing(
+            &mut a,
+            serde_json::json!([{"part":"herdr","why":"herdr on this machine didn't answer within a few seconds"}]),
+        );
+        let seen = rows(&a);
+        assert!(seen.iter().all(|(_, cached, _)| *cached), "{seen:?}");
+        assert!(seen.iter().all(|(_, _, error)| error.is_none()), "{seen:?}");
+        let key = card_with_no_workspace(&mut a, i);
+        let peek = peek_at(&mut a, &key);
+        assert!(peek.contains("workspace not known"), "{peek}");
+        assert!(!peek.contains("no workspace open"), "{peek}");
+        let c = a.card(&key).unwrap().clone();
+        assert_eq!(
+            crate::ui::card_ui::place_for_test(&a, &c).0,
+            "workspace not known"
+        );
+
+        // One session: that session's alone.
+        let first = seen[0].0.clone();
+        failing(
+            &mut a,
+            serde_json::json!([{"part":"session","session":first,"why":"it didn't list its tabs in time"}]),
+        );
+        for (session, cached, _) in rows(&a) {
+            assert_eq!(cached, session == first, "{session}");
+        }
+    }
+
+    #[test]
+    fn a_card_open_in_several_workspaces_says_so_and_any_other_looks_as_before() {
+        let mut a = demo(false);
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        let key = card_with_no_workspace(&mut a, i);
+        let set = |a: &mut App, places: &[&str]| {
+            let c = a.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+            c.detail.as_mut().unwrap().open_in = places.iter().map(|p| p.to_string()).collect();
+            c.clone()
+        };
+        // None, or the one place the card already names: nothing more said.
+        assert_eq!(open_in_line(&set(&mut a, &[])), None);
+        assert_eq!(open_in_line(&set(&mut a, &["web/w1"])), None);
+        let peek = peek_at(&mut a, &key);
+        assert!(!peek.contains("workspaces ("), "{peek}");
+        // More than one: every place, within reason.
+        assert_eq!(
+            open_in_line(&set(&mut a, &["web/w1", "ops/w3"])).as_deref(),
+            Some("open in 2 workspaces (web/w1, ops/w3), so two agents may be at it")
+        );
+        let peek = peek_at(&mut a, &key);
+        assert!(
+            peek.contains("open in 2 workspaces (web/w1, ops/w3)"),
+            "{peek}"
+        );
+        assert_eq!(
+            open_in_line(&set(&mut a, &["a/1", "b/2", "c/3", "d/4", "e/5"])).as_deref(),
+            Some("open in 5 workspaces (a/1, b/2, c/3, 2 more), so two agents may be at it")
+        );
+        // Only ever plain text, however a feed writes it.
+        let long = "x".repeat(200);
+        let line = open_in_line(&set(&mut a, &["web/\u{1b}[31mw1", &long])).unwrap();
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(line.len() < 120, "{line}");
     }
 
     #[test]

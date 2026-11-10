@@ -262,7 +262,7 @@ fn event_loop(
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
                 (r.ok || r.partial)
                     && !(request["action"] == "account-signin"
-                        && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
+                        && (r.signin_under_way() || request["step"] == "cancel"))
             });
             // For the error log, should it be a failure.
             app.answer_stderr = stderr;

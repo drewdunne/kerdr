@@ -37,6 +37,11 @@ fn closed_on(c: &Card) -> Option<String> {
     Some(d.get(5..10).unwrap_or(d).to_string())
 }
 
+#[cfg(test)]
+pub(super) fn place_for_test(app: &App, c: &Card) -> (String, Color) {
+    place(app, c, c, true)
+}
+
 /// Where a row's work runs, for its WHERE IT RUNS column, and the colour it says it in.
 fn place(app: &App, c: &Card, holder: &Card, itself: bool) -> (String, Color) {
     if c.dismissed() {
@@ -89,7 +94,15 @@ fn place(app: &App, c: &Card, holder: &Card, itself: bool) -> (String, Color) {
         };
     }
     if !c.is_open_workspace() {
-        return ("no workspace open".into(), DIM);
+        return (
+            if app.workspaces_stale(c) {
+                "workspace not known"
+            } else {
+                "no workspace open"
+            }
+            .into(),
+            DIM,
+        );
     }
     if itself {
         return match &c.own_tab {

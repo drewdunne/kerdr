@@ -52,6 +52,8 @@ pub struct Signin {
     pub started_fresh: bool,
     /// He chose a token instead of the browser: its stopping isn't a failure (intent 0591).
     pub set_aside: bool,
+    /// A newer sign-in of the same account took its place: not a failure either (intent 0591).
+    pub replaced: bool,
     pub editing: bool,
     pub poll_at: Instant,
     pub failed: bool,
@@ -94,6 +96,12 @@ fn for_copy(mut request: Value, copy: Option<&str>) -> Value {
 }
 
 impl Signin {
+    /// Whether it stopped because something went wrong, rather than by his own choice or for a
+    /// newer sign-in: only then is it drawn as a failure (intent 0591).
+    pub fn went_wrong(&self) -> bool {
+        self.failed && !self.set_aside && !self.replaced
+    }
+
     /// Whether the code to type on the provider's page has run out: r then starts again.
     pub fn expired(&self, now: chrono::DateTime<chrono::Local>) -> bool {
         self.user_code.is_some()
@@ -1166,6 +1174,7 @@ impl App {
             page_code: String::new(),
             started_fresh: false,
             set_aside: false,
+            replaced: false,
             editing: false,
             poll_at: Instant::now() + Duration::from_secs(2),
             failed: false,
@@ -1613,6 +1622,16 @@ impl App {
                 KeyCode::Enter => {
                     if self.target_current(target) {
                         if let Some(to) = choices.get(*sel) {
+                            if let Some(stays) = self.held_to(target.machine, &target.agent, to) {
+                                self.say(
+                                    format!(
+                                        "{} has to stay on {stays}: its safety settings only work there. Pick a {stays} account.",
+                                        target.reference
+                                    ),
+                                    Tone::Warn,
+                                );
+                                return Action::None;
+                            }
                             request = Some((
                                 target.machine,
                                 json!({"action":"account-move","pane":target.agent.pane,"session":target.agent.session,"conversation":target.agent.conversation,"to":to}),
@@ -1915,6 +1934,9 @@ impl App {
                     KeyCode::Char('r') if !s.editing && (s.failed || s.expired(self.now())) => {
                         s.failed = false;
                         s.set_aside = false;
+                        s.replaced = false;
+                        // Asked for by hand: its link opens, and it may start afresh once more.
+                        s.started_fresh = false;
                         s.url = None;
                         s.page_code.clear();
                         s.needs_code = false;
@@ -2416,8 +2438,11 @@ impl App {
                     return;
                 }
                 s.message = response.message.clone();
-                if !response.ok || !matches!(response.status.as_deref(), Some("waiting" | "done")) {
+                if !response.ok
+                    || !(response.signin_under_way() || response.status.as_deref() == Some("done"))
+                {
                     s.failed = true;
+                    s.replaced = response.replaced;
                     s.editing = false;
                     if request["step"] == "start" && response.ticket.is_some() {
                         s.ticket = response.ticket;
@@ -2459,18 +2484,33 @@ impl App {
                         }
                         self.account_queue.push_back((mi, s.start()));
                     }
-                } else if request["step"] == "start" {
+                } else if response.status.as_deref() == Some("starting")
+                    && response.url.is_none()
+                    && response
+                        .ticket
+                        .as_deref()
+                        .or(s.ticket.as_deref())
+                        .is_some_and(|t| !t.is_empty())
+                {
+                    // A slow program with no link yet: its ticket is kept, and a poll brings the
+                    // link (intent 0591).
+                    if response.ticket.is_some() {
+                        s.ticket = response.ticket;
+                    }
+                } else if request["step"] == "start" || (s.url.is_none() && response.url.is_some())
+                {
+                    let ticket = response.ticket.or_else(|| s.ticket.clone());
                     let valid = response
                         .url
                         .as_deref()
                         .is_some_and(crate::accounts::valid_signin_url);
-                    if !valid || response.ticket.as_deref().is_none_or(str::is_empty) {
+                    if !valid || ticket.as_deref().is_none_or(str::is_empty) {
                         s.failed = true;
                         let name = self.machines[machine].name();
                         s.message = format!(
                             "{name}'s backend sent a sign-in link Kerdr won't open (not a plain https link with a ticket), so that sign-in was cancelled. r tries again; if it happens again, that backend needs a fix."
                         );
-                        if let Some(ticket) = response.ticket {
+                        if let Some(ticket) = ticket {
                             self.account_queue.push_back((
                                 machine,
                                 json!({"action":"account-signin","step":"cancel","ticket":ticket}),
@@ -2488,19 +2528,23 @@ impl App {
                         s.message = format!(
                             "{name}'s backend sent a code to type that Kerdr can't show safely, so that sign-in was cancelled. r tries again."
                         );
-                        if let Some(ticket) = response.ticket {
+                        if let Some(ticket) = ticket {
                             self.account_queue.push_back((
                                 machine,
                                 json!({"action":"account-signin","step":"cancel","ticket":ticket}),
                             ));
                         }
                     } else {
-                        s.ticket = response.ticket;
+                        s.ticket = ticket;
                         s.url = response.url;
                         s.user_code = response.user_code;
                         s.expires = response.expires;
                         s.needs_code = response.needs_code && s.user_code.is_none();
-                        self.signin_open = s.url.clone();
+                        // One Kerdr started by itself shows its link and leaves the browser be:
+                        // nobody may be at the machine by then (intent 0591).
+                        if !s.started_fresh {
+                            self.signin_open = s.url.clone();
+                        }
                     }
                 }
                 s.poll_at = Instant::now() + Duration::from_secs(2);
@@ -2672,13 +2716,37 @@ impl App {
                 _ => {}
             }
         }
+        // The test found it isn't signed in: the box that signs it in opens over the list, and
+        // nothing starts until ⏎ (intent 0591).
+        if action == "account-test"
+            && !response.ok
+            && response.sign_in
+            && visible
+            && let Some(code) = request["code"].as_str()
+        {
+            let copy = request["copy"].as_str().and_then(|id| {
+                let c = self.account(machine, code)?.copy(id)?;
+                Some((c.id.clone(), c.name().to_string()))
+            });
+            let label = format!("Sign {code} in on {}", self.machines[machine].name());
+            self.push_account_screen(AccountScreen::Where {
+                code: code.to_string(),
+                copy,
+                message: response.message.clone(),
+                choices: vec![WhereChoice {
+                    label,
+                    machines: vec![machine],
+                }],
+                sel: 0,
+            });
+        }
         // Done is the success colour; done already, or done with something still to come, is
-        // news; not done is a warning (intent 0591).
+        // news; not done is a warning (intent 0591). Sign-ins say `status`, moves `state`.
         let did_nothing = response.account_unchanged
-            || matches!(
-                response.status.as_deref(),
-                Some("stale" | "unchanged" | "already")
-            );
+            || [response.status.as_deref(), response.state.as_deref()]
+                .into_iter()
+                .any(|said| matches!(said, Some("stale" | "unchanged" | "already")))
+            || response.message.starts_with("already on ");
         let left = response
             .note
             .as_deref()
@@ -2721,14 +2789,20 @@ fn fresh_signin_words(message: &str) -> String {
     if message.contains("had ended") {
         return "That sign-in had ended; here's a new link.".into();
     }
-    let said = message
-        .trim()
-        .trim_end_matches("r starts a new one.")
+    // Its "r starts a new one" is for a Kerdr that doesn't start one by itself.
+    let said = message.trim();
+    let said = said
+        .split_once(" r starts a new")
+        .map_or(said, |(before, _)| before)
         .trim_end();
-    if said.is_empty() {
-        "Kerdr started a fresh sign-in.".into()
-    } else {
-        format!("{said} Kerdr started a fresh sign-in.")
+    let mut letters = said.chars();
+    match letters.next() {
+        Some(first) => format!(
+            "{}{} Kerdr started a fresh sign-in.",
+            first.to_uppercase(),
+            letters.as_str()
+        ),
+        None => "Kerdr started a fresh sign-in.".into(),
     }
 }
 
@@ -2823,6 +2897,21 @@ mod tests {
             answer(json!({"ok":true,"status":"stale","message":"ARK_C was checked a moment ago."})),
         );
         assert_eq!(a.message().map(|(_, t)| t), Some(Tone::Info));
+        // The same for a backend's real answers, which say `state` or say so in words.
+        for nothing in [
+            json!({"ok":true,"state":"stale","message":"that pane runs another agent now; nothing moved"}),
+            json!({"ok":true,"state":"already","message":"ARK_C was already off the account list"}),
+            json!({"ok":true,"state":"moved","account":"ARK_C","message":"already on ARK_C"}),
+        ] {
+            a.finish_action(0, test.clone(), answer(nothing));
+            assert_eq!(a.message().map(|(_, t)| t), Some(Tone::Info));
+        }
+        a.finish_action(
+            0,
+            test.clone(),
+            answer(json!({"ok":true,"state":"moved","account":"ARK_C","message":"moved to ARK_C"})),
+        );
+        assert_eq!(a.message().map(|(_, t)| t), Some(Tone::Good));
         // Done, with its push to come: said, as news.
         a.finish_action(
             0,
@@ -2929,6 +3018,312 @@ mod tests {
         let s = signin_screen(&a);
         assert!(s.failed && s.message.contains("had ended"), "{}", s.message);
         assert!(a.account_queue.is_empty());
+    }
+
+    fn poll_now(a: &mut App) -> Action {
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now();
+        }
+        let poll = a.account_tick();
+        assert_eq!(sent(poll.clone()).1["step"], "poll");
+        poll
+    }
+
+    #[test]
+    fn each_sign_in_that_asks_for_another_gets_one_with_its_link_shown_not_opened() {
+        // The words the backend gives for a refused code, an unused link and a program that
+        // stopped.
+        for (said, words) in [
+            (
+                "that code was refused (it may have expired), so nothing was saved. r starts a new sign-in.",
+                "That code was refused (it may have expired), so nothing was saved. Kerdr started a fresh sign-in.",
+            ),
+            (
+                "that sign-in's link went unused for 15 minutes, so it ended. r starts a new one.",
+                "That sign-in's link went unused for 15 minutes, so it ended. Kerdr started a fresh sign-in.",
+            ),
+            (
+                "the sign-in program on lab stopped without signing in or saying why, so nothing was saved. r starts a new one.",
+                "The sign-in program on lab stopped without signing in or saying why, so nothing was saved. Kerdr started a fresh sign-in.",
+            ),
+            (
+                "That sign-in isn't on lab any more. r starts a new one there.",
+                "That sign-in isn't on lab any more. Kerdr started a fresh sign-in.",
+            ),
+        ] {
+            let mut a = app();
+            let action = signin(&mut a);
+            complete(&mut a, action, started());
+            assert!(a.signin_open.take().is_some(), "the first link opens");
+            let poll = poll_now(&mut a);
+            complete(
+                &mut a,
+                poll,
+                json!({"ok":false,"status":"failed","again":true,"message":said}),
+            );
+            assert_eq!(a.message().unwrap().0, words);
+            let start = a.account_tick();
+            assert_eq!(sent(start.clone()).1["step"], "start");
+            complete(&mut a, start, started());
+            let s = signin_screen(&a);
+            assert!(!s.failed && s.url.is_some(), "{}", s.message);
+            assert!(a.signin_open.is_none(), "shown in the box, not opened");
+            // That one ends too: it stops for r, and r by hand opens its link.
+            let poll = poll_now(&mut a);
+            complete(
+                &mut a,
+                poll,
+                json!({"ok":false,"status":"failed","again":true,"message":said}),
+            );
+            assert!(signin_screen(&a).went_wrong());
+            let cancel = press(&mut a, 'r');
+            complete(
+                &mut a,
+                cancel,
+                json!({"ok":true,"status":"cancelled","message":"cancelled"}),
+            );
+            let start = a.account_tick();
+            complete(&mut a, start, started());
+            assert!(a.signin_open.is_some());
+        }
+    }
+
+    #[test]
+    fn a_sign_in_a_newer_one_replaced_is_not_drawn_as_a_failure() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"cancelled","replaced":true,"message":"a newer sign-in of KBZ_C on lab replaced this one"}),
+        );
+        let s = signin_screen(&a);
+        assert!(s.failed && s.replaced && !s.went_wrong(), "r still works");
+        let screen = crate::ui::tests_render(&a, 120, 40);
+        assert!(screen.contains("replaced by a newer sign-in"), "{screen}");
+        assert!(screen.contains("r take it back"), "{screen}");
+        assert!(!screen.contains("sign-in stopped"), "{screen}");
+        // r takes it back like any other restart, and it's a plain sign-in again.
+        let cancel = press(&mut a, 'r');
+        assert!(!signin_screen(&a).replaced);
+        assert_eq!(sent(cancel).1["step"], "cancel");
+
+        // Cancelled with nothing newer: as it always was.
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"cancelled","message":"cancelled"}),
+        );
+        assert!(signin_screen(&a).went_wrong());
+        let screen = crate::ui::tests_render(&a, 120, 40);
+        assert!(screen.contains("sign-in stopped"), "{screen}");
+    }
+
+    #[test]
+    fn a_sign_in_still_starting_is_waited_for_and_a_poll_brings_its_link() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"status":"starting","ticket":"login-ticket","message":"Asking the sign-in program for a link…"}),
+        );
+        let s = signin_screen(&a);
+        assert!(!s.failed && s.url.is_none(), "{}", s.message);
+        assert_eq!(s.ticket.as_deref(), Some("login-ticket"));
+        assert!(a.signin_open.is_none());
+        // Still starting: it's kept, and goes on being asked.
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"starting","message":"Still asking…"}),
+        );
+        assert!(!signin_screen(&a).failed);
+        assert_eq!(signin_screen(&a).ticket.as_deref(), Some("login-ticket"));
+        // The link comes with a poll, without a ticket of its own, and opens as a start's does.
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"waiting","message":"Authorize in your browser.","url":"https://example.com/authorize?state=example"}),
+        );
+        let s = signin_screen(&a);
+        assert!(!s.failed && s.url.is_some(), "{}", s.message);
+        assert_eq!(s.ticket.as_deref(), Some("login-ticket"));
+        assert!(a.signin_open.is_some());
+        // A link Kerdr won't open is refused from a poll too, and that sign-in cancelled.
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"status":"starting","ticket":"login-ticket","message":"…"}),
+        );
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"waiting","message":"…","url":"http://example.com/"}),
+        );
+        assert!(signin_screen(&a).failed);
+        assert_eq!(a.account_queue.len(), 1);
+        // With no ticket to ask about, there's nothing to wait for.
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"status":"starting","message":"…"}),
+        );
+        assert!(signin_screen(&a).failed);
+        // A still-going sign-in isn't news for the feed either.
+        let going: crate::actions::Response =
+            serde_json::from_value(json!({"ok":true,"status":"starting","message":"…"})).unwrap();
+        assert!(going.signin_under_way());
+        let done: crate::actions::Response =
+            serde_json::from_value(json!({"ok":true,"status":"done","message":"…"})).unwrap();
+        assert!(!done.signin_under_way());
+    }
+
+    #[test]
+    fn a_test_that_finds_it_isnt_signed_in_opens_the_box_that_signs_it_in() {
+        let not_signed_in = json!({"ok":false,"status":"failed","sign_in":true,
+            "message":"ARK_C isn't signed in on lab (expired): Enter on it signs it in."});
+        let mut a = app();
+        open_copies(&mut a, "agents");
+        let test = press(&mut a, 't');
+        complete(&mut a, test, not_signed_in.clone());
+        let Mode::Accounts {
+            screen:
+                AccountScreen::Where {
+                    code,
+                    copy,
+                    message,
+                    choices,
+                    ..
+                },
+            ..
+        } = &a.mode
+        else {
+            panic!("{:?}", a.mode)
+        };
+        assert_eq!(code, "ARK_C");
+        assert_eq!(copy.as_ref().map(|c| c.0.as_str()), Some("agents"));
+        assert!(message.contains("isn't signed in"), "{message}");
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].machines, vec![1]);
+        assert!(a.account_queue.is_empty(), "nothing starts until Enter");
+        assert_eq!(a.message().unwrap().1, Tone::Warn);
+        // Enter is what starts it.
+        let start = key(&mut a, KeyCode::Enter);
+        let (machine, request) = sent(start);
+        assert_eq!(machine, 1);
+        assert_eq!(request["step"], "start");
+        assert_eq!(request["code"], "ARK_C");
+        assert_eq!(request["copy"], "agents");
+
+        // Any other failed test only says so, as it always has.
+        let mut a = app();
+        open_copies(&mut a, "agents");
+        let test = press(&mut a, 't');
+        complete(
+            &mut a,
+            test,
+            json!({"ok":false,"status":"failed","message":"ARK_C didn't answer."}),
+        );
+        assert!(matches!(
+            &a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::List { .. },
+                ..
+            }
+        ));
+
+        // Nor does it open over whatever you've gone on to.
+        let mut a = app();
+        open_copies(&mut a, "agents");
+        let test = press(&mut a, 't');
+        key(&mut a, KeyCode::Esc);
+        complete(&mut a, test, not_signed_in);
+        assert!(!matches!(
+            &a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Where { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn accounts_an_agent_is_held_from_are_dim_in_the_picker_and_say_why() {
+        let held = |a: &mut App, programs: Vec<String>| {
+            a.machines[1]
+                .feed
+                .as_mut()
+                .unwrap()
+                .agents
+                .iter_mut()
+                .find(|a| a.session == "api" && a.pane == "w1:p1")
+                .unwrap()
+                .programs = programs;
+            a.rebuild();
+        };
+        let on_codex = |a: &mut App| {
+            pick(a);
+            press(a, 's');
+            let Mode::Accounts {
+                screen: AccountScreen::Move { choices, sel, .. },
+                ..
+            } = &mut a.mode
+            else {
+                panic!("{:?}", a.mode)
+            };
+            *sel = choices.iter().position(|c| c == "KBZ_X").unwrap();
+        };
+        let mut a = app();
+        held(&mut a, vec!["claude".into()]);
+        on_codex(&mut a);
+        let screen = crate::ui::tests_render(&a, 120, 40);
+        assert!(screen.contains("has to stay on Claude Code"), "{screen}");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        let (said, tone) = a.message().unwrap();
+        assert!(said.starts_with("#44 has to stay on Claude Code"), "{said}");
+        assert!(said.contains("Pick a Claude Code account"), "{said}");
+        assert_eq!(tone, Tone::Warn);
+        assert!(matches!(
+            &a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Move { .. },
+                ..
+            }
+        ));
+        // One of its own program's accounts goes as ever, with no reason beside it.
+        let agent = a.account_agent(a.selected().unwrap()).unwrap().clone();
+        assert_eq!(a.held_to(1, &agent, "ARK_C"), None);
+        assert_eq!(a.held_to(1, &agent, "list"), None);
+
+        // A feed that doesn't say: exactly as before.
+        let mut a = app();
+        on_codex(&mut a);
+        let screen = crate::ui::tests_render(&a, 120, 40);
+        assert!(!screen.contains("has to stay on"), "{screen}");
+        let (_, request) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(request["to"], "KBZ_X");
+        // And a null there is no restriction either.
+        let agent: crate::accounts::AccountAgent =
+            serde_json::from_value(json!({"pane":"w1:p1","programs":null})).unwrap();
+        assert!(agent.programs.is_empty());
     }
 
     #[test]

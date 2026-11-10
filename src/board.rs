@@ -119,6 +119,17 @@ impl MachineState {
             .map(|f| f.why.clone())
     }
 
+    /// Whether its feed says herdr, or this session, wasn't read: what the feed says of its
+    /// workspaces is out of date. Marked quietly, at once; words wait until it lasts (intent 0591).
+    pub fn workspaces_stale(&self, session: Option<&str>) -> bool {
+        self.feed.as_ref().is_some_and(|feed| {
+            feed.read_failures.iter().any(|f| {
+                f.part == "herdr"
+                    || (f.part == "session" && session.is_some() && f.session.as_deref() == session)
+            })
+        })
+    }
+
     /// Why herdr's list of sessions can't be read, once that has lasted QUIET_FOR seconds.
     pub fn sessions_problem(&self, now: DateTime<Local>) -> Option<&str> {
         self.sessions_failing
@@ -1045,7 +1056,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                     .filter(|c| c.needs_you())
                     .count(),
                 cards: open_cards,
-                cached: !m.conn.is_live(),
+                cached: !m.conn.is_live() || m.workspaces_stale(Some(&info.name)),
                 // Only once it lasts: a read that failed once says nothing (intent 0591).
                 error: m
                     .session_problem(&info.name, now)
@@ -1083,7 +1094,7 @@ pub fn build(machines: &[MachineState], cfg: &Config) -> Board {
                 note: card
                     .filter(|c| c.attention == Attention::Done)
                     .map(|_| "its card is done".to_string()),
-                cached: !m.conn.is_live(),
+                cached: !m.conn.is_live() || m.workspaces_stale(Some(&w.session)),
             }
         })
         .collect();

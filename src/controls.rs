@@ -17,6 +17,8 @@ const MAX_ANSWER: usize = 300;
 
 /// What the busy line of an account request adds while it's sent again by itself (intent 0591).
 const RETRYING_TAIL: &str = " trying again…";
+/// The backend's words when a yes doesn't fit the question it answers: nothing started.
+const YES_NOT_MATCHED: &str = "couldn't be matched to the question";
 
 /// An action's answer cut to what the board shows, ending in "…" when it was longer.
 pub(super) fn short(text: String) -> String {
@@ -3235,6 +3237,29 @@ impl App {
             && !response.confirmation
             && response.follow.is_some()
         {
+            return;
+        }
+        // Its yes couldn't be matched to the question (a Kerdr and backend that disagree): nothing
+        // started, so the question is asked afresh rather than dropped. Only a yes does this, so
+        // it can't go round by itself (intent 0591).
+        if let Ok(response) = &result
+            && !response.ok
+            && response.message.contains(YES_NOT_MATCHED)
+            && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+            && (request["override"] == true || request.get("confirm").is_some())
+        {
+            let mut again = request;
+            if let Some(fields) = again.as_object_mut() {
+                for answer in ["op", "override", "confirm", "queue"] {
+                    fields.remove(answer);
+                }
+            }
+            self.say(
+                "That yes couldn't be matched to the question it answered, so nothing started. Asking it again.",
+                Tone::Info,
+            );
+            self.resend
+                .push_back((machine, crate::actions::with_op(again), from));
             return;
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
