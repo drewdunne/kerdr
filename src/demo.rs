@@ -162,8 +162,12 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         snapshots: [("web".to_string(), Ok(laptop_snap))].into_iter().collect(),
         keys: true,
         feed: None,
+        sessions_failed: None,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
+        read_at: Default::default(),
+        sessions_read_at: None,
+        said: Default::default(),
     });
 
     // The build box: the API and the background lane.
@@ -226,8 +230,12 @@ pub fn machines(away: bool) -> Vec<MachineState> {
         .collect(),
         keys: true,
         feed: None,
+        sessions_failed: None,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
+        read_at: Default::default(),
+        sessions_read_at: None,
+        said: Default::default(),
     });
 
     gpu.conn = Conn::HostKey {
@@ -781,6 +789,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
                         }
                         .into(),
                         how: if handed { "next" } else { "list" }.into(),
+                        programs: vec![],
                         problem: None,
                         waiting: waiting.then(|| crate::accounts::Waiting {
                             why: "usage".into(),
@@ -987,6 +996,9 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             user_code: None,
             expires: None,
             page_code: String::new(),
+            started_fresh: false,
+            set_aside: false,
+            replaced: false,
             editing: false,
             poll_at: std::time::Instant::now(),
             failed: false,
@@ -1009,6 +1021,9 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             user_code: None,
             expires: None,
             page_code: String::new(),
+            started_fresh: false,
+            set_aside: false,
+            replaced: false,
             editing: true,
             poll_at: std::time::Instant::now(),
             failed: true,
@@ -1032,6 +1047,9 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             user_code: None,
             expires: None,
             page_code: String::new(),
+            started_fresh: false,
+            set_aside: false,
+            replaced: false,
             editing: true,
             poll_at: std::time::Instant::now(),
             failed: false,
@@ -1055,6 +1073,9 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             user_code: Some("K7QD-3MPWX".into()),
             expires: Some((now() + chrono::Duration::minutes(15)).to_rfc3339()),
             page_code: String::new(),
+            started_fresh: false,
+            set_aside: false,
+            replaced: false,
             editing: false,
             poll_at: std::time::Instant::now(),
             failed: false,
@@ -1102,6 +1123,9 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             user_code: None,
             expires: None,
             page_code: String::new(),
+            started_fresh: false,
+            set_aside: false,
+            replaced: false,
             editing: false,
             poll_at: std::time::Instant::now(),
             failed: false,

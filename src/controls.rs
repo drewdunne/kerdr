@@ -15,6 +15,11 @@ const MAX_WORDS: usize = 48_000;
 /// characters, which would fill the screen (intent 0411).
 const MAX_ANSWER: usize = 300;
 
+/// What the busy line of an account request adds while it's sent again by itself (intent 0591).
+const RETRYING_TAIL: &str = " trying again…";
+/// The backend's words when a yes doesn't fit the question it answers: nothing started.
+const YES_NOT_MATCHED: &str = "couldn't be matched to the question";
+
 /// An action's answer cut to what the board shows, ending in "…" when it was longer.
 pub(super) fn short(text: String) -> String {
     match text.char_indices().nth(MAX_ANSWER) {
@@ -1014,7 +1019,10 @@ impl App {
 
     fn intent_action(&mut self, action: &str, extra: Value) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
-            self.say("Select an intent first.", Tone::Info);
+            self.say(
+                "Nothing is selected for that key to act on: pick a card first.",
+                Tone::Info,
+            );
             return Action::None;
         };
         self.intent_action_on(card, action, extra)
@@ -1024,7 +1032,10 @@ impl App {
     /// row inside a card or the misc list starts that card's work (intent 0404).
     pub(super) fn intent_action_on(&mut self, card: Card, action: &str, extra: Value) -> Action {
         let Some(detail) = &card.detail else {
-            self.say("This workspace has no intent record to change.", Tone::Info);
+            self.say(
+                "This workspace has no intent, so there's nothing to start, reorder or change; ⏎ goes in.",
+                Tone::Info,
+            );
             return Action::None;
         };
         if self.still_saving(&card) || self.still_changing(&card, action) {
@@ -1069,7 +1080,7 @@ impl App {
         if action == "restore" && !card.dismissed() {
             self.say(
                 format!(
-                    "u brings back work from won't do; {} isn't there.",
+                    "{} isn't set aside, so there's nothing to bring back.",
                     card.reference
                 ),
                 Tone::Info,
@@ -1225,12 +1236,15 @@ impl App {
     /// request names the workspace and tab the yes was for, so the backend closes nothing else.
     fn cancel_action(&mut self) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
-            self.say("Select an intent first.", Tone::Info);
+            self.say(
+                "Nothing is selected for that key to act on: pick a card first.",
+                Tone::Info,
+            );
             return Action::None;
         };
         let Some(detail) = &card.detail else {
             self.say(
-                "This workspace has no intent record: X cancels an intent's work. Close the workspace in herdr instead.",
+                "This workspace has no intent, so X has no work to cancel; close the workspace in herdr instead.",
                 Tone::Info,
             );
             return Action::None;
@@ -1947,6 +1961,10 @@ impl App {
                 plain,
                 ..
             } => {
+                // A yes is a new request: never the question's op (intent 0591).
+                if let Some(fields) = request.as_object_mut() {
+                    fields.remove("op");
+                }
                 // A question that just appeared, or a key held down, never answers it.
                 let early = key.kind == KeyEventKind::Repeat
                     || ready_at.is_some_and(|at| Instant::now() < at);
@@ -2361,6 +2379,52 @@ impl App {
         })
     }
 
+    /// Whether a request whose answer was lost may be sent to this machine again by itself: its
+    /// feed, the last one read, says its backend keeps ops, so the same request is never done twice
+    /// there (intent 0591). Any other machine's is never resent: its result is said to be unknown.
+    pub fn resends_to(&self, machine: usize) -> bool {
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .is_some_and(|f| f.supports("op"))
+    }
+
+    /// A request is being sent again by itself, with the same op (intent 0591): a change's card,
+    /// or the busy line of an account request, says so quietly. Nothing red, and nothing in the
+    /// error log: only its last answer counts, and that's said as any answer is.
+    pub fn resending(&mut self, job: Option<u64>, _machine: usize, _why: &crate::actions::Resend) {
+        match job {
+            Some(n) => {
+                if self.resolver.note_retrying(n, true) {
+                    self.rebuild();
+                }
+            }
+            None if self.busy && !self.busy_label.ends_with(RETRYING_TAIL) => {
+                self.busy_label = format!("{}{RETRYING_TAIL}", self.busy_label);
+            }
+            None => {}
+        }
+    }
+
+    /// A start that waited for its intent's write-up is going ahead from his words as they are,
+    /// since that write-up failed (intent 0591): said, so it's no surprise on the card.
+    pub fn starts_from_words(&mut self, n: u64) {
+        let Some(id) = self
+            .resolver
+            .job_request(n)
+            .and_then(|r| r["id"].as_str().map(str::to_string))
+        else {
+            return;
+        };
+        let reference = self.reference_for(&id);
+        self.say(
+            format!(
+                "{reference} couldn't be written up, so it starts from your words as they are."
+            ),
+            Tone::Info,
+        );
+    }
+
     /// A change's answer, from the action resolution tool: one that went as shown keeps showing
     /// until the feed has it; any other takes its effect with it, so the card is back as it really
     /// is before anything is said or asked.
@@ -2369,6 +2433,9 @@ impl App {
             return;
         };
         let mut job = job;
+        // Answered at last: whatever it says, it's no longer being sent again, and its card
+        // stops saying so.
+        let was_retrying = std::mem::replace(&mut job.retrying, false);
         let machine = job.machine;
         let by_enter = job.by_enter;
         self.action_from = job.from.clone();
@@ -2426,8 +2493,11 @@ impl App {
             }
             if let Some(follow) = response.follow.clone() {
                 // It goes on after this answer, and Kerdr follows it (intent 0591): shown on its
-                // card in the follow's words until it ends.
-                self.begin_follow(job, follow);
+                // card in the follow's words until it ends, with what's still to come said too.
+                self.begin_follow(job, follow, response.note.as_deref());
+                if was_retrying {
+                    self.rebuild();
+                }
                 // Joined to a move already under way, which an account picked with s didn't
                 // reach: that's said, as on any start that restarted nothing (intent 0591).
                 if response.ok && response.account_unchanged && !response.message.is_empty() {
@@ -2438,7 +2508,7 @@ impl App {
                 let changes = guessed_wrong
                     || matches!(job.effect, Some(Effect::Starting | Effect::StartingOn(_)));
                 self.resolver.settle(job);
-                if changes {
+                if changes || was_retrying {
                     self.rebuild();
                 }
             }
@@ -2996,6 +3066,32 @@ impl App {
         })
     }
 
+    /// How an answer that never came names the change it was for, without saying whether it
+    /// happened, which nobody knows: "Marking #41 done" (intent 0591).
+    fn what_was_asked(&self, request: &Value) -> Option<String> {
+        let id = request["id"].as_str()?;
+        let reference = self.reference_for(id);
+        Some(match request["action"].as_str()? {
+            "dispatch" => format!("Starting {reference}"),
+            "reopen"
+                if self.board.cards.iter().any(|c| {
+                    c.detail.as_ref().is_some_and(|d| d.id == id) && c.outside_herdr().is_some()
+                }) =>
+            {
+                format!("Moving {reference} into herdr")
+            }
+            "reopen" => format!("Reopening {reference}"),
+            "close" => format!("Marking {reference} done"),
+            "dismiss" => format!("Setting {reference} aside"),
+            "cancel" => format!("Cancelling {reference}"),
+            "restore" => format!("Bringing {reference} back"),
+            "refresh" => format!("Refreshing {reference}"),
+            "move" => format!("Moving {reference}"),
+            "answer" => format!("Saving {reference}'s answers"),
+            _ => format!("Changing {reference}"),
+        })
+    }
+
     pub fn finish_action(
         &mut self,
         machine: usize,
@@ -3141,6 +3237,33 @@ impl App {
             && !response.confirmation
             && response.follow.is_some()
         {
+            return;
+        }
+        // Its yes couldn't be matched to the question (a Kerdr and backend that disagree): nothing
+        // started, so the question is asked afresh rather than dropped. Only a yes does this, so
+        // it can't go round by itself (intent 0591). Only to a backend whose feed says it keeps
+        // ops, as every request sent by itself: a released backend's refusal can't be shown to
+        // come before anything changed (a followed worker can start a session, then refuse), so
+        // there it's only said, and the next key press asks again.
+        if let Ok(response) = &result
+            && !response.ok
+            && response.message.contains(YES_NOT_MATCHED)
+            && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+            && (request["override"] == true || request.get("confirm").is_some())
+            && self.resends_to(machine)
+        {
+            let mut again = request;
+            if let Some(fields) = again.as_object_mut() {
+                for answer in ["op", "override", "confirm", "queue"] {
+                    fields.remove(answer);
+                }
+            }
+            self.say(
+                "That yes couldn't be matched to the question it answered, so nothing started. Asking it again.",
+                Tone::Info,
+            );
+            self.resend
+                .push_back((machine, crate::actions::with_op(again), from));
             return;
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
@@ -3366,6 +3489,24 @@ impl App {
                 if request["action"] == "answer" && response.ok {
                     note = Some(message.clone());
                 }
+                // A change that stands with something still to come (its push, say): that's said
+                // even when nothing else would be, and even as Kerdr goes in (intent 0591).
+                let left = response
+                    .note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| response.ok && !n.is_empty());
+                if let Some(left) = left {
+                    note = Some(match note.take() {
+                        Some(n) if n.contains(left) => n,
+                        Some(n) => format!("{n} {left}"),
+                        None if message.contains(left) => message.clone(),
+                        None => match request["id"].as_str() {
+                            Some(id) => format!("{}: {left}", self.reference_for(id)),
+                            None => left.to_string(),
+                        },
+                    });
+                }
                 // Followed work done, not gone into: what it did, and where it is.
                 if self.follow_end.is_some()
                     && response.ok
@@ -3386,7 +3527,18 @@ impl App {
                 {
                     self.kickoff_kept.remove(id);
                 }
-                if !response.ok {
+                if !response.ok && response.partial {
+                    // Part of it happened, and the backend's words say which: not a change that
+                    // didn't happen, so no "didn't" (intent 0591). The feed is read at once.
+                    let kept = self.kickoff_kept_note(&request);
+                    let text = match request["id"].as_str() {
+                        Some(id) if !message.contains(&self.reference_for(id)) => {
+                            format!("{}: {message}{kept}", self.reference_for(id))
+                        }
+                        _ => format!("{message}{kept}"),
+                    };
+                    self.say(short(text), Tone::Warn);
+                } else if !response.ok {
                     // The card is back as it really is; say what didn't happen, and why.
                     let what = self.what_failed(&request);
                     let kept = self.kickoff_kept_note(&request);
@@ -3400,14 +3552,20 @@ impl App {
                 }
             }
             Err(error) => {
-                // Its result may be unknown (a timeout): the error says so in its own words.
                 let kept = self.kickoff_kept_note(&request);
-                match request["id"].as_str() {
-                    Some(id) => {
-                        let reference = self.reference_for(id);
-                        self.fail(short(format!("{reference}: {error}{kept}")))
+                // Its result unknown (no answer came, the connection dropped): named by what was
+                // asked, never as something that didn't happen. Otherwise nothing was sent, and
+                // it says what didn't happen, as a refusal does (intent 0591).
+                let what = if crate::actions::result_unknown(&error) {
+                    self.what_was_asked(&request)
+                } else {
+                    self.what_failed(&request)
+                };
+                match what {
+                    Some(what) if !error.starts_with(&what) => {
+                        self.fail(short(format!("{what}: {error}{kept}")))
                     }
-                    None => self.fail(short(error)),
+                    _ => self.fail(short(format!("{error}{kept}"))),
                 }
             }
         }
@@ -3478,16 +3636,37 @@ impl App {
                 if on_it {
                     self.new_intent_id = response.id.clone().map(|id| (machine, id));
                 }
+                // Made, but only part of what follows happened: said plainly, not as a failure
+                // (intent 0591). An older backend's refusal that names what it made is one.
+                if !response.ok && response.partial {
+                    return self.say(short(response.message), Tone::Warn);
+                }
                 if !response.ok {
                     return self.fail(short(response.message));
                 }
+                // Made, with something still to come by itself (its push): said even where the
+                // card would have said it all (intent 0591).
+                let left = response
+                    .note
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|n| !n.is_empty())
+                    .map(str::to_string);
                 let mut message = response.message;
+                if let Some(left) = &left
+                    && !message.contains(left.as_str())
+                {
+                    message = format!("{message} {left}");
+                }
                 if self.filtering() {
                     message.push_str(
                         " A filter may hide it until it's written up: F shows everything.",
                     );
                 } else if on_it && matches!(self.mode, Mode::Backlog { .. }) {
-                    // Saved as shown: its card says so.
+                    // Saved as shown: its card says so, and only what's still to come is said.
+                    if let Some(left) = left {
+                        self.say(short(left), Tone::Info);
+                    }
                     return;
                 } else {
                     message.push_str(" b shows it in the backlog.");
@@ -3510,15 +3689,29 @@ impl App {
                 )));
             }
             Err(error) => {
-                let unheard = at.map(|i| {
-                    self.submissions[i].unknown = true;
-                    self.submissions[i].clone()
-                });
+                // Nothing sent: it wasn't saved. Otherwise nobody knows (intent 0591).
+                let unknown = crate::actions::result_unknown(&error);
+                if let Some(i) = at {
+                    self.submissions[i].unknown |= unknown;
+                }
+                // As for a refusal: settled, unless this send or an earlier one went unheard.
+                let unheard = at
+                    .map(|i| self.submissions[i].clone())
+                    .filter(|s| s.unknown);
+                if let Some(i) = at.filter(|_| unheard.is_none()) {
+                    self.submissions.remove(i);
+                }
+                let maybe = unheard.is_some();
                 let into_box = self.give_back(words.0, words.1, unheard);
-                self.fail(format!(
-                    "Your new intent may not have been saved ({error}). {}; sending them again never makes a second one.",
-                    back(into_box)
-                ));
+                let error = super::edit_controls::first_clause(&error);
+                self.fail(if maybe {
+                    format!(
+                        "Your new intent may not have been saved: {error}. {}; sending them again never makes a second one.",
+                        back(into_box)
+                    )
+                } else {
+                    format!("Your new intent wasn't saved: {error}. {}.", back(into_box))
+                });
             }
         }
     }

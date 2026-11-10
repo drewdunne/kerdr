@@ -76,6 +76,83 @@ pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "crate::accounts::null_default")]
     pub create_fields: Vec<String>,
+    /// What this machine's backend does beyond feed version 1 (intent 0591): `op` (it keeps a
+    /// record of each request by its op, so the same request sent again is never done twice),
+    /// `retry` (a refusal that will likely clear by itself says how long to wait) and `follow`.
+    /// Absent on older feeds: Kerdr never sends a request to them again by itself.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "crate::accounts::null_default")]
+    pub supports: Vec<String>,
+    /// What this feed couldn't read, in plain words (intent 0591): the board says it only once it
+    /// has lasted. Anything here that isn't the shape below is passed over, not a failed feed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(deserialize_with = "read_failures")]
+    pub read_failures: Vec<ReadFailure>,
+}
+
+/// One thing a feed couldn't read: `part` is "feed" (the whole feed failed), "herdr" (herdr on
+/// that machine didn't answer) or "session" (one session, named in `session`, didn't).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct ReadFailure {
+    pub part: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session: Option<String>,
+    pub why: String,
+}
+
+impl ReadFailure {
+    /// Which failure this is, whatever its words: a run of the same one counts as one.
+    pub fn key(&self) -> String {
+        match &self.session {
+            Some(session) => format!("{} {session}", self.part),
+            None => self.part.clone(),
+        }
+    }
+}
+
+impl ReadFailure {
+    /// The shape docs/feed.md gives: `feed` or `herdr` naming no session, `session` naming one.
+    /// Anything else is passed over: it must neither fail the whole feed nor warn of a session.
+    fn well_formed(&self) -> bool {
+        match self.part.as_str() {
+            "feed" | "herdr" => self.session.is_none(),
+            "session" => self
+                .session
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty()),
+            _ => false,
+        }
+    }
+
+    /// Plain words of Kerdr's own when the feed gave none.
+    fn said_why(mut self) -> ReadFailure {
+        if self.why.trim().is_empty() {
+            self.why = match (self.part.as_str(), &self.session) {
+                ("feed", _) => "it failed without saying why".into(),
+                ("session", Some(session)) => format!("herdr session {session} wasn't read"),
+                _ => "herdr on this machine wasn't read".into(),
+            };
+        }
+        self
+    }
+}
+
+fn read_failures<'de, D>(d: D) -> Result<Vec<ReadFailure>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(|e| serde_json::from_value::<ReadFailure>(e.clone()).ok())
+                .filter(ReadFailure::well_formed)
+                .map(ReadFailure::said_why)
+                .collect()
+        })
+        .unwrap_or_default())
 }
 
 /// One stage list: the columns between Backlog and Done for the teams that use it (intent 0595).
@@ -117,6 +194,11 @@ where
 }
 
 impl Feed {
+    /// Whether this machine's backend says it does `what` (Feed::supports).
+    pub fn supports(&self, what: &str) -> bool {
+        self.supports.iter().any(|s| s == what)
+    }
+
     /// The record of the agent in a pane: of the conversation herdr sees there, and none when no
     /// record has it. Where herdr doesn't know the conversation yet, the newest record on the pane,
     /// which is the first, since a feed lists `agents` newest first. A pane can hold records left
@@ -198,6 +280,14 @@ pub struct FeedCard {
     /// when none could; absent once it's written up.
     #[serde(default)]
     pub intake: Option<String>,
+    /// With `intake: failed`: why, in a few plain words ("no account was free"); absent on older
+    /// feeds (intent 0591).
+    #[serde(default)]
+    pub intake_why: Option<String>,
+    /// Every `<session>/<workspace id>` the intent is open in here, when that's more than one,
+    /// since two agents may be at it (intent 0591).
+    #[serde(default, deserialize_with = "crate::accounts::null_default")]
+    pub open_in: Vec<String>,
     /// The submission Kerdr sent the words with, while the record is still being written up from
     /// them: the card shown while they were saved gives way to this one (intent 0445).
     #[serde(default)]
@@ -408,16 +498,75 @@ impl FeedCard {
     }
 }
 
-/// Reads a feed, accepting only the version this Kerdr knows.
+/// Why a feed's cards couldn't be read: plain words of Kerdr's own for the board, and what the feed
+/// printed, as it printed it, for the error log alone (intent 0591).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Unread {
+    pub words: String,
+    pub printed: Option<String>,
+}
+
+/// How much of what a feed printed instead of its cards goes to the error log.
+const MOST_PRINTED: usize = 2048;
+
+/// A feed's cards, or why they can't be read, in words for the board (intent 0591).
 pub fn parse(text: &str) -> Result<Feed, String> {
-    let start = text.find('{').ok_or("the feed printed no JSON")?;
-    let feed: Feed =
-        serde_json::from_str(&text[start..]).map_err(|e| format!("the feed's JSON: {e}"))?;
+    parse_keeping(text).map_err(|unread| unread.words)
+}
+
+/// Reads a feed, accepting only the version this Kerdr knows. What it printed in place of cards
+/// never reaches the board: the words say what happened, and the error log gets what it printed.
+pub fn parse_keeping(text: &str) -> Result<Feed, Unread> {
+    let printed = || {
+        let text = text.trim();
+        let mut end = text.len().min(MOST_PRINTED);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        Some(text[..end].to_string()).filter(|t| !t.is_empty())
+    };
+    let Some(start) = text.find('{') else {
+        return Err(match printed() {
+            None => Unread {
+                words: "it printed no cards".into(),
+                printed: None,
+            },
+            Some(said) => Unread {
+                words: "it printed something other than its cards (what it printed is in Kerdr's error log)".into(),
+                printed: Some(said),
+            },
+        });
+    };
+    let feed: Feed = serde_json::from_str(&text[start..]).map_err(|e| {
+        if e.is_eof() {
+            Unread {
+                words: "its answer was cut off partway (most often the connection dropping)".into(),
+                printed: None,
+            }
+        } else {
+            Unread {
+                words: "its cards couldn't be read (what it printed is in Kerdr's error log)"
+                    .into(),
+                printed: printed().map(|p| format!("{e}: {p}")),
+            }
+        }
+    })?;
     if feed.kerdr_feed != 1 {
-        return Err(format!(
-            "the feed is version {}; this Kerdr reads version 1",
-            feed.kerdr_feed
-        ));
+        return Err(Unread {
+            words: format!(
+                "its cards use feed version {}, and this Kerdr ({}) reads version 1: update Kerdr here, or restart it if it's already updated",
+                feed.kerdr_feed,
+                env!("CARGO_PKG_VERSION")
+            ),
+            printed: None,
+        });
+    }
+    // It says itself that its cards are empty because it failed: the last good ones stand.
+    if let Some(failed) = feed.read_failures.iter().find(|f| f.part == "feed") {
+        return Err(Unread {
+            words: failed.why.clone(),
+            printed: None,
+        });
     }
     Ok(feed)
 }
@@ -425,6 +574,117 @@ pub fn parse(text: &str) -> Result<Feed, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_card_s_write_up_reason_is_optional() {
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[
+                {"id":"1","title":"a","intake":"failed","intake_why":"no account was free"},
+                {"id":"2","title":"b","intake":"failed"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            feed.cards[0].intake_why.as_deref(),
+            Some("no account was free")
+        );
+        assert_eq!(feed.cards[1].intake_why, None);
+    }
+
+    #[test]
+    fn a_feed_says_what_it_takes_and_what_it_could_not_read() {
+        let feed = parse(
+            r#"{"kerdr_feed":1,"supports":["op","retry","follow"],"read_failures":[
+                {"part":"herdr","why":"herdr on this machine didn't answer within a few seconds"},
+                {"part":"session","session":"web","why":"herdr session web didn't list its tabs in time"},
+                {"nonsense":true}, 7]}"#,
+        )
+        .unwrap();
+        assert!(feed.supports("op") && !feed.supports("telepathy"));
+        // What isn't that shape is passed over: never a failed feed.
+        assert_eq!(feed.read_failures.len(), 2);
+        assert_eq!(feed.read_failures[1].key(), "session web");
+        assert!(
+            parse(r#"{"kerdr_feed":1,"read_failures":"oops"}"#)
+                .unwrap()
+                .read_failures
+                .is_empty()
+        );
+        // An older feed says nothing of either.
+        let old = parse(r#"{"kerdr_feed":1}"#).unwrap();
+        assert!(!old.supports("op") && old.read_failures.is_empty());
+        // One that says it failed as a whole is a failed read: the last good cards stand.
+        assert_eq!(
+            parse(r#"{"kerdr_feed":1,"cards":[],"read_failures":[{"part":"feed","why":"ark-sdlc's card feed hit a bug"}]}"#)
+                .unwrap_err(),
+            "ark-sdlc's card feed hit a bug"
+        );
+    }
+
+    #[test]
+    fn a_read_failure_of_another_shape_is_passed_over_and_never_fails_the_feed() {
+        // `session` goes only with `"part": "session"`, which needs one (docs/feed.md).
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"a"}],"read_failures":[
+                {"part":"feed","session":"web","why":"a feed failure naming a session"},
+                {"part":"telepathy","session":"web","why":"a part nobody knows"},
+                {"part":"session","why":"a session failure naming none"},
+                {"part":"session","session":"  ","why":"a blank session"},
+                {"part":"herdr","session":"web","why":"herdr naming a session"},
+                {"part":"session","session":"api","why":""}]}"#,
+        )
+        .unwrap();
+        assert_eq!(feed.cards.len(), 1, "the feed and its cards stand");
+        assert_eq!(feed.read_failures.len(), 1, "{:?}", feed.read_failures);
+        assert_eq!(feed.read_failures[0].key(), "session api");
+        // An entry without words gets Kerdr's own, never an empty line on the board.
+        assert_eq!(feed.read_failures[0].why, "herdr session api wasn't read");
+        // A feed failure without words still fails the feed, in Kerdr's words.
+        assert_eq!(
+            parse(r#"{"kerdr_feed":1,"read_failures":[{"part":"feed","why":" "}]}"#).unwrap_err(),
+            "it failed without saying why"
+        );
+        // A feed failure with a null session is the shape the docs give.
+        assert!(
+            parse(r#"{"kerdr_feed":1,"read_failures":[{"part":"feed","session":null,"why":"x"}]}"#)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn what_a_feed_printed_instead_of_cards_never_reaches_the_board() {
+        for printed in [
+            "Traceback (most recent call last):\n  File \"/home/x/bin/ark-cards\", line 9\nKeyError: 'state'",
+            "{\"kerdr_feed\":1,\"cards\":[{\"id\":7}]} ERR_SOMETHING at /srv/ark",
+        ] {
+            let unread = parse_keeping(printed).unwrap_err();
+            for raw in [
+                "Traceback",
+                "KeyError",
+                "/home/x",
+                "ERR_SOMETHING",
+                "/srv/ark",
+                "line 1 column",
+            ] {
+                assert!(!unread.words.contains(raw), "{}", unread.words);
+            }
+            assert!(
+                unread.words.contains("Kerdr's error log"),
+                "{}",
+                unread.words
+            );
+            let kept = unread.printed.unwrap();
+            assert!(
+                kept.contains("KeyError") || kept.contains("ERR_SOMETHING"),
+                "{kept}"
+            );
+        }
+        // One cut off partway says so, as before.
+        assert!(
+            parse(r#"{"kerdr_feed":1,"cards":["#)
+                .unwrap_err()
+                .contains("cut off partway")
+        );
+    }
 
     #[test]
     fn optional_account_fields_accept_future_providers_and_null_usage() {

@@ -153,6 +153,9 @@ pub struct Refresh {
     pub away: u64,
 }
 
+/// How long after `R` a machine it couldn't bring up to date coming back is said (intent 0591).
+const REFRESH_BACK_WITHIN: Duration = Duration::from_secs(120);
+
 /// How many failures one box shows: a key takes those down, and the rest come up next, so none
 /// goes unseen.
 pub const FAIL_PAGE: usize = 3;
@@ -623,6 +626,10 @@ pub struct App {
     pub account_cancels: Vec<(usize, serde_json::Value)>,
     pub signin_open: Option<String>,
     pub account_batch_messages: Vec<String>,
+    /// Some machine's part of that batch didn't happen: the summary is a warning (intent 0591).
+    pub account_batch_failed: bool,
+    /// Machines `R` couldn't bring up to date, still being tried, and when (intent 0591).
+    pub refresh_behind: Option<(Instant, Vec<usize>)>,
     pub account_pending: Option<account_controls::Pending>,
     /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
     /// your version until a save of it succeeds.
@@ -736,6 +743,8 @@ impl App {
             account_cancels: Vec::new(),
             signin_open: None,
             account_batch_messages: vec![],
+            account_batch_failed: false,
+            refresh_behind: None,
             account_pending: None,
             edits: Default::default(),
             edit_flights: vec![],
@@ -952,7 +961,7 @@ impl App {
         self.refresh = (!waiting.is_empty()).then(|| Refresh {
             since,
             waiting,
-            missed: trying.iter().map(|&i| self.machines[i].name()).collect(),
+            missed: trying.iter().map(|&i| self.machine_why(i)).collect(),
             said,
             away: self.away,
         });
@@ -982,6 +991,9 @@ impl App {
         if r.away != self.away {
             return;
         }
+        let whys: Vec<String> = (0..self.machines.len())
+            .map(|i| self.machine_why(i))
+            .collect();
         let machines = &self.machines;
         let missed = &mut r.missed;
         r.waiting.retain(|&i| {
@@ -993,7 +1005,11 @@ impl App {
             }
             let failed = !m.conn.is_live() || (fed.contains(&i) && m.feed_error.is_some());
             if failed {
-                missed.push(m.name());
+                missed.push(whys[i].clone());
+            } else if fed.contains(&i) && m.sessions_failing.is_some() {
+                // Its cards are new, but herdr's list of sessions, and so its workspaces, are as
+                // they last were (intent 0591).
+                missed.push(format!("{}'s herdr sessions", m.name()));
             } else if fed.contains(&i) && !m.snapshot_errors.is_empty() {
                 // Its cards are new, but a stuck session's workspaces are as they last were.
                 let mut sessions: Vec<&str> =
@@ -1015,6 +1031,64 @@ impl App {
         } else {
             let names = r.missed.join(", ");
             self.say(format!("Up to date, except {names}."), Tone::Info);
+            // Those still reading again by themselves: said when they land.
+            let behind: Vec<usize> = (0..self.machines.len())
+                .filter(|&i| self.machines[i].is_shown() && !self.machines[i].conn.is_live())
+                .collect();
+            if !behind.is_empty() {
+                self.refresh_behind = Some((Instant::now(), behind));
+            }
+        }
+    }
+
+    /// A machine by name, and why it's behind when that's known: "arknet-one (SSH timed out,
+    /// still trying)" (intent 0591).
+    /// Whether its machine's feed says herdr wasn't read for this card, so "no workspace" is
+    /// only a guess (intent 0591).
+    pub fn workspaces_stale(&self, c: &Card) -> bool {
+        self.machines
+            .get(c.machine_index)
+            .is_some_and(|m| m.workspaces_stale(c.session.as_deref()))
+    }
+
+    fn machine_why(&self, i: usize) -> String {
+        let m = &self.machines[i];
+        let why = m.conn.briefly().or_else(|| {
+            m.feed_error
+                .as_ref()
+                .map(|e| format!("its feed failed: {e}"))
+        });
+        match why {
+            Some(why) => format!("{} ({why})", m.name()),
+            None => m.name(),
+        }
+    }
+
+    /// `R` couldn't bring these machines up to date and they've come back since: said once they
+    /// all have, unless something else has been said meanwhile.
+    fn refresh_landed(&mut self) {
+        let Some((at, behind)) = self.refresh_behind.as_mut() else {
+            return;
+        };
+        if at.elapsed() >= REFRESH_BACK_WITHIN {
+            self.refresh_behind = None;
+            return;
+        }
+        let machines = &self.machines;
+        behind.retain(|&i| {
+            machines
+                .get(i)
+                .is_some_and(|m| m.is_shown() && !m.conn.is_live())
+        });
+        if !behind.is_empty() {
+            return;
+        }
+        self.refresh_behind = None;
+        if self
+            .message()
+            .is_none_or(|(said, _)| said.starts_with("Up to date, except"))
+        {
+            self.say("Now up to date.", Tone::Good);
         }
     }
 
@@ -1032,6 +1106,9 @@ impl App {
             m.take(data, ev.at);
         }
         self.keep_machine_problems(ev.machine);
+        if read {
+            self.refresh_landed();
+        }
         // A change that succeeded shows from the feed itself once a read has it (intent 0416).
         if read {
             self.resolver
@@ -1639,7 +1716,17 @@ impl App {
             .map(|(i, _)| i);
         match idx {
             Some(i) => self.set_tab(i),
-            None => self.say(format!("There's no session tab {n}."), Tone::Info),
+            None => {
+                let count = self
+                    .tabs
+                    .iter()
+                    .filter(|t| matches!(t, Scope::Session(..)))
+                    .count();
+                self.say(
+                    format!("There's no session tab {n}; this view has {count}."),
+                    Tone::Info,
+                )
+            }
         }
     }
 
@@ -3032,8 +3119,26 @@ pub(crate) mod tests {
             "Reading every machine now, and trying 1 again."
         );
         app.settle_refresh(&[0]);
-        let said = format!("Up to date, except {down}.");
+        // Which machine, and why in a few words (intent 0591).
+        let said = format!("Up to date, except {down} (no answer, still trying).");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+        // Its retry lands by itself: that's said, once.
+        app.machines[1].conn = Conn::Live {
+            latency: Duration::from_millis(1),
+        };
+        app.apply(Event {
+            machine: 1,
+            conn: Conn::Live {
+                latency: Duration::from_millis(1),
+            },
+            data: Some(crate::poll::MachineData {
+                feed: Some(Ok(crate::feed::Feed::default())),
+                ..Default::default()
+            }),
+            at: Local::now(),
+        });
+        assert_eq!(app.message(), Some(("Now up to date.", Tone::Good)));
+        assert!(app.refresh_behind.is_none());
     }
 
     #[test]
@@ -3135,7 +3240,7 @@ pub(crate) mod tests {
         app.machines[0].feed_error = Some("timed out".into());
         app.machines[1].conn = Conn::Hidden;
         app.settle_refresh(&[0]);
-        let said = format!("Up to date, except {failed}.");
+        let said = format!("Up to date, except {failed} (its feed failed: timed out).");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
     }
 
@@ -3149,6 +3254,20 @@ pub(crate) mod tests {
             .insert("web".into(), crate::poll::SESSION_SILENT.into());
         app.settle_refresh(&[0]);
         let said = format!("Up to date, except {name}'s web.");
+        assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
+    }
+
+    #[test]
+    fn r_never_calls_a_list_of_sessions_kept_from_before_up_to_date() {
+        let mut app = demo_app();
+        asked_to_refresh(&mut app, vec![0]);
+        let name = app.machines[0].name();
+        app.machines[0].sessions_failing = Some((
+            "herdr printed nothing for its list of sessions".into(),
+            chrono::Local::now(),
+        ));
+        app.settle_refresh(&[0]);
+        let said = format!("Up to date, except {name}'s herdr sessions.");
         assert_eq!(app.message(), Some((said.as_str(), Tone::Info)));
     }
 
@@ -4790,7 +4909,7 @@ pub(crate) mod tests {
         let (text, tone) = app.message().unwrap();
         assert_eq!(tone, Tone::Fail);
         assert!(
-            text.contains("may not have been saved (timed out)"),
+            text.contains("may not have been saved: timed out."),
             "{text}"
         );
         assert_eq!(app.draft, "Back up the NAS");
@@ -4848,6 +4967,47 @@ pub(crate) mod tests {
         assert!(app.draft.is_empty());
         assert!(!matches!(app.mode, Mode::Compose { .. }));
         assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Fail));
+    }
+
+    #[test]
+    fn a_new_intent_saved_with_its_push_to_come_says_so_even_where_its_card_says_the_rest() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let request = send_words(&mut app, "Back up the NAS");
+        assert!(matches!(app.mode, Mode::Backlog { .. }));
+        app.queue_action(0, request.clone());
+        let left = "saved here; it reaches your other machines once the push goes through.";
+        reply_to(
+            &mut app,
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: format!("Saved as #9005: {left}"),
+                note: Some(left.into()),
+                id: Some("9005".into()),
+                ..Default::default()
+            }),
+        );
+        settle(&mut app);
+        assert_eq!(app.message(), Some((left, Tone::Info)));
+        // Only part of it: said plainly, not as a failure, and the words aren't sent again.
+        let request = send_words(&mut app, "Wake the screens");
+        app.queue_action(0, request.clone());
+        reply_to(
+            &mut app,
+            0,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                partial: true,
+                message: "Saved as #9006, but its write-up couldn't start.".into(),
+                id: Some("9006".into()),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(app.message().map(|(_, t)| t), Some(Tone::Warn));
+        assert!(app.submissions.is_empty());
     }
 
     fn answer(ok: bool, id: Option<&str>) -> Result<crate::actions::Response, String> {
@@ -7135,12 +7295,83 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_yes_that_cant_be_matched_to_its_question_asks_the_question_afresh() {
+        let refused = || {
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "Kerdr's yes couldn't be matched to the question it answered, so nothing started; ask again.".into(),
+                ..Default::default()
+            })
+        };
+        let yes_refused = |keeps_ops: bool| {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            if keeps_ops {
+                app.machines[0].feed.as_mut().unwrap().supports = vec!["op".into()];
+            }
+            let (_, id) = closed_workspace_card(&mut app);
+            reopen_by_enter(&mut app);
+            let n = app
+                .resolver
+                .unanswered_for("reopen", Some(id.as_str()))
+                .unwrap();
+            let mut yes = app.resolver.job_request(n).unwrap().clone();
+            let op = yes["op"].clone();
+            yes["override"] = serde_json::json!(true);
+            yes["confirm"] = serde_json::json!("not-a-token");
+            yes["queue"] = serde_json::json!(true);
+            app.finish_job(n, yes, refused());
+            (app, id, op)
+        };
+        // A backend whose feed doesn't say it keeps ops is sent nothing by itself: the refusal is
+        // said, and the next key press asks again.
+        let (app, id, _) = yes_refused(false);
+        assert!(app.resend.is_empty());
+        assert!(
+            app.resolver
+                .unanswered_for("reopen", Some(id.as_str()))
+                .is_none()
+        );
+        assert!(last_said(&app).unwrap().0.contains("couldn't be matched"));
+
+        let (app, id, op) = yes_refused(true);
+        // The same job goes again, as a new ask: no answer of the old question, and its own op.
+        let n = app
+            .resolver
+            .unanswered_for("reopen", Some(id.as_str()))
+            .unwrap();
+        let again = app.resolver.job_request(n).unwrap().clone();
+        assert_eq!(again["action"], "reopen");
+        assert_eq!(again["id"], serde_json::json!(id));
+        for answer in ["override", "confirm", "queue"] {
+            assert!(again.get(answer).is_none(), "{again}");
+        }
+        assert!(again["op"].is_string() && again["op"] != op, "{again}");
+        assert!(last_said(&app).unwrap().0.contains("Asking it again"));
+
+        // Not a yes: only said, so it can't go round by itself.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        reply_to(&mut app, 0, request, refused());
+        assert!(app.resend.is_empty());
+        assert!(last_said(&app).unwrap().0.contains("couldn't be matched"));
+    }
+
+    #[test]
     fn a_refusal_naming_another_home_is_sent_there_once() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id) = closed_workspace_card(&mut app);
         let reference = app.card(&key).unwrap().reference.clone();
-        let request = reopen_by_enter(&mut app);
+        reopen_by_enter(&mut app);
+        // As the runner has it: with the op Kerdr gave it.
+        let n = app
+            .resolver
+            .unanswered_for("reopen", Some(id.as_str()))
+            .unwrap();
+        let request = app.resolver.job_request(n).unwrap().clone();
         let moved = || {
             Ok(crate::actions::Response {
                 ok: false,
@@ -7161,6 +7392,13 @@ pub(crate) mod tests {
         assert_eq!(again["action"], "reopen");
         assert_eq!(again["id"].as_str(), Some(id.as_str()));
         assert_eq!(again["session"], "ARK");
+        // The same request, sent on: never under a new op (intent 0591).
+        assert!(
+            request["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("k-"))
+        );
+        assert_eq!(again["op"], request["op"]);
         assert!(app.resolver.holds_you(), "its answer may still take you in");
         let _ = &key;
         // Until the board catches up, its next actions go there too.
@@ -7286,7 +7524,22 @@ pub(crate) mod tests {
             serde_json::json!({"action": "close", "id": "1"}),
             Err("Couldn't close it.".into()),
         );
-        assert_eq!(last_said(&app).unwrap().0, "1: Couldn't close it.");
+        // Nothing says it wasn't sent, so nobody knows whether it happened: named by what was
+        // asked, never as a change that didn't happen (intent 0591).
+        assert_eq!(
+            last_said(&app).unwrap().0,
+            "Marking 1 done: Couldn't close it."
+        );
+        reply_to(
+            &mut app,
+            0,
+            serde_json::json!({"action": "close", "id": "1"}),
+            Err(crate::actions::NO_BACKEND.into()),
+        );
+        assert_eq!(
+            last_said(&app).unwrap().0,
+            "1 wasn't marked done: Kerdr has no action backend set ([actions] command in its config), so nothing was sent"
+        );
     }
 
     #[test]
@@ -7711,6 +7964,178 @@ pub(crate) mod tests {
             c.detail.as_ref().unwrap().id.clone(),
             c.machine_index,
         )
+    }
+
+    fn status_of(app: &App, key: &str) -> Option<String> {
+        app.card(key)?.detail.as_ref()?.status.clone()
+    }
+
+    #[test]
+    fn a_change_sent_again_by_itself_says_so_quietly_on_its_card_and_nowhere_red() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id, machine) = waiting_card(&app);
+        app.queue_action(machine, serde_json::json!({"action": "refresh", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        assert!(
+            request["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("k-"))
+        );
+        app.message = None;
+        app.resending(
+            Some(n),
+            machine,
+            &crate::actions::Resend::Retry {
+                wait: Duration::from_secs(5),
+                message: "#1's record is locked by a pull under way.".into(),
+            },
+        );
+        assert_eq!(
+            status_of(&app, &key).as_deref(),
+            Some(crate::resolve::RETRYING)
+        );
+        assert_eq!(app.message(), None, "nothing said while it tries again");
+        // Its answer at last takes the words down, and a change that went says nothing.
+        app.finish_job(n, request, done("Refreshed."));
+        assert_ne!(
+            status_of(&app, &key).as_deref(),
+            Some(crate::resolve::RETRYING)
+        );
+        assert_eq!(app.message(), None);
+    }
+
+    #[test]
+    fn a_change_that_stands_with_its_push_still_to_come_says_what_is_left() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "refresh", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.message = None;
+        let left = "saved here; it reaches your other machines once the push goes through, which is retried by itself.";
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: true,
+                message: format!("Refreshed {reference}: {left}"),
+                note: Some(left.into()),
+                ..Default::default()
+            }),
+        );
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "it stands: not a failure");
+        assert!(said.contains(left), "{said}");
+    }
+
+    #[test]
+    fn a_change_done_only_in_part_is_a_warning_that_says_what_happened_without_didnt() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                partial: true,
+                message: "marked done, but its workspace couldn't be closed: herdr didn't answer."
+                    .into(),
+                ..Default::default()
+            }),
+        );
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert_eq!(
+            said,
+            format!(
+                "{reference}: marked done, but its workspace couldn't be closed: herdr didn't answer."
+            )
+        );
+        assert!(!said.contains("wasn't marked done"), "{said}");
+    }
+
+    #[test]
+    fn an_answer_that_never_came_names_what_was_asked_and_never_says_it_didnt_happen() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        let lost = format!(
+            "the connection to arknet-one dropped before its answer came; {}, and its card shows how it stands.",
+            crate::actions::UNKNOWN
+        );
+        app.finish_job(n, request, Err(lost.clone()));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Fail);
+        assert_eq!(said, format!("Marking {reference} done: {lost}"));
+        // A request never sent is known not to have happened, and says so.
+        app.message = None;
+        app.queue_action(machine, serde_json::json!({"action": "close", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request, Err(crate::actions::NO_BACKEND.into()));
+        assert!(
+            app.message().unwrap().0.starts_with(&format!(
+                "{reference} wasn't marked done: Kerdr has no action backend"
+            )),
+            "{:?}",
+            app.message()
+        );
+    }
+
+    #[test]
+    fn only_a_machine_whose_feed_says_it_keeps_ops_is_sent_a_lost_request_again() {
+        let mut app = demo_app();
+        assert!(!app.resends_to(0), "the demo's feed says nothing of ops");
+        app.machines[0].feed.as_mut().unwrap().supports = vec!["op".into(), "retry".into()];
+        assert!(app.resends_to(0));
+        app.machines[0].feed.as_mut().unwrap().supports = vec!["retry".into()];
+        assert!(!app.resends_to(0));
+        assert!(!app.resends_to(99));
+    }
+
+    #[test]
+    fn what_a_key_cant_do_says_why_in_plain_words() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        // A tab number past the last says how many there are (intent 0591).
+        let count = app
+            .tabs
+            .iter()
+            .filter(|t| matches!(t, Scope::Session(..)))
+            .count();
+        app.session_tab(count + 5);
+        assert_eq!(
+            app.message().unwrap().0,
+            format!(
+                "There's no session tab {}; this view has {count}.",
+                count + 5
+            )
+        );
+        // u on work that isn't set aside: a fact, not a refusal.
+        let (key, _, _) = waiting_card(&app);
+        select_key(&mut app, &key);
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(press(&mut app, 'u'), Action::None);
+        assert_eq!(
+            app.message(),
+            Some((
+                format!("{reference} isn't set aside, so there's nothing to bring back.").as_str(),
+                Tone::Info
+            ))
+        );
+        // A full board advises; it doesn't refuse.
+        assert_eq!(
+            crate::model::Verdict::Full.text(),
+            "Sessions full: d asks before starting another"
+        );
     }
 
     fn refused(message: &str) -> Result<crate::actions::Response, String> {
@@ -8630,13 +9055,15 @@ pub(crate) mod tests {
         queue.push_gated(n, m, app.resolver.key_of(n), &request);
         let failed = std::collections::HashMap::from([(id.clone(), Some("failed".to_string()))]);
         assert_eq!(queue.written(m, &failed), vec![n]);
-        assert!(queue.is_empty(), "it never starts");
-        // The runner answers it with the reason, which the board shows.
-        app.finish_job(n, request, Err(crate::resolve::NOT_WRITTEN_UP.into()));
-        assert!(!app.starts_when_written(&key));
-        let (said, _) = app.message().unwrap();
-        assert!(said.contains("couldn't be written up"), "{said}");
-        assert!(said.contains("d starts it as it is"), "{said}");
+        // It starts from his words as they are, and the board says so (intent 0591).
+        assert_eq!(queue.startable(), vec![n]);
+        app.starts_from_words(n);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info);
+        assert!(
+            said.contains("couldn't be written up, so it starts from your words as they are"),
+            "{said}"
+        );
     }
 
     #[test]

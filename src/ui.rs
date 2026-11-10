@@ -843,6 +843,21 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
             };
             spans.push(Span::styled(format!("{} ", conn.glyph()), gstyle));
             spans.push(Span::styled(name.clone(), nstyle));
+            // The last good state's age, quietly, while a drop or a failing feed is short
+            // (intent 0591).
+            let now = app.now();
+            let age = m
+                .and_then(|m| {
+                    let quiet_feed =
+                        m.conn.is_live() && m.feed_error.is_some() && m.feed_problem(now).is_none();
+                    let since = match m.conn {
+                        Conn::Reconnecting { .. } => m.last_ok,
+                        _ if quiet_feed => m.feed_taken,
+                        _ => None,
+                    };
+                    since.map(|t| format!(" · cards {} old", ago(t, now)))
+                })
+                .unwrap_or_default();
             if !conn.is_live() && !matches!(conn, Conn::Connecting) {
                 let short = match &conn {
                     Conn::Reconnecting { .. } => "reconnecting",
@@ -853,6 +868,9 @@ fn tab_spans(app: &App, i: usize, scope: &Scope) -> Vec<Span<'static>> {
                     _ => "",
                 };
                 spans.push(Span::styled(format!(" {short}"), fg(conn_color(&conn))));
+            }
+            if !age.is_empty() {
+                spans.push(Span::styled(age, fg(DIM)));
             }
             spans.push(Span::raw(" "));
             spans
@@ -1155,20 +1173,23 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         Conn::HerdrTooOld { .. } | Conn::HerdrMissing => 3,
         _ => 9,
     };
+    // A drop shows here only once it lasts; its tab is marked meanwhile (intent 0591).
     let mut troubled: Vec<usize> = (0..app.machines.len())
-        .filter(|&i| rank(&app.machines[i].conn) < 9)
+        .filter(|&i| rank(&app.machines[i].conn) < 9 && app.machines[i].conn.lasting(now))
         .collect();
     troubled.sort_by_key(|&i| rank(&app.machines[i].conn));
-    let &i = troubled.first()?;
+    let reading = read_troubles(app);
+    let Some(&i) = troubled.first() else {
+        return reading_banner(reading);
+    };
     let m = &app.machines[i];
     let name = m.name();
+    // Every card of it the board shows, whatever its column: all of them are dimmed.
     let cards = app
         .board
         .cards
         .iter()
-        .filter(|c| {
-            c.machine == name && !matches!(c.stage, Stage::Backlog | Stage::Maintain | Stage::Misc)
-        })
+        .filter(|c| c.machine == name && app.card_visible(c))
         .count();
     let as_of = m.last_ok.map(clock);
     let color = conn_color(&m.conn);
@@ -1181,7 +1202,11 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         } => {
             let mut v = vec![
                 Span::styled(
-                    format!("⟳ {name} dropped {} ago", ago(*since, now)),
+                    format!(
+                        "⟳ {name} dropped {} ago: {}",
+                        ago(*since, now),
+                        m.conn.cause().unwrap_or("it can't be reached")
+                    ),
                     bold(color),
                 ),
                 Span::styled(
@@ -1195,16 +1220,18 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
             ];
             if let Some(t) = as_of {
                 v.push(Span::styled(
-                    format!("   its {cards} cards are dimmed, as they were at {t}"),
+                    match cards {
+                        0 => format!("   its cards are as they were at {t}"),
+                        1 => format!("   its 1 card is dimmed, as it was at {t}"),
+                        n => format!("   its {n} cards are dimmed, as they were at {t}"),
+                    },
                     fg(DIM),
                 ));
             }
             v
         }
         Conn::Unreachable {
-            since,
-            retry_at,
-            detail,
+            since, retry_at, ..
         } => {
             let mut v = vec![
                 Span::styled(format!("○ can't reach {name}"), bold(FG2)),
@@ -1212,7 +1239,7 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
                     format!(
                         "   no answer since {} ({})",
                         clock(*since),
-                        trunc(detail, 40)
+                        m.conn.cause().unwrap_or("it doesn't answer")
                     ),
                     fg(FG),
                 ),
@@ -1256,18 +1283,69 @@ fn banner(app: &App) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
         )],
         _ => return None,
     };
-    if troubled.len() > 1 {
-        left.push(Span::styled(
-            format!("   +{} more", troubled.len() - 1),
-            fg(DIM),
-        ));
-    }
+    // The rest, its machines' feed or herdr reads that keep failing too: named here, said on M.
+    let more: Vec<String> = troubled[1..]
+        .iter()
+        .map(|&j| app.machines[j].name())
+        .chain(reading.into_iter().map(|(name, ..)| name))
+        .collect();
+    left.extend(more_span(&more));
     let right = match &m.conn {
         Conn::HostKey { .. } | Conn::Auth { .. } => key_hints(&[("M", "then ⏎ answers it")]),
         Conn::HerdrMissing | Conn::HerdrTooOld { .. } => key_hints(&[("M", "then u sets it up")]),
         _ => key_hints(&[("r", "retry now"), ("M", "machines")]),
     };
     Some((left, right))
+}
+
+/// The machines that answer, but whose feed or herdr reads have kept failing past the quiet
+/// spell (intent 0591): each one's name, why in plain words (the feed's own reason first), and
+/// since when.
+fn read_troubles(app: &App) -> Vec<(String, String, chrono::DateTime<chrono::Local>)> {
+    let now = app.now();
+    app.machines
+        .iter()
+        .filter(|m| m.is_shown() && m.conn.is_live())
+        .filter_map(|m| {
+            let (why, since) = m.lasting_problem(now)?;
+            Some((m.name(), why, since))
+        })
+        .collect()
+}
+
+/// "+2 more: laptop, mac" for the banner, naming the other machines in trouble; nothing for none.
+fn more_span(more: &[String]) -> Option<Span<'static>> {
+    (!more.is_empty()).then(|| {
+        Span::styled(
+            format!("   +{} more: {}", more.len(), more.join(", ")),
+            fg(DIM),
+        )
+    })
+}
+
+/// With every machine answering: one line about the first whose feed or herdr reads have kept
+/// failing past the quiet spell (intent 0591), said once, in plain words, the feed's own reason
+/// first. Its rows and cards are marked out of date meanwhile; this says why.
+fn reading_banner(
+    troubled: Vec<(String, String, chrono::DateTime<chrono::Local>)>,
+) -> Option<(Vec<Span<'static>>, Vec<Span<'static>>)> {
+    let (name, why, since) = troubled.first()?;
+    let mut left = vec![
+        Span::styled(format!("● {name}: {why}"), bold(YELLOW)),
+        Span::styled(
+            format!(
+                "   since {}; what's shown of it is from its last good read",
+                clock(*since)
+            ),
+            fg(DIM),
+        ),
+    ];
+    let more: Vec<String> = troubled[1..]
+        .iter()
+        .map(|(name, ..)| name.clone())
+        .collect();
+    left.extend(more_span(&more));
+    Some((left, key_hints(&[("M", "machines")])))
 }
 
 fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
@@ -1631,7 +1709,8 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     for (row, &i) in items.iter().enumerate().skip(start).take(visible) {
         let c = &app.board.cards[i];
         let y = body.y + (row - start) as u16;
-        let (mut glyph, mut gcolor, mut meta, mut mcolor) = list_glyph(c, now);
+        let (mut glyph, mut gcolor, mut meta, mut mcolor) =
+            list_glyph(c, now, body.width as usize / 2);
         if app.starts_when_written(&c.key) {
             meta = "starts once written up".into();
         }
@@ -1713,9 +1792,67 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
     }
 }
 
+/// The most of a write-up's reason any card shows: a few words, as the feed promises.
+const WRITE_UP_WHY_MOST: usize = 60;
+
+/// What a card says of an intent open in more than one workspace, from its feed's `open_in`: two
+/// agents may be at it. None for one place or none, as older feeds say (intent 0591).
+fn open_in_line(c: &Card) -> Option<String> {
+    const NAMED_MOST: usize = 3;
+    let places = &c.detail.as_ref()?.open_in;
+    if places.len() < 2 {
+        return None;
+    }
+    let mut named: Vec<String> = places
+        .iter()
+        .take(NAMED_MOST)
+        .map(|p| {
+            trunc(
+                &p.chars().filter(|ch| !ch.is_control()).collect::<String>(),
+                40,
+            )
+        })
+        .collect();
+    if places.len() > NAMED_MOST {
+        named.push(format!("{} more", places.len() - NAMED_MOST));
+    }
+    Some(format!(
+        "open in {} workspaces ({}), so two agents may be at it",
+        places.len(),
+        named.join(", ")
+    ))
+}
+
+/// Why a card's write-up failed, in its feed's words on one line and cut to fit; None when the
+/// feed doesn't say, as older feeds don't (intent 0591).
+fn write_up_why(c: &Card) -> Option<String> {
+    let why = c.detail.as_ref()?.intake_why.as_deref()?;
+    let why: String = why
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .filter(|ch| !ch.is_control())
+        .collect();
+    (!why.is_empty()).then(|| trunc(&why, WRITE_UP_WHY_MOST))
+}
+
+/// What a list row says of a card whose write-up failed, in at most `room` columns when it gives
+/// a reason: without room for any of that, the plain words, which never shrink.
+fn not_written_up(c: &Card, room: usize) -> String {
+    const PLAIN: &str = "not written up";
+    match write_up_why(c) {
+        // ": ", and at least one character of it before the "…".
+        Some(why) if room >= width(PLAIN) + 4 => trunc(&format!("{PLAIN}: {why}"), room),
+        _ => PLAIN.into(),
+    }
+}
+
+/// A list row's glyph, and its note on the right, which takes at most `room` columns.
 fn list_glyph(
     c: &Card,
     now: chrono::DateTime<chrono::Local>,
+    room: usize,
 ) -> (
     &'static str,
     ratatui::style::Color,
@@ -1723,8 +1860,13 @@ fn list_glyph(
     ratatui::style::Color,
 ) {
     // A start or a reopen on its way (intents 0416 and 0445): shown the moment it's sent,
-    // whatever the column, a start on another machine too.
+    // whatever the column, a start on another machine too. Any change, a new intent's words
+    // included, being sent again by itself says so, quietly (intent 0591).
     match c.detail.as_ref().and_then(|d| d.status.as_deref()) {
+        Some(crate::resolve::RETRYING_SAVE) => {
+            return ("◐", BLUE, "saving, trying again…".into(), BLUE);
+        }
+        Some(crate::resolve::RETRYING) => return ("◐", BLUE, "trying again…".into(), BLUE),
         Some(s) if s.starts_with("Starting") => return ("◐", BLUE, "starting up".into(), BLUE),
         Some("Reopening…") => return ("◐", BLUE, "reopening".into(), BLUE),
         _ => {}
@@ -1751,7 +1893,7 @@ fn list_glyph(
         // A new intent still being saved (intent 0445).
         _ if c.intake() == Some(crate::resolve::SAVING) => ("◐", BLUE, "saving…".into(), BLUE),
         _ if c.intake() == Some("pending") => ("✎", PURPLE, "writing it up".into(), PURPLE),
-        _ if c.intake() == Some("failed") => ("✎", YELLOW, "not written up".into(), YELLOW),
+        _ if c.intake() == Some("failed") => ("✎", YELLOW, not_written_up(c, room), YELLOW),
         // Not started, but waiting on you all the same: questions asked before it starts.
         _ if c.needs_you() && !c.dismissed() => (
             Attention::NeedsYou.glyph(),
@@ -2161,11 +2303,15 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             Stage::Backlog if c.intake() == Some("pending") => {
                 "✎ being written up from your words; d starts it once that's done".into()
             }
-            Stage::Backlog if c.intake() == Some("failed") => {
-                "✎ not written up: the agent that starts it writes it up".into()
-            }
+            Stage::Backlog if c.intake() == Some("failed") => match write_up_why(c) {
+                Some(why) => {
+                    format!("✎ not written up ({why}): the agent that starts it writes it up")
+                }
+                None => "✎ not written up: the agent that starts it writes it up".into(),
+            },
             Stage::Backlog => "not started".into(),
             Stage::Maintain => "closed".into(),
+            _ if app.workspaces_stale(c) => "workspace not known: herdr didn't answer".into(),
             _ => "no workspace open".into(),
         });
     }
@@ -2178,6 +2324,9 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             _ => "status unknown",
         };
         facts.push(format!("{} {what}", a.agent));
+    }
+    if let Some(line) = open_in_line(c) {
+        facts.push(line);
     }
     if let Some(t) = c.cached_at {
         facts.push(format!("as last seen at {}", clock(t)));
@@ -2241,10 +2390,15 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
                 .map_or("It stays".into(), |p| format!("It stays on {p}"));
             lines.extend(wrapped(
                 &format!(
-                    "Handed over from {} ({}){when}: {}. {fresh} picked up from the log.",
+                    "Handed over from {} ({}){when}: {}{}. {fresh} picked up from the log.",
                     from.account,
                     providers.program_label(&from.program),
-                    from.reason()
+                    from.reason(),
+                    if from.why == "sign_in" {
+                        " (⏎ on it in A signs it in again)"
+                    } else {
+                        ""
+                    }
                 ),
                 w,
                 fg(YELLOW),
@@ -3995,25 +4149,42 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
     let now = app.now();
     let as_of = m.last_ok.map(clock);
     match &m.conn {
-        Conn::Live { latency } => vec![
-            format!(
+        Conn::Live { latency } => {
+            let mut lines = vec![format!(
                 "Answering. Read every {}s{}; the last read took {} ms.",
                 if m.machine.is_local() { app.cfg.machines.local_every } else { app.cfg.machines.remote_every },
                 if m.machine.is_local() { "" } else { " over SSH" },
                 latency.as_millis()
-            ),
-            match (&m.machine.feed, &m.feed_error) {
+            )];
+            // Its feed, and herdr as Kerdr reads it, each in its own words: a herdr read that
+            // keeps failing is never called the feed's failure, and the feed's reason comes first
+            // (intent 0591).
+            let feed_says: Vec<&str> = m.read_failures_lasting(now).iter().map(|f| f.why.as_str()).collect();
+            lines.push(match (&m.machine.feed, m.feed_problem(now)) {
                 (Some(_), Some(e)) => format!("Its card feed failed ({e}), so it shows the last cards it sent, with herdr's live view."),
+                (Some(cmd), None) if !feed_says.is_empty() => {
+                    format!("Cards come from its feed ({cmd}), which says: {}.", feed_says.join("; "))
+                }
                 (Some(cmd), None) => format!("Cards come from its feed: {cmd}"),
                 (None, _) => "No card feed: every herdr workspace with an agent is a card.".into(),
-            },
-        ],
+            });
+            if feed_says.is_empty()
+                && let Some(why) = m.sessions_problem(now)
+            {
+                lines.push(format!(
+                    "Kerdr's own read of herdr there: {}. Its last list of sessions stands, marked out of date.",
+                    why.trim_end_matches('.')
+                ));
+            }
+            lines
+        }
         Conn::Connecting => vec!["Reaching it for the first time.".into()],
-        Conn::Reconnecting { since, attempt, retry_at, detail } => vec![
+        // Why, in Kerdr's words: SSH's own stay in the error log (intent 0591).
+        Conn::Reconnecting { since, attempt, retry_at, .. } => vec![
             format!(
-                "Lost the connection {} ago ({}). Trying again in {}s (try {}). The wait grows to 15 seconds.",
+                "Lost the connection {} ago{}. Trying again in {}s (try {}). The wait grows to 15 seconds.",
                 ago(*since, now),
-                detail,
+                m.conn.cause().map(|c| format!(" ({c})")).unwrap_or_default(),
                 (*retry_at - now).num_seconds().max(0),
                 attempt + 1
             ),
@@ -4022,16 +4193,21 @@ fn machine_explain(app: &App, i: usize) -> Vec<String> {
                 as_of.map(|t| format!(", as they were at {t}")).unwrap_or_default()
             ),
         ],
-        Conn::Unreachable { since, retry_at, detail } => vec![
-            format!("No answer since {} ({detail}): asleep, off, or off the network.", clock(*since)),
-            format!("Kerdr tries again in {}s, then every 15 seconds; r tries now.", (*retry_at - now).num_seconds().max(0)),
+        Conn::Unreachable { since, retry_at, .. } => vec![
+            format!(
+                "No answer since {}{}: asleep, off, or off the network.",
+                clock(*since),
+                m.conn.cause().map(|c| format!(" ({c})")).unwrap_or_default()
+            ),
+            format!("Kerdr tries again in {}s, then every 15 seconds; r tries now. ⏎ and d on its cards wait for it, then carry on.", (*retry_at - now).num_seconds().max(0)),
         ],
+        // What SSH says of the key is kept as it said it: you compare it to approve it.
         Conn::HostKey { detail } => vec![
             format!("SSH asked whether to trust this machine's host key ({detail})."),
             "Kerdr never answers that for you: ⏎ runs ssh here, so you can check the key and answer it yourself.".into(),
         ],
-        Conn::Auth { detail } => vec![
-            format!("SSH wants a password, a passphrase or another key ({detail})."),
+        Conn::Auth { .. } => vec![
+            "SSH wants a password, a passphrase or another key (what it said is in Kerdr's error log).".into(),
             "⏎ runs ssh here so you can answer it. For a key with a passphrase, ssh-add keeps it answered.".into(),
         ],
         Conn::HerdrMissing => vec![
@@ -4768,7 +4944,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     for (k, &i) in items.iter().enumerate() {
         let c = &app.board.cards[i];
         let place = order.iter().position(|&j| j == i).unwrap_or(k) + 1;
-        let (glyph, gc, meta, meta_color) = list_glyph(c, now);
+        let (glyph, gc, meta, meta_color) = list_glyph(c, now, list.width as usize / 2);
         let age = c
             .stale_days
             .map(|days| {
@@ -4919,8 +5095,11 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
             }
             Some("failed") => {
                 out.push(Line::raw(""));
+                let why = write_up_why(c)
+                    .map(|why| format!(" ({why})"))
+                    .unwrap_or_default();
                 out.extend(wrapped(
-                    "✎ No agent could write this up, so it keeps your words and their first ones as its title. The agent that starts it writes it up.",
+                    &format!("✎ No agent could write this up{why}, so it keeps your words and their first ones as its title. The agent that starts it writes it up."),
                     w,
                     fg(YELLOW),
                     None,
@@ -5116,6 +5295,427 @@ mod tests {
         a
     }
 
+    /// A Build card with no workspace, on machine `i`, as a read after the last rebuild left it.
+    fn card_with_no_workspace(a: &mut App, i: usize) -> String {
+        let card = a
+            .board
+            .cards
+            .iter_mut()
+            .find(|c| c.stage == Stage::Build && c.detail.is_some())
+            .unwrap();
+        card.machine_index = i;
+        card.workspace_id = None;
+        card.session = None;
+        card.key.clone()
+    }
+
+    fn peek_at(a: &mut App, key: &str) -> String {
+        let c = a.board.cards.iter().find(|c| c.key == key).unwrap();
+        a.sel = crate::app::Selection {
+            col: c.stage.index(),
+            key: Some(c.key.clone()),
+        };
+        a.mode = Mode::Peek {
+            scroll: 0,
+            back: Box::new(Mode::Board),
+        };
+        rendered(a, 176, 44)
+    }
+
+    /// The demo with every machine answering, but for the ones a test puts in trouble.
+    fn all_answering(away: bool) -> App {
+        let mut a = demo(away);
+        for m in a.machines.iter_mut() {
+            if m.is_shown() && !matches!(m.conn, Conn::Reconnecting { .. }) {
+                m.conn = Conn::Live {
+                    latency: Default::default(),
+                };
+            }
+        }
+        a
+    }
+
+    #[test]
+    fn a_read_failure_that_lasts_is_said_once_on_the_board_in_plain_words() {
+        let mut a = all_answering(false);
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        let name = a.machines[i].name();
+        let now = a.now();
+        let reason = "herdr on this machine didn't answer within a few seconds";
+        // herdr fails every call: the feed says so, and Kerdr's own read of its list fails too.
+        let herdr_failing = |a: &mut App, secs: i64| {
+            let since = now - chrono::Duration::seconds(secs);
+            let m = &mut a.machines[i];
+            let feed = m.feed.as_mut().unwrap();
+            feed.read_failures =
+                serde_json::from_value(serde_json::json!([{"part":"herdr","why":reason}])).unwrap();
+            let key = feed.read_failures[0].key();
+            m.read_failing_since = [(key, since)].into_iter().collect();
+            m.sessions_failing = Some((
+                "herdr answered its list of sessions with something Kerdr can't read (what it printed is in Kerdr's error log).".into(),
+                since,
+            ));
+        };
+        // A few seconds of it: the board stays quiet, its rows only marked.
+        herdr_failing(&mut a, 10);
+        let screen = rendered(&a, 200, 44);
+        assert!(!screen.contains(reason), "{screen}");
+        // Past the quiet spell: said once, in the feed's words, never herdr's or as the feed's
+        // own failure.
+        herdr_failing(&mut a, 45);
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains(&format!("{name}: {reason}")), "{screen}");
+        assert_eq!(screen.matches(reason).count(), 1, "{screen}");
+        assert!(!screen.contains("can't read"), "{screen}");
+        assert!(!screen.contains("feed failed"), "{screen}");
+        // M's detail too: the feed's reason, and no feed failure.
+        let explained = machine_explain(&a, i).join(" ");
+        assert!(explained.contains(reason), "{explained}");
+        assert!(!explained.contains("feed failed"), "{explained}");
+        // Without the feed's reason, Kerdr's own words for herdr's list, still not the feed's.
+        a.machines[i].feed.as_mut().unwrap().read_failures.clear();
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("{name}: herdr answered its list of sessions")),
+            "{screen}"
+        );
+        let explained = machine_explain(&a, i).join(" ");
+        assert!(!explained.contains("feed failed"), "{explained}");
+        assert!(
+            explained.contains("Kerdr's own read of herdr"),
+            "{explained}"
+        );
+
+        // The feed prints nothing: quiet for one read, said once it lasts.
+        let mut a = all_answering(false);
+        let feed_failing = |a: &mut App, reads: u32, secs: i64| {
+            let m = &mut a.machines[i];
+            m.feed_error = Some(crate::poll::FEED_EMPTY.into());
+            m.feed_failures = reads;
+            m.feed_failing_since = Some(now - chrono::Duration::seconds(secs));
+        };
+        feed_failing(&mut a, 1, 5);
+        let screen = rendered(&a, 200, 44);
+        assert!(!screen.contains(crate::poll::FEED_EMPTY), "{screen}");
+        feed_failing(&mut a, 3, 42);
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("{name}: its card feed failed: it printed nothing")),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn a_read_failure_that_lasts_is_named_beside_another_machine_s_connection_trouble() {
+        // One machine waits for its host key to be approved while another's feed has failed for
+        // 45 s: the first is the warning, and the second is still named (Codex's look).
+        let mut a = all_answering(false);
+        let gpu = a.machine_index("gpu-rig").unwrap();
+        a.machines[gpu].conn = Conn::HostKey {
+            detail: "Host key verification failed.".into(),
+        };
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        assert_ne!(i, gpu);
+        let name = a.machines[i].name();
+        let now = a.now();
+        let feed_failing = |a: &mut App, reads: u32, secs: i64| {
+            let m = &mut a.machines[i];
+            m.feed_error = Some(crate::poll::FEED_EMPTY.into());
+            m.feed_failures = reads;
+            m.feed_failing_since = Some(now - chrono::Duration::seconds(secs));
+        };
+        feed_failing(&mut a, 3, 45);
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains("gpu-rig needs you"), "{screen}");
+        assert!(screen.contains(&format!("+1 more: {name}")), "{screen}");
+        // A moment's failure isn't named, as it isn't said anywhere yet.
+        feed_failing(&mut a, 1, 5);
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains("gpu-rig needs you"), "{screen}");
+        assert!(!screen.contains("more:"), "{screen}");
+        // Two machines with read trouble alone: the first said, the other named.
+        let mut a = all_answering(false);
+        for (k, m) in a
+            .machines
+            .iter_mut()
+            .enumerate()
+            .filter(|(_, m)| m.is_shown())
+        {
+            m.feed_error = Some(crate::poll::FEED_EMPTY.into());
+            m.feed_failures = 3;
+            m.feed_failing_since = Some(now - chrono::Duration::seconds(45 + k as i64));
+        }
+        let shown = a.machines.iter().filter(|m| m.is_shown()).count();
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("+{} more: ", shown - 1)),
+            "{screen}"
+        );
+    }
+
+    #[test]
+    fn the_machines_screen_says_why_in_kerdr_s_words_and_keeps_a_host_key_as_ssh_said_it() {
+        let mut a = all_answering(true);
+        let i = a.machine_index("build-box").unwrap();
+        let now = a.now();
+        let said = |a: &App| machine_explain(a, i).join(" ");
+        let raw = "ssh: connect to host build-box port 22: No route to host";
+        a.machines[i].conn = Conn::Reconnecting {
+            since: now - chrono::Duration::seconds(40),
+            attempt: 2,
+            retry_at: now + chrono::Duration::seconds(8),
+            detail: raw.into(),
+        };
+        let text = said(&a);
+        assert!(text.contains("ago (there's no route to it)."), "{text}");
+        assert!(!text.contains("No route to host"), "{text}");
+        a.machines[i].conn = Conn::Unreachable {
+            since: now - chrono::Duration::minutes(3),
+            retry_at: now + chrono::Duration::seconds(10),
+            detail: raw.into(),
+        };
+        let text = said(&a);
+        assert!(text.contains("(there's no route to it): asleep"), "{text}");
+        assert!(!text.contains("No route to host"), "{text}");
+        // What SSH says that Kerdr doesn't know: none of it, and no empty brackets.
+        a.machines[i].conn = Conn::Reconnecting {
+            since: now - chrono::Duration::seconds(40),
+            attempt: 2,
+            retry_at: now + chrono::Duration::seconds(8),
+            detail: "mux_client_request_session: session request failed".into(),
+        };
+        let text = said(&a);
+        assert!(!text.contains("mux_client"), "{text}");
+        assert!(!text.contains("()"), "{text}");
+        assert!(text.contains("ago. Trying again"), "{text}");
+        a.machines[i].conn = Conn::Auth {
+            detail: "drew@build-box: Permission denied (publickey,password).".into(),
+        };
+        let text = said(&a);
+        assert!(!text.contains("Permission denied"), "{text}");
+        assert!(text.contains("Kerdr's error log"), "{text}");
+        // A host key's details stay exactly as SSH gave them: you compare them to approve it.
+        let key =
+            "The ECDSA host key for build-box has changed: SHA256:2fQ0mY0sVb5rQe9x8kFjT1LhW7cZ";
+        a.machines[i].conn = Conn::HostKey { detail: key.into() };
+        let text = said(&a);
+        assert!(text.contains(key), "{text}");
+    }
+
+    #[test]
+    fn a_dropped_machine_s_banner_counts_every_card_it_dims_and_says_why_in_plain_words() {
+        let mut a = all_answering(true);
+        let i = a.machine_index("build-box").unwrap();
+        let raw = "ssh: connect to host build-box port 22: No route to host";
+        if let Conn::Reconnecting { detail, .. } = &mut a.machines[i].conn {
+            *detail = raw.into();
+        }
+        // Backlog cards of its own, as on the run that found it: dimmed like the rest.
+        let backlog: Vec<usize> = (0..a.board.cards.len())
+            .filter(|&k| a.board.cards[k].stage == Stage::Backlog)
+            .take(3)
+            .collect();
+        assert_eq!(backlog.len(), 3);
+        for k in backlog {
+            let c = &mut a.board.cards[k];
+            c.machine = "build-box".into();
+            c.machine_index = i;
+        }
+        let shown = a
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.machine == "build-box" && a.card_visible(c))
+            .count();
+        assert!(shown >= 3);
+        let screen = rendered(&a, 200, 44);
+        assert!(
+            screen.contains(&format!("its {shown} cards are dimmed")),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("build-box dropped 40s ago: there's no route to it"),
+            "{screen}"
+        );
+        assert!(!screen.contains("No route to host"), "{screen}");
+        // Past two minutes it can't be reached: its cause in the same words, never SSH's.
+        let now = a.now();
+        a.machines[i].conn = Conn::Unreachable {
+            since: now - chrono::Duration::minutes(3),
+            retry_at: now + chrono::Duration::seconds(10),
+            detail: raw.into(),
+        };
+        let screen = rendered(&a, 200, 44);
+        assert!(screen.contains("can't reach build-box"), "{screen}");
+        assert!(screen.contains("(there's no route to it)"), "{screen}");
+        assert!(!screen.contains("No route to host"), "{screen}");
+    }
+
+    #[test]
+    fn a_feed_that_couldnt_read_herdr_marks_its_workspaces_stale_quietly() {
+        let mut a = demo(false);
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        let name = a.machines[i].name();
+        let rows = |a: &App| {
+            a.board
+                .sessions
+                .iter()
+                .filter(|r| r.machine == name)
+                .map(|r| (r.session.clone(), r.cached, r.error.clone()))
+                .collect::<Vec<_>>()
+        };
+        // Its feed says nothing failed: exactly as before.
+        assert!(rows(&a).iter().all(|(_, cached, _)| !cached));
+        let key = card_with_no_workspace(&mut a, i);
+        assert!(peek_at(&mut a, &key).contains("no workspace open"));
+        let c = a.card(&key).unwrap().clone();
+        assert_eq!(
+            crate::ui::card_ui::place_for_test(&a, &c).0,
+            "no workspace open"
+        );
+
+        let failing = |a: &mut App, list: serde_json::Value| {
+            a.machines[i].feed.as_mut().unwrap().read_failures =
+                serde_json::from_value(list).unwrap();
+            a.mode = Mode::Board;
+            a.rebuild();
+        };
+        // herdr itself: every session's workspaces, marked at once, and no words until it lasts.
+        failing(
+            &mut a,
+            serde_json::json!([{"part":"herdr","why":"herdr on this machine didn't answer within a few seconds"}]),
+        );
+        let seen = rows(&a);
+        assert!(seen.iter().all(|(_, cached, _)| *cached), "{seen:?}");
+        assert!(seen.iter().all(|(_, _, error)| error.is_none()), "{seen:?}");
+        let key = card_with_no_workspace(&mut a, i);
+        let peek = peek_at(&mut a, &key);
+        assert!(peek.contains("workspace not known"), "{peek}");
+        assert!(!peek.contains("no workspace open"), "{peek}");
+        let c = a.card(&key).unwrap().clone();
+        assert_eq!(
+            crate::ui::card_ui::place_for_test(&a, &c).0,
+            "workspace not known"
+        );
+
+        // One session: that session's alone.
+        let first = seen[0].0.clone();
+        failing(
+            &mut a,
+            serde_json::json!([{"part":"session","session":first,"why":"it didn't list its tabs in time"}]),
+        );
+        for (session, cached, _) in rows(&a) {
+            assert_eq!(cached, session == first, "{session}");
+        }
+    }
+
+    #[test]
+    fn a_card_open_in_several_workspaces_says_so_and_any_other_looks_as_before() {
+        let mut a = demo(false);
+        let i = a.machines.iter().position(|m| m.feed.is_some()).unwrap();
+        let key = card_with_no_workspace(&mut a, i);
+        let set = |a: &mut App, places: &[&str]| {
+            let c = a.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+            c.detail.as_mut().unwrap().open_in = places.iter().map(|p| p.to_string()).collect();
+            c.clone()
+        };
+        // None, or the one place the card already names: nothing more said.
+        assert_eq!(open_in_line(&set(&mut a, &[])), None);
+        assert_eq!(open_in_line(&set(&mut a, &["web/w1"])), None);
+        let peek = peek_at(&mut a, &key);
+        assert!(!peek.contains("workspaces ("), "{peek}");
+        // More than one: every place, within reason.
+        assert_eq!(
+            open_in_line(&set(&mut a, &["web/w1", "ops/w3"])).as_deref(),
+            Some("open in 2 workspaces (web/w1, ops/w3), so two agents may be at it")
+        );
+        let peek = peek_at(&mut a, &key);
+        assert!(
+            peek.contains("open in 2 workspaces (web/w1, ops/w3)"),
+            "{peek}"
+        );
+        assert_eq!(
+            open_in_line(&set(&mut a, &["a/1", "b/2", "c/3", "d/4", "e/5"])).as_deref(),
+            Some("open in 5 workspaces (a/1, b/2, c/3, 2 more), so two agents may be at it")
+        );
+        // Only ever plain text, however a feed writes it.
+        let long = "x".repeat(200);
+        let line = open_in_line(&set(&mut a, &["web/\u{1b}[31mw1", &long])).unwrap();
+        assert!(!line.contains('\u{1b}'), "{line}");
+        assert!(line.len() < 120, "{line}");
+    }
+
+    #[test]
+    fn a_failed_write_up_says_why_when_its_feed_does_and_looks_as_before_when_it_doesnt() {
+        let a = demo(false);
+        let now = a.now();
+        let key = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.stage == Stage::Backlog && !c.dismissed())
+            .unwrap()
+            .key
+            .clone();
+        let mut a = a;
+        // The backlog's own screen, where a row has room to spare.
+        a.mode = Mode::Backlog { sel: 0 };
+        let set = |a: &mut App, intake: &str, why: Option<&str>| {
+            for c in a.board.cards.iter_mut().filter(|c| c.key == key) {
+                let d = c.detail.as_mut().unwrap();
+                d.intake = Some(intake.into());
+                d.intake_why = why.map(str::to_string);
+            }
+            a.board.cards.iter().find(|c| c.key == key).unwrap().clone()
+        };
+        // A feed that doesn't say: exactly as before, whatever the room.
+        let c = set(&mut a, "failed", None);
+        for room in [0, 17, 30, usize::MAX] {
+            let row = list_glyph(&c, now, room);
+            assert_eq!(
+                (row.0, row.1, row.2.as_str(), row.3),
+                ("✎", YELLOW, "not written up", YELLOW)
+            );
+        }
+        let screen = crate::ui::tests_render(&a, 200, 50);
+        assert!(screen.contains("not written up"), "{screen}");
+        assert!(!screen.contains("not written up:"), "{screen}");
+        // One that does: its words, in the same colours.
+        let c = set(&mut a, "failed", Some("no account was free"));
+        let row = list_glyph(&c, now, usize::MAX);
+        assert_eq!(
+            (row.0, row.1, row.2.as_str(), row.3),
+            ("✎", YELLOW, "not written up: no account was free", YELLOW)
+        );
+        let screen = crate::ui::tests_render(&a, 200, 50);
+        assert!(
+            screen.contains("not written up: no account was free"),
+            "{screen}"
+        );
+        // Cut to the room there is; with no room for any of it, the plain words.
+        let cut = list_glyph(&c, now, 24).2;
+        assert_eq!(cut, "not written up: no acco…");
+        assert_eq!(width(&cut), 24);
+        assert_eq!(list_glyph(&c, now, 17).2, "not written up");
+        // However long a feed makes it, a row never gets more than a few words.
+        let long = "x".repeat(500);
+        let c = set(&mut a, "failed", Some(&long));
+        let row = list_glyph(&c, now, usize::MAX).2;
+        assert_eq!(width(&row), width("not written up: ") + WRITE_UP_WHY_MOST);
+        assert!(row.ends_with('…'), "{row}");
+        // One line, and blank is no reason at all.
+        let c = set(&mut a, "failed", Some(" no account\nwas\tfree "));
+        assert_eq!(
+            list_glyph(&c, now, usize::MAX).2,
+            "not written up: no account was free"
+        );
+        let c = set(&mut a, "failed", Some("  \n "));
+        assert_eq!(list_glyph(&c, now, usize::MAX).2, "not written up");
+        // Only a failed write-up says it.
+        let c = set(&mut a, "pending", Some("no account was free"));
+        assert_eq!(list_glyph(&c, now, usize::MAX).2, "writing it up");
+    }
+
     #[test]
     fn a_backlog_row_waiting_on_you_says_so_in_yellow() {
         let a = demo(false);
@@ -5126,10 +5726,10 @@ mod tests {
             .find(|c| c.stage == Stage::Backlog && !c.dismissed())
             .unwrap()
             .clone();
-        let quiet = list_glyph(&c, a.now());
+        let quiet = list_glyph(&c, a.now(), usize::MAX);
         assert_ne!(quiet.2, "needs you");
         c.attention = Attention::NeedsYou;
-        let (glyph, color, meta, mcolor) = list_glyph(&c, a.now());
+        let (glyph, color, meta, mcolor) = list_glyph(&c, a.now(), usize::MAX);
         assert_eq!(
             (glyph, color, meta.as_str(), mcolor),
             ("●", YELLOW, "needs you", YELLOW)
@@ -6852,11 +7452,76 @@ mod tests {
             .cloned()
             .expect("a done card in the demo");
         done.detail.as_mut().unwrap().status = Some("Reopening…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "reopening");
+        assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "reopening");
         done.detail.as_mut().unwrap().status = Some("Starting…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "starting up");
+        assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "starting up");
         done.detail.as_mut().unwrap().status = Some("Starting on arknet-one…".into());
-        assert_eq!(list_glyph(&done, a.now()).2, "starting up");
+        assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "starting up");
+    }
+
+    #[test]
+    fn a_row_says_when_its_change_or_its_new_intent_is_being_sent_again() {
+        use crate::app::tests::{demo_app, press};
+        let mut a = demo_app();
+        a.cfg.actions.command = Some("test-adapter".into());
+        let again = crate::actions::Resend::Retry {
+            wait: std::time::Duration::from_secs(5),
+            message: "#4's record is locked by a pull under way.".into(),
+        };
+        let backlog: Vec<Card> = a
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.stage == Stage::Backlog && !c.dismissed() && c.intake().is_none())
+            .filter(|c| c.detail.is_some())
+            .take(2)
+            .cloned()
+            .collect();
+        // A refresh refused for something passing, sent again by itself (intent 0591).
+        let (refreshed, started) = (&backlog[0], &backlog[1]);
+        let id = |c: &Card| c.detail.as_ref().unwrap().id.clone();
+        a.queue_action(
+            refreshed.machine_index,
+            serde_json::json!({"action": "refresh", "id": id(refreshed)}),
+        );
+        let (n, ..) = a.resolver.ready()[0].clone();
+        a.resending(Some(n), refreshed.machine_index, &again);
+        let row = |a: &App, key: &str| list_glyph(a.card(key).unwrap(), a.now(), usize::MAX);
+        let (glyph, color, words, _) = row(&a, &refreshed.key);
+        assert_eq!((glyph, color, words.as_str()), ("◐", BLUE, "trying again…"));
+        a.mode = Mode::Backlog { sel: 0 };
+        let screen = tests_render(&a, 200, 50);
+        assert!(screen.contains("trying again…"), "{screen}");
+        // A new intent's words: not just "saving…".
+        a.mode = Mode::Board;
+        press(&mut a, 'c');
+        for c in "Back up the NAS".chars() {
+            press(&mut a, c);
+        }
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let crate::app::Action::Mutate { machine, request } =
+            a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        a.queue_action(machine, request);
+        let (n, ..) = a.resolver.ready()[0].clone();
+        a.resending(Some(n), machine, &again);
+        let saving = a.backlog_card_for_keys().cloned().expect("its card");
+        assert_eq!(row(&a, &saving.key).2, "saving, trying again…");
+        let screen = tests_render(&a, 200, 50);
+        assert!(screen.contains("saving, trying again…"), "{screen}");
+        // A start's place says so too.
+        a.mode = Mode::Board;
+        a.queue_action(
+            started.machine_index,
+            serde_json::json!({"action": "dispatch", "id": id(started)}),
+        );
+        let (n, ..) = a.resolver.ready()[0].clone();
+        a.resending(Some(n), started.machine_index, &again);
+        let c = a.card(&started.key).unwrap().clone();
+        let place = crate::ui::card_ui::place_for_test(&a, &c).0;
+        assert!(place.starts_with("◐ starting up, trying again…"), "{place}");
     }
 
     /// Intent 0455: a current account shows on the top bar, even when its usage doesn't fit, and on

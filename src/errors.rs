@@ -219,16 +219,33 @@ impl App {
             return;
         };
         let name = m.name();
+        // Only what has lasted (intent 0591): a short drop, or a read that failed once, is kept
+        // quiet here as on the board.
+        let at = self.now();
         let mut now: Vec<(String, String)> = vec![];
-        if let Some(problem) = conn_problem(&m.conn, &name) {
+        if let Some(problem) = conn_problem(&m.conn, &name).filter(|_| m.conn.lasting(at)) {
             now.push(("conn".into(), problem));
         }
-        if let Some(e) = &m.feed_error {
+        if let Some(e) = m.feed_problem(at) {
             now.push(("feed".into(), format!("{name}'s feed failed: {e}")));
         }
+        if let Some(why) = m.sessions_problem(at) {
+            now.push(("sessions".into(), format!("{name}: {why}")));
+        }
+        for failed in m.read_failures_lasting(at) {
+            now.push((
+                format!("read {}", failed.key()),
+                format!("{name}'s feed: {}", failed.why),
+            ));
+        }
         if let Some(data) = &m.data {
-            for (session, snap) in &data.snapshots {
-                if let Err(e) = snap {
+            let sessions = data
+                .snapshots
+                .keys()
+                .chain(m.snapshot_errors.keys())
+                .collect::<std::collections::BTreeSet<_>>();
+            for session in sessions {
+                if let Some(e) = m.session_problem(session, at) {
                     now.push((
                         format!("session {session}"),
                         format!("{name}'s herdr session {session} didn't answer: {e}"),
@@ -236,22 +253,32 @@ impl App {
                 }
             }
         }
+        // What herdr or the feed printed, which the board's words leave out: kept with them, so
+        // a failure that keeps coming back can be found and told apart (intent 0591).
+        let now: Vec<(String, String, Option<String>)> = now
+            .into_iter()
+            .map(|(what, text)| {
+                let printed = m.said.get(&what).cloned();
+                (what, text, printed)
+            })
+            .collect();
         self.machine_problems
-            .retain(|(i, what), _| *i != machine || now.iter().any(|(w, _)| w == what));
+            .retain(|(i, what), _| *i != machine || now.iter().any(|(w, ..)| w == what));
         let mut new = vec![];
-        for (what, text) in now {
+        for (what, text, printed) in now {
             let key = (machine, what);
             if self.machine_problems.get(&key) != Some(&text) {
                 self.machine_problems.insert(key, text.clone());
-                new.push(text);
+                new.push((text, printed));
             }
         }
-        for text in new {
+        for (text, printed) in new {
             let entry = Entry {
                 source: "machine",
                 shown: "board",
                 machine: Some(name.clone()),
                 message: text,
+                answer: printed,
                 ..Default::default()
             };
             self.error_log.write(&entry, &self.typed_now(), &[]);
@@ -286,10 +313,10 @@ fn conn_problem(conn: &Conn, name: &str) -> Option<String> {
         }
         Conn::Unreachable { detail, .. } => Some(format!("{name} can't be reached: {detail}")),
         Conn::HostKey { detail } => Some(format!(
-            "SSH wants a decision about {name}'s host key: {detail}"
+            "SSH wants a decision about {name}'s host key: {detail}. On the machines screen (M), ⏎ on it answers it."
         )),
         Conn::Auth { detail } => Some(format!(
-            "SSH wants a password or another key for {name}: {detail}"
+            "SSH wants a password or another key for {name}: {detail}. On the machines screen (M), ⏎ on it lets you type it."
         )),
         Conn::HerdrMissing => Some(format!("{name} has no herdr.")),
         Conn::HerdrTooOld { version } => Some(format!("{name}'s herdr {version} is too old.")),
@@ -547,8 +574,8 @@ mod tests {
     fn a_machine_that_stops_answering_is_kept_once_until_it_changes() {
         let (_dir, mut app, path) = board();
         let name = app.machines[1].name();
-        let dropped = |attempt| Conn::Reconnecting {
-            since: Local::now(),
+        let dropped = |attempt, ago: i64| Conn::Reconnecting {
+            since: Local::now() - chrono::Duration::seconds(ago),
             attempt,
             retry_at: Local::now(),
             detail: "ssh: connect to host lab port 22: Connection timed out".into(),
@@ -559,9 +586,13 @@ mod tests {
             data: None,
             at: Local::now(),
         };
-        app.apply(event(dropped(1)));
-        app.apply(event(dropped(2)));
-        app.apply(event(dropped(3)));
+        // A short drop is kept quiet: most come back within a try or two (intent 0591).
+        app.apply(event(dropped(1, 2)));
+        app.apply(event(dropped(2, 6)));
+        assert!(lines(&path).is_empty(), "{:?}", lines(&path));
+        // Once it lasts, it's kept, once.
+        app.apply(event(dropped(3, crate::poll::QUIET_FOR)));
+        app.apply(event(dropped(4, crate::poll::QUIET_FOR + 15)));
         let l = one(&path);
         assert_eq!(l["source"], "machine");
         assert_eq!(l["shown"], "board");
@@ -572,7 +603,7 @@ mod tests {
                 .unwrap()
                 .contains("Connection timed out")
         );
-        // Worse is a change; back is not an error; dropping again is a new one.
+        // Worse is a change; back is not an error; dropping again is a new one, once it lasts.
         app.apply(event(Conn::Unreachable {
             since: Local::now(),
             retry_at: Local::now(),
@@ -583,8 +614,121 @@ mod tests {
             latency: Duration::from_millis(5),
         }));
         assert_eq!(lines(&path).len(), 2);
-        app.apply(event(dropped(1)));
+        app.apply(event(dropped(1, 2)));
+        assert_eq!(lines(&path).len(), 2);
+        app.apply(event(dropped(5, crate::poll::QUIET_FOR + 1)));
         assert_eq!(lines(&path).len(), 3);
+    }
+
+    #[test]
+    fn a_feed_or_a_session_that_fails_once_is_kept_quiet_until_it_lasts() {
+        let (_dir, mut app, path) = board();
+        let read = |feed: Result<crate::feed::Feed, String>, session: Result<(), String>, at| {
+            let mut data = crate::poll::MachineData {
+                feed: Some(feed),
+                ..Default::default()
+            };
+            data.snapshots.insert(
+                "web".into(),
+                session.map(|_| crate::herdr::Snapshot::default()),
+            );
+            Event {
+                machine: 1,
+                conn: Conn::Live {
+                    latency: Duration::from_millis(5),
+                },
+                data: Some(data),
+                at,
+            }
+        };
+        let good = || crate::feed::parse(r#"{"kerdr_feed":1}"#);
+        let now = Local::now();
+        app.apply(read(good(), Ok(()), now));
+        // One failed feed read, re-read at once and good: nothing said, nothing kept.
+        app.apply(read(Err(crate::poll::FEED_EMPTY.into()), Ok(()), now));
+        app.apply(read(good(), Ok(()), now));
+        assert!(app.machines[1].feed_problem(now).is_none());
+        // A session slow once under load: the same.
+        app.apply(read(good(), Err(crate::poll::SESSION_SILENT.into()), now));
+        assert!(app.machines[1].session_problem("web", now).is_none());
+        assert!(lines(&path).is_empty(), "{:?}", lines(&path));
+        // Three feed reads in a row fail: now it's said, with its reason, and kept once.
+        for _ in 0..3 {
+            app.apply(read(
+                Err(crate::poll::FEED_CUT_OFF.into()),
+                Err(crate::poll::SESSION_SILENT.into()),
+                now,
+            ));
+        }
+        assert_eq!(
+            app.machines[1].feed_problem(now),
+            Some(crate::poll::FEED_CUT_OFF)
+        );
+        let kept = lines(&path);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        assert!(kept[0]["message"].as_str().unwrap().contains("cut off"));
+        // The session's failure, once it has lasted QUIET_FOR, is said too.
+        let later = now + chrono::Duration::seconds(crate::poll::QUIET_FOR);
+        assert_eq!(
+            app.machines[1].session_problem("web", later).as_deref(),
+            Some(crate::poll::SESSION_SILENT)
+        );
+    }
+
+    #[test]
+    fn what_a_feed_printed_in_place_of_cards_is_in_the_error_log_and_never_on_the_board() {
+        let (_dir, mut app, path) = board();
+        let printed = "Traceback (most recent call last):\n  File \"/home/x/bin/ark-cards\", line 9\nKeyError: 'state'";
+        let read = |at| {
+            let mut data = crate::poll::MachineData {
+                feed: Some(crate::feed::parse(printed)),
+                ..Default::default()
+            };
+            data.said.insert("feed".into(), printed.into());
+            Event {
+                machine: 1,
+                conn: Conn::Live {
+                    latency: Duration::from_millis(5),
+                },
+                data: Some(data),
+                at,
+            }
+        };
+        let now = Local::now();
+        for _ in 0..crate::poll::FEED_QUIET_READS {
+            app.apply(read(now));
+        }
+        // On the board: Kerdr's words. In the log: those, and what it printed.
+        let shown = app.machines[1].feed_problem(now).unwrap().to_string();
+        assert!(
+            !shown.contains("KeyError") && !shown.contains("/home/x"),
+            "{shown}"
+        );
+        let kept = lines(&path);
+        assert_eq!(kept.len(), 1, "{kept:?}");
+        let message = kept[0]["message"].as_str().unwrap();
+        assert!(!message.contains("KeyError"), "{message}");
+        assert!(
+            kept[0]["answer"]
+                .as_str()
+                .unwrap()
+                .contains("KeyError: 'state'"),
+            "{:?}",
+            kept[0]
+        );
+        // Over: nothing of it is held on to.
+        app.apply(Event {
+            machine: 1,
+            conn: Conn::Live {
+                latency: Duration::from_millis(5),
+            },
+            data: Some(crate::poll::MachineData {
+                feed: Some(crate::feed::parse(r#"{"kerdr_feed":1}"#)),
+                ..Default::default()
+            }),
+            at: now,
+        });
+        assert!(app.machines[1].said.is_empty());
     }
 
     #[test]

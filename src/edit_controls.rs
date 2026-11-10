@@ -131,7 +131,7 @@ fn partly_saved(reference: &str, r: Response) -> String {
 
 /// An action's error to its first clause: "the action timed out" rather than its advice on
 /// retrying, which a save's own message replaces.
-fn first_clause(error: &str) -> &str {
+pub(super) fn first_clause(error: &str) -> &str {
     let end = [error.find("; "), error.find(". ")]
         .into_iter()
         .flatten()
@@ -144,7 +144,10 @@ impl App {
     /// `e`: the selected card's text, if it's backlog work.
     pub(super) fn edit_action(&mut self) -> Action {
         let Some(card) = self.selected_for_control().cloned() else {
-            self.say("Select an intent first.", Tone::Info);
+            self.say(
+                "Nothing is selected for that key to act on: pick a card first.",
+                Tone::Info,
+            );
             return Action::None;
         };
         self.edit_action_on(card)
@@ -163,7 +166,7 @@ impl App {
     pub fn edit_action_on(&mut self, card: Card) -> Action {
         let Some(detail) = card.detail.clone() else {
             self.say(
-                "This workspace has no intent record: e edits a backlog item's text.",
+                "This workspace has no intent, so there's no text to edit.",
                 Tone::Info,
             );
             return Action::None;
@@ -1001,7 +1004,28 @@ impl App {
                 self.edits.remove(key);
                 if partial(&r) {
                     self.fail(partly_saved(reference, r));
+                } else if let Some(left) =
+                    r.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                {
+                    // Saved, with something still to come by itself (its push): said, not red
+                    // (intent 0591).
+                    self.say(format!("{reference}'s text is saved; {left}"), Tone::Info);
                 }
+            }
+            // Only part of it happened, and the backend's words say which: his version stays, and
+            // e checks what's there before it opens it (intent 0591).
+            Ok(r) if r.partial => {
+                if let Some(held) = self.edits.get_mut(key) {
+                    held.machine = machine;
+                    held.check_first = true;
+                }
+                self.say(
+                    format!(
+                        "{reference}'s save happened only in part: {} e checks the text, and opens your version if it isn't there.",
+                        short(r.message)
+                    ),
+                    Tone::Warn,
+                );
             }
             Ok(r) => {
                 let stale = r.status.as_deref() == Some("stale");
@@ -1172,9 +1196,12 @@ mod tests {
             .resolver
             .ready()
             .into_iter()
-            .find(|(_, m, r, gated)| *m == machine && *r == request && !gated)
-            .map(|(n, ..)| n)
+            .find(|(_, m, r, gated)| {
+                *m == machine && crate::actions::without_op(r) == request && !gated
+            })
+            .map(|(n, _, r, _)| (n, r))
             .expect("it goes to the runner at once");
+        let (n, request) = n;
         app.job_started(n);
         app.resolver.handed(n);
         Sent {
@@ -1274,8 +1301,16 @@ mod tests {
         assert!(intro.contains(&reference), "{intro}");
         let sent = saves(&mut app, &key, wrote("New words."));
         assert_eq!(sent.machine, machine);
+        // A save changes something: it carries an op of its own (intent 0591).
+        assert!(
+            sent.request["op"]
+                .as_str()
+                .is_some_and(|op| op.len() == 18 && op.starts_with("k-")),
+            "{}",
+            sent.request
+        );
         assert_eq!(
-            sent.request,
+            crate::actions::without_op(&sent.request),
             json!({"action":"edit","id":id,"text":"New words.","was":"sha256:aa","from":crate::config::hostname()})
         );
         answer(&mut app, &sent, saved());
@@ -1641,7 +1676,11 @@ mod tests {
             "won't do; u brings it back",
         );
         // A card with no record behind it.
-        check(&mut app, &|c| c.detail = None, "no intent record");
+        check(
+            &mut app,
+            &|c| c.detail = None,
+            "no intent, so there's no text to edit",
+        );
         // On a card in a working column, too.
         let started = app
             .board
@@ -2509,6 +2548,62 @@ mod tests {
         let sent = saves(&mut app, &key, wrote("Newer words."));
         answer(&mut app, &sent, saved());
         assert_eq!(app.message(), None);
+    }
+
+    #[test]
+    fn a_save_that_stands_with_its_push_to_come_says_so_and_a_partial_one_keeps_your_version() {
+        // Release 2's backends: ok means the change stands, with a note for what's left; only
+        // part happening is `partial` (intent 0591).
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        let left = "saved here; it reaches your other machines once the push goes through, which is retried by itself.";
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                message: format!("Saved {reference}'s text: {left}"),
+                note: Some(left.into()),
+                ..Default::default()
+            }),
+        );
+        assert!(app.edits.is_empty(), "saved: his version let go");
+        assert_eq!(
+            app.message(),
+            Some((
+                format!("{reference}'s text is saved; {left}").as_str(),
+                Tone::Info
+            ))
+        );
+        caught_up(&mut app);
+        app.message = None;
+        opened(&mut app, &key, &id, "New words.", "sha256:bb");
+        let sent = saves(&mut app, &key, wrote("Newer words."));
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                partial: true,
+                message: "Its text changed, but its title couldn't be.".into(),
+                ..Default::default()
+            }),
+        );
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.starts_with(&format!(
+                "{reference}'s save happened only in part: Its text changed"
+            )),
+            "{said}"
+        );
+        assert!(!said.contains("wasn't saved"), "{said}");
+        assert!(
+            app.edits.contains_key(&key),
+            "his version stays until e checks"
+        );
     }
 
     #[test]

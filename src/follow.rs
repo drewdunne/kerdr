@@ -137,8 +137,9 @@ fn how_long(d: Duration) -> String {
 
 impl App {
     /// A change answered with `follow`: Kerdr follows it from now (see the module's notes). Its card
-    /// keeps showing it, in the follow's words.
-    pub(super) fn begin_follow(&mut self, mut job: Job, follow: Follow) {
+    /// keeps showing it, in the follow's words, and the message line says them with the answer's
+    /// `note`, what's still to come by itself (its push, say), when it has one (intent 0591).
+    pub(super) fn begin_follow(&mut self, mut job: Job, follow: Follow, note: Option<&str>) {
         let id = job.id().unwrap_or_default().to_string();
         let reference = self.reference_for(&id);
         let say = if follow.say.trim().is_empty() {
@@ -198,7 +199,13 @@ impl App {
         self.resolver.settle_following(job, say.clone(), life);
         self.follows.push(following);
         self.rebuild();
-        self.say(say, Tone::Info);
+        match note
+            .map(str::trim)
+            .filter(|n| !n.is_empty() && !say.contains(*n))
+        {
+            Some(note) => self.say(super::controls::short(format!("{say} {note}")), Tone::Info),
+            None => self.say(say, Tone::Info),
+        }
         // ⏎ asked for it: in as soon as its workspace shows, as a ⏎ remembered on a starting card
         // goes (intent 0491), even before the answer that it's done.
         if enter
@@ -749,6 +756,27 @@ mod tests {
 
     fn key_enter(app: &mut App) -> Action {
         key(app, KeyCode::Enter)
+    }
+
+    #[test]
+    fn a_followed_answer_whose_change_has_its_push_still_to_come_says_so() {
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        let say = "Starting web on build-box, then #39…";
+        let left = "Saved here; it reaches your other machines once the push goes through.";
+        let mut reply = follow_reply(&id, "start", say);
+        reply["note"] = json!(left);
+        reply["message"] = json!(format!("Starting web; ⏎ again in a minute goes in. {left}"));
+        answer(&mut app, machine, &request, reply);
+        assert_eq!(app.follows.len(), 1, "followed all the same");
+        // The follow's words, and what's still to come: quietly, not a failure (intent 0591).
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info);
+        assert_eq!(said, format!("{say} {left}"));
+        // Its card shows the follow's words only.
+        assert_eq!(status_shown(&app, &key).as_deref(), Some(say));
     }
 
     #[test]

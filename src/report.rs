@@ -99,10 +99,23 @@ pub fn args(r: &Report) -> Result<Vec<String>, String> {
 pub fn run(r: &Report) -> Result<(), String> {
     let a = args(r)?;
     let herdr = std::env::var("HERDR_BIN_PATH").unwrap_or_else(|_| "herdr".into());
-    let out = Command::new(&herdr)
-        .args(&a)
-        .output()
-        .map_err(|e| format!("{herdr}: {e}"))?;
+    let send = || {
+        Command::new(&herdr)
+            .args(&a)
+            .output()
+            .map_err(|e| format!("{herdr}: {e}"))
+    };
+    let mut out = send()?;
+    // Refused while herdr reloads, most often: asked once more, unless its workspace has gone
+    // (intent 0591).
+    if !out.status.success()
+        && !String::from_utf8_lossy(&out.stderr)
+            .to_lowercase()
+            .contains("not found")
+    {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        out = send()?;
+    }
     if !out.status.success() {
         let err = String::from_utf8_lossy(&out.stderr);
         return Err(err

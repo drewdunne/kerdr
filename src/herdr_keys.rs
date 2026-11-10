@@ -76,10 +76,17 @@ pub fn install(path: &Path) -> Result<bool, String> {
     }
     out.push_str(SNIPPET);
     out.parse::<DocumentMut>().map_err(|e| {
-        format!(
-            "{} wouldn't be valid TOML with Kerdr's keys added: {e}",
-            path.display()
-        )
+        // Most often it's herdr's config that's already broken, and adding the keys didn't do it.
+        match text.parse::<DocumentMut>() {
+            Err(own) => format!(
+                "{} is already not valid TOML, so Kerdr can't add its keys; fix this first: {own}",
+                path.display()
+            ),
+            Ok(_) => format!(
+                "{} wouldn't be valid TOML with Kerdr's keys added: {e}",
+                path.display()
+            ),
+        }
     })?;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
@@ -150,6 +157,15 @@ pub const TOKEN: &str = JUMP_TOKEN;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_already_broken_is_said_to_be_rather_than_blamed_on_the_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[keys\nnot toml").unwrap();
+        let error = install(&path).unwrap_err();
+        assert!(error.contains("already not valid TOML"), "{error}");
+    }
 
     #[test]
     fn hides_the_sidebar_and_keeps_your_settings() {

@@ -247,11 +247,22 @@ fn event_loop(
                     }
                     continue;
                 }
+                // Sent again by itself (intent 0591): said quietly, on its card or the busy line.
+                Answer::Resending(job, machine, why) => {
+                    app.resending(job, machine, &why);
+                    continue;
+                }
+                Answer::NotWrittenUp(n) => {
+                    app.starts_from_words(n);
+                    continue;
+                }
                 Answer::Done(done) => *done,
             };
+            // Done, or done in part (intent 0591): its machine's feed is read now, to show it.
             let succeeded = result.as_ref().is_ok_and(|r: &crate::actions::Response| {
-                r.ok && !(request["action"] == "account-signin"
-                    && (r.status.as_deref() == Some("waiting") || request["step"] == "cancel"))
+                (r.ok || r.partial)
+                    && !(request["action"] == "account-signin"
+                        && (r.signin_under_way() || request["step"] == "cancel"))
             });
             // For the error log, should it be a failure.
             app.answer_stderr = stderr;
@@ -711,6 +722,11 @@ enum Answer {
     /// The answer to a request that asked an old backend to bring its ark-sdlc up to date, for
     /// an account picked with s (intent 0591).
     Update(usize, u64, Result<crate::actions::Response, String>),
+    /// A change (by its number, or an account request) is being sent again by itself, with the
+    /// same op, and why (intent 0591).
+    Resending(Option<u64>, usize, crate::actions::Resend),
+    /// A start that waited for its write-up goes ahead from the words as they are: it failed.
+    NotWrittenUp(u64),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -724,6 +740,8 @@ enum ToRunner {
         request: serde_json::Value,
         /// A start that waits for its intent's write-up, as that machine's feed shows it.
         gated: bool,
+        /// Its machine's backend keeps ops: an answer lost on the way is asked for again.
+        resends: bool,
     },
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
@@ -750,7 +768,7 @@ impl Runner {
             let mut queue = crate::resolve::Queue::default();
             let mut waiting: std::collections::HashMap<
                 u64,
-                (usize, Machine, String, serde_json::Value),
+                (usize, Machine, String, serde_json::Value, bool),
             > = Default::default();
             // Each machine's newest feed, by record: a start that waits for its write-up checks
             // it as soon as it's asked for, not only at the next read.
@@ -769,6 +787,7 @@ impl Runner {
                         command,
                         request,
                         gated,
+                        resends,
                     } => {
                         if gated {
                             queue.push_gated(n, machine, key, &request);
@@ -778,7 +797,7 @@ impl Runner {
                         } else {
                             queue.push(n, machine, key, &request);
                         }
-                        waiting.insert(n, (machine, target, command, request));
+                        waiting.insert(n, (machine, target, command, request, resends));
                     }
                     ToRunner::Done(n) => queue.done(n),
                     // Said either way, so the board keeps a start Esc came too late for.
@@ -799,21 +818,14 @@ impl Runner {
                         seen.insert(machine, intakes);
                     }
                 }
-                // Its write-up failed: it never starts, and the board says so.
+                // Its write-up failed: it starts from his words as they are, and the board says
+                // so (intent 0591).
                 for n in failed {
-                    if let Some((machine, _, _, request)) = waiting.remove(&n) {
-                        let metadata = crate::actions::request_metadata(&request);
-                        let _ = answers.send(Answer::Done(Box::new((
-                            Some(n),
-                            machine,
-                            metadata,
-                            Err(crate::resolve::NOT_WRITTEN_UP.into()),
-                            String::new(),
-                        ))));
-                    }
+                    let _ = answers.send(Answer::NotWrittenUp(n));
                 }
                 for n in queue.startable() {
-                    let Some((machine, target, command, request)) = waiting.remove(&n) else {
+                    let Some((machine, target, command, request, resends)) = waiting.remove(&n)
+                    else {
                         continue;
                     };
                     let _ = answers.send(Answer::Started(n));
@@ -821,13 +833,21 @@ impl Runner {
                     std::thread::spawn(move || {
                         // Its command having the whole request lets Kerdr quit (intent 0445).
                         let handed = answers.clone();
-                        let answered = crate::actions::run_handing(
+                        let told = answers.clone();
+                        // Sent again by itself, same op, while it holds its record's turn: what
+                        // comes after it for the same card waits (intent 0591).
+                        let answered = crate::actions::run_resending(
                             &target,
                             &command,
                             &request,
-                            Box::new(move || {
+                            Some(Box::new(move || {
                                 let _ = handed.send(Answer::Handed(n));
-                            }),
+                            })),
+                            resends,
+                            &mut |r| {
+                                let _ = told.send(Answer::Resending(Some(n), machine, r.clone()));
+                            },
+                            &std::thread::sleep,
                         );
                         let metadata = crate::actions::request_metadata(&request);
                         drop(request);
@@ -924,6 +944,9 @@ fn start_action(
         return;
     };
     let tx = tx.clone();
+    // Its own op, kept for Kerdr's own resends of it (intent 0591).
+    let request = crate::actions::with_op(request);
+    let resends = app.resends_to(machine);
     app.busy = true;
     app.busy_id = request["id"].as_str().map(str::to_string);
     app.busy_since = Some(Instant::now());
@@ -932,7 +955,18 @@ fn start_action(
         app.say(app.busy_label.clone(), Tone::Info);
     }
     std::thread::spawn(move || {
-        let answered = crate::actions::run_keeping_stderr(&target, &command, &request);
+        let told = tx.clone();
+        let answered = crate::actions::run_resending(
+            &target,
+            &command,
+            &request,
+            None,
+            resends,
+            &mut |r| {
+                let _ = told.send(Answer::Resending(None, machine, r.clone()));
+            },
+            &std::thread::sleep,
+        );
         let metadata = crate::actions::request_metadata(&request);
         drop(request);
         let _ = tx.send(Answer::Done(Box::new((
@@ -956,7 +990,7 @@ fn ask_progress(app: &mut App, tx: &mpsc::Sender<Answer>) {
         let command = app.cfg.actions.command.clone();
         let target = app.machines.get(machine).map(|m| m.machine.clone());
         let (Some(command), Some(target)) = (command, target) else {
-            app.progress_answered(&token, Err("actions are disabled".into()));
+            app.progress_answered(&token, Err(crate::actions::NO_BACKEND.into()));
             continue;
         };
         let tx = tx.clone();
@@ -979,7 +1013,7 @@ fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
     let command = app.cfg.actions.command.clone();
     let target = app.machines.get(machine).map(|m| m.machine.clone());
     let (Some(command), Some(target)) = (command, target) else {
-        app.update_answered(machine, n, Err("actions are disabled".into()));
+        app.update_answered(machine, n, Err(crate::actions::NO_BACKEND.into()));
         return;
     };
     let tx = tx.clone();
@@ -999,14 +1033,11 @@ fn run_ready(app: &mut App, runner: &Runner) {
         let target = app.machines.get(machine).map(|m| m.machine.clone());
         let (Some(command), Some(target)) = (command, target) else {
             let metadata = crate::actions::request_metadata(&request);
-            app.finish_job(
-                n,
-                metadata,
-                Err("actions are disabled; configure [actions] command".into()),
-            );
+            app.finish_job(n, metadata, Err(crate::actions::NO_BACKEND.into()));
             continue;
         };
         let key = app.resolver.key_of(n);
+        let resends = app.resends_to(machine);
         let _ = runner.tx.send(ToRunner::Run {
             n,
             machine,
@@ -1015,6 +1046,7 @@ fn run_ready(app: &mut App, runner: &Runner) {
             command,
             request,
             gated,
+            resends,
         });
     }
 }
@@ -1217,6 +1249,9 @@ fn run_jump(
     );
     bg.holds.borrow_mut().left(app, opened);
     app.unsay(&opening);
+    if let Some(note) = jump::take_note() {
+        app.say(note, Tone::Info);
+    }
     outcome
 }
 
@@ -1609,6 +1644,15 @@ mod tests {
             ),
             Answer::Progress(token, _, _) => format!("progress {token}"),
             Answer::Update(machine, n, _) => format!("update {n} on machine {machine}"),
+            Answer::NotWrittenUp(n) => format!("not written up {n}"),
+            Answer::Resending(n, _, why) => format!(
+                "resending {} {}",
+                n.unwrap_or(0),
+                match why {
+                    crate::actions::Resend::Retry { .. } => "retry",
+                    crate::actions::Resend::Lost { .. } => "lost",
+                }
+            ),
         }
     }
 
@@ -1653,6 +1697,7 @@ mod tests {
                     command: command.into(),
                     request: serde_json::json!({"action":"move","id":"7","delta":1}),
                     gated: false,
+                    resends: false,
                 })
                 .unwrap();
         }
@@ -1663,6 +1708,70 @@ mod tests {
             }
         }
         assert_eq!(seen, ["started 1", "done 1 ok", "started 2", "done 2 ok"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_refused_with_retry_holds_its_card_s_place_while_the_runner_sends_it_again() {
+        // The first is refused for something passing (a lock held): the runner says so, waits,
+        // and sends it again with the same op, and the record's next change waits meanwhile
+        // (intent 0591).
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let log_q = crate::transport::quote(log.to_str().unwrap());
+        let command = format!(
+            "cat >> {log_q}\necho >> {log_q}\nif [ \"$(wc -l < {log_q})\" -lt 2 ]; then printf '%s' '{{\"ok\":false,\"retry\":1,\"message\":\"locked\"}}'; else printf '%s' '{{\"ok\":true,\"message\":\"done\"}}'; fi\n"
+        );
+        for n in [1, 2] {
+            runner
+                .tx
+                .send(ToRunner::Run {
+                    n,
+                    machine: 0,
+                    key: Some("here:7".into()),
+                    target: machine.clone(),
+                    command: command.clone(),
+                    request: crate::actions::with_op(
+                        serde_json::json!({"action":"move","id":"7","delta":1}),
+                    ),
+                    gated: false,
+                    resends: true,
+                })
+                .unwrap();
+        }
+        let mut seen = vec![];
+        while seen.len() < 5 {
+            if let Some(said) = next_heard(&rx, 10_000) {
+                seen.push(said);
+            }
+        }
+        assert_eq!(
+            seen,
+            [
+                "started 1",
+                "resending 1 retry",
+                "done 1 ok",
+                "started 2",
+                "done 2 ok"
+            ]
+        );
+        let sent: Vec<String> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect();
+        assert_eq!(sent.len(), 3);
+        assert_eq!(sent[0], sent[1], "sent again as it was, op and all");
+        assert_ne!(sent[1], sent[2], "the next change has an op of its own");
     }
 
     #[cfg(unix)]
@@ -1690,6 +1799,7 @@ mod tests {
             command: command.into(),
             request: serde_json::json!({"action":"move","id":"7","delta":1}),
             gated: false,
+            resends: false,
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
@@ -1725,6 +1835,7 @@ mod tests {
             command: command.into(),
             request: serde_json::json!({"action":"dispatch","id":n.to_string()}),
             gated,
+            resends: false,
         };
         let next = || heard(rx.recv_timeout(Duration::from_secs(10)).unwrap());
         // Not yet written up: taken out before it started.
@@ -1810,7 +1921,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn the_runner_starts_a_start_once_its_write_up_is_read_and_never_after_a_failed_one() {
+    fn the_runner_starts_a_start_once_its_write_up_is_read_and_from_his_words_after_a_failed_one() {
         // Feeds reach it from the readers' threads, so this happens while Andrew is inside a
         // workspace too (intent 0445).
         let (tx, rx) = mpsc::channel();
@@ -1848,6 +1959,7 @@ mod tests {
                     command: command.into(),
                     request: serde_json::json!({"action":"dispatch","id":id}),
                     gated: true,
+                    resends: false,
                 })
                 .unwrap();
         }
@@ -1861,11 +1973,10 @@ mod tests {
                 intakes: intakes(&[("7", Some("pending")), ("9", Some("failed"))]),
             })
             .unwrap();
-        assert_eq!(
-            next(),
-            "done 3 failed",
-            "its write-up failed: never started"
-        );
+        // Its write-up failed: it starts from his words as they are, and that's said (intent 0591).
+        assert_eq!(next(), "not written up 3");
+        assert_eq!(next(), "started 3");
+        assert_eq!(next(), "done 3 ok");
         runner
             .tx
             .send(ToRunner::Feed {

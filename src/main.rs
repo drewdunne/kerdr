@@ -214,6 +214,21 @@ fn doctor() -> anyhow::Result<()> {
         if !s.conn.is_live() && !matches!(s.conn, Conn::Hidden) {
             all_ok = false;
         }
+        // A diagnosis says what herdr or the feed printed where a read failed, under Kerdr's own
+        // words for it, which are all the board says (intent 0591).
+        let printed = |what: &str| {
+            if let Some(text) = s.said.get(what) {
+                println!("    it printed:");
+                for line in text.lines() {
+                    println!("      {line}");
+                }
+            }
+        };
+        if let Some((why, _)) = &s.sessions_failing {
+            println!("  herdr's sessions: {why}");
+            printed("sessions");
+            all_ok = false;
+        }
         if let Some(d) = &s.data {
             println!(
                 "  herdr: {}",
@@ -236,6 +251,7 @@ fn doctor() -> anyhow::Result<()> {
             for (name, snap) in &d.snapshots {
                 if let Err(e) = snap {
                     println!("  session {name}: couldn't read it ({e})");
+                    printed(&format!("session {name}"));
                     all_ok = false;
                 }
             }
@@ -250,6 +266,7 @@ fn doctor() -> anyhow::Result<()> {
             }
             (Some(cmd), None, Some(e)) => {
                 println!("  feed: failed ({e}) from {cmd}");
+                printed("feed");
                 all_ok = false;
             }
             (Some(cmd), None, None) => println!("  feed: not read ({cmd})"),

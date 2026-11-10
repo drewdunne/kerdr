@@ -599,7 +599,7 @@ impl Verdict {
         match self {
             Verdict::FinishFirst(1) => "Finish first: 1 waits on you".to_string(),
             Verdict::FinishFirst(n) => format!("Finish first: {n} wait on you"),
-            Verdict::Full => "Full: finish or shelve one first".to_string(),
+            Verdict::Full => "Sessions full: d asks before starting another".to_string(),
             Verdict::Room { session, free: 1 } => format!("Room for one more in {session}"),
             Verdict::Room { session, free } => format!("Room for {free} more in {session}"),
             Verdict::Empty => "Nothing under way".to_string(),

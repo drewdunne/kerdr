@@ -201,7 +201,10 @@ impl App {
         } else {
             return RunState::Unavailable(match card.stage {
                 Stage::Backlog => format!("{reference} has nothing to start yet."),
-                _ => format!("{reference} has no agent running and nothing s can start."),
+                _ => format!(
+                    "{reference} is in {} with no agent and no workspace, and Kerdr doesn't know how to start it from there.",
+                    card.stage.name()
+                ),
             });
         };
         if !self.actions_on() {
@@ -276,6 +279,30 @@ impl App {
             .filter(|p| p.id == a.provider)
             .flat_map(|p| p.programs.clone())
             .collect()
+    }
+
+    /// The program this agent has to stay on, in words, when `code` runs another: None for an
+    /// account it may move to, and for a feed that doesn't say (intent 0591).
+    pub fn held_to(
+        &self,
+        machine: usize,
+        agent: &crate::accounts::AccountAgent,
+        code: &str,
+    ) -> Option<String> {
+        if agent.programs.is_empty() {
+            return None;
+        }
+        let runs = self.account_runs(machine, self.account(machine, code)?);
+        if runs.is_empty() || runs.iter().any(|p| agent.programs.contains(p)) {
+            return None;
+        }
+        let providers = self.providers(machine);
+        let stays: Vec<String> = agent
+            .programs
+            .iter()
+            .map(|p| providers.program_label(p))
+            .collect();
+        Some(stays.join(" or "))
     }
 
     /// `s` on a card: the picker its state calls for, or why there's none.
@@ -369,7 +396,10 @@ impl App {
     /// (a start already on its way, kickoff questions, a full session) still apply.
     pub(super) fn start_on_account(&mut self, key: &str, start: &Start, to: &str) -> Action {
         let Some(card) = self.card(key).cloned() else {
-            self.say("That card is gone from the board.", Tone::Warn);
+            self.say(
+                "That card is gone from the board (finished or moved), so nothing started.",
+                Tone::Warn,
+            );
             return Action::None;
         };
         let reference = card.reference.clone();

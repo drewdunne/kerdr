@@ -56,6 +56,54 @@ impl Conn {
         matches!(self, Conn::Live { .. })
     }
 
+    /// Whether what's wrong has lasted long enough to be said (intent 0591): a drop is quiet for
+    /// its first QUIET_FOR seconds, since most come back within a try or two; anything that needs
+    /// Andrew, or a machine that can't be reached at all, is said at once.
+    pub fn lasting(&self, now: DateTime<Local>) -> bool {
+        match self {
+            Conn::Connecting | Conn::Live { .. } | Conn::Hidden => false,
+            Conn::Reconnecting { since, .. } => (now - *since).num_seconds() >= QUIET_FOR,
+            _ => true,
+        }
+    }
+
+    /// Why it isn't answering, in a few words, for `R` (intent 0591): "SSH timed out, still
+    /// trying". None when it is, or when nothing keeps it from answering that Kerdr can name.
+    pub fn briefly(&self) -> Option<String> {
+        match self {
+            Conn::Reconnecting { .. } | Conn::Unreachable { .. } => {}
+            Conn::HostKey { .. } | Conn::Auth { .. } => return Some("SSH needs you".into()),
+            _ => return None,
+        }
+        Some(format!(
+            "{}, still trying",
+            self.cause().unwrap_or("no answer")
+        ))
+    }
+
+    /// Why a dropped or unreachable machine isn't answering, in Kerdr's words, when SSH's own
+    /// says something Kerdr knows: never SSH's text itself, which stays off the board (intent
+    /// 0591). None: nothing it knows, or not a drop.
+    pub fn cause(&self) -> Option<&'static str> {
+        let (Conn::Reconnecting { detail, .. } | Conn::Unreachable { detail, .. }) = self else {
+            return None;
+        };
+        let d = detail.to_lowercase();
+        Some(if d.contains("timed out") {
+            "SSH timed out"
+        } else if d.contains("refused") {
+            "its connection was refused"
+        } else if d.contains("resolve") || d.contains("name or service") {
+            "its name can't be found"
+        } else if d.contains("no route") || d.contains("unreachable") {
+            "there's no route to it"
+        } else if d.contains("broken pipe") || d.contains("reset") || d.contains("dropped") {
+            "the connection dropped"
+        } else {
+            return None;
+        })
+    }
+
     pub fn needs_you(&self) -> bool {
         matches!(self, Conn::HostKey { .. } | Conn::Auth { .. })
     }
@@ -107,10 +155,26 @@ pub struct MachineData {
     pub keys: bool,
     /// None when the feed wasn't due this time; the last one still stands.
     pub feed: Option<Result<Feed, String>>,
+    /// Why herdr's list of sessions couldn't be read this time, when it couldn't: the machine
+    /// answered, so it's live, and the last list stands (intent 0591).
+    pub sessions_failed: Option<String>,
     /// A feed read that failed after the good one above, when two reads were merged into one.
     pub feed_failed_after: Option<String>,
     /// The same for a session: its last good snapshot, where a later read in the merge failed.
     pub kept_snapshots: BTreeMap<String, Snapshot>,
+    /// When each snapshot here, or in `kept_snapshots`, that an earlier read brought into a merge
+    /// was read: it's shown as of then, never as of this read (intent 0591). One not named here was
+    /// read with this data.
+    pub read_at: BTreeMap<String, DateTime<Local>>,
+    /// When the list of sessions here was read, for one an earlier read brought into a merge
+    /// because a newer read of herdr's list failed: it's that read's list, an empty one too, and
+    /// the board shows it rather than its own older one (intent 0591). None: read with this data,
+    /// or not read at all (`sessions_failed`).
+    pub sessions_read_at: Option<DateTime<Local>>,
+    /// What herdr or the feed printed, as it printed it, where a read of it failed: for the error
+    /// log alone, never the board, whose words are Kerdr's own (intent 0591). Keyed as the board's
+    /// problems are: `feed`, `sessions`, `session <name>`.
+    pub said: BTreeMap<String, String>,
 }
 
 #[derive(Debug)]
@@ -127,7 +191,27 @@ pub struct Event {
 /// so the board ends up where applying both in turn would have left it.
 fn replace(old: Event, mut new: Event) -> Event {
     match (&mut new.data, old.data) {
-        (Some(data), Some(old_data)) => {
+        (Some(data), Some(mut old_data)) => {
+            // What the older read's failures printed stands where the newer's didn't say again.
+            for (what, printed) in std::mem::take(&mut old_data.said) {
+                data.said.entry(what).or_insert(printed);
+            }
+            // When each of the older read's snapshots was read: with it, or earlier still.
+            let old_read_at = std::mem::take(&mut old_data.read_at);
+            let read_when = |session: &str| old_read_at.get(session).copied().unwrap_or(old.at);
+            // The newer read has no list of sessions where the older had one, good or carried on
+            // from a good one before it: that list stands, an empty one too, through any number of
+            // failures, as of when it was read (intent 0591).
+            let old_has_list =
+                old_data.sessions_failed.is_none() || old_data.sessions_read_at.is_some();
+            if data.sessions_failed.is_some() && data.sessions_read_at.is_none() && old_has_list {
+                data.sessions = old_data.sessions.clone();
+                data.snapshots = old_data.snapshots.clone();
+                data.sessions_read_at = Some(old_data.sessions_read_at.unwrap_or(old.at));
+                for session in data.snapshots.keys() {
+                    data.read_at.insert(session.clone(), read_when(session));
+                }
+            }
             // A session that failed after a good read stays as that read left it, not as the
             // board last showed it (intent 0491).
             let failed = |data: &MachineData, session: &str| {
@@ -141,6 +225,7 @@ fn replace(old: Event, mut new: Event) -> Event {
             );
             for (session, snap) in good {
                 if failed(data, &session) {
+                    data.read_at.insert(session.clone(), read_when(&session));
                     data.kept_snapshots.insert(session, snap);
                 }
             }
@@ -357,6 +442,17 @@ pub fn backoff(attempt: u32) -> Duration {
 
 const GIVE_UP_AFTER: i64 = 120;
 
+/// How long, in seconds, a machine that dropped, or a herdr session or a feed that fails, stays
+/// quiet before the board says why (intent 0591): the last good state shows meanwhile.
+pub const QUIET_FOR: i64 = 30;
+
+/// How many failed feed reads in a row the board waits for before it says the feed is failing,
+/// unless QUIET_FOR passes first. A failed read is read again at once, once.
+pub const FEED_QUIET_READS: u32 = 3;
+
+/// How soon a failed feed read is read again.
+const FEED_REREAD: Duration = Duration::from_secs(1);
+
 pub fn spawn(
     index: usize,
     machine: Machine,
@@ -379,6 +475,10 @@ pub fn spawn(
         // rather than making it wait seconds behind the feed. Never a machine's first read, or
         // an empty board would say there are no cards before its feed has come (intent 0491).
         let mut quick_first = false;
+        // A failed feed read is read again at once, once in a run of failures (intent 0591): a
+        // cut-off read is most often a dropped connection.
+        let mut feed_reread = false;
+        let mut list_most = SESSION_MOST;
         loop {
             let feed_owed = machine.feed.is_some()
                 && last_feed.is_none_or(|t| t.elapsed() >= timing.feed_every);
@@ -387,19 +487,30 @@ pub fn spawn(
                 inbox.reading_feed(index, reader);
             }
             let started = Instant::now();
-            let out = collect(&machine, feed_due);
+            let out = collect(&machine, feed_due, list_most);
             let now = Local::now();
             let (conn, data, wait) = match read(&target, &out, feed_due) {
                 Ok(data) => {
+                    // A list that ran out of time gets longer next pass (intent 0591).
+                    list_most = if out.stdout.contains(SESSIONS_SILENT) {
+                        SESSIONS_MOST_AFTER_SILENCE
+                    } else {
+                        SESSION_MOST
+                    };
                     attempt = 0;
                     first_failure = None;
                     ever_live = true;
+                    let feed_failed = matches!(data.feed, Some(Err(_)));
+                    let again = feed_due && feed_failed && !feed_reread;
                     // The inbox keeps this feed even if a newer read takes this one's place.
                     if feed_due {
-                        last_feed = Some(Instant::now());
+                        last_feed = (!again).then(Instant::now);
                         fed_once = true;
+                        feed_reread = feed_failed;
                     }
-                    let wait = if feed_owed && !feed_due {
+                    let wait = if again {
+                        FEED_REREAD
+                    } else if feed_owed && !feed_due {
                         Duration::ZERO
                     } else {
                         timing.every
@@ -479,11 +590,24 @@ const MARK: &str = "@@KERDR ";
 /// with it its machine, off the board (intent 0491). Generous, since LAB-Server's load spikes.
 pub const SESSION_MOST: Duration = Duration::from_secs(5);
 
+/// What a feed cut off by its 12-second limit fails with.
+pub const FEED_CUT_OFF: &str = "it took over 12 s and was cut off";
+
+/// What a feed that printed nothing at all fails with.
+pub const FEED_EMPTY: &str = "it printed nothing";
+
 /// What a session that ran out of that time shows in its row.
 pub const SESSION_SILENT: &str = "this herdr session didn't answer in 5 s";
 
 /// What the machine shows when herdr's list of sessions ran out of that time: no list, no read.
 pub const SESSIONS_SILENT: &str = "herdr didn't list its sessions in 5 s";
+
+/// How long that list gets on the read after one that ran out of time (intent 0591): herdr slow
+/// under load isn't the machine dropping.
+const SESSIONS_MOST_AFTER_SILENCE: Duration = Duration::from_secs(10);
+
+/// Sets the command that keeps herdr to the time in M.
+const LIMIT_TO_M: &str = "T=limited; command -v timeout >/dev/null 2>&1 && T=\"timeout $M\"\n";
 
 /// That limit, for machines with no `timeout` command, macOS among them: the command in the
 /// background and a watchdog that stops it, with `timeout`'s exit status. The watchdog's output
@@ -502,14 +626,19 @@ const WATCHDOG: &str = r#"limited() {
 
 /// The script one read runs on the machine.
 pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
+    build_script_within(herdr, feed, SESSION_MOST)
+}
+
+/// As build_script, herdr's list of sessions given `list_most` to answer.
+fn build_script_within(herdr: &str, feed: Option<&str>, list_most: Duration) -> String {
     let mut s = String::new();
     s.push_str(PATH_PREFIX);
     s.push('\n');
     s.push_str(&format!("unset {}\n", HERDR_VARS.join(" ")));
     s.push_str(&format!("H={}\n", transport::herdr_word(herdr)));
-    s.push_str(&format!("M={}\n", SESSION_MOST.as_secs()));
+    s.push_str(&format!("M={}\n", list_most.as_secs()));
     s.push_str(WATCHDOG);
-    s.push_str("T=limited; command -v timeout >/dev/null 2>&1 && T=\"timeout $M\"\n");
+    s.push_str(LIMIT_TO_M);
     s.push_str(&format!("echo '{MARK}host'; uname -n\n"));
     s.push_str(&format!(
         "if ! command -v \"$H\" >/dev/null 2>&1; then echo '{MARK}missing'; exit 0; fi\n"
@@ -522,6 +651,8 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
         "S=$($T \"$H\" session list --json 2>&1) || {{ [ $? = 124 ] && S={}; }}; echo '{MARK}sessions'; printf '%s\\n' \"$S\"\n",
         transport::quote(SESSIONS_SILENT)
     ));
+    s.push_str(&format!("M={}\n", SESSION_MOST.as_secs()));
+    s.push_str(LIMIT_TO_M);
     // Session names only split into words here; never expanded as file patterns.
     s.push_str("set -f\n");
     s.push_str(
@@ -533,8 +664,11 @@ pub fn build_script(herdr: &str, feed: Option<&str>) -> String {
     ));
     if let Some(cmd) = feed {
         s.push_str(&format!("KERDR_FEED={}\n", transport::quote(cmd)));
+        // A feed cut off by its time limit says so, rather than looking empty or half-written,
+        // and one that didn't end its line can't hide the marker after it (intent 0591).
         s.push_str(&format!(
-            "echo '{MARK}feed'; cd \"$HOME\" && if command -v timeout >/dev/null 2>&1; then timeout 12 sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; else sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; fi\n"
+            "echo '{MARK}feed'; cd \"$HOME\" && if command -v timeout >/dev/null 2>&1; then timeout 12 sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; else sh -c \"$KERDR_FEED\" </dev/null 2>/dev/null; fi; r=$?; echo; [ $r = 124 ] && printf '{MARK}feed_error\\n%s\\n' {}\n",
+            transport::quote(FEED_CUT_OFF)
         ));
     }
     s.push_str(&format!("echo '{MARK}end'\n"));
@@ -605,7 +739,7 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
             .stderr
             .lines()
             .rfind(|l| !l.trim().is_empty())
-            .unwrap_or("the read stopped part way")
+            .unwrap_or("the connection dropped partway through a read")
             .trim()
             .to_string();
         return Err(Failure::Ssh(Problem::Other(detail)));
@@ -618,18 +752,46 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
             version: herdr::version_string(v),
         }));
     }
-    let sessions = herdr::parse_sessions(sections.sessions.as_deref().unwrap_or(""))
-        .map_err(|e| Failure::Ssh(Problem::Other(e)))?;
+    // What herdr or the feed printed where a read failed: the error log's, never the board's.
+    let mut said = BTreeMap::new();
+    // A list that can't be read is herdr's trouble, not the machine's, which has just answered.
+    let (sessions, sessions_failed) =
+        match herdr::parse_sessions(sections.sessions.as_deref().unwrap_or("")) {
+            Ok(sessions) => (sessions, None),
+            Err(e) => {
+                let (words, printed) = sessions_trouble(&e);
+                if let Some(printed) = printed {
+                    said.insert("sessions".to_string(), printed);
+                }
+                (vec![], Some(words))
+            }
+        };
     let snapshots = sections
         .snapshots
         .into_iter()
-        .map(|(name, body)| (name, herdr::parse_snapshot(&body)))
+        .map(|(name, body)| {
+            let snapshot = herdr::parse_snapshot(&body).map_err(|e| {
+                let (words, printed) = snapshot_trouble(&e);
+                if let Some(printed) = printed {
+                    said.insert(format!("session {name}"), printed);
+                }
+                words
+            });
+            (name, snapshot)
+        })
         .collect();
     let feed = if feed_due {
         Some(match (sections.feed_error, sections.feed.as_deref()) {
             (Some(error), _) => Err(error),
-            (_, Some(body)) if !body.trim().is_empty() => feed::parse(body),
-            _ => Err("the feed printed nothing".to_string()),
+            (_, Some(body)) if !body.trim().is_empty() => {
+                feed::parse_keeping(body).map_err(|unread| {
+                    if let Some(printed) = unread.printed {
+                        said.insert("feed".to_string(), printed);
+                    }
+                    unread.words
+                })
+            }
+            _ => Err(FEED_EMPTY.to_string()),
         })
     } else {
         None
@@ -641,18 +803,87 @@ fn read(target: &Target, out: &transport::Output, feed_due: bool) -> Result<Mach
         snapshots,
         keys: sections.keys.unwrap_or(false),
         feed,
+        sessions_failed,
         feed_failed_after: None,
         kept_snapshots: Default::default(),
+        read_at: Default::default(),
+        sessions_read_at: None,
+        said,
     })
 }
 
-fn collect(machine: &Machine, feed_due: bool) -> transport::Output {
+/// How much of what herdr printed in place of an answer goes to the error log.
+const MOST_PRINTED: usize = 1024;
+
+/// What herdr printed, made short for the error log.
+fn printed(error: &str) -> String {
+    error.trim().chars().take(MOST_PRINTED).collect()
+}
+
+/// Why herdr's list of sessions failed, in words for the board: herdr's trouble, not the
+/// machine's, in Kerdr's own words, and what herdr printed, when it printed something, for the
+/// error log (intent 0591): its error codes and paths never reach the board.
+fn sessions_trouble(error: &str) -> (String, Option<String>) {
+    let error = error.trim();
+    if error.is_empty() || error == "herdr printed nothing" {
+        return (
+            "herdr printed nothing for its list of sessions".into(),
+            None,
+        );
+    }
+    if error == SESSIONS_SILENT {
+        return (
+            "herdr is slow there: it didn't list its sessions in time".into(),
+            None,
+        );
+    }
+    let lower = error.to_lowercase();
+    let setup =
+        if lower.contains("version") || lower.contains("mismatch") || lower.contains("differ") {
+            " On the machines screen (M), u runs herdr's own setup there."
+        } else {
+            ""
+        };
+    (
+        format!(
+            "herdr answered its list of sessions with something Kerdr can't read (what it printed is in Kerdr's error log).{setup}"
+        ),
+        Some(printed(error)),
+    )
+}
+
+/// Why a herdr session's snapshot failed, as sessions_trouble says it of the list: Kerdr's own
+/// words stay as they are, and anything herdr printed goes to the error log alone.
+fn snapshot_trouble(error: &str) -> (String, Option<String>) {
+    let error = error.trim();
+    if [
+        SESSION_SILENT,
+        "herdr printed nothing",
+        "herdr's snapshot couldn't be read",
+    ]
+    .contains(&error)
+    {
+        return (error.to_string(), None);
+    }
+    (
+        "herdr answered with something Kerdr can't read (what it printed is in Kerdr's error log)"
+            .into(),
+        Some(printed(error)),
+    )
+}
+
+fn collect(machine: &Machine, feed_due: bool, list_most: Duration) -> transport::Output {
     #[cfg(windows)]
     if machine.is_local() {
+        let _ = list_most;
         return crate::windows::poll(machine, feed_due);
     }
     let target = crate::jump::target(machine);
-    let script = build_script(&machine.herdr, machine.feed.as_deref().filter(|_| feed_due));
+    let script = build_script_within(
+        &machine.herdr,
+        machine.feed.as_deref().filter(|_| feed_due),
+        list_most,
+    );
     transport::run_script(&target, &script, Duration::from_secs(25))
 }
 
@@ -662,7 +893,7 @@ pub fn read_once(machine: &Machine) -> (Conn, Option<MachineData>) {
         Some(host) => Target::Ssh(host.clone()),
         None => Target::Local,
     };
-    let out = collect(machine, machine.feed.is_some());
+    let out = collect(machine, machine.feed.is_some(), SESSION_MOST);
     let now = Local::now();
     match read(&target, &out, machine.feed.is_some()) {
         Ok(data) => (Conn::Live { latency: out.took }, Some(data)),
@@ -1036,6 +1267,129 @@ esac
     }
 
     #[cfg(unix)]
+    /// A stand-in herdr for this machine, which notes each read in `log`, and a machine that reads
+    /// it with `feed` as its feed.
+    #[cfg(unix)]
+    fn noting_machine(dir: &std::path::Path, log: &std::path::Path, feed: &str) -> Machine {
+        use std::os::unix::fs::PermissionsExt;
+        let bin = dir.join("herdr");
+        std::fs::write(
+            &bin,
+            format!(
+                r#"#!/bin/sh
+case "$*" in
+  --version) echo read >>"{log}"; echo "herdr 0.9.1";;
+  "session list --json") echo '{{"sessions":[]}}';;
+esac
+"#,
+                log = log.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: bin.display().to_string(),
+            feed: Some(feed.to_string()),
+            hidden: false,
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_feed_read_is_read_again_at_once_but_only_once_in_a_row() {
+        // A cut-off read is most often a dropped connection: the next one is asked for at once,
+        // not at the next turn of the feed (intent 0591).
+        let lines = |log: &std::path::Path| -> Vec<String> {
+            std::fs::read_to_string(log)
+                .unwrap_or_default()
+                .lines()
+                .map(str::to_string)
+                .collect()
+        };
+        let timing = || Timing {
+            every: Duration::from_secs(600),
+            feed_every: Duration::from_secs(3600),
+        };
+        // Empty the first time, whole the second.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let feed = format!(
+            r#"echo feed >>"{l}"; [ "$(grep -c feed "{l}")" -lt 2 ] && exit 0; echo '{{"kerdr_feed":1}}'"#,
+            l = log.display()
+        );
+        let inbox = Arc::new(Inbox::default());
+        let poller = spawn(
+            0,
+            noting_machine(dir.path(), &log, &feed),
+            timing(),
+            inbox,
+            0,
+        );
+        let by = Instant::now() + Duration::from_secs(20);
+        while lines(&log).len() < 4 && Instant::now() < by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(1500));
+        assert_eq!(lines(&log), ["read", "feed", "read", "feed"]);
+        let _ = poller.wake.send(Wake::Stop);
+        // Empty every time: read again once, then it waits its turn.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let feed = format!(r#"echo feed >>"{}""#, log.display());
+        let inbox = Arc::new(Inbox::default());
+        let poller = spawn(
+            0,
+            noting_machine(dir.path(), &log, &feed),
+            timing(),
+            inbox,
+            0,
+        );
+        let by = Instant::now() + Duration::from_secs(20);
+        while lines(&log).len() < 4 && Instant::now() < by {
+            thread::sleep(Duration::from_millis(20));
+        }
+        thread::sleep(Duration::from_millis(2500));
+        assert_eq!(lines(&log), ["read", "feed", "read", "feed"]);
+        let _ = poller.wake.send(Wake::Stop);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_feed_cut_off_by_its_limit_says_so_and_an_empty_one_says_it_printed_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("log");
+        let run = |feed: &str| {
+            let machine = noting_machine(dir.path(), &log, feed);
+            let script = build_script(&machine.herdr, machine.feed.as_deref())
+                .replace("timeout 12", "timeout 1");
+            let out = transport::run_script(&Target::Local, &script, Duration::from_secs(10));
+            read(&Target::Local, &out, true)
+                .ok()
+                .expect("the read works")
+                .feed
+                .unwrap()
+        };
+        if std::process::Command::new("sh")
+            .args(["-c", "command -v timeout"])
+            .output()
+            .is_ok_and(|o| o.status.success())
+        {
+            assert_eq!(
+                run(r#"printf '{"kerdr_feed":1,"cards":['; sleep 5"#).unwrap_err(),
+                FEED_CUT_OFF
+            );
+        }
+        assert_eq!(run("true").unwrap_err(), FEED_EMPTY);
+        assert_eq!(
+            run(r#"printf '{"kerdr_feed":1,"cards":['"#).unwrap_err(),
+            "its answer was cut off partway (most often the connection dropping)"
+        );
+        assert!(run(r#"echo '{"kerdr_feed":1}'"#).is_ok());
+    }
+
+    #[cfg(unix)]
     #[test]
     fn the_script_finds_running_sessions_without_jq() {
         let script = build_script("herdr", None);
@@ -1161,11 +1515,115 @@ esac
             let t = Instant::now();
             let out = transport::run_script(&Target::Local, &script, Duration::from_secs(20));
             assert!(t.elapsed() < Duration::from_secs(10), "{:?}", t.elapsed());
+            // herdr is slow; the machine has answered, so it stays live (intent 0591).
             match read(&Target::Local, &out, false) {
-                Err(Failure::Ssh(Problem::Other(why))) => assert_eq!(why, SESSIONS_SILENT),
+                Ok(data) => {
+                    assert_eq!(
+                        data.sessions_failed.as_deref(),
+                        Some("herdr is slow there: it didn't list its sessions in time")
+                    );
+                    assert!(data.sessions.is_empty());
+                }
                 _ => panic!("expected it to say why: {}", out.stdout),
             }
         }
+    }
+
+    #[test]
+    fn what_herdr_says_of_its_list_of_sessions_is_herdr_s_trouble_in_plain_words() {
+        assert_eq!(
+            sessions_trouble("herdr printed nothing"),
+            (
+                "herdr printed nothing for its list of sessions".into(),
+                None
+            )
+        );
+        assert_eq!(
+            sessions_trouble("Error: socket closed"),
+            (
+                "herdr answered its list of sessions with something Kerdr can't read (what it printed is in Kerdr's error log).".into(),
+                Some("Error: socket closed".into())
+            )
+        );
+        assert!(
+            sessions_trouble("herdr client and server versions differ")
+                .0
+                .contains("u runs herdr's own setup")
+        );
+        // The list gets longer on the read after one that ran out of time, and only the list.
+        let script = build_script_within("herdr", None, SESSIONS_MOST_AFTER_SILENCE);
+        assert!(script.contains("M=10\n"), "{script}");
+        let list = script.find("session list").unwrap();
+        let back = script.find("M=5\n").unwrap();
+        assert!(back > list, "{script}");
+    }
+
+    #[test]
+    fn what_herdr_or_a_feed_printed_never_reaches_the_board_and_is_kept_for_the_log() {
+        // herdr's own error, codes and paths and all, for its list and for a session's snapshot,
+        // and a feed that printed a traceback in place of its cards.
+        let herdr_error = r#"{"id":"1","error":{"code":"ERR_SOCKET_GONE","message":"no socket at /run/user/1000/herdr/main.sock"}}"#;
+        let out = transport::Output {
+            stdout: format!(
+                "{MARK}host\nlab\n{MARK}version\nherdr 0.9.1\n{MARK}keys\nyes\n{MARK}sessions\n{herdr_error}\n{MARK}snapshot web\n{herdr_error}\n{MARK}feed\nTraceback (most recent call last):\n  File \"/home/x/bin/ark-cards\", line 9\nKeyError: 'state'\n{MARK}end\n"
+            ),
+            stderr: String::new(),
+            status: Some(0),
+            timed_out: false,
+            took: Duration::from_millis(5),
+        };
+        let Ok(data) = read(&Target::Local, &out, true) else {
+            panic!("a read herdr answered is a read");
+        };
+        let shown = [
+            data.sessions_failed.clone().unwrap(),
+            data.snapshots["web"].clone().unwrap_err(),
+            data.feed.clone().unwrap().unwrap_err(),
+        ];
+        for words in &shown {
+            for raw in [
+                "ERR_SOCKET_GONE",
+                "/run/user",
+                "Traceback",
+                "KeyError",
+                "/home/x",
+            ] {
+                assert!(!words.contains(raw), "{words}");
+            }
+            assert!(words.contains("Kerdr's error log"), "{words}");
+        }
+        assert!(data.said["sessions"].contains("ERR_SOCKET_GONE"));
+        assert!(data.said["session web"].contains("main.sock"));
+        assert!(data.said["feed"].contains("KeyError: 'state'"));
+        // Through a merge with a newer read that failed the same way, without saying it again.
+        let event = |data, at| Event {
+            machine: 0,
+            conn: live(),
+            data: Some(data),
+            at,
+        };
+        let inbox = Inbox::default();
+        inbox.put(event(data, Local::now()), Instant::now(), 0);
+        let mut quiet = MachineData {
+            sessions_failed: Some(
+                "herdr is slow there: it didn't list its sessions in time".into(),
+            ),
+            ..Default::default()
+        };
+        quiet
+            .snapshots
+            .insert("web".into(), Err(SESSION_SILENT.into()));
+        inbox.put(event(quiet, Local::now()), Instant::now(), 0);
+        let merged = inbox.take().pop().unwrap().data.unwrap();
+        assert!(merged.said["feed"].contains("KeyError"));
+        // A feed that says nothing failed: no words are made up.
+        assert_eq!(
+            feed::parse_keeping("").unwrap_err(),
+            feed::Unread {
+                words: "it printed no cards".into(),
+                printed: None
+            }
+        );
     }
 
     /// Whether this machine has a `timeout` command to test.

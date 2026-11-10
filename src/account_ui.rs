@@ -244,6 +244,15 @@ fn line(text: impl Into<String>, color: ratatui::style::Color) -> Line<'static> 
 fn heading(text: impl Into<String>) -> Line<'static> {
     Line::styled(text.into(), bold(FG))
 }
+/// A row that can't be chosen, and says why in its text: dim until the cursor is on it.
+fn held_back(text: impl Into<String>, yes: bool) -> Line<'static> {
+    if yes {
+        selected(text, yes)
+    } else {
+        Line::styled(format!("  {}", text.into()), fg(DIM))
+    }
+}
+
 fn selected(text: impl Into<String>, yes: bool) -> Line<'static> {
     Line::styled(
         format!("{} {}", if yes { "›" } else { " " }, text.into()),
@@ -426,9 +435,21 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 ),
                 line(
                     if target.agent.waiting_for_usage() {
-                        "Usage Limit Reached"
+                        // When it comes back, where that's known (intent 0591).
+                        match app
+                            .account(target.machine, &target.agent.account)
+                            .filter(|a| a.status == "out")
+                            .and_then(|a| a.until.as_deref())
+                        {
+                            Some(until) => format!(
+                                "Usage Limit Reached: {} is back at {}",
+                                target.agent.account,
+                                crate::accounts::reset_time(until)
+                            ),
+                            None => "Usage Limit Reached".to_string(),
+                        }
                     } else {
-                        "Choose an account"
+                        "Choose an account".to_string()
                     },
                     if target.agent.waiting_for_usage() {
                         RED
@@ -459,7 +480,11 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 } else {
                     format!("{code} · no longer available")
                 };
-                lines.push(selected(text, i == *sel));
+                // An account this agent may not move to: dim, with the reason (intent 0591).
+                lines.push(match app.held_to(target.machine, &target.agent, code) {
+                    Some(stays) => held_back(format!("{text} · has to stay on {stays}"), i == *sel),
+                    None => selected(text, i == *sel),
+                });
             }
             lines.push(Line::raw(""));
             if let Some(problem) = target
@@ -863,7 +888,13 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                             "✓ signed in"
                         } else if i == s.current {
                             if s.failed {
-                                "✕ sign-in stopped"
+                                if s.set_aside {
+                                    "set aside for a token"
+                                } else if s.replaced {
+                                    "replaced by a newer sign-in"
+                                } else {
+                                    "✕ sign-in stopped"
+                                }
                             } else if s.user_code.is_some() {
                                 "◐ type the code on the page"
                             } else {
@@ -886,7 +917,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             lines.extend(wrapped(
                 &s.message,
                 68,
-                fg(if s.failed { RED } else { FG2 }),
+                fg(if s.went_wrong() { RED } else { FG2 }),
                 None,
             ));
             if s.current < s.machines.len()
@@ -976,6 +1007,8 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 "Signed in.    esc accounts".to_string()
             } else if done {
                 "All selected machines signed in.    esc accounts".to_string()
+            } else if s.replaced {
+                "r take it back    esc close".to_string()
             } else if s.failed {
                 format!(
                     "r try again{}    esc later",
@@ -998,7 +1031,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 lines,
                 &hints,
                 code_at.unwrap_or(s.current + top),
-                if s.failed { RED } else { CYAN },
+                if s.went_wrong() { RED } else { CYAN },
             );
         }
         AccountScreen::Where {

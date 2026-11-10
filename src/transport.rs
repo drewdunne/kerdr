@@ -352,7 +352,9 @@ fn run(
                 let _ = child.wait();
                 return Output {
                     status: Some(127),
-                    stderr: format!("couldn't bound adapter lifetime: {e}"),
+                    stderr: format!(
+                        "Windows wouldn't let Kerdr keep track of that command ({e}), so it didn't run it"
+                    ),
                     took: started.elapsed(),
                     ..Default::default()
                 };
@@ -463,7 +465,7 @@ fn run(
     if overflow || stdout.len() as u64 > MAX_CAPTURE || stderr.len() as u64 > MAX_CAPTURE {
         return Output {
             status: Some(125),
-            stderr: "command output exceeded 32 MiB; its result is unknown".into(),
+            stderr: "it printed over 32 MiB, so Kerdr stopped it; whatever it was doing may or may not have happened".into(),
             took: started.elapsed(),
             ..Default::default()
         };
@@ -510,6 +512,11 @@ pub enum Problem {
 }
 
 impl Problem {
+    /// Whether only Andrew can clear it: a host key to trust, or a password or key to give.
+    pub fn needs_you(&self) -> bool {
+        matches!(self, Problem::HostKey(_) | Problem::Auth(_))
+    }
+
     pub fn detail(&self) -> &str {
         match self {
             Problem::Unreachable(d)
@@ -534,7 +541,7 @@ pub fn classify(target: &Target, out: &Output) -> Option<Problem> {
         .lines()
         .map(str::trim)
         .rfind(|l| !l.is_empty())
-        .unwrap_or("SSH failed")
+        .unwrap_or("SSH ended without saying why")
         .to_string();
     Some(
         if err.contains("host key verification failed")

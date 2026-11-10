@@ -154,8 +154,8 @@ fn first_line_or(text: &str, fallback: &str) -> String {
 }
 
 pub fn parse_sessions(text: &str) -> Result<Vec<SessionInfo>, String> {
-    let list: SessionList =
-        serde_json::from_str(json_part(text)?).map_err(|e| format!("herdr's session list: {e}"))?;
+    let list: SessionList = serde_json::from_str(json_part(text)?)
+        .map_err(|_| first_line_or(text, "herdr printed nothing"))?;
     Ok(list.sessions)
 }
 

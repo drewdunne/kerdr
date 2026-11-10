@@ -542,6 +542,10 @@ pub struct AccountAgent {
     pub program: String,
     /// The agent it took over from, when it was handed over from another program.
     pub handed_from: Option<HandedFrom>,
+    /// The programs something holds it to, its safety settings working only there; empty, any
+    /// (intent 0591).
+    #[serde(deserialize_with = "null_default")]
+    pub programs: Vec<String>,
 }
 
 /// Where a handed-over agent's work came from: the account and program before, the conversation
