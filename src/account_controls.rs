@@ -1956,7 +1956,7 @@ impl App {
                             } else {
                                 request = Some((
                                     machine,
-                                    json!({"action":"account-signin","ticket":ticket,"step":"finish","page_code":s.page_code.trim()}),
+                                    json!({"action":"account-signin","ticket":ticket,"step":"finish","page_code":code_from_paste(s.page_code.trim())}),
                                 ));
                                 s.page_code.clear();
                                 s.editing = false;
@@ -2700,6 +2700,22 @@ impl App {
     }
 }
 
+/// The code a sign-in page shows, out of a longer paste: pages give `code#state` and browsers add
+/// text around it. Anything else is sent as it was typed (intent 0591).
+fn code_from_paste(pasted: &str) -> &str {
+    let is_part = |p: &str| {
+        p.len() >= 16
+            && p.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' || c == '~')
+    };
+    pasted
+        .split(|c: char| {
+            c.is_whitespace() || matches!(c, '"' | '\'' | '`' | '<' | '>' | '(' | ')' | ',')
+        })
+        .find(|word| matches!(word.split_once('#'), Some((a, b)) if is_part(a) && is_part(b)))
+        .unwrap_or(pasted)
+}
+
 /// What's said as a fresh sign-in starts in place of one that stopped by itself (intent 0591).
 fn fresh_signin_words(message: &str) -> String {
     if message.contains("had ended") {
@@ -2862,6 +2878,22 @@ mod tests {
             "{said}"
         );
     }
+    #[test]
+    fn a_page_code_is_taken_out_of_a_longer_paste_and_anything_else_is_sent_as_typed() {
+        let code = "AbCdEfGhIjKlMnOp1234#StAtEsTrInG5678_-";
+        assert_eq!(code_from_paste(code), code);
+        assert_eq!(
+            code_from_paste(&format!(
+                "Paste this into Claude Code: {code} (expires soon)"
+            )),
+            code
+        );
+        assert_eq!(code_from_paste(&format!("`{code}`")), code);
+        // Not that shape: as it was typed, the backend's to judge.
+        assert_eq!(code_from_paste("short#one"), "short#one");
+        assert_eq!(code_from_paste("123456"), "123456");
+    }
+
     #[test]
     fn a_sign_in_that_ended_by_itself_starts_a_fresh_one_in_its_place_but_only_once() {
         let mut a = app();

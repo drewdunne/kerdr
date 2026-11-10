@@ -1470,16 +1470,10 @@ esac
         assert_eq!(outcome, None);
         assert_eq!(calls, [FOCUS_W4, FOCUS_T2, FOCUS_T2]);
         // Any other answer short of "focused" stops a strict jump too.
-        for (moves_to, answer) in [(None, says(0, "garbled"))] {
-            let (answer_fn, focused) = herdr_with(moves_to, answer, says(0, WORKSPACE_FOCUSED));
-            let strict = Jump {
-                strict: true,
-                ..jump(Some("w4:t2"))
-            };
-            let outcome = focus_with(&strict, answer_fn).0;
-            assert!(matches!(outcome, Some(Outcome::Failed(_))), "{outcome:?}");
-            assert_eq!(*focused.borrow(), "w4");
-        }
+        let (answer_fn, focused) = herdr_with(None, says(0, "garbled"), says(0, WORKSPACE_FOCUSED));
+        let outcome = focus_with(&moved, answer_fn).0;
+        assert!(matches!(outcome, Some(Outcome::Failed(_))), "{outcome:?}");
+        assert_eq!(*focused.borrow(), "w4");
         // Refused twice: said in herdr's own words, and herdr is put back.
         let (outcome, calls) = focus_with(&moved, |line| {
             if line == FOCUS_T2 {

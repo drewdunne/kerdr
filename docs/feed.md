@@ -95,13 +95,15 @@ know rather than guessing.
 | `refreshed_at` | The last date someone confirmed that the work is still wanted. This is separate from creation and ordinary record updates. |
 | `backlog_rank` | An optional signed integer ordering the backlog, lower numbers first. The action backend writes the canonical order. |
 | `disposition` | An optional record of a backlog decision, such as `kept` or `dropped`. |
-| `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. |
+| `intake` | `pending` while a record made from someone's words is being written up, `failed` when it couldn't be. Absent once it's written up. Kerdr marks it ✎ in the backlog. A `d` waiting for a write-up that then fails goes ahead with the words as they are, and says so. |
 | `item_text`, `item_was` | Optional, together. A backlog item's whole text as an `edit` read answers it, and the `was` that read would give, so `e` opens your editor at once with no read. Kerdr then sends no read at all, and the save's `was` is what checks it. Leave them out for a record whose text you wouldn't hand over, and for a copy from a machine that isn't the record's home, since a save goes there. Without them `e` reads first, as below. |
 | `submission` | The `submission` a `create` request carried, for a record it made. Kerdr's card for new words, shown while they're saved, gives way to the card carrying it as soon as any machine's feed shows one, even before the request answers. Optional. |
 | `resume` | For work under way or done: the agent conversation that worked it, `{"agent": "codex", "conversation": "<its id>"}`. Kerdr names the agent when `Enter` would reopen the card; the action backend does the resuming, so this is only what it would resume. |
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
+| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"` and `"follow"`. See [Asking again](#asking-again-op-and-retry). A feed with no `supports`, or one without `"op"`, is never sent a request again after an answer that was lost. |
+| `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)). Entries of any other shape are ignored. |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
 ## Owners, teams and stage lists
@@ -234,7 +236,8 @@ machine it runs on.
 ```
 
 Kerdr sends the same `submission` again only for the same words, images, owner and team to the
-same session, and only while an earlier send of them never got an answer (a timeout, say). When a record already
+same session, and only while an earlier send of them never got an answer (a timeout, say): by itself
+to a backend that keeps `op` records (below), or when you send those words again. When a record already
 exists for it, answer with that record's `id` instead of making another. Changed words or images
 are new work with a new `submission`.
 
@@ -247,7 +250,7 @@ same words again.
 the active backlog and `restore` brings it back. `move` changes backlog order. `reopen`,
 `close`, `cancel` and `edit` are described below, and so is `dismiss` for work already started.
 
-Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission`, `confirm`, `text`, `was`, `from`, `account`, `outside_since` and `follow` (strings),
+Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `project`, `session`, `workspace`, `tab`, `submission`, `confirm`, `text`, `was`, `from`, `account`, `outside_since`, `follow` and `op` (strings),
 `override`, `top` and `queue` (booleans), `delta` (a signed integer), and `images` (an array, on
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
@@ -260,8 +263,10 @@ with any failure it shows, in the log the README's "Errors are kept" describes.
 
 `ok` (boolean) and `message` (string) are required. Optional fields are `confirmation` (boolean,
 default false), `used` and `limit` (nonnegative integers or null), `status`, `session`, `id`,
-`workspace`, `label`, `tab`, `home`, `confirm`, `text`, `was`, `state` and `say` (strings or null), and
-`follow` (an object, below). Unknown response fields are allowed for future additions. A valid JSON response is
+`workspace`, `label`, `tab`, `home`, `confirm`, `text`, `was`, `state`, `say` and `note` (strings or
+null), `retry` (seconds), `repeat` and `partial` (booleans), and `follow` (an object, below). See
+[Asking again](#asking-again-op-and-retry) and [What an answer means](#what-an-answer-means) for
+`op`, `retry`, `repeat`, `note` and `partial`. Unknown response fields are allowed for future additions. A valid JSON response is
 read even if the command exits nonzero, allowing the backend to explain a refused action or ask
 for confirmation:
 
@@ -417,6 +422,89 @@ Both ways keep working. A Kerdr that doesn't follow reads the answer as an ordin
 `message`, so word `message` for it: what's happening, and that `Enter` again in a minute goes in. A
 backend that never sends `follow` works with this Kerdr as before, and Kerdr only ever sends
 `progress` with a token a `follow` gave it, so a backend that doesn't know `progress` is never asked.
+
+## Asking again: op and retry
+
+Most things that go wrong between Kerdr and a backend pass by themselves: a lock held, a push race,
+herdr slow to answer, a connection that drops for a moment. Kerdr asks again by itself, so you only
+hear about what's still wrong afterwards, and so that asking again can never do anything twice.
+
+**`op`: one id per request.** Every request that can change something carries
+`"op": "k-<16 lowercase hex>"`: every action except `progress`, `kickoff` and an `edit` that only
+reads (no `text`). It's new for each key you press, a yes to a question included, and the same for
+every automatic resend of that request. A resend is byte for byte the request it repeats, `op` and
+all, so a backend can fingerprint the request without it. A request sent on to the home machine a
+refusal named keeps its `op`, since it's the same request; that machine has no record of it yet.
+
+A backend that keeps ops lists `"op"` in its feed's `supports`, and does this, for every action:
+
+- A request with no `op` behaves as it always has, and an `op` of any other shape is refused.
+- It keeps a record for each `op`, for at least a day: the request's fingerprint and, once there is
+  one, its final answer. Write the answer to the record before printing it.
+- It takes that `op`'s own lock, a leaf held before anything else. While another send of the same
+  `op` is still running, it waits up to 20 seconds, then answers
+  `{"ok":false,"retry":5,"message":"…"}`.
+- A recorded answer is given again as it was, plus `"repeat": true`, and nothing is done. A recorded
+  fingerprint that differs is refused: that id was used for another request. An answer with `follow`
+  is recorded with its token, so a repeat follows the same work; a question is recorded too, so a
+  repeat asks the same question with the same token. An answer with `retry` isn't recorded: it's a
+  send that didn't happen yet.
+
+**`retry`: seconds, on a refusal that's passing.** Answer `ok: false` with `"retry": N` when the cause
+will likely clear by itself, after waiting out anything that clears in a second or two yourself.
+Kerdr waits N seconds and sends the same request with the same `op`, saying "Trying again…" quietly on
+the card, up to two minutes in all for that request; then it shows the last message as it is. Decide
+everything again at each send: a request whose card has changed meanwhile is decided for the card
+as it is now, and one that would now need a question asks it. A change is followed only with an `op`;
+a read (an `edit` with no `text`, a `kickoff` check) changes nothing, so its `retry` is followed too.
+
+**A lost answer.** When no answer comes in time, or the connection drops before one does (ssh's own
+exit, 255), nobody can tell whether the request happened. To a machine whose feed lists `"op"`, Kerdr
+sends it again with the same `op`, after 5, 10 and 15 seconds, and the record answers if it did. To
+any other machine, Kerdr never sends it again: it says plainly that it can't tell whether it
+happened, and that the card shows how it stands. A backend that crashed or printed something that
+isn't JSON isn't a lost answer, since sending it again would most likely do the same: what it printed
+goes to Kerdr's error log, never the board.
+
+Kerdr waits in the place of that card's change, so later changes to the same record wait behind
+it. Quitting Kerdr while it waits leaves the request as it was last sent.
+
+### What an answer means
+
+`ok` means the change stands. A change saved on this machine whose push, or whose write-up's start, is
+still to come is `ok: true` with `"note"` saying what's left, in plain words ("saved here; it reaches
+your other machines once the push goes through"). `ok: false` only when the change didn't happen.
+When only part happened, answer `ok: false` with `"partial": true`, and say plainly in `message` what
+happened and what didn't. Kerdr shows a `note` quietly (even when it goes straight into the work),
+and a `partial` answer as a warning that doesn't claim nothing happened. A Kerdr that doesn't know
+these reads `ok` and `message` only, so an `ok: true` answer with a `note` also says it in `message`.
+
+Say why in plain words, name the card as `#N`, and say what can be done when something can. Never send
+a traceback, an error class's name, an internal path or a herdr error code: they go in your own log.
+An unexpected error is `ok: false`, "`#N`'s <what> stopped partway: <why>. The card shows how it
+stands.", and only before anything was changed "…, so nothing was changed."
+
+### Older and newer, mixed
+
+A backend with no `supports` gets `op` fields it can ignore, and everything else as before: lost
+answers are never resent to it. A Kerdr that doesn't send `op` gets exactly today's behaviour from a
+backend that keeps ops, and reads a `retry` refusal or a `note` by its `message`.
+
+## A quiet board
+
+A read that fails once says nothing. While a machine has dropped, or a feed or a herdr read is
+failing, the board keeps its last good state: that machine's cards dimmed with the time they were
+read, and its tab marked with how old they are. Only when it lasts (past 30 seconds, or three feed
+reads in a row) does it say why, once, in plain words, and only then is it kept in the error log.
+What can't pass by itself, like SSH wanting a key or a password, is said at once.
+
+A failed feed read is read again at once, once in a run of failures. Give a plain reason when you
+know one, in `read_failures` (above), which Kerdr shows when it has lasted. A feed that printed
+nothing, was cut off by the 12-second limit, or was cut off partway says so in those words.
+
+When herdr answers but can't list its sessions, that's herdr's trouble rather than the machine
+dropping: the machine stays live with its last list, and the list gets 10 seconds rather than 5 on
+the next read if it ran out of time.
 
 ## Starting work nobody started
 
@@ -1001,7 +1089,8 @@ page, when it expires, and `needs_code: false`:
 
 Kerdr shows the code in a box with how long it lasts and no code field; `c` copies the code,
 `l` the link, and `o` opens the page again. Polling finishes it as usual; once `expires` has
-passed, `r` cancels that ticket and starts again. A `user_code` that isn't 4–32 letters, digits
+passed with its page unused, Kerdr cancels that ticket and starts again by itself, once, showing the
+new code in place; after that `r` does. A `user_code` that isn't 4–32 letters, digits
 and dashes is never shown or copied: Kerdr stops that sign-in, cancelling its ticket, and says
 so. `user_code` and `expires` go through the same credential scrub as the rest of an answer; a
 `status` the protocol knows (`waiting`, `done`, `failed`, …) is kept as it is.
@@ -1034,7 +1123,10 @@ Responses have `status: "waiting"`, `"done"`, or `"failed"`; cancel answers `"ca
 unfinished sign-in for that code and copy on that machine only; another copy's sign-in carries on. A failed finish may report an account identity mismatch,
 which Kerdr shows without advancing to another machine. Kerdr polls every two seconds
 while the dialog remains open, pauses while a page code is being entered, and stops on unknown results.
-A retry cancels any known previous ticket before starting another. Escape cancels a known ticket;
+A retry cancels any known previous ticket before starting another, and goes on to start whether or
+not that cancel worked, since a start replaces an unfinished sign-in. A `failed` answer with
+`"again": true`, or one with `retry` whose retries have run out, means the sign-in ended by itself:
+Kerdr starts a fresh one in its place, once, and says so. Every other failure stops, for `r`. Escape cancels a known ticket;
 a ticket returned after Escape is also cancelled, without opening a browser. After `done`,
 adding an account proceeds to the next selected machine with a **new** start and ticket.
 A `paste` step instead sends `code` and a `token` string (and `copy`, when pasting for one),

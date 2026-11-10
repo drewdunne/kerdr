@@ -7274,7 +7274,13 @@ pub(crate) mod tests {
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id) = closed_workspace_card(&mut app);
         let reference = app.card(&key).unwrap().reference.clone();
-        let request = reopen_by_enter(&mut app);
+        reopen_by_enter(&mut app);
+        // As the runner has it: with the op Kerdr gave it.
+        let n = app
+            .resolver
+            .unanswered_for("reopen", Some(id.as_str()))
+            .unwrap();
+        let request = app.resolver.job_request(n).unwrap().clone();
         let moved = || {
             Ok(crate::actions::Response {
                 ok: false,
@@ -7295,6 +7301,13 @@ pub(crate) mod tests {
         assert_eq!(again["action"], "reopen");
         assert_eq!(again["id"].as_str(), Some(id.as_str()));
         assert_eq!(again["session"], "ARK");
+        // The same request, sent on: never under a new op (intent 0591).
+        assert!(
+            request["op"]
+                .as_str()
+                .is_some_and(|op| op.starts_with("k-"))
+        );
+        assert_eq!(again["op"], request["op"]);
         assert!(app.resolver.holds_you(), "its answer may still take you in");
         let _ = &key;
         // Until the board catches up, its next actions go there too.
