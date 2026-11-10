@@ -515,7 +515,10 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             ..
         } => {
             let resumes = start.how == crate::app::run_state::StartHow::Reopen;
-            let state = if start.outside {
+            let fresh = start.how == crate::app::run_state::StartHow::Fresh;
+            let state = if fresh {
+                "no agent running and no intent; a fresh agent starts in a new tab"
+            } else if start.outside {
                 "running in a terminal outside herdr; it moves into herdr"
             } else if resumes {
                 "no agent running; it resumes its conversation"
@@ -560,7 +563,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                     app.machines[start.machine].name()
                 ));
             }
-            let then = if start.outside {
+            let then = if fresh {
+                "A fresh agent of the chosen account's program starts in a new tab of this workspace, and stays on that account until moved or it runs out. There's no conversation to resume."
+            } else if start.outside {
                 "Its conversation stops in the terminal once its turn ends and carries on in herdr on the chosen account, and stays there until moved or it runs out."
             } else if resumes {
                 "It starts again on the chosen account, resuming its conversation, and stays there until moved or it runs out."
@@ -568,7 +573,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 "Its agent starts on the chosen account, and stays there until moved or it runs out."
             };
             lines.extend(wrapped(&format!("{first}{then}"), 68, fg(FG2), None));
-            let title = if start.restore {
+            let title = if fresh {
+                format!("Start an agent in {} on an account", reference)
+            } else if start.restore {
                 format!("Bring {} back on an account", reference)
             } else if start.outside {
                 format!("Move {} into herdr on an account", reference)
@@ -1067,14 +1074,38 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             yes,
             no,
             target,
+            choices,
             ..
         } => {
+            let mut body = wrapped(message, 68, fg(FG), None);
+            // More than yes and no: one answer to a line, as the board's questions list them
+            // (intent 0591). Otherwise the one line it always had.
+            let hints = if choices.is_empty() {
+                format!("y {yes}    n {no}    esc cancel")
+            } else {
+                body.push(Line::raw(""));
+                let keys = crate::actions::choice_keys(choices);
+                let mut answers = vec![("y".to_string(), yes.clone())];
+                for (choice, key) in choices.iter().zip(keys) {
+                    if let Some(key) = key {
+                        answers.push((key.to_string(), choice.label.clone()));
+                    }
+                }
+                answers.push(("n".to_string(), no.clone()));
+                for (key, words) in answers {
+                    body.push(Line::from(vec![
+                        Span::styled(format!("{key}  "), bold(FG)),
+                        Span::styled(words, fg(FG2)),
+                    ]));
+                }
+                "esc cancel".to_string()
+            };
             modal(
                 f,
                 area,
                 &confirm_title(app, *machine, request, target.as_deref()),
-                wrapped(message, 68, fg(FG), None),
-                &format!("y {yes}    n {no}    esc cancel"),
+                body,
+                &hints,
                 0,
                 YELLOW,
             );

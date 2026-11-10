@@ -409,6 +409,9 @@ fn move_hint(app: &App, card: &Card) -> Option<String> {
         RunState::Stopped(start) if start.how == StartHow::Reopen => {
             Some("resume it on an account".into())
         }
+        RunState::Stopped(start) if start.how == StartHow::Fresh => {
+            Some("start an agent here on an account".into())
+        }
         RunState::Stopped(_) => Some("start it on an account".into()),
         // Its machine's accounts are on their way: s waits for them (intent 0591).
         RunState::NoAccounts(_) => Some("start it on an account".into()),

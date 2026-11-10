@@ -1045,6 +1045,8 @@ impl App {
         {
             return if request["action"] == "account-signin" {
                 "Signing in…".into()
+            } else if request["action"] == "account-start" {
+                "Starting a fresh agent…".into()
             } else {
                 "Updating accounts…".into()
             };

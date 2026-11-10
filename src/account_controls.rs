@@ -31,6 +31,14 @@ pub struct MoveTarget {
     pub agent: AccountAgent,
 }
 
+/// A move whose account isn't signed in on its machine: the sign-in first, then the move again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AfterSignin {
+    pub machine: usize,
+    pub code: String,
+    pub request: Value,
+}
+
 /// How the agent a move was chosen for stands now (intent 0591, K2-13, K2-64).
 enum MoveNow {
     /// As it was, or the same agent now that its conversation is known.
@@ -210,6 +218,9 @@ pub enum AccountScreen {
         no: String,
         target: Option<Box<MoveTarget>>,
         ready_at: Instant,
+        /// The answers its backend offers beyond yes and no (intent 0591): each sends the request
+        /// again with its token and `choice`.
+        choices: Vec<crate::actions::Choice>,
     },
 }
 
@@ -1260,6 +1271,77 @@ impl App {
         }
     }
 
+    /// After a sign-in's answer: once the sign-in a move waits on is done on its machine, the
+    /// sign-in closes and the move goes again by itself as a new request, from the screen under it
+    /// (the move picker it was asked in, as a rule) (intent 0591, B3-10). A sign-in that failed keeps the move waiting
+    /// while r can try again; leaving it drops the move.
+    fn signin_then_move(&mut self) {
+        let Some(after) = self.after_signin.clone() else {
+            return;
+        };
+        let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            back,
+        } = &self.mode
+        else {
+            return;
+        };
+        if s.code != after.code
+            || !s.machines.contains(&after.machine)
+            || s.failed
+            || s.current < s.machines.len()
+        {
+            return;
+        }
+        self.after_signin = None;
+        self.mode = (**back).clone();
+        self.say(
+            format!(
+                "{} is signed in on {}, so the move goes on.",
+                after.code,
+                self.machines[after.machine].name()
+            ),
+            Tone::Info,
+        );
+        self.account_queue.push_back((after.machine, after.request));
+    }
+
+    /// A move waiting on a sign-in he has left (the box asking where to sign in, or the sign-in
+    /// itself): dropped, and said (intent 0591, B3-10).
+    fn drop_left_signin(&mut self) {
+        let Some(after) = &self.after_signin else {
+            return;
+        };
+        let on_it = match &self.mode {
+            Mode::Accounts {
+                screen: AccountScreen::Where { code, .. },
+                ..
+            } => *code == after.code,
+            Mode::Accounts {
+                screen: AccountScreen::Signin(s),
+                ..
+            } => s.code == after.code,
+            _ => false,
+        };
+        if on_it {
+            return;
+        }
+        let Some(after) = self.after_signin.take() else {
+            return;
+        };
+        self.say(
+            format!(
+                "Nothing moved: {} isn't signed in on {}.",
+                after.code,
+                self.machines
+                    .get(after.machine)
+                    .map(|m| m.name())
+                    .unwrap_or_default()
+            ),
+            Tone::Info,
+        );
+    }
+
     /// The move picker's agent, as it is now, in place (intent 0591, K2-13).
     fn retarget_picker(&mut self, agent: AccountAgent) {
         if let Mode::Accounts {
@@ -1694,7 +1776,7 @@ impl App {
                                         KeyCode::Char('x') => {
                                             let message =
                                                 self.remove_question(*machine, &a.code, &a.name);
-                                            self.push_account_screen(AccountScreen::Confirm { machine:*machine, request:json!({"action":"account-remove","code":code}), message, yes:"remove".into(), no:"keep it".into(), target:None, ready_at:Instant::now()+Duration::from_millis(500) });
+                                            self.push_account_screen(AccountScreen::Confirm { machine:*machine, request:json!({"action":"account-remove","code":code}), message, yes:"remove".into(), no:"keep it".into(), target:None, ready_at:Instant::now()+Duration::from_millis(500), choices:vec![] });
                                             return Action::None;
                                         }
                                         _ => {}
@@ -1928,6 +2010,7 @@ impl App {
                         no: "keep this list".into(),
                         target: None,
                         ready_at: Instant::now() + Duration::from_millis(500),
+                        choices: vec![],
                     });
                     return Action::None;
                 }
@@ -2228,13 +2311,25 @@ impl App {
                 request: pending,
                 target,
                 ready_at,
+                choices,
                 ..
             } => match key.code {
                 KeyCode::Char('n') => {
                     self.mode = *back;
                     return Action::None;
                 }
-                KeyCode::Char('y') if Instant::now() >= *ready_at => {
+                // Yes, or one of the answers its backend offers (intent 0591): the same request
+                // with its token, and that choice.
+                KeyCode::Char(c)
+                    if Instant::now() >= *ready_at
+                        && (c == 'y'
+                            || crate::actions::choice_keys(choices).contains(&Some(c))) =>
+                {
+                    let chosen = choices
+                        .iter()
+                        .zip(crate::actions::choice_keys(choices))
+                        .find(|(_, k)| *k == Some(c) && c != 'y')
+                        .map(|(choice, _)| choice.id.clone());
                     let now = target
                         .as_ref()
                         .map(|t| (t.reference.clone(), self.move_now(t)));
@@ -2243,7 +2338,11 @@ impl App {
                         // checks its token and asks again if that changed what it asked.
                         None | Some((_, MoveNow::Same(_) | MoveNow::AccountChanged(_))) => {
                             // A yes is a new request: never the question's op (intent 0591).
-                            request = Some((*machine, crate::actions::without_op(pending)));
+                            let mut answer = crate::actions::without_op(pending);
+                            if let Some(id) = chosen {
+                                answer["choice"] = json!(id);
+                            }
+                            request = Some((*machine, answer));
                             self.mode = *back;
                             if let Some((mi, r)) = request {
                                 return self.send_account(mi, r);
@@ -2363,6 +2462,7 @@ impl App {
 
     /// Called by the event loop; only polls a visible sign-in, never retries an unknown write.
     pub fn account_tick(&mut self) -> Action {
+        self.drop_left_signin();
         if self.busy {
             return Action::None;
         }
@@ -2491,6 +2591,12 @@ impl App {
                 && crate::actions::without_op(&p.request)
                     == crate::actions::without_op(&crate::actions::request_metadata(&request))
         });
+        // A fresh agent's start (intent 0591, K1-105): the card it was asked on, for going in.
+        let start_from = if request["action"] == "account-start" {
+            self.action_from.take()
+        } else {
+            None
+        };
         let visible = match (&pending, &self.mode) {
             (Some(p), Mode::Accounts { screen, .. }) => p
                 .screen
@@ -2545,7 +2651,9 @@ impl App {
             }
         };
         let action = request["action"].as_str().unwrap_or("");
-        if action == "account-models" && response.ok {
+        // A list is saved even when its backend then asks about the agents left running elsewhere
+        // (intent 0591, B3-42).
+        if action == "account-models" && (response.ok || response.confirmation) {
             self.saved_models(machine, &request);
         }
         if action == "account-current" && response.ok {
@@ -2814,6 +2922,7 @@ impl App {
                 }
                 s.poll_at = Instant::now() + Duration::from_secs(2);
             }
+            self.signin_then_move();
             return;
         }
         // Its agent wasn't running, so the backend started it on the account picked instead, as a
@@ -2862,6 +2971,75 @@ impl App {
                 return;
             }
         }
+        // A fresh agent started in an empty workspace: gone into, as a reopen is, while you're
+        // still on its card; otherwise said, with how to go in (intent 0591, K1-105).
+        if action == "account-start"
+            && response.ok
+            && !response.confirmation
+            && let (Some(session), Some(workspace)) =
+                (response.session.clone(), response.workspace.clone())
+        {
+            match start_from.filter(|f| self.still_on(f, Some(&workspace))) {
+                Some(from) => {
+                    self.open_after = Some(crate::app::OpenAfter {
+                        machine,
+                        label: response.label.clone().unwrap_or_else(|| workspace.clone()),
+                        session,
+                        workspace,
+                        tab: response.tab.clone(),
+                        from: from.key,
+                    });
+                }
+                None => {
+                    let message = if response.message.contains('⏎') {
+                        response.message.clone()
+                    } else {
+                        format!("{} ⏎ on its card goes in.", response.message.trim_end())
+                    };
+                    self.say(message, Tone::Good);
+                }
+            }
+            return;
+        }
+        // Another account action's question (a list saved with agents left elsewhere, an account
+        // that exists as the other kind, a machine's own sign-in to remove): asked as a move's is,
+        // its yes the same request with its token (intent 0591). Over the screen it was asked
+        // from, or once he's back where it can't take typing.
+        if action != "account-move"
+            && response.confirmation
+            && let Some(token) = response.confirm.clone()
+            && request["confirm"].as_str() != Some(token.as_str())
+        {
+            // The list is saved: its screen is done with.
+            if action == "account-models"
+                && visible
+                && let Mode::Accounts { back, .. } = self.mode.clone()
+            {
+                self.mode = *back;
+            }
+            let mut request = request;
+            request["confirm"] = json!(token);
+            let question = AccountScreen::Confirm {
+                machine,
+                request,
+                message: response.message.clone(),
+                yes: response.yes.clone().unwrap_or_else(|| "yes".into()),
+                no: response.no.clone().unwrap_or_else(|| "no".into()),
+                target: None,
+                ready_at: Instant::now() + Duration::from_millis(500),
+                choices: response.choices.clone(),
+            };
+            if visible || self.enter_can_land_here() {
+                self.push_account_screen(question);
+            } else {
+                self.held_move_question = Some(question);
+                self.say(
+                    "An account change asks you something first; it's asked once you're back on the board.",
+                    Tone::Info,
+                );
+            }
+            return;
+        }
         if action == "account-move" && response.confirmation && !visible {
             // He left the picker before its question came: it's asked once he's back on the board
             // or a list, for the agent as it is then, never over typing (intent 0591, K2-27).
@@ -2882,6 +3060,7 @@ impl App {
                     no: response.no.unwrap_or_else(|| "leave it".into()),
                     target: (!starts).then_some(target),
                     ready_at: Instant::now() + Duration::from_millis(500),
+                    choices: response.choices.clone(),
                 };
                 if self.enter_can_land_here() {
                     self.ask_held_move(question);
@@ -2970,6 +3149,7 @@ impl App {
                         no: response.no.unwrap_or_else(|| "leave it".into()),
                         target: (!starts).then_some(target),
                         ready_at: Instant::now() + Duration::from_millis(500),
+                        choices: response.choices.clone(),
                     });
                     return;
                 }
@@ -3048,6 +3228,31 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        // The account a move or the current account needs isn't signed in on that machine: the box
+        // that signs it in opens, and a move goes on by itself once that's done (intent 0591,
+        // B3-10, B3-40). Only where it can't take typing.
+        if response.sign_in
+            && matches!(action, "account-move" | "account-current")
+            && (visible || self.enter_can_land_here())
+            && let Some(code) = response.code.clone().filter(|c| !c.is_empty())
+        {
+            self.after_signin = (action == "account-move" && !response.ok).then(|| AfterSignin {
+                machine,
+                code: code.clone(),
+                request: crate::actions::without_op(&request),
+            });
+            let label = format!("Sign {code} in on {}", self.machines[machine].name());
+            self.push_account_screen(AccountScreen::Where {
+                code,
+                copy: None,
+                message: response.message.clone(),
+                choices: vec![WhereChoice {
+                    label,
+                    machines: vec![machine],
+                }],
+                sel: 0,
+            });
         }
         // The test found it isn't signed in: the box that signs it in opens over the list, and
         // nothing starts until ⏎ (intent 0591).
@@ -3153,6 +3358,10 @@ fn account_error(request: &Value, error: &str) -> String {
         "account-test" => format!("Testing {}", code("code")),
         "account-current" => "Setting the current account".into(),
         "account-models" => "Saving the model list".into(),
+        "account-start" => match code("to").as_str() {
+            "list" => "Starting an agent on its owner's list".into(),
+            to => format!("Starting an agent on {to}"),
+        },
         _ => "Changing accounts".into(),
     };
     let error = error.replace(
@@ -6673,5 +6882,257 @@ mod tests {
         assert!(matches!(press(&mut a, 'c'), Action::None));
         assert!(matches!(press(&mut a, 'C'), Action::None));
         assert!(a.message().unwrap().0.contains("no current account yet"));
+    }
+
+    /// Intent 0591: the other answers a move's backend offers are shown beside yes and no, and
+    /// the one picked is sent as the move again with its token and that choice, never an override.
+    #[test]
+    fn an_account_question_offers_its_backends_other_answers_and_sends_the_one_picked() {
+        let mut a = app();
+        let action = move_44(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"#44 is mid-job: move it now?","confirmation":"#44 is mid-job: move it now?","confirm":"t-1","yes":"move now","no":"leave it","choices":[{"id":"after-job","key":"j","label":"move it when the job ends"}]}),
+        );
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm { choices, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("{:?}", a.mode)
+        };
+        assert_eq!(choices.len(), 1);
+        let shown = crate::ui::tests_render(&a, 120, 40);
+        assert!(shown.contains("j  move it when the job ends"), "{shown}");
+        assert!(shown.contains("y  move now"), "{shown}");
+        assert!(shown.contains("n  leave it"), "{shown}");
+        // Not before the question has been up long enough to be read, as with y.
+        assert_eq!(press(&mut a, 'j'), Action::None);
+        settle(&mut a);
+        let (machine, r) = sent(press(&mut a, 'j'));
+        assert_eq!(machine, 1);
+        assert_eq!(
+            r,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C","confirm":"t-1","choice":"after-job"})
+        );
+        // A key the question doesn't offer does nothing.
+        let action = move_44(&mut a);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"move?","confirmation":"move?","confirm":"t-2"}),
+        );
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'j'), Action::None);
+        assert!(matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Confirm { .. },
+                ..
+            }
+        ));
+    }
+
+    /// Intent 0591, B3-42 and B3-46: another account action's question is asked in the same box,
+    /// its yes the same request with its token; a saved list is taken as saved first, and a
+    /// question that comes while he types waits until he's back.
+    #[test]
+    fn another_account_actions_question_is_asked_and_its_yes_is_the_same_request_with_its_token() {
+        let question = json!({"ok":false,"confirmation":"Saved. Two agents run on accounts off the list: move them now?","confirm":"t-1","yes":"move them","no":"leave them","message":"Saved. Two agents run on accounts off the list: move them now?"});
+        let models = |a: &mut App| {
+            let owner = a.account_feed(0).unwrap().owners[0].clone();
+            a.push_account_screen(AccountScreen::Models {
+                machine: 0,
+                models: vec!["KBZ_C".into()],
+                owner,
+                sel: 0,
+                move_waiting: false,
+            });
+            key(a, KeyCode::Enter)
+        };
+        let mut a = app();
+        let action = models(&mut a);
+        let (_, asked) = sent(action.clone());
+        complete(&mut a, action, question.clone());
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                message, yes, no, ..
+            },
+            back,
+        } = &a.mode
+        else {
+            panic!("not asked: {:?}", a.mode)
+        };
+        assert!(message.ends_with("move them now?"), "{message}");
+        assert_eq!((yes.as_str(), no.as_str()), ("move them", "leave them"));
+        assert!(
+            matches!(**back, Mode::Board),
+            "the list's screen is done with"
+        );
+        let owner = &a.account_feed(0).unwrap().owners[0];
+        assert_eq!(owner.models, vec!["KBZ_C".to_string()], "saved either way");
+        settle(&mut a);
+        let (machine, r) = sent(press(&mut a, 'y'));
+        assert_eq!(machine, 0);
+        let mut yes = asked.clone();
+        yes["confirm"] = json!("t-1");
+        assert_eq!(r, yes);
+        // n leaves it as it is.
+        let mut a = app();
+        let action = models(&mut a);
+        complete(&mut a, action, question.clone());
+        assert_eq!(press(&mut a, 'n'), Action::None);
+        assert!(matches!(a.mode, Mode::Board));
+        // While he types, it waits, and is asked once he's back.
+        let mut a = app();
+        let action = models(&mut a);
+        a.busy = true;
+        key(&mut a, KeyCode::Esc);
+        press(&mut a, 'c');
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        complete(&mut a, action, question);
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        assert!(a.held_move_question.is_some());
+        key(&mut a, KeyCode::Esc);
+        a.account_owed();
+        assert!(matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::Confirm { .. },
+                ..
+            }
+        ));
+    }
+
+    /// The answer a move gets when its account isn't signed in on that machine (intent 0591,
+    /// B3-10).
+    fn needs_signin() -> Value {
+        json!({"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C isn't signed in on build-box: sign it in, and the move goes on once you have."})
+    }
+
+    /// Intent 0591, B3-10: a move to an account not signed in on its machine opens the box that
+    /// signs it in there; once that's done, the move goes again by itself, from its picker.
+    #[test]
+    fn a_move_to_an_account_not_signed_in_there_signs_it_in_then_moves() {
+        let mut a = app();
+        let action = move_44(&mut a);
+        let (_, asked) = sent(action.clone());
+        complete(&mut a, action, needs_signin());
+        let (message, choices) = where_screen(&a);
+        assert!(message.contains("isn't signed in"), "{message}");
+        assert_eq!(choices.len(), 1);
+        assert_eq!(choices[0].machines, vec![1]);
+        let start = key(&mut a, KeyCode::Enter);
+        let (machine, r) = sent(start.clone());
+        assert_eq!((machine, r["step"].as_str()), (1, Some("start")));
+        assert_eq!(r["code"], "ARK_C");
+        complete(&mut a, start, started());
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"done","message":"ARK_C is signed in on build-box."}),
+        );
+        assert!(a.after_signin.is_none());
+        assert!(
+            matches!(
+                a.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::Move { .. },
+                    ..
+                }
+            ),
+            "back on the picker it was asked in: {:?}",
+            a.mode
+        );
+        assert!(a.message().unwrap().0.contains("the move goes on"));
+        let (machine, again) = sent(a.account_tick());
+        assert_eq!(machine, 1);
+        assert_eq!(again, asked, "the same move, as a new request");
+        complete(
+            &mut a,
+            Action::Mutate {
+                machine,
+                request: again,
+            },
+            json!({"ok":true,"message":"Moved #44's agent to ARK_C."}),
+        );
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+    }
+
+    /// Intent 0591, B3-10: a sign-in that fails keeps the move for r; leaving the box drops it
+    /// and says so; and one that came while he was elsewhere opens nothing over his typing.
+    #[test]
+    fn a_move_waiting_on_a_sign_in_is_dropped_once_he_leaves_it() {
+        let mut a = app();
+        let action = move_44(&mut a);
+        complete(&mut a, action, needs_signin());
+        let start = key(&mut a, KeyCode::Enter);
+        complete(&mut a, start, started());
+        let poll = poll_now(&mut a);
+        complete(
+            &mut a,
+            poll,
+            json!({"ok":false,"status":"failed","message":"The browser sign-in was refused."}),
+        );
+        a.account_tick();
+        assert!(a.after_signin.is_some(), "kept while r can try again");
+        key(&mut a, KeyCode::Esc);
+        a.account_tick();
+        assert!(a.after_signin.is_none());
+        assert_eq!(
+            a.message().unwrap().0,
+            format!(
+                "Nothing moved: ARK_C isn't signed in on {}.",
+                a.machines[1].name()
+            )
+        );
+        assert!(a.account_queue.is_empty());
+        // Esc on the box asking where to sign it in drops it the same way.
+        let mut a = app();
+        let action = move_44(&mut a);
+        complete(&mut a, action, needs_signin());
+        key(&mut a, KeyCode::Esc);
+        a.account_tick();
+        assert!(a.after_signin.is_none());
+        assert!(a.message().unwrap().0.starts_with("Nothing moved"));
+        // Typing: only the backend's words, nothing opened over it and nothing kept.
+        let mut a = app();
+        let action = move_44(&mut a);
+        a.busy = true;
+        key(&mut a, KeyCode::Esc);
+        press(&mut a, 'c');
+        complete(&mut a, action, needs_signin());
+        assert!(matches!(a.mode, Mode::Compose { .. }));
+        assert!(a.after_signin.is_none());
+        assert!(a.message().unwrap().0.contains("isn't signed in"));
+    }
+
+    /// Intent 0591, B3-40: the current account set where it isn't signed in opens the box that
+    /// signs it in there, and nothing is sent again after.
+    #[test]
+    fn a_current_account_not_signed_in_here_opens_the_box_that_signs_it_in() {
+        let mut a = app();
+        knows_current(&mut a);
+        a.open_accounts();
+        let action = press(&mut a, 'c');
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"sign_in":true,"code":"KBZ_C","message":"KBZ_C is the current account now, but it isn't signed in here.","current":{"account":"KBZ_C","status":"sign_in"}}),
+        );
+        assert_eq!(
+            a.machines[0]
+                .feed
+                .as_ref()
+                .unwrap()
+                .current_account()
+                .map(|c| c.account.as_str()),
+            Some("KBZ_C")
+        );
+        let (_, choices) = where_screen(&a);
+        assert_eq!(choices[0].machines, vec![0]);
+        assert!(a.after_signin.is_none());
     }
 }

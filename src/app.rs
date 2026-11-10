@@ -683,6 +683,9 @@ pub struct App {
     /// A move's question that came after its picker closed: asked once you're back on the board or
     /// a list, never over typing (intent 0591, K2-27).
     pub held_move_question: Option<account_controls::AccountScreen>,
+    /// A move waiting on its account's sign-in on that machine: sent again by itself, as a new
+    /// request, once that sign-in is done; dropped if he leaves it (intent 0591, B3-10).
+    pub after_signin: Option<account_controls::AfterSignin>,
     /// The number of the last request asking an old backend to update, so each answer finds the
     /// waits it was asked for.
     pub update_asks: u64,
@@ -787,6 +790,7 @@ impl App {
             pending_go: None,
             owed_accounts: Vec::new(),
             held_move_question: None,
+            after_signin: None,
             update_asks: 0,
             follow_end: None,
             enter_sent: None,

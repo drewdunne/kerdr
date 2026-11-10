@@ -110,6 +110,10 @@ pub struct Response {
     /// On a failed test: the sign-in is what's wrong, so the way to fix it can open (intent 0591).
     #[serde(default)]
     pub sign_in: bool,
+    /// With `sign_in` on a move or the current account: the account to sign in there (intent 0591,
+    /// release 3).
+    #[serde(default)]
+    pub code: Option<String>,
     /// With a question: the answers it offers beyond yes and no, each sent back as the same request
     /// with `choice` and the question's `confirm` (intent 0591, release 3).
     #[serde(default, deserialize_with = "choices")]

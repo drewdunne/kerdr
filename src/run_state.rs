@@ -30,6 +30,10 @@ pub enum StartHow {
     /// Work that ran and has no agent now (its workspace closed, or open with its agent gone), or
     /// done work: `reopen`, as ⏎ sends, which resumes its conversation.
     Reopen,
+    /// An open workspace with no intent and nothing running: `account-start`, a fresh agent of the
+    /// account's own program in a new tab there, since there's no conversation to resume (intent
+    /// 0591, K1-105).
+    Fresh,
 }
 
 impl StartHow {
@@ -37,6 +41,7 @@ impl StartHow {
         match self {
             StartHow::Dispatch => "dispatch",
             StartHow::Reopen => "reopen",
+            StartHow::Fresh => "account-start",
         }
     }
 }
@@ -176,6 +181,21 @@ impl App {
             ));
         }
         if card.detail.is_none() {
+            // An open workspace with nothing running and no intent: a fresh agent starts in a new
+            // tab there, on the account picked, where its backend can (intent 0591, K1-105). Only
+            // the workspace s was pressed on, on its own machine.
+            if card.is_open_workspace()
+                && self.actions_on()
+                && self
+                    .account_feed(card.machine_index)
+                    .is_some_and(|f| f.starts_on(StartHow::Fresh.action()))
+            {
+                return RunState::Stopped(Start {
+                    how: StartHow::Fresh,
+                    machine: card.machine_index,
+                    ..Start::default()
+                });
+            }
             return RunState::Unavailable(format!(
                 "{} has no agent running and no intent to start: s starts or moves an intent's agent.",
                 card.workspace_name()
@@ -503,6 +523,31 @@ impl App {
         match start.how {
             StartHow::Dispatch => self.intent_action_on(card, "dispatch", extra),
             StartHow::Reopen => self.reopen_action_with(&card, extra),
+            StartHow::Fresh => self.start_fresh(card, to),
+        }
+    }
+
+    /// A fresh agent in a new tab of this open workspace, on the account picked; you go in once it
+    /// starts, while you're still on its card (intent 0591, K1-105).
+    fn start_fresh(&mut self, card: Card, to: &str) -> Action {
+        let (Some(session), Some(workspace)) = (card.session.clone(), card.workspace_id.clone())
+        else {
+            self.say(
+                format!(
+                    "{} isn't open any more, so nothing started.",
+                    card.workspace_name()
+                ),
+                Tone::Info,
+            );
+            return Action::None;
+        };
+        if !self.can_write(card.machine_index) {
+            return Action::None;
+        }
+        self.action_from = Some(CardSnapshot::of(&card));
+        Action::Mutate {
+            machine: card.machine_index,
+            request: json!({"action":"account-start","session":session,"workspace":workspace,"to":to}),
         }
     }
 
@@ -1891,5 +1936,116 @@ mod tests {
             panic!("expected the model list, got {:?}", a.message())
         };
         assert_eq!(owner.id, "platform", "web's owner here isn't this card's");
+    }
+
+    /// The demo's bare workspace, emptied of agents, on a machine whose backend can start a fresh
+    /// agent there when `fresh` (intent 0591, K1-105).
+    fn bare_workspace(a: &mut App, fresh: bool) -> String {
+        let i = a
+            .board
+            .cards
+            .iter()
+            .position(|c| {
+                c.source == crate::model::Source::Workspace
+                    && c.is_open_workspace()
+                    && a.account_feed(c.machine_index).is_some()
+            })
+            .expect("the demo has a bare workspace on a machine with accounts");
+        a.board.cards[i].agents.clear();
+        let mi = a.board.cards[i].machine_index;
+        let mut starts: Vec<String> = STARTS_ON.iter().map(|s| s.to_string()).collect();
+        if fresh {
+            starts.push("account-start".into());
+        }
+        a.machines[mi].feed.as_mut().unwrap().starts_on = starts;
+        a.board.cards[i].key.clone()
+    }
+
+    /// Intent 0591, K1-105: s on an empty workspace with no intent starts a fresh agent there on
+    /// the account picked, and goes in while you're still on it.
+    #[test]
+    fn s_on_an_empty_workspace_starts_a_fresh_agent_there_and_goes_in() {
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let (start, choices) = start_screen(&a);
+        assert_eq!(start.how, StartHow::Fresh);
+        assert_eq!(start.machine, card.machine_index);
+        assert_eq!(choices.last().map(String::as_str), Some("list"));
+        let at = choices.iter().position(|c| c != "list").unwrap();
+        let code = choices[at].clone();
+        for _ in 0..at {
+            key(&mut a, KeyCode::Down);
+        }
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        assert_eq!(machine, card.machine_index);
+        assert_eq!(
+            request,
+            json!({"action":"account-start","session":card.session,"workspace":card.workspace_id,"to":code})
+        );
+        assert_eq!(a.working_on(&request), "Starting a fresh agent…");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        let reply = json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."});
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request.clone()),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+        let open = a.open_after.take().expect("went in");
+        assert_eq!(
+            (open.session.as_str(), open.workspace.as_str()),
+            (session.as_str(), workspace.as_str())
+        );
+        assert_eq!(open.tab.as_deref(), Some("t9"));
+        assert_eq!(open.from, k);
+        // Gone on to another card meanwhile: said, with how to go in, and you stay put.
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!()
+        };
+        let other = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != k)
+            .unwrap()
+            .key
+            .clone();
+        select(&mut a, &other);
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+        assert!(a.open_after.is_none());
+        let (said, tone) = a.message().unwrap();
+        assert_eq!(
+            said,
+            "Started a new Claude Code agent in scratch on ARK_C. ⏎ on its card goes in."
+        );
+        assert_eq!(tone, Tone::Good);
+    }
+
+    /// Intent 0591, K1-105: a backend that can't start a fresh agent there is never sent one; s
+    /// says why as before. Nor is one started beside something running in it.
+    #[test]
+    fn an_empty_workspace_on_an_older_backend_keeps_the_refusal() {
+        let mut a = app();
+        let k = bare_workspace(&mut a, false);
+        let card = a.card(&k).unwrap().clone();
+        assert!(
+            matches!(a.run_state(&card), RunState::Unavailable(why) if why.contains("no intent to start"))
+        );
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let mut card = a.card(&k).unwrap().clone();
+        card.workspace_id = None;
+        assert!(matches!(a.run_state(&card), RunState::Unavailable(_)));
     }
 }
