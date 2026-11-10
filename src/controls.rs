@@ -2493,8 +2493,8 @@ impl App {
             }
             if let Some(follow) = response.follow.clone() {
                 // It goes on after this answer, and Kerdr follows it (intent 0591): shown on its
-                // card in the follow's words until it ends.
-                self.begin_follow(job, follow);
+                // card in the follow's words until it ends, with what's still to come said too.
+                self.begin_follow(job, follow, response.note.as_deref());
                 if was_retrying {
                     self.rebuild();
                 }

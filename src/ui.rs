@@ -1801,8 +1801,13 @@ fn list_glyph(
     ratatui::style::Color,
 ) {
     // A start or a reopen on its way (intents 0416 and 0445): shown the moment it's sent,
-    // whatever the column, a start on another machine too.
+    // whatever the column, a start on another machine too. Any change, a new intent's words
+    // included, being sent again by itself says so, quietly (intent 0591).
     match c.detail.as_ref().and_then(|d| d.status.as_deref()) {
+        Some(crate::resolve::RETRYING_SAVE) => {
+            return ("◐", BLUE, "saving, trying again…".into(), BLUE);
+        }
+        Some(crate::resolve::RETRYING) => return ("◐", BLUE, "trying again…".into(), BLUE),
         Some(s) if s.starts_with("Starting") => return ("◐", BLUE, "starting up".into(), BLUE),
         Some("Reopening…") => return ("◐", BLUE, "reopening".into(), BLUE),
         _ => {}
@@ -7146,6 +7151,71 @@ mod tests {
         assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "starting up");
         done.detail.as_mut().unwrap().status = Some("Starting on arknet-one…".into());
         assert_eq!(list_glyph(&done, a.now(), usize::MAX).2, "starting up");
+    }
+
+    #[test]
+    fn a_row_says_when_its_change_or_its_new_intent_is_being_sent_again() {
+        use crate::app::tests::{demo_app, press};
+        let mut a = demo_app();
+        a.cfg.actions.command = Some("test-adapter".into());
+        let again = crate::actions::Resend::Retry {
+            wait: std::time::Duration::from_secs(5),
+            message: "#4's record is locked by a pull under way.".into(),
+        };
+        let backlog: Vec<Card> = a
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.stage == Stage::Backlog && !c.dismissed() && c.intake().is_none())
+            .filter(|c| c.detail.is_some())
+            .take(2)
+            .cloned()
+            .collect();
+        // A refresh refused for something passing, sent again by itself (intent 0591).
+        let (refreshed, started) = (&backlog[0], &backlog[1]);
+        let id = |c: &Card| c.detail.as_ref().unwrap().id.clone();
+        a.queue_action(
+            refreshed.machine_index,
+            serde_json::json!({"action": "refresh", "id": id(refreshed)}),
+        );
+        let (n, ..) = a.resolver.ready()[0].clone();
+        a.resending(Some(n), refreshed.machine_index, &again);
+        let row = |a: &App, key: &str| list_glyph(a.card(key).unwrap(), a.now(), usize::MAX);
+        let (glyph, color, words, _) = row(&a, &refreshed.key);
+        assert_eq!((glyph, color, words.as_str()), ("◐", BLUE, "trying again…"));
+        a.mode = Mode::Backlog { sel: 0 };
+        let screen = tests_render(&a, 200, 50);
+        assert!(screen.contains("trying again…"), "{screen}");
+        // A new intent's words: not just "saving…".
+        a.mode = Mode::Board;
+        press(&mut a, 'c');
+        for c in "Back up the NAS".chars() {
+            press(&mut a, c);
+        }
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let crate::app::Action::Mutate { machine, request } =
+            a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send")
+        };
+        a.queue_action(machine, request);
+        let (n, ..) = a.resolver.ready()[0].clone();
+        a.resending(Some(n), machine, &again);
+        let saving = a.backlog_card_for_keys().cloned().expect("its card");
+        assert_eq!(row(&a, &saving.key).2, "saving, trying again…");
+        let screen = tests_render(&a, 200, 50);
+        assert!(screen.contains("saving, trying again…"), "{screen}");
+        // A start's place says so too.
+        a.mode = Mode::Board;
+        a.queue_action(
+            started.machine_index,
+            serde_json::json!({"action": "dispatch", "id": id(started)}),
+        );
+        let (n, ..) = a.resolver.ready()[0].clone();
+        a.resending(Some(n), started.machine_index, &again);
+        let c = a.card(&started.key).unwrap().clone();
+        let place = crate::ui::card_ui::place_for_test(&a, &c).0;
+        assert!(place.starts_with("◐ starting up, trying again…"), "{place}");
     }
 
     /// Intent 0455: a current account shows on the top bar, even when its usage doesn't fit, and on

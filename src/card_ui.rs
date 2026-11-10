@@ -64,7 +64,9 @@ fn place(app: &App, c: &Card, holder: &Card, itself: bool) -> (String, Color) {
         } else {
             "starting up".to_string()
         };
-        return (format!("◐ {what}… {secs} s"), CYAN);
+        // Sent again by itself, the same op, after a refusal that passes (intent 0591).
+        let again = if job.retrying { ", trying again" } else { "" };
+        return (format!("◐ {what}{again}… {secs} s"), CYAN);
     }
     if family::finished(c) {
         return match closed_on(c) {

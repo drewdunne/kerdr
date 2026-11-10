@@ -2254,6 +2254,24 @@ impl App {
         let response = match result {
             Ok(r) => r,
             Err(e) => {
+                // r, or a code that ran out, goes on to start whatever its cancel came to, no answer
+                // included: a start replaces any sign-in still running (intent 0591). If the machine
+                // is truly away, the start says so.
+                if request["action"] == "account-signin"
+                    && request["step"] == "cancel"
+                    && visible
+                    && let Mode::Accounts {
+                        screen: AccountScreen::Signin(s),
+                        ..
+                    } = &mut self.mode
+                    && s.restart
+                {
+                    s.restart = false;
+                    s.ticket = None;
+                    s.failed = false;
+                    self.account_queue.push_back((machine, s.start()));
+                    return;
+                }
                 // Named by what was asked, in words for the accounts screen (intent 0591).
                 let e = account_error(&request, &e);
                 if request["action"] == "account-move-waiting" {
@@ -4829,6 +4847,47 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn r_goes_on_to_start_even_when_its_cancel_got_no_answer() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        a.on_paste("page-code");
+        let action = key(&mut a, KeyCode::Enter);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"status":"failed","message":"that signed in as X, not KBZ_C's Y"}),
+        );
+        let (mi, cancel) = sent(press(&mut a, 'r'));
+        assert_eq!(cancel["step"], "cancel");
+        // The connection dropped before the cancel's answer came (intent 0591).
+        a.finish_action(
+            mi,
+            crate::actions::with_op(cancel),
+            Err(format!(
+                "the connection to arknet-one dropped before its answer came; {}, and its card shows how it stands.",
+                crate::actions::UNKNOWN
+            )),
+        );
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if !s.failed && !s.restart && s.ticket.is_none()),
+            "{:?}",
+            a.mode
+        );
+        let (to, again) = a.account_queue.pop_front().expect("a fresh start");
+        assert_eq!((to, again["step"].as_str()), (mi, Some("start")));
+        // A cancel nobody restarts after says what went wrong, as before.
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        key(&mut a, KeyCode::Esc);
+        let (mi, cancel) = sent(a.account_tick());
+        assert_eq!(cancel["step"], "cancel");
+        a.finish_action(mi, crate::actions::with_op(cancel), Err("no answer".into()));
+        assert!(a.account_queue.is_empty());
     }
 
     #[test]
