@@ -456,7 +456,8 @@ A backend that keeps ops lists `"op"` in its feed's `supports`, and does this, f
 will likely clear by itself, after waiting out anything that clears in a second or two yourself.
 Kerdr waits N seconds and sends the same request with the same `op`, saying "Trying again…" quietly on
 the card, up to two minutes in all for that request, by the clock, from its first answer: every wait
-(as long as it really took) and every resend's own time come out of those two minutes, and a resend
+(as long as it really took, time the computer spent asleep included) and every resend's own time
+come out of those two minutes, and a resend
 is given only what's left of them to answer in. A wait is never cut short: when N seconds, and at
 least 10 more for the resend to answer in, don't fit in what's left, or a wait ends with less than 10
 left, Kerdr sends nothing more and shows the last message as it is.

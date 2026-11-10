@@ -1,6 +1,6 @@
 //! Opt-in actions sent as JSON to a command on the card's home machine.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -182,6 +182,33 @@ pub fn without_op(request: &Value) -> Value {
 /// How long Kerdr keeps sending a request again by itself, counted from its first answer (intent
 /// 0591): every wait and every resend's own time come out of it, and none goes past it.
 pub const RETRY_MOST: Duration = Duration::from_secs(120);
+
+/// The time by two clocks, for RETRY_MOST: the steady one (`Instant`), which a change of the
+/// computer's clock doesn't move, and the wall clock, which goes on while the computer sleeps, as
+/// Linux's steady clock doesn't. Retrying's two minutes are up when either says so (Codex's third
+/// look, intent 0591): a laptop that slept through a wait sends nothing more when it wakes.
+#[derive(Clone, Copy, Debug)]
+pub struct Clocks {
+    pub steady: Instant,
+    pub wall: SystemTime,
+}
+
+impl Clocks {
+    pub fn now() -> Clocks {
+        Clocks {
+            steady: Instant::now(),
+            wall: SystemTime::now(),
+        }
+    }
+
+    /// What's left of RETRY_MOST from `start` to now, by whichever clock has less left. A wall
+    /// clock set back counts nothing as gone, so the steady clock's count stands.
+    fn left_of_retrying(start: Clocks, now: Clocks) -> Duration {
+        let steady = now.steady.saturating_duration_since(start.steady);
+        let wall = now.wall.duration_since(start.wall).unwrap_or_default();
+        RETRY_MOST.saturating_sub(steady.max(wall))
+    }
+}
 
 /// The least a resend is given to answer in, within RETRY_MOST: most answers come in a second or
 /// two. With less left, Kerdr sends nothing more and says the last answer as it is, rather than wait
@@ -415,7 +442,7 @@ pub fn run_resending(
         resends,
         tell,
         pause,
-        &Instant::now,
+        &Clocks::now,
         deadline_for(request),
     )
 }
@@ -431,7 +458,7 @@ fn run_resending_within(
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
-    clock: &dyn Fn() -> Instant,
+    clock: &dyn Fn() -> Clocks,
     deadline: Duration,
 ) -> Answered {
     resending(
@@ -473,7 +500,7 @@ fn resending(
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
-    clock: &dyn Fn() -> Instant,
+    clock: &dyn Fn() -> Clocks,
     deadline: Duration,
     send: &mut dyn FnMut(Option<transport::Handed>, Duration) -> Sent,
 ) -> Answered {
@@ -482,15 +509,15 @@ fn resending(
     // and a read changes nothing however often it's sent.
     let may = resends && (request.get("op").is_some() || !changes(request));
     let mut this_deadline = deadline;
-    // The end of retrying: RETRY_MOST from the first answer, fixed then.
-    let mut until: Option<Instant> = None;
+    // When retrying started: at the first answer, fixed then. It ends RETRY_MOST later.
+    let mut start: Option<Clocks> = None;
     let mut lost = 0;
     loop {
         let sent = send(handed.take(), this_deadline);
         if !may {
             return sent.answered;
         }
-        let until = *until.get_or_insert_with(|| clock() + RETRY_MOST);
+        let start = *start.get_or_insert_with(clock);
         let why = match &sent.answered.result {
             Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
                 // As long as it asked, never less; at least a second.
@@ -509,7 +536,7 @@ fn resending(
         };
         // The wait is set against what's left before anything is added to it, so no wait asked
         // for, however long, can overflow.
-        let left = until.saturating_duration_since(clock());
+        let left = Clocks::left_of_retrying(start, clock());
         if wait > left || left - wait < RESEND_ROOM {
             return sent.answered;
         }
@@ -518,7 +545,7 @@ fn resending(
         }
         tell(&why);
         pause(wait);
-        let left = until.saturating_duration_since(clock());
+        let left = Clocks::left_of_retrying(start, clock());
         if left < RESEND_ROOM {
             return sent.answered;
         }
@@ -1037,7 +1064,7 @@ printf '%s' "$answer"
                 waits.borrow_mut().push(d);
                 waited.set(waited.get() + d);
             },
-            &|| Instant::now() + waited.get(),
+            &|| later(Clocks::now(), waited.get()),
             deadline,
         );
         (answered, told, waits.into_inner())
@@ -1196,8 +1223,8 @@ printf '%s' "$answer"
         let mut deadlines = vec![];
         let mut told = vec![];
         let waits = std::cell::RefCell::new(vec![]);
-        let now = std::cell::Cell::new(Instant::now());
-        let first = std::cell::Cell::new(None);
+        let now = std::cell::Cell::new(Clocks::now());
+        let first = std::cell::Cell::new(None::<Clocks>);
         let answered = resending(
             request,
             None,
@@ -1207,7 +1234,7 @@ printf '%s' "$answer"
                 let mut waits = waits.borrow_mut();
                 let over = late.get(waits.len()).copied().unwrap_or_default();
                 waits.push(d);
-                now.set(now.get() + d + over);
+                now.set(later(now.get(), d + over));
             },
             &|| now.get(),
             deadline_for(request),
@@ -1217,7 +1244,7 @@ printf '%s' "$answer"
                 if out.timed_out {
                     out.took = deadline;
                 }
-                now.set(now.get() + out.took);
+                now.set(later(now.get(), out.took));
                 if first.get().is_none() {
                     first.set(Some(now.get()));
                 }
@@ -1232,8 +1259,16 @@ printf '%s' "$answer"
                 }
             },
         );
-        let spent = now.get() - first.get().expect("sent at least once");
+        let spent = now.get().steady - first.get().expect("sent at least once").steady;
         (answered, told, deadlines, waits.into_inner(), spent)
+    }
+
+    /// Both clocks, `d` later: time that passes while the computer is awake.
+    fn later(c: Clocks, d: Duration) -> Clocks {
+        Clocks {
+            steady: c.steady + d,
+            wall: c.wall + d,
+        }
     }
 
     fn timed_out() -> transport::Output {
@@ -1384,7 +1419,7 @@ printf '%s' "$answer"
             stderr: String::new(),
         };
         let mut answers = vec![refusal(5), refusal(u64::MAX)].into_iter();
-        let now = std::cell::Cell::new(Instant::now());
+        let now = std::cell::Cell::new(Clocks::now());
         let waits = std::cell::RefCell::new(vec![]);
         let mut sends = 0;
         let answered = resending(
@@ -1394,13 +1429,13 @@ printf '%s' "$answer"
             &mut |_| {},
             &|d| {
                 waits.borrow_mut().push(d);
-                now.set(now.get() + d);
+                now.set(later(now.get(), d));
             },
             &|| now.get(),
             deadline_for(&close),
             &mut |_, _| {
                 sends += 1;
-                now.set(now.get() + Duration::from_secs(1));
+                now.set(later(now.get(), Duration::from_secs(1)));
                 Sent {
                     answered: answers.next().expect("sent more often than expected"),
                     lost: false,
@@ -1410,6 +1445,75 @@ printf '%s' "$answer"
         assert_eq!(sends, 2);
         assert_eq!(waits.into_inner(), [Duration::from_secs(5)]);
         assert_eq!(answered.result.unwrap().retry, Some(u64::MAX));
+    }
+
+    #[test]
+    fn a_computer_asleep_through_a_wait_sends_nothing_more_when_it_wakes() {
+        // Linux's steady clock stops while the computer sleeps; the wall clock doesn't. A laptop
+        // shut for ten minutes during a 5 s wait wakes past the two minutes, and that refusal
+        // stands, unsent again (Codex's third look, intent 0591).
+        let close = with_op(json!({"action":"close","id":"0041"}));
+        let refused = || Answered {
+            result: Ok(Response {
+                ok: false,
+                retry: Some(5),
+                message: "#41 is locked by another request.".into(),
+                ..Default::default()
+            }),
+            stderr: String::new(),
+        };
+        let run = |asleep: Duration, wall_set: Duration| {
+            let now = std::cell::Cell::new(Clocks::now());
+            let mut sends = 0;
+            let answered = resending(
+                &close,
+                None,
+                true,
+                &mut |_| {},
+                &|d| {
+                    // Awake for the wait asked for, then asleep: the steady clock stops.
+                    let c = later(now.get(), d);
+                    now.set(Clocks {
+                        steady: c.steady,
+                        wall: c.wall + asleep - wall_set,
+                    });
+                },
+                &|| now.get(),
+                deadline_for(&close),
+                &mut |_, _| {
+                    sends += 1;
+                    let answered = if sends == 1 {
+                        refused()
+                    } else {
+                        Answered {
+                            result: Ok(Response {
+                                ok: true,
+                                message: "Marked #41 done.".into(),
+                                ..Default::default()
+                            }),
+                            stderr: String::new(),
+                        }
+                    };
+                    Sent {
+                        answered,
+                        lost: false,
+                    }
+                },
+            );
+            (sends, answered.result.unwrap())
+        };
+        let (sends, r) = run(Duration::from_secs(600), Duration::ZERO);
+        assert_eq!(sends, 1, "sent again ten minutes later");
+        assert!(!r.ok && r.retry == Some(5));
+        // Awake all along, it's sent again, as ever.
+        let (sends, r) = run(Duration::ZERO, Duration::ZERO);
+        assert_eq!(sends, 2);
+        assert!(r.ok);
+        // A wall clock set back an hour meanwhile counts nothing as gone: the steady clock's
+        // count stands, and it's sent again.
+        let (sends, r) = run(Duration::ZERO, Duration::from_secs(3600));
+        assert_eq!(sends, 2);
+        assert!(r.ok);
     }
 
     #[test]
