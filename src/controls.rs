@@ -899,7 +899,7 @@ impl App {
     /// Whether the backend where this card's record lives does each key's step first and asks its
     /// own questions for C, x and X on work an agent may be at: its feed's `supports` has "steps"
     /// (intent 0591). Any other gets 0.33.0's behaviour: Kerdr's own question or refusal first.
-    pub(super) fn does_steps(&self, card: &Card) -> bool {
+    pub(crate) fn does_steps(&self, card: &Card) -> bool {
         let home = card
             .detail
             .as_ref()

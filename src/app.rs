@@ -1445,13 +1445,27 @@ impl App {
                 card.state.as_deref(),
                 Some("closed" | "active" | "background")
             );
+        // As herdr says it is now, which the board will say at its next read.
+        let mut gone = card.clone();
+        gone.workspace_id = None;
+        gone.session = None;
+        gone.tab_id = None;
+        gone.agents.clear();
+        // A conversation on record: reopened, as for work under way, and its backend refuses
+        // one still running elsewhere (intent 0591, K3-02).
+        let conversation = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.resume.as_ref())
+            .is_some_and(|r| r.conversation.is_some());
+        if conversation && !card.dismissed() && self.actions_on() {
+            let action = self.reopen_action(&gone);
+            if matches!(action, Action::Mutate { .. }) {
+                self.action_from = Some(CardSnapshot::of(&card));
+            }
+            return self.by_enter(action);
+        }
         if never_started && self.actions_on() {
-            // As herdr says it is now, which the board will say at its next read.
-            let mut gone = card.clone();
-            gone.workspace_id = None;
-            gone.session = None;
-            gone.tab_id = None;
-            gone.agents.clear();
             let action = self.intent_action_on(gone, "dispatch", serde_json::json!({}));
             if matches!(action, Action::Mutate { .. }) {
                 // Its answer asks or takes you in on the card as the board still shows it.
@@ -1632,9 +1646,28 @@ impl App {
         if self.card(&pending.key).is_some() {
             return Some(Action::Jump(pending.key));
         }
+        // An intent's card under another key now (it moved home, or another machine's copy
+        // shows it): found by its number, and ⏎ does for it what it does now: goes in, reopens
+        // it, or asks the done-work question (intent 0591, K1-04).
+        let number = pending
+            .key
+            .rsplit_once(':')
+            .map(|(_, id)| id)
+            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
+        let found = number.and_then(|id| {
+            self.board
+                .cards
+                .iter()
+                .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+                .map(|c| c.key.clone())
+        });
+        if let Some(key) = found {
+            self.go_to(&key);
+            return Some(self.jump_action(key));
+        }
         self.say(
             format!(
-                "{} closed while {} was away; it's off the board now.",
+                "{} closed while {} was away, and nothing of it is left to open.",
                 pending.workspace, pending.machine
             ),
             Tone::Warn,
@@ -4292,7 +4325,7 @@ pub(crate) mod tests {
             app.message(),
             Some((
                 format!(
-                    "Workspace {} closed while build-box was away; it's off the board now.",
+                    "Workspace {} closed while build-box was away, and nothing of it is left to open.",
                     card.reference
                 )
                 .as_str(),
@@ -4326,6 +4359,49 @@ pub(crate) mod tests {
             "dispatch"
         };
         assert_eq!(request["action"], expected);
+    }
+
+    #[test]
+    fn a_waiting_jump_finds_its_intent_by_number_when_its_card_has_another_key_now() {
+        // Intent 0591, K1-04: it moved home, or another machine's copy shows it: ⏎ does for it
+        // what it does now, never "it's off the board".
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        app.pending_jump = Some(PendingJump {
+            key: format!("elsewhere:{id}"),
+            workspace: "07-build".into(),
+            machine: "gone-box".into(),
+            stuck: None,
+            bare: None,
+        });
+        app.mode = Mode::Board;
+        let Some(Action::Mutate { request, .. }) = app.pending_jump_ready() else {
+            panic!("nothing done: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+    }
+
+    #[test]
+    fn a_closed_workspace_on_work_with_a_conversation_on_record_reopens_it() {
+        // Intent 0591, K3-02: neither under way nor done (shelved), but its conversation is on
+        // record: reopened as for work under way, never "has closed since the board last read it".
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.stage = Stage::Backlog;
+        card.state = Some("shelved".into());
+        card.workspace_id = Some("w5".into());
+        card.session = Some("web".into());
+        assert!(!app.closed_under_you(&key, Some("w5")));
+        let Action::Mutate { request, .. } = app.after_closed(&key, Some("w5"), false) else {
+            panic!("nothing done: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
     }
 
     #[test]

@@ -342,6 +342,10 @@ pub(crate) fn where_to_answer(app: &App, c: &Card) -> String {
         return "It runs in a terminal outside herdr: ⏎ moves it into herdr to answer in.".into();
     }
     if c.dismissed() {
+        // A backend that brings it back as it starts it (intent 0591, K1-06).
+        if app.does_steps(c) {
+            return "It's in won't do: ⏎ asks to bring it back and start it.".into();
+        }
         return "It's in won't do: u brings it back, then ⏎ starts it.".into();
     }
     if c.can_reopen_done() {
