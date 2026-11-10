@@ -2260,10 +2260,15 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
                 .map_or("It stays".into(), |p| format!("It stays on {p}"));
             lines.extend(wrapped(
                 &format!(
-                    "Handed over from {} ({}){when}: {}. {fresh} picked up from the log.",
+                    "Handed over from {} ({}){when}: {}{}. {fresh} picked up from the log.",
                     from.account,
                     providers.program_label(&from.program),
-                    from.reason()
+                    from.reason(),
+                    if from.why == "sign_in" {
+                        " (⏎ on it in A signs it in again)"
+                    } else {
+                        ""
+                    }
                 ),
                 w,
                 fg(YELLOW),

@@ -100,6 +100,9 @@ pub struct Response {
     /// With `ok: false`: part of the change happened, and the message says which part.
     #[serde(default)]
     pub partial: bool,
+    /// On a sign-in that stopped: a fresh one is what's wanted, its login having ended by itself.
+    #[serde(default)]
+    pub again: bool,
 }
 
 /// `retry` as a backend gives it: whole or fractional seconds, rounded up; anything else is none.

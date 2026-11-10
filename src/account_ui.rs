@@ -426,9 +426,21 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 ),
                 line(
                     if target.agent.waiting_for_usage() {
-                        "Usage Limit Reached"
+                        // When it comes back, where that's known (intent 0591).
+                        match app
+                            .account(target.machine, &target.agent.account)
+                            .filter(|a| a.status == "out")
+                            .and_then(|a| a.until.as_deref())
+                        {
+                            Some(until) => format!(
+                                "Usage Limit Reached: {} is back at {}",
+                                target.agent.account,
+                                crate::accounts::reset_time(until)
+                            ),
+                            None => "Usage Limit Reached".to_string(),
+                        }
                     } else {
-                        "Choose an account"
+                        "Choose an account".to_string()
                     },
                     if target.agent.waiting_for_usage() {
                         RED
@@ -863,7 +875,11 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                             "✓ signed in"
                         } else if i == s.current {
                             if s.failed {
-                                "✕ sign-in stopped"
+                                if s.set_aside {
+                                    "set aside for a token"
+                                } else {
+                                    "✕ sign-in stopped"
+                                }
                             } else if s.user_code.is_some() {
                                 "◐ type the code on the page"
                             } else {

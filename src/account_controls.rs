@@ -48,6 +48,10 @@ pub struct Signin {
     pub user_code: Option<String>,
     pub expires: Option<String>,
     pub page_code: String,
+    /// A fresh sign-in has started by itself in place of one that ended (intent 0591): only once.
+    pub started_fresh: bool,
+    /// He chose a token instead of the browser: its stopping isn't a failure (intent 0591).
+    pub set_aside: bool,
     pub editing: bool,
     pub poll_at: Instant,
     pub failed: bool,
@@ -1160,6 +1164,8 @@ impl App {
             user_code: None,
             expires: None,
             page_code: String::new(),
+            started_fresh: false,
+            set_aside: false,
             editing: false,
             poll_at: Instant::now() + Duration::from_secs(2),
             failed: false,
@@ -1801,9 +1807,22 @@ impl App {
                             );
                         } else if let Some(missing) = missing {
                             self.say(
-                                format!("{} needs {missing}.", add.provider.name()),
+                                format!(
+                                    "{} needs {missing}: type it in the {missing} row.",
+                                    add.provider.name()
+                                ),
                                 Tone::Warn,
                             );
+                            // The cursor goes to that row (intent 0591).
+                            if let Some(row) = add
+                                .provider
+                                .fields
+                                .iter()
+                                .zip(&add.extra)
+                                .position(|(f, value)| f.required && value.trim().is_empty())
+                            {
+                                add.field = AddAccount::FIELDS_AT + row;
+                            }
                         } else if self.code_taken(add.code()) {
                             self.say(
                                 "That code exists. Select its account and press e to rename it.",
@@ -1868,8 +1887,9 @@ impl App {
                         }
                         s.url = None;
                         s.failed = true;
+                        s.set_aside = true;
                         s.message =
-                            "Browser sign-in cancelled. Paste a token, or r to start again.".into();
+                            "Browser sign-in set aside for a token. r starts it again.".into();
                         let code = s.code.clone();
                         let copy = s.copy.as_ref().map(|(id, _)| id.clone());
                         self.mode = Mode::Accounts { screen, back };
@@ -1894,6 +1914,7 @@ impl App {
                     }
                     KeyCode::Char('r') if !s.editing && (s.failed || s.expired(self.now())) => {
                         s.failed = false;
+                        s.set_aside = false;
                         s.url = None;
                         s.page_code.clear();
                         s.needs_code = false;
@@ -2144,6 +2165,33 @@ impl App {
             }
             return action;
         }
+        // The code to type ran out with the page unused: a new one, by itself, once (intent 0591).
+        let now = self.now();
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut self.mode
+            && !s.failed
+            && !s.started_fresh
+            && !s.restart
+            && s.page_code.is_empty()
+            && !s.editing
+            && s.expired(now)
+            && let (Some(&mi), Some(ticket)) = (s.machines.get(s.current), s.ticket.clone())
+        {
+            s.started_fresh = true;
+            s.restart = true;
+            s.url = None;
+            s.needs_code = false;
+            s.user_code = None;
+            s.expires = None;
+            s.message = "Starting a fresh sign-in…".into();
+            self.say("That code ran out; here's a new one.", Tone::Info);
+            return self.send_account(
+                mi,
+                json!({"action":"account-signin","step":"cancel","ticket":ticket}),
+            );
+        }
         if let Mode::Accounts {
             screen: AccountScreen::Signin(s),
             ..
@@ -2255,16 +2303,17 @@ impl App {
                     && s.restart
                 {
                     s.restart = false;
-                    if response.ok {
-                        s.ticket = None;
-                        s.failed = false;
-                        self.account_queue.push_back((machine, s.start()));
-                    } else {
-                        s.failed = true;
-                        s.message = format!("Could not cancel sign-in: {}", response.message);
-                    }
+                    // A start replaces any sign-in still running, so r goes on whatever the
+                    // cancel said (intent 0591).
+                    s.ticket = None;
+                    s.failed = false;
+                    self.account_queue.push_back((machine, s.start()));
+                    return;
                 }
-                if !response.ok {
+                // Asked to stop one that has gone already: that's what was asked for.
+                let gone =
+                    response.message.contains("no such") || response.message.contains("had ended");
+                if !response.ok && !gone {
                     if let Mode::Accounts {
                         screen: AccountScreen::PasteToken { submit, .. },
                         ..
@@ -2334,6 +2383,29 @@ impl App {
                 ..
             } = &mut self.mode
             {
+                // It ended by itself, or a passing failure outlasted its retries: a fresh sign-in
+                // starts in its place, once, in place of a dead end (intent 0591).
+                if !response.ok
+                    && (response.again || response.retry.is_some())
+                    && !s.started_fresh
+                    && matches!(request["step"].as_str(), Some("start" | "poll" | "finish"))
+                {
+                    s.started_fresh = true;
+                    s.ticket = None;
+                    s.url = None;
+                    s.page_code.clear();
+                    s.needs_code = false;
+                    s.user_code = None;
+                    s.expires = None;
+                    s.editing = false;
+                    s.failed = false;
+                    s.note = None;
+                    s.message = "Starting a fresh sign-in…".into();
+                    let start = s.start();
+                    self.account_queue.push_back((machine, start));
+                    self.say(fresh_signin_words(&response.message), Tone::Info);
+                    return;
+                }
                 if request["step"] == "finish" && !response.ok && response.status.is_none() {
                     // The backend refused that code and waits on for the right one: say why
                     // under the box, and keep it open.
@@ -2628,6 +2700,22 @@ impl App {
     }
 }
 
+/// What's said as a fresh sign-in starts in place of one that stopped by itself (intent 0591).
+fn fresh_signin_words(message: &str) -> String {
+    if message.contains("had ended") {
+        return "That sign-in had ended; here's a new link.".into();
+    }
+    let said = message
+        .trim()
+        .trim_end_matches("r starts a new one.")
+        .trim_end();
+    if said.is_empty() {
+        "Kerdr started a fresh sign-in.".into()
+    } else {
+        format!("{said} Kerdr started a fresh sign-in.")
+    }
+}
+
 /// An account request's error, named by what was asked: "Moving the agent to ARK_C: no answer
 /// came…". One whose result is unknown points at the accounts screen, not a card (intent 0591).
 fn account_error(request: &Value, error: &str) -> String {
@@ -2774,6 +2862,74 @@ mod tests {
             "{said}"
         );
     }
+    #[test]
+    fn a_sign_in_that_ended_by_itself_starts_a_fresh_one_in_its_place_but_only_once() {
+        let mut a = app();
+        let action = signin(&mut a);
+        complete(&mut a, action, started());
+        a.on_paste("page-code");
+        let action = key(&mut a, KeyCode::Enter);
+        let ended = json!({"ok":false,"status":"failed","again":true,"message":"that sign-in had ended (they last 15 minutes), so nothing was saved. r starts a new one."});
+        complete(&mut a, action, ended.clone());
+        assert_eq!(
+            a.message().unwrap().0,
+            "That sign-in had ended; here's a new link."
+        );
+        assert!(
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if !s.failed && s.ticket.is_none() && s.started_fresh)
+        );
+        // The fresh one goes out next, and it starts like any other.
+        let again = a.account_tick();
+        let (_, request) = sent(again.clone());
+        assert_eq!(request["step"], "start");
+        complete(&mut a, again, started());
+        assert!(signin_screen(&a).ticket.is_some());
+        // That one ends too: it stops, for r, rather than go round for ever.
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now();
+        }
+        let poll = a.account_tick();
+        complete(&mut a, poll, ended);
+        let s = signin_screen(&a);
+        assert!(s.failed && s.message.contains("had ended"), "{}", s.message);
+        assert!(a.account_queue.is_empty());
+    }
+
+    #[test]
+    fn a_code_that_ran_out_with_its_page_unused_is_replaced_by_itself_once() {
+        let mut a = app();
+        let action = signin(&mut a);
+        let mut reply = started();
+        reply["user_code"] = json!("K7QD-3MPWX");
+        reply["expires"] = json!("2000-01-01T00:00:00Z");
+        complete(&mut a, action, reply);
+        assert!(signin_screen(&a).user_code.is_some());
+        let cancel = a.account_tick();
+        let (_, request) = sent(cancel.clone());
+        assert_eq!(request["step"], "cancel");
+        assert_eq!(
+            a.message().unwrap().0,
+            "That code ran out; here's a new one."
+        );
+        complete(
+            &mut a,
+            cancel,
+            json!({"ok":true,"status":"cancelled","message":"cancelled"}),
+        );
+        let start = a.account_tick();
+        assert_eq!(sent(start.clone()).1["step"], "start");
+        let mut reply = started();
+        reply["user_code"] = json!("K7QD-3MPWY");
+        reply["expires"] = json!("2000-01-01T00:00:00Z");
+        complete(&mut a, start, reply);
+        // Once only: this one, run out too, waits for r.
+        assert_eq!(a.account_tick(), Action::None);
+    }
+
     fn key(a: &mut App, k: KeyCode) -> Action {
         a.on_key(KeyEvent::new(k, KeyModifiers::NONE))
     }
@@ -4176,7 +4332,7 @@ mod tests {
     }
 
     #[test]
-    fn identity_mismatch_and_refused_cancel_do_not_advance_signin() {
+    fn identity_mismatch_does_not_advance_signin_and_r_goes_on_even_if_its_cancel_is_refused() {
         let mut a = app();
         let action = signin(&mut a);
         complete(&mut a, action, started());
@@ -4196,10 +4352,12 @@ mod tests {
             cancel,
             json!({"ok":false,"message":"cancel refused"}),
         );
-        assert!(a.account_queue.is_empty());
+        // A start replaces whatever is still running, so r goes on anyway (intent 0591).
         assert!(
-            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed && s.ticket.is_some() && s.message.contains("cancel refused"))
+            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if !s.failed && s.ticket.is_none())
         );
+        let (_, again) = a.account_queue.pop_front().unwrap();
+        assert_eq!(again["step"], "start");
         key(&mut a, KeyCode::Esc);
         assert!(!matches!(
             a.mode,
@@ -5048,9 +5206,12 @@ mod tests {
         assert!(screen.contains("address"), "{screen}");
         assert!(screen.contains("a model on your network"), "{screen}");
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
-        assert!(a.message().unwrap().0.contains("Local needs address"));
-        key(&mut a, KeyCode::Tab);
-        key(&mut a, KeyCode::Tab);
+        assert_eq!(
+            a.message().unwrap().0,
+            "Local needs address: type it in the address row."
+        );
+        // The cursor is on that row already (intent 0591).
+        assert_eq!(add_screen(&a).field, AddAccount::FIELDS_AT);
         type_text(&mut a, "http://studio-gpu:8000/v1");
         let action = key(&mut a, KeyCode::Enter);
         let (_, request) = sent(action.clone());
