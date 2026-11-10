@@ -2879,6 +2879,42 @@ mod tests {
         a
     }
 
+    /// The backend's answer as Kerdr reads it off a real command: through the transport and its
+    /// reading of the answer, not handed over already parsed.
+    #[cfg(unix)]
+    fn through_transport(request: &Value, reply: &Value) -> Result<Response, String> {
+        let here = Config::default().machines("here", &[]).remove(0);
+        let command = format!(
+            "cat >/dev/null; printf '%s' {}",
+            crate::transport::quote(&reply.to_string())
+        );
+        crate::actions::run(&here, &command, request)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_answer_that_moved_nothing_is_news_when_it_comes_through_the_real_transport() {
+        let mut a = app();
+        let request = crate::actions::with_op(
+            json!({"action":"account-move","pane":"w1:p1","session":"web","conversation":"c","to":"ARK_C"}),
+        );
+        for nothing in [
+            json!({"ok":true,"state":"stale","message":"that pane runs another agent now; nothing moved"}),
+            json!({"ok":true,"state":"already","message":"ARK_C was already off the account list"}),
+        ] {
+            let result = through_transport(&request, &nothing);
+            a.finish_action(0, request.clone(), result);
+            assert_eq!(
+                a.message().map(|(_, t)| t),
+                Some(Tone::Info),
+                "{nothing}: nothing moved, so not the success colour"
+            );
+        }
+        let moved = json!({"ok":true,"state":"moved","account":"ARK_C","message":"moved to ARK_C"});
+        a.finish_action(0, request.clone(), through_transport(&request, &moved));
+        assert_eq!(a.message(), Some(("moved to ARK_C", Tone::Good)));
+    }
+
     #[test]
     fn an_account_answer_is_coloured_by_what_happened_and_an_error_names_what_was_asked() {
         let mut a = app();

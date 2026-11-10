@@ -179,9 +179,14 @@ pub fn without_op(request: &Value) -> Value {
     request
 }
 
-/// How long Kerdr keeps sending a request again for refusals that say they're passing (`retry`),
-/// counted from its first answer (intent 0591).
+/// How long Kerdr keeps sending a request again by itself, counted from its first answer (intent
+/// 0591): every wait and every resend's own time come out of it, and none goes past it.
 pub const RETRY_MOST: Duration = Duration::from_secs(120);
+
+/// The least a resend is given to answer in, within RETRY_MOST: most answers come in a second or
+/// two. With less left, Kerdr sends nothing more and says the last answer as it is, rather than wait
+/// a shorter while than was asked or send one that can't hear back.
+pub const RESEND_ROOM: Duration = Duration::from_secs(10);
 
 /// The waits before each resend of a request whose answer was lost (no answer in time, the
 /// connection dropped, the answer cut off), to a backend that keeps ops: three, over about 30 s.
@@ -322,6 +327,20 @@ const KNOWN_STATUSES: &[&str] = &[
     "partial",
 ];
 
+/// The states a `progress` answer gives (docs/feed.md).
+const PROGRESS_STATES: &[&str] = &["running", "done", "asks", "failed", "unknown"];
+
+/// The states other answers give (an account move's, an account removal's), kept as they are by the
+/// credential scrub, as KNOWN_STATUSES are.
+const ANSWER_STATES: &[&str] = &[
+    "stale",
+    "queued",
+    "waiting",
+    "moved",
+    "already",
+    "unchanged",
+];
+
 /// Metadata returned to the UI after sending; credentials never enter its result queue, and a
 /// new intent's images, and an edited item's text, are only counted there: the board keeps the
 /// text itself until it's saved (intent 0414).
@@ -369,15 +388,16 @@ fn most_bytes(request: &Value) -> usize {
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
-    run_with_deadline(machine, command, request, deadline_for(request), None).0
+    run_with_deadline(machine, command, request, deadline_for(request), None).result
 }
 
-/// As run_handing, sending the same request again, with the same op, by itself (intent 0591):
-/// after a refusal with `retry`, once that many seconds have passed, for up to RETRY_MOST in all;
-/// and, with `resends` (its machine's backend keeps ops), after an answer that was lost, up to
-/// three times over about 30 seconds. A change without an op is never sent again; a read (an
-/// item's text, a kickoff check), which changes nothing, is as if it had one. `tell` hears each
-/// resend before its wait, and `pause` does the waiting (a test's own, which needn't).
+/// As run_handing, sending the same request again, with the same op, by itself (intent 0591), only
+/// with `resends` (its machine's feed says its backend keeps ops, so nothing is done twice there):
+/// after a refusal with `retry`, once that many seconds have passed, and after an answer that was
+/// lost, up to three times over about 30 seconds; all of it within RETRY_MOST of the first answer.
+/// A change without an op is never sent again; a read (an item's text, a kickoff check), which
+/// changes nothing, is as if it had one. `tell` hears each resend before its wait, and `pause` does
+/// the waiting (a test's own, which needn't).
 pub fn run_resending(
     machine: &Machine,
     command: &str,
@@ -399,7 +419,7 @@ pub fn run_resending(
     )
 }
 
-/// As run_resending, each send given `deadline` to answer.
+/// As run_resending, the first send given `deadline` to answer, and each resend no more than that.
 #[allow(clippy::too_many_arguments)]
 fn run_resending_within(
     machine: &Machine,
@@ -411,62 +431,89 @@ fn run_resending_within(
     pause: &dyn Fn(Duration),
     deadline: Duration,
 ) -> Answered {
-    resending(request, handed, resends, tell, pause, &mut |handed| {
-        let (result, stderr, lost) = run_with_deadline(machine, command, request, deadline, handed);
-        (keep_stderr(result, stderr, request), lost)
-    })
+    resending(
+        request,
+        handed,
+        resends,
+        tell,
+        pause,
+        deadline,
+        &mut |handed, deadline| {
+            let began = Instant::now();
+            let ran = run_with_deadline(machine, command, request, deadline, handed);
+            let lost = ran.lost;
+            Sent {
+                answered: keep_stderr(ran, request),
+                lost,
+                took: began.elapsed(),
+            }
+        },
+    )
 }
 
-/// The resends themselves: `send` sends the request once, and says whether its answer was lost.
+/// One send, as `resending` sees it.
+struct Sent {
+    answered: Answered,
+    /// Its answer was lost on the way: the request may or may not have happened.
+    lost: bool,
+    /// How long it took, which comes out of RETRY_MOST once it's a resend.
+    took: Duration,
+}
+
+/// The resends themselves: `send` sends the request once, given the deadline it names. Only with
+/// `resends` is anything sent twice (intent 0591): a backend that doesn't keep ops could do a
+/// change twice. Every resend fits in RETRY_MOST from the first answer, its wait whole and at least
+/// RESEND_ROOM for it to answer in; one that doesn't isn't sent, and the last answer stands.
 fn resending(
     request: &Value,
     handed: Option<transport::Handed>,
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
-    send: &mut dyn FnMut(Option<transport::Handed>) -> (Answered, bool),
+    deadline: Duration,
+    send: &mut dyn FnMut(Option<transport::Handed>, Duration) -> Sent,
 ) -> Answered {
     let mut handed = handed;
-    let mut first_answer: Option<Instant> = None;
-    // What's been waited, which a test's pause doesn't spend.
-    let mut waited = Duration::ZERO;
+    // Safe to send again: the backend keeps ops and answers a second send of one from its record,
+    // and a read changes nothing however often it's sent.
+    let may = resends && (request.get("op").is_some() || !changes(request));
+    let mut this_deadline = deadline;
+    // Retrying's time so far, from the first answer: the waits, and each resend's own time.
+    let mut spent: Option<Duration> = None;
     let mut lost = 0;
-    // Safe to send again: the backend answers a second send of an op from its record, and a read
-    // changes nothing however often it's sent.
-    let op = request.get("op").is_some() || !changes(request);
     loop {
-        let (answered, was_lost) = send(handed.take());
-        let began = *first_answer.get_or_insert_with(Instant::now);
-        if op {
-            match &answered.result {
-                Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => {
-                    let wait = Duration::from_secs(r.retry.unwrap_or(1).clamp(1, 60));
-                    if began.elapsed().max(waited) + wait <= RETRY_MOST {
-                        tell(&Resend::Retry {
-                            wait,
-                            message: r.message.clone(),
-                        });
-                        pause(wait);
-                        waited += wait;
-                        continue;
-                    }
-                }
-                Err(error) if was_lost && resends && lost < LOST_WAITS.len() => {
-                    let wait = LOST_WAITS[lost];
-                    lost += 1;
-                    tell(&Resend::Lost {
-                        wait,
-                        error: error.clone(),
-                        attempt: lost,
-                    });
-                    pause(wait);
-                    waited += wait;
-                    continue;
-                }
-                _ => {}
-            }
+        let sent = send(handed.take(), this_deadline);
+        let now = spent.map_or(Duration::ZERO, |s| s + sent.took);
+        if !may {
+            return sent.answered;
         }
-        return answered;
+        let why = match &sent.answered.result {
+            Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
+                // As long as it asked, never less; at least a second.
+                wait: Duration::from_secs(r.retry.unwrap_or(1).max(1)),
+                message: r.message.clone(),
+            },
+            Err(error) if sent.lost && lost < LOST_WAITS.len() => Resend::Lost {
+                wait: LOST_WAITS[lost],
+                error: error.clone(),
+                attempt: lost + 1,
+            },
+            _ => return sent.answered,
+        };
+        let wait = match &why {
+            Resend::Retry { wait, .. } | Resend::Lost { wait, .. } => *wait,
+        };
+        let left = RETRY_MOST.saturating_sub(now + wait);
+        if left < RESEND_ROOM {
+            return sent.answered;
+        }
+        if matches!(why, Resend::Lost { .. }) {
+            lost += 1;
+        }
+        tell(&why);
+        pause(wait);
+        spent = Some(now + wait);
+        this_deadline = deadline.min(left);
     }
 }
 
@@ -538,18 +585,60 @@ fn answer_with_stderr(
     deadline: Duration,
     handed: Option<transport::Handed>,
 ) -> Answered {
-    let (result, stderr, _) = run_with_deadline(machine, command, request, deadline, handed);
-    keep_stderr(result, stderr, request)
+    keep_stderr(
+        run_with_deadline(machine, command, request, deadline, handed),
+        request,
+    )
 }
 
-/// An answer, with the end of what its command printed on standard error made fit for the error
-/// log: nothing typed into the request in it, nor a credential.
-fn keep_stderr(result: Result<Response, String>, stderr: String, request: &Value) -> Answered {
-    // Its end says what finally went wrong; the board never sees this.
-    let stderr = crate::errlog::last_part(&stderr, crate::errlog::MOST_STDERR);
+/// How much of what a backend printed in place of a proper answer goes to the error log: its
+/// beginning, which says what it is.
+const MOST_PRINTED: usize = 4 * 1024;
+
+/// An answer, with the end of what its command printed on standard error, and the beginning of a
+/// malformed answer it printed, made fit for the error log: nothing typed into the request in it,
+/// nor a credential. The board never sees this.
+fn keep_stderr(ran: Ran, request: &Value) -> Answered {
+    let printed = ran
+        .printed
+        .as_deref()
+        .map(|p| redact_credentials(p.trim(), request))
+        .map(|p| beginning(&p, MOST_PRINTED).to_string())
+        .filter(|p| !p.is_empty());
+    // Its end says what finally went wrong; room is left for what it printed instead of an answer.
+    let room = crate::errlog::MOST_STDERR - printed.as_ref().map_or(0, |_| MOST_PRINTED + 64);
+    let mut stderr = crate::errlog::last_part(ran.stderr.trim_end(), room).to_string();
+    if let Some(printed) = printed {
+        if !stderr.is_empty() {
+            stderr.push('\n');
+        }
+        stderr.push_str("[its answer, which Kerdr couldn't read] ");
+        stderr.push_str(&printed);
+    }
     let typed = typed_in(request);
-    let stderr = crate::errlog::scrub(&redact_credentials(stderr, request), &typed, &typed);
-    Answered { result, stderr }
+    let stderr = crate::errlog::scrub(&redact_credentials(&stderr, request), &typed, &typed);
+    Answered {
+        result: ran.result,
+        stderr,
+    }
+}
+
+/// The first `most` bytes of `text`, never half a word: no token is left half there, where the
+/// error log's scrub might not know it.
+fn beginning(text: &str, most: usize) -> &str {
+    if text.len() <= most {
+        return text;
+    }
+    let mut end = most;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = &text[..end];
+    if text[end..].starts_with(|c: char| c.is_alphanumeric()) {
+        cut.trim_end_matches(|c: char| c.is_alphanumeric())
+    } else {
+        cut
+    }
 }
 
 /// What was typed into a request: a new intent's words, an edit, an answer.
@@ -564,28 +653,47 @@ pub fn typed_in(request: &Value) -> Vec<&str> {
     typed
 }
 
-/// The answer, what the command printed on standard error, unscrubbed, and whether the answer
-/// was lost (none in time, or none that could be read): the request may or may not have happened.
+/// One send of a request, as its command answered it.
+struct Ran {
+    result: Result<Response, String>,
+    /// What the command printed on standard error, unscrubbed.
+    stderr: String,
+    /// What it printed on standard output, unscrubbed, when that wasn't a proper answer: its error
+    /// says that's in Kerdr's error log (intent 0591).
+    printed: Option<String>,
+    /// Whether its answer was lost (none in time, or the connection dropped): the request may or
+    /// may not have happened.
+    lost: bool,
+}
+
+impl Ran {
+    /// A request never sent: nothing printed, nothing lost.
+    fn unsent(error: String) -> Ran {
+        Ran {
+            result: Err(error),
+            stderr: String::new(),
+            printed: None,
+            lost: false,
+        }
+    }
+}
+
 fn run_with_deadline(
     machine: &Machine,
     command: &str,
     request: &Value,
     deadline: Duration,
     handed: Option<transport::Handed>,
-) -> (Result<Response, String>, String, bool) {
+) -> Ran {
     if command.trim().is_empty() {
-        return (Err(NO_BACKEND.into()), String::new(), false);
+        return Ran::unsent(NO_BACKEND.into());
     }
     let json = match serde_json::to_string(request) {
         Ok(json) => json,
         Err(e) => {
-            return (
-                Err(format!(
-                    "Kerdr couldn't build that request (a fault in Kerdr: {e}), {NOT_SENT}"
-                )),
-                String::new(),
-                false,
-            );
+            return Ran::unsent(format!(
+                "Kerdr couldn't build that request (a fault in Kerdr: {e}), {NOT_SENT}"
+            ));
         }
     };
     if json.len() > most_bytes(request) {
@@ -597,7 +705,7 @@ fn run_with_deadline(
         } else {
             "the request is too large to send (64 KiB at most), so nothing was sent".into()
         };
-        return (Err(said), String::new(), false);
+        return Ran::unsent(said);
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -605,7 +713,6 @@ fn run_with_deadline(
     };
     // The configured command is source; user data is JSON on stdin, never source.
     let output = transport::run_adapter_handing(&target, command, Some(&json), deadline, handed);
-    let stderr = output.stderr.clone();
     let result = answer_of(
         &output,
         request,
@@ -614,7 +721,16 @@ fn run_with_deadline(
         machine.ssh.is_some(),
     );
     let lost = result.is_err() && lost(&output, machine.ssh.is_some());
-    (result, stderr, lost)
+    // An answer it couldn't read, or one far too long: what it printed goes to the error log, as
+    // its error says (intent 0591). A lost answer's error promises nothing of the kind.
+    let printed = (result.is_err() && !lost && !output.stdout.trim().is_empty())
+        .then(|| output.stdout.clone());
+    Ran {
+        result,
+        stderr: output.stderr,
+        printed,
+        lost,
+    }
 }
 
 /// Whether an answer was lost on its way: none came in time, or the connection to its machine
@@ -687,13 +803,19 @@ fn answer_of(
                 *text = redact(text);
             }
         }
-        // Only the states the protocol knows; anything else reads as one Kerdr can't follow.
-        if response
-            .state
-            .as_deref()
-            .is_some_and(|s| !matches!(s, "running" | "done" | "asks" | "failed" | "unknown"))
-        {
-            response.state = Some("unknown".into());
+        // A progress answer's state: only those the protocol knows, anything else reading as one
+        // Kerdr can't follow. Any other answer's (an account move's `stale`, `already`) is its own,
+        // and stays as it is when it's one the protocol knows (intent 0591).
+        if request["action"] == "progress" {
+            if response
+                .state
+                .as_deref()
+                .is_some_and(|s| !PROGRESS_STATES.contains(&s))
+            {
+                response.state = Some("unknown".into());
+            }
+        } else if let Some(state) = response.state.as_mut().filter(|s| !ANSWER_STATES.contains(&s.as_str())) {
+            *state = redact(state);
         }
         for question in &mut response.questions {
             for text in [&mut question.num, &mut question.question, &mut question.background, &mut question.pick, &mut question.why] {
@@ -822,7 +944,7 @@ mod tests {
         deadline: Duration,
         handed: Option<transport::Handed>,
     ) -> Result<Response, String> {
-        run_with_deadline(machine, command, request, deadline, handed).0
+        run_with_deadline(machine, command, request, deadline, handed).result
     }
 
     fn machine() -> Machine {
@@ -1019,30 +1141,192 @@ printf '%s' "$answer"
         resends: bool,
         outputs: Vec<transport::Output>,
     ) -> (Answered, Vec<Resend>, usize) {
+        let (answered, told, sends, _, _) = over_ssh_timed(request, resends, outputs);
+        (answered, told, sends.len())
+    }
+
+    /// As over_ssh, with the deadline each send was given, and the waits asked for. An output that
+    /// timed out took its whole deadline, as a real one does.
+    #[allow(clippy::type_complexity)]
+    fn over_ssh_timed(
+        request: &Value,
+        resends: bool,
+        outputs: Vec<transport::Output>,
+    ) -> (
+        Answered,
+        Vec<Resend>,
+        Vec<Duration>,
+        Vec<Duration>,
+        Duration,
+    ) {
         let mut outputs = outputs.into_iter();
-        let mut sends = 0;
+        let mut deadlines = vec![];
         let mut told = vec![];
+        let waits = std::cell::RefCell::new(vec![]);
+        let mut took = Duration::ZERO;
         let answered = resending(
             request,
             None,
             resends,
             &mut |r| told.push(r.clone()),
-            &|_| {},
-            &mut |_| {
-                sends += 1;
-                let out = outputs.next().expect("sent more often than expected");
-                let result = answer_of(&out, request, deadline_for(request), "arknet-one", true);
+            &|d| waits.borrow_mut().push(d),
+            deadline_for(request),
+            &mut |_, deadline| {
+                deadlines.push(deadline);
+                let mut out = outputs.next().expect("sent more often than expected");
+                if out.timed_out {
+                    out.took = deadline;
+                }
+                // Only a resend's own time counts, from the first answer.
+                if deadlines.len() > 1 {
+                    took += out.took;
+                }
+                let result = answer_of(&out, request, deadline, "arknet-one", true);
                 let lost = result.is_err() && lost(&out, true);
-                (
-                    Answered {
+                Sent {
+                    answered: Answered {
                         result,
                         stderr: out.stderr.clone(),
                     },
                     lost,
-                )
+                    took: out.took,
+                }
             },
         );
-        (answered, told, sends)
+        let waits = waits.into_inner();
+        let spent = took + waits.iter().sum::<Duration>();
+        (answered, told, deadlines, waits, spent)
+    }
+
+    fn timed_out() -> transport::Output {
+        transport::Output {
+            status: None,
+            stdout: String::new(),
+            stderr: String::new(),
+            timed_out: true,
+            took: Duration::ZERO,
+        }
+    }
+
+    #[test]
+    fn no_request_is_ever_sent_again_to_a_backend_that_keeps_no_ops_even_after_retry() {
+        // Kerdr gives every change an op, an old backend's included; only its feed saying "op"
+        // makes a resend safe (intent 0591). A released backend could do the change twice.
+        let change = with_op(json!({"action":"close","id":"0041"}));
+        let refused = || {
+            output(
+                0,
+                r##"{"ok":false,"retry":3,"message":"#41 is locked by another request."}"##,
+                "",
+            )
+        };
+        let (answered, told, sends) = over_ssh(&change, false, vec![refused()]);
+        assert_eq!(sends, 1);
+        assert!(told.is_empty());
+        let r = answered.result.unwrap();
+        assert!(!r.ok);
+        assert_eq!(r.message, "#41 is locked by another request.");
+        // Nor a read: no resend of any kind goes to it.
+        let read = json!({"action":"kickoff","id":"0041"});
+        let (_, told, sends) = over_ssh(&read, false, vec![refused()]);
+        assert_eq!((sends, told.len()), (1, 0));
+        // The same refusal from a backend that keeps ops is sent again, with the same op.
+        let (answered, told, sends) = over_ssh(
+            &change,
+            true,
+            vec![
+                refused(),
+                output(0, r#"{"ok":true,"message":"Marked #41 done."}"#, ""),
+            ],
+        );
+        assert!(answered.result.unwrap().ok);
+        assert_eq!((sends, told.len()), (2, 1));
+    }
+
+    #[test]
+    fn one_two_minute_deadline_covers_all_the_retrying_and_a_wait_asked_for_is_never_cut_short() {
+        let reopen = with_op(json!({"action":"reopen","id":"0041"}));
+        let retry = |n: u64| {
+            output(
+                0,
+                &format!(r#"{{"ok":false,"retry":{n},"message":"herdr isn't answering yet."}}"#),
+                "",
+            )
+        };
+        // A quick retry: 5, then a resend that hangs. It's given only what's left of the two
+        // minutes, not a reopen's five, and once that's spent nothing more is sent, lost or not.
+        let (answered, told, deadlines, waits, spent) =
+            over_ssh_timed(&reopen, true, vec![retry(5), timed_out()]);
+        assert_eq!(
+            deadlines,
+            [Duration::from_secs(300), Duration::from_secs(115)]
+        );
+        assert_eq!(waits, [Duration::from_secs(5)]);
+        assert_eq!(told.len(), 1);
+        assert!(spent <= RETRY_MOST, "{spent:?}");
+        let error = answered.result.unwrap_err();
+        assert!(result_unknown(&error), "{error}");
+        // A lost answer's resends come out of the same two minutes.
+        let close = with_op(json!({"action":"close","id":"0041"}));
+        let (_, told, deadlines, waits, spent) = over_ssh_timed(
+            &close,
+            true,
+            vec![timed_out(), timed_out(), timed_out(), timed_out()],
+        );
+        assert!(spent <= RETRY_MOST, "{spent:?}");
+        assert_eq!(waits, [Duration::from_secs(5)], "{told:?}");
+        assert_eq!(
+            deadlines,
+            [Duration::from_secs(120), Duration::from_secs(115)]
+        );
+        // A long wait asked for is waited whole: 90 s is 90 s, and the resend gets what's left.
+        let (answered, _, deadlines, waits, _) = over_ssh_timed(
+            &close,
+            true,
+            vec![
+                retry(90),
+                output(0, r#"{"ok":true,"message":"Marked #41 done."}"#, ""),
+            ],
+        );
+        assert!(answered.result.unwrap().ok);
+        assert_eq!(waits, [Duration::from_secs(90)]);
+        assert_eq!(deadlines[1], Duration::from_secs(30));
+        // One that leaves no room for the resend to answer isn't cut short: the refusal stands.
+        let (answered, told, _, waits, _) = over_ssh_timed(&close, true, vec![retry(115)]);
+        assert!(told.is_empty() && waits.is_empty());
+        assert_eq!(answered.result.unwrap().retry, Some(115));
+    }
+
+    #[test]
+    fn an_account_answer_keeps_its_own_state_and_only_a_progress_answer_s_is_narrowed() {
+        let stale = answered(
+            &json!({"action":"account-move","pane":"w1:p1","to":"ARK_C"}),
+            r#"{"ok":true,"state":"stale","message":"that pane runs another agent now; nothing moved"}"#,
+        )
+        .unwrap();
+        assert_eq!(stale.state.as_deref(), Some("stale"));
+        for state in ["queued", "waiting", "moved", "already"] {
+            let r = answered(
+                &json!({"action":"account-remove","code":"ARK_C"}),
+                &json!({"ok":true,"state":state,"message":"m"}).to_string(),
+            )
+            .unwrap();
+            assert_eq!(r.state.as_deref(), Some(state));
+        }
+        // A state that echoes a credential is scrubbed like any other field.
+        let r = answered(
+            &json!({"action":"account-signin","step":"paste","token":"fixture-private-value"}),
+            r#"{"ok":false,"state":"fixture-private-value","message":"no"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.state.as_deref(), Some("[redacted]"));
+        // A progress answer's is still only one Kerdr can follow.
+        let r = answered(
+            &progress_request("f-0123456789abcdef0123"),
+            r#"{"ok":true,"state":"stale","message":"m"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.state.as_deref(), Some("unknown"));
     }
 
     fn output(status: i32, stdout: &str, stderr: &str) -> transport::Output {
@@ -1118,7 +1402,7 @@ printf '%s' "$answer"
         let read = json!({"action":"kickoff","id":"0041"});
         let (answered, told, sends) = over_ssh(
             &read,
-            false,
+            true,
             vec![
                 output(
                     0,
@@ -1209,7 +1493,14 @@ printf '%s' '{{"ok":true,"message":"Marked #41 done."}}'
             "",
         );
         let request = with_op(json!({"action":"close","id":"0041"}));
+        // A backend whose feed doesn't say it keeps ops is never sent it again: the refusal stands.
         let (answered, told, waits) = resent(&command, &request, false, Duration::from_secs(20));
+        assert!(!answered.result.unwrap().ok);
+        assert!(told.is_empty() && waits.is_empty());
+        assert_eq!(lines(dir.path(), "requests.log").len(), 1);
+        fs::remove_file(dir.path().join("requests.log")).unwrap();
+        // One that does is, quietly, with the same op, and does it once.
+        let (answered, told, waits) = resent(&command, &request, true, Duration::from_secs(20));
         assert!(answered.result.unwrap().ok);
         assert_eq!(waits, [Duration::from_secs(2); 2]);
         assert!(
@@ -1546,6 +1837,87 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
             answered.stderr.contains("tracker unavailable"),
             "{}",
             answered.stderr
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_backend_printed_in_place_of_an_answer_is_kept_for_the_log_as_its_error_says() {
+        let dir = tempfile::tempdir().unwrap();
+        // Nothing on standard error at all: what it printed instead is all there is to go on.
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\necho 'ark-card-action: printed a warning before its answer'\necho '{\"ok\":tru'\n",
+            "",
+        );
+        let request = json!({"action":"refresh","id":"4"});
+        let answered = run_keeping_stderr(&machine(), &command, &request);
+        let error = answered.result.unwrap_err();
+        assert!(error.contains("in Kerdr's error log"), "{error}");
+        assert!(!error.contains("printed a warning"), "{error}");
+        assert!(
+            answered
+                .stderr
+                .contains("printed a warning before its answer"),
+            "{}",
+            answered.stderr
+        );
+        // Scrubbed as standard error is: neither what was typed nor a credential.
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\necho 'not an answer: my private secret words, fixture-private-value'\n",
+            "",
+        );
+        let answered = run_keeping_stderr(
+            &machine(),
+            &command,
+            &json!({"action":"create","words":"my private secret words"}),
+        );
+        assert!(
+            answered.stderr.contains("not an answer"),
+            "{}",
+            answered.stderr
+        );
+        assert!(
+            !answered.stderr.contains("private secret"),
+            "{}",
+            answered.stderr
+        );
+        let answered = run_keeping_stderr(
+            &machine(),
+            &command,
+            &json!({"action":"account-signin","step":"paste","token":"fixture-private-value"}),
+        );
+        assert!(
+            !answered.stderr.contains("fixture-private-value"),
+            "{}",
+            answered.stderr
+        );
+        // One far too long: its beginning, bounded, after the end of its standard error.
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\necho 'the push failed' >&2\nprintf '{\"ok\":true,\"message\":\"'\nhead -c 100000 /dev/zero | tr '\\0' 'y'\n",
+            "",
+        );
+        let answered = run_keeping_stderr(&machine(), &command, &request);
+        assert!(answered.result.unwrap_err().contains("far too long"));
+        assert!(
+            answered.stderr.starts_with("the push failed"),
+            "{}",
+            &answered.stderr[..80]
+        );
+        assert!(answered.stderr.contains(r#"{"ok":true,"message":""#));
+        assert!(answered.stderr.len() <= crate::errlog::MOST_STDERR);
+        // A good answer keeps nothing of what it printed.
+        let command = fixture(
+            dir.path(),
+            "cat >/dev/null\nprintf '%s' '{\"ok\":true,\"message\":\"Refreshed.\"}'\n",
+            "",
+        );
+        assert!(
+            run_keeping_stderr(&machine(), &command, &request)
+                .stderr
+                .is_empty()
         );
     }
 

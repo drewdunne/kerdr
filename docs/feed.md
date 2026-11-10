@@ -104,7 +104,7 @@ know rather than guessing.
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
-| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"` and `"follow"`. See [Asking again](#asking-again-op-and-retry). A feed with no `supports`, or one without `"op"`, is never sent a request again after an answer that was lost. |
+| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"` and `"follow"`. See [Asking again](#asking-again-op-and-retry). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
 | `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)); until they're gone, and from the first read that names them, that session's workspaces are marked out of date, dim on the board, and a card with no workspace says "workspace not known" instead of "no workspace open". Entries of any other shape are ignored. |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
@@ -455,14 +455,20 @@ A backend that keeps ops lists `"op"` in its feed's `supports`, and does this, f
 **`retry`: seconds, on a refusal that's passing.** Answer `ok: false` with `"retry": N` when the cause
 will likely clear by itself, after waiting out anything that clears in a second or two yourself.
 Kerdr waits N seconds and sends the same request with the same `op`, saying "Trying again…" quietly on
-the card, up to two minutes in all for that request; then it shows the last message as it is. Decide
-everything again at each send: a request whose card has changed meanwhile is decided for the card
-as it is now, and one that would now need a question asks it. A change is followed only with an `op`;
-a read (an `edit` with no `text`, a `kickoff` check) changes nothing, so its `retry` is followed too.
+the card, up to two minutes in all for that request, counted from its first answer: every wait and
+every resend's own time come out of those two minutes, and a resend is given only what's left of them
+to answer in. A wait is never cut short: when N seconds, and at least 10 more for the resend to
+answer in, don't fit in what's left, Kerdr sends nothing more and shows the last message as it is.
+Decide everything again at each send: a request whose card has changed meanwhile is decided for the
+card as it is now, and one that would now need a question asks it. Kerdr follows `retry` only from a
+machine whose feed lists `"op"`: there a change is followed with its `op`, and a read (an `edit` with
+no `text`, a `kickoff` check) changes nothing, so its `retry` is followed too. From any other
+machine, a `retry` refusal is shown as it is, and nothing is sent again.
 
 **A lost answer.** When no answer comes in time, or the connection drops before one does (ssh's own
 exit, 255), nobody can tell whether the request happened. To a machine whose feed lists `"op"`, Kerdr
-sends it again with the same `op`, after 5, 10 and 15 seconds, and the record answers if it did. To
+sends it again with the same `op`, after 5, 10 and 15 seconds, within the same two minutes as
+`retry`, and the record answers if it did. To
 any other machine, Kerdr never sends it again: it says plainly that it can't tell whether it
 happened, and that the card shows how it stands. A backend that crashed or printed something that
 isn't JSON isn't a lost answer, since sending it again would most likely do the same: what it printed
@@ -488,8 +494,8 @@ stands.", and only before anything was changed "…, so nothing was changed."
 
 ### Older and newer, mixed
 
-A backend with no `supports` gets `op` fields it can ignore, and everything else as before: lost
-answers are never resent to it. A Kerdr that doesn't send `op` gets exactly today's behaviour from a
+A backend with no `supports` gets `op` fields it can ignore, and everything else as before: nothing
+is ever sent to it again by itself, after a lost answer or a `retry` refusal. A Kerdr that doesn't send `op` gets exactly today's behaviour from a
 backend that keeps ops, and reads a `retry` refusal or a `note` by its `message`.
 
 ## A quiet board
