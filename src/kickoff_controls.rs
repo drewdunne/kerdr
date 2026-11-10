@@ -326,14 +326,14 @@ impl App {
             questions: preloaded.questions.clone(),
             prefill: self
                 .kickoff_prefill
-                .get(&detail.id)
+                .get(&card.key)
                 .cloned()
                 .unwrap_or_default(),
             ..Default::default()
         };
         let kept = self
             .kickoff_kept
-            .get(&detail.id)
+            .get(&card.key)
             .cloned()
             .unwrap_or_default();
         let mut form = Kickoff::from_answer(
@@ -349,7 +349,7 @@ impl App {
         let check = form.check;
         let id = detail.id.clone();
         // In the box now: kept there, and with what's typed if he leaves it.
-        self.kickoff_prefill.remove(&id);
+        self.kickoff_prefill.remove(&card.key);
         self.mode = Mode::Kickoff {
             form,
             back: Box::new(self.mode.clone()),
@@ -370,7 +370,7 @@ impl App {
         request: &Value,
         result: Result<Response, String>,
     ) {
-        let Mode::Kickoff { form, back, .. } = &mut self.mode else {
+        let Mode::Kickoff { form, back, target } = &mut self.mode else {
             return;
         };
         if form.request["id"] != request["id"] || request["check"] != json!(form.check) {
@@ -390,9 +390,9 @@ impl App {
             }
             // None left to ask, or it can't be answered now: the box goes, keeping what's typed.
             Ok(response) => {
-                let (form, back) = (form.clone(), back.clone());
+                let (form, back, target) = (form.clone(), back.clone(), target.clone());
                 self.kickoff_sent.insert(form.asked.clone());
-                self.keep_kickoff(&form);
+                self.keep_kickoff(&form, target.as_deref());
                 self.mode = *back;
                 if response.ok {
                     self.say(response.message, Tone::Info);
@@ -416,7 +416,7 @@ impl App {
                 return if form.reached > 0 {
                     self.leave_kickoff(form, target, Leaving::Keep)
                 } else {
-                    self.keep_kickoff(&form);
+                    self.keep_kickoff(&form, target.as_deref());
                     Action::None
                 };
             }
@@ -496,11 +496,13 @@ impl App {
         Action::None
     }
 
-    /// Keeps what's typed in the box until it's saved, for when `d` opens it again.
-    fn keep_kickoff(&mut self, form: &Kickoff) {
+    /// Keeps what's typed in the box until it's saved, for when `d` opens it again: for its own
+    /// card, by key, never another source's with the same number (Codex's fifth look).
+    fn keep_kickoff(&mut self, form: &Kickoff, target: Option<&CardSnapshot>) {
         let Some(id) = form.request["id"].as_str() else {
             return;
         };
+        let held = self.intent_key(form.machine, id, target);
         let mut kept = form.kept();
         // No question of their own: an empty number marks them for the next box's note.
         kept.extend(
@@ -509,19 +511,18 @@ impl App {
                 .map(|words| (String::new(), String::new(), words.clone())),
         );
         if kept.is_empty() {
-            self.kickoff_kept.remove(id);
+            self.kickoff_kept.remove(&held);
         } else {
-            self.kickoff_kept.insert(id.to_string(), kept);
+            self.kickoff_kept.insert(held, kept);
         }
     }
 
-    /// What a failure adds when it has words of yours in hand: where they went.
-    pub(super) fn kickoff_kept_note(&self, request: &Value) -> &'static str {
+    /// What a failure adds when it has words of yours in hand: where they went. `held` is its
+    /// card's key.
+    pub(super) fn kickoff_kept_note(&self, request: &Value, held: Option<&str>) -> &'static str {
         let holds = matches!(request["action"].as_str(), Some("dispatch" | "answer"))
             && request.get("answers").is_some()
-            && request["id"]
-                .as_str()
-                .is_some_and(|id| self.kickoff_kept.contains_key(id));
+            && held.is_some_and(|k| self.kickoff_kept.contains_key(k));
         if holds {
             " Your answers are kept: d opens them again."
         } else {
@@ -567,7 +568,7 @@ impl App {
         target: Option<Box<CardSnapshot>>,
         how: Leaving,
     ) -> Action {
-        self.keep_kickoff(&form);
+        self.keep_kickoff(&form, target.as_deref());
         let answered = if matches!(how, Leaving::Start) {
             form.questions.len()
         } else {
@@ -739,6 +740,11 @@ mod tests {
 
     fn open(response: &Response) -> App {
         open_on(response).0
+    }
+
+    /// The key the demo's card for record `id` has, which what's kept for it goes by.
+    fn held(id: &str) -> String {
+        format!("demo:{id}")
     }
 
     /// Presses a key, past the wait a new question has.
@@ -1029,9 +1035,8 @@ mod tests {
             question("1", "Whose is it?", "Kibbelz"),
             question("3", "Where does it run, now?", "The server"),
         ]);
-        let id = card.detail.as_ref().unwrap().id.clone();
         app.kickoff_prefill.insert(
-            id.clone(),
+            card.key.clone(),
             vec![Prefill {
                 num: "3".into(),
                 text: Some("on  the laptop".into()),
@@ -1039,7 +1044,7 @@ mod tests {
         );
         let request = sent(d(&mut app, &card));
         assert_eq!(showing(&app).drafts, ["", "on the laptop"]);
-        assert!(!app.kickoff_prefill.contains_key(&id));
+        assert!(!app.kickoff_prefill.contains_key(&card.key));
         let mut now = answer();
         now.questions = vec![
             question("1", "Whose is it?", "Kibbelz"),
@@ -1115,7 +1120,7 @@ mod tests {
         assert!(!matches!(app.mode, Mode::Kickoff { .. }));
         // Reopened from the feed, once it has caught up: the words are in the note, no answer.
         let id = card.detail.as_ref().unwrap().id.clone();
-        let kept = app.kickoff_kept[&id].clone();
+        let kept = app.kickoff_kept[&card.key].clone();
         let form =
             Kickoff::from_answer(0, &json!({"id": id}), &now, "#41".into(), "t".into(), &kept)
                 .unwrap();
@@ -1137,10 +1142,7 @@ mod tests {
         app.finish_kickoff_check(0, &request, Ok(done));
         assert!(matches!(app.mode, Mode::Board));
         assert!(app.message().unwrap().0.contains("d starts it"));
-        assert_eq!(
-            app.kickoff_kept[&request["id"].as_str().unwrap().to_string()][0].2,
-            "kept"
-        );
+        assert_eq!(app.kickoff_kept[&card.key][0].2, "kept");
         // A refusal, in red: it started elsewhere, say.
         let request = sent(d(&mut app, &card));
         let refused = Response {
@@ -1298,8 +1300,11 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         let request = sent(key(&mut app, KeyCode::Enter));
         assert_eq!(request["answers"][0]["text"], "mine");
-        assert!(app.kickoff_kept_note(&request).contains("kept"));
-        let kept = app.kickoff_kept.get(&id).cloned().unwrap();
+        assert!(
+            app.kickoff_kept_note(&request, Some(&held(&id)))
+                .contains("kept")
+        );
+        let kept = app.kickoff_kept.get(&held(&id)).cloned().unwrap();
         let reopened =
             Kickoff::from_answer(0, &request, &answer(), "#41".into(), "t".into(), &kept).unwrap();
         assert_eq!(reopened.drafts[0], "mine");
@@ -1321,7 +1326,7 @@ mod tests {
         let (mut app, id) = open_on(&answer());
         typed(&mut app, "half a thought");
         assert!(matches!(key(&mut app, KeyCode::Esc), Action::None));
-        assert_eq!(app.kickoff_kept[&id][0].2, "half a thought");
+        assert_eq!(app.kickoff_kept[&held(&id)][0].2, "half a thought");
     }
 
     #[test]

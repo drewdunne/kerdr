@@ -20,6 +20,49 @@ const RETRYING_TAIL: &str = " trying again…";
 /// The backend's words when a yes doesn't fit the question it answers: nothing started.
 const YES_NOT_MATCHED: &str = "couldn't be matched to the question";
 
+/// What a feed lists in `supports` when its backend does each key's step first (intent 0591).
+pub(crate) const STEPS: &str = "steps";
+
+/// What a backend must list in `supports` to take this request as Kerdr means it (Codex's fifth
+/// look): a cancel only a newer backend knows, which an older one would read as X's; or a request
+/// sent on the strength of its backend doing each key's step first, judged by the card it was
+/// asked on (`from`), which an older backend would refuse or do without its question. When it
+/// goes on to another machine than the one that asked (`forwarded`), a choice or a save's token
+/// counts too, since only such a backend gives those. None when every backend takes it alike.
+pub(crate) fn needs(
+    request: &Value,
+    from: Option<&CardSnapshot>,
+    forwarded: bool,
+) -> Option<&'static str> {
+    use crate::app::cancels::{CANCEL_BACKLOG, CANCEL_WORKSPACE, is_bare_cancel, is_stop_start};
+    if is_bare_cancel(request) {
+        return Some(CANCEL_WORKSPACE);
+    }
+    if is_stop_start(request) {
+        return Some(CANCEL_BACKLOG);
+    }
+    let action = request["action"].as_str().unwrap_or_default();
+    if forwarded
+        && (request.get("choice").is_some()
+            || (action == "edit" && request.get("confirm").is_some()))
+    {
+        return Some(STEPS);
+    }
+    let f = from?;
+    let steps = match action {
+        // C or x on work an agent may be at, C on work in Won't do, x on done work.
+        "close" | "dismiss" => f.dismissed || (!f.waiting && (f.done || f.workspace.is_some())),
+        // d or ⏎ on work in Won't do: brought back and started in one request.
+        "dispatch" | "reopen" => f.dismissed,
+        // X on done work, or on work in Won't do, whose workspace is still open.
+        "cancel" => f.done || f.dismissed,
+        // e's save on work that isn't waiting in the backlog.
+        "edit" => request.get("text").is_some() && !f.waiting,
+        _ => false,
+    };
+    steps.then_some(STEPS)
+}
+
 /// An action's answer cut to what the board shows, ending in "…" when it was longer.
 pub(super) fn short(text: String) -> String {
     match text.char_indices().nth(MAX_ANSWER) {
@@ -918,7 +961,95 @@ impl App {
         self.machines
             .get(machine)
             .and_then(|m| m.feed.as_ref())
-            .is_some_and(|f| f.supports("steps"))
+            .is_some_and(|f| f.supports(STEPS))
+    }
+
+    /// What this request needs that `machine`'s backend doesn't list in `supports`, checked where
+    /// it actually goes: a fresh send, a question's yes, or a resend to the machine a refusal named
+    /// (`forwarded`). None when it takes it (Codex's fifth look).
+    pub(crate) fn missing_on(
+        &self,
+        machine: usize,
+        request: &Value,
+        from: Option<&CardSnapshot>,
+        forwarded: bool,
+    ) -> Option<&'static str> {
+        needs(request, from, forwarded).filter(|what| {
+            !self
+                .machines
+                .get(machine)
+                .and_then(|m| m.feed.as_ref())
+                .is_some_and(|f| f.supports(what))
+        })
+    }
+
+    /// Whether `machine`'s backend starts this on the account it names, by its feed's `starts_on`,
+    /// checked where it goes as `missing_on` is: true for anything that names none, or isn't a
+    /// start (Codex's fifth look). An older backend would start it on its owner's list without a
+    /// word (intent 0580).
+    pub(crate) fn starts_named_account_on(&self, machine: usize, request: &Value) -> bool {
+        let action = request["action"].as_str().unwrap_or_default();
+        let names = match action {
+            "dispatch" | "reopen" => request.get("account").is_some(),
+            "account-start" | crate::app::resume::RESUME => true,
+            _ => false,
+        };
+        !names
+            || self
+                .machines
+                .get(machine)
+                .and_then(|m| m.feed.as_ref())
+                .is_some_and(|f| f.starts_on(action))
+    }
+
+    /// A request that wasn't sent because its backend lacks `what`: said as a backend without it
+    /// would have it, and the key again asks there as that backend takes it.
+    pub(crate) fn not_sent_for(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        from: Option<&CardSnapshot>,
+        what: &str,
+        forwarded: bool,
+    ) {
+        use crate::app::cancels::{CANCEL_BACKLOG, CANCEL_WORKSPACE, NO_INTENT};
+        let reference = from
+            .and_then(|f| self.card(&f.key))
+            .map(|c| c.reference.clone())
+            .unwrap_or_else(|| self.reference_for(request["id"].as_str().unwrap_or_default()));
+        let name = self
+            .machines
+            .get(machine)
+            .map(|m| m.name())
+            .unwrap_or_default();
+        let (said, tone) = match (what, forwarded) {
+            (CANCEL_WORKSPACE, _) => (NO_INTENT.to_string(), Tone::Info),
+            (CANCEL_BACKLOG, true) => (
+                format!(
+                    "{reference} lives on {name} now, whose backend can't put it back in the backlog, so it wasn't stopped: X on its card stops it and sets it aside."
+                ),
+                Tone::Warn,
+            ),
+            (CANCEL_BACKLOG, false) => (
+                format!(
+                    "{reference} wasn't stopped: {name}'s backend can't put it back in the backlog. X on its card stops it and sets it aside."
+                ),
+                Tone::Warn,
+            ),
+            (_, true) => (
+                format!(
+                    "{reference} lives on {name} now, whose backend doesn't do that step first, so nothing was sent there. The same key on its card asks again, as that backend takes it."
+                ),
+                Tone::Warn,
+            ),
+            (_, false) => (
+                format!(
+                    "{name}'s backend doesn't do that step first, so nothing was sent for {reference}. The same key on its card asks again, as that backend takes it."
+                ),
+                Tone::Warn,
+            ),
+        };
+        self.say(said, tone);
     }
 
     /// The machine a card's record lives on, where its actions run: its home, or the machine its
@@ -2274,12 +2405,7 @@ impl App {
                         _ => return Some(Action::None),
                     };
                     self.mode = *back;
-                    return Some(self.stop_start_answered(
-                        machine,
-                        &request,
-                        target.map(|t| *t),
-                        yes,
-                    ));
+                    return Some(self.stop_start_answered(&request, target.map(|t| *t), yes));
                 }
                 if early
                     && (matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w'))
@@ -2287,11 +2413,15 @@ impl App {
                 {
                     return Some(Action::None);
                 }
-                // Its yes is ⏎'s when the start it answers was (Codex's review).
-                let by_enter = self
+                // Its yes is ⏎'s when the start it answers was (Codex's review): kept by its card's
+                // key, never another source's with the same number (Codex's fifth look).
+                let asked_by_enter = self
                     .confirm_by_enter
                     .take()
-                    .filter(|id| request["id"].as_str() == Some(id.as_str()));
+                    .filter(|k| target.as_ref().is_some_and(|t| t.key == *k));
+                let by_enter = asked_by_enter
+                    .as_ref()
+                    .and_then(|_| request["id"].as_str().map(str::to_string));
                 let queues = key.code == KeyCode::Enter && enter_queues;
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n' | 'q') => {
@@ -2316,7 +2446,7 @@ impl App {
                     }
                     // At the most a session holds, a yes can't open it: only its queue is offered.
                     KeyCode::Char('y') if enter_queues => {
-                        self.confirm_by_enter = by_enter;
+                        self.confirm_by_enter = asked_by_enter;
                     }
                     KeyCode::Enter | KeyCode::Char('y') => {
                         self.mode = *back;
@@ -2345,7 +2475,7 @@ impl App {
                     }
                     _ => {
                         // Still asking: the yes to come is ⏎'s as before.
-                        self.confirm_by_enter = by_enter;
+                        self.confirm_by_enter = asked_by_enter;
                     }
                 }
                 return Some(Action::None);
@@ -2472,6 +2602,31 @@ impl App {
             return self.queue_create(machine, request);
         }
         let from = self.action_from.take();
+        // Only what its backend takes, checked on the machine it goes to, whatever sent it: a
+        // key, a question's yes, a resend (Codex's fifth look).
+        if let Some(what) = self.missing_on(machine, &request, from.as_ref(), false) {
+            self.not_sent_for(machine, &request, from.as_ref(), what, false);
+            return;
+        }
+        if !self.starts_named_account_on(machine, &request) {
+            let reference = from
+                .as_ref()
+                .and_then(|f| self.card(&f.key))
+                .map(|c| c.reference.clone())
+                .unwrap_or_else(|| self.reference_for(request["id"].as_str().unwrap_or_default()));
+            let name = self
+                .machines
+                .get(machine)
+                .map(|m| m.name())
+                .unwrap_or_default();
+            self.say(
+                format!(
+                    "{name}'s backend can't start work on a chosen account, so nothing was sent for {reference}: s on its card brings its ark-sdlc up to date first."
+                ),
+                Tone::Warn,
+            );
+            return;
+        }
         let id = request["id"].as_str().unwrap_or_default().to_string();
         // An item's new text is for the card whose text Kerdr holds (intent 0414).
         let held = (request["action"] == "edit")
@@ -2925,7 +3080,9 @@ impl App {
         // Whether ⏎ asked for it: a question it asks stays ⏎'s (Codex's review), and a start that
         // answers with its workspace goes in.
         self.answer_by_enter = by_enter;
+        self.answer_job = Some(n);
         self.finish_action(machine, request, result);
+        self.answer_job = None;
         self.answer_by_enter = false;
         // Sent on to the machine its refusal named: back in its place in the queue, still shown,
         // so a later change to the same record can't overtake it (intent 0416).
@@ -3616,6 +3773,13 @@ impl App {
                         }
                         return;
                     }
+                    // Only what that machine's backend takes, checked there: one it would read
+                    // otherwise (a stop back to the backlog read as X's, say) isn't sent on
+                    // (Codex's fifth look).
+                    if let Some(what) = self.missing_on(to, &request, from.as_ref(), true) {
+                        self.not_sent_for(to, &request, from.as_ref(), what, true);
+                        return;
+                    }
                     let mut request = request;
                     if request["action"] == "reopen" && !session.is_empty() {
                         request["session"] = json!(session);
@@ -3708,6 +3872,11 @@ impl App {
                         .as_deref()
                         .is_some_and(|t| request["confirm"].as_str() != Some(t)))
         };
+        // Its card's key: what's kept of his Kickoff answers is its own, never another source's
+        // with the same number (Codex's fifth look).
+        let held = request["id"]
+            .as_str()
+            .map(|id| self.intent_key(machine, id, from.as_ref()));
         match result {
             Ok(response) if asks(&response) => {
                 // Only while you're still on that work: a question that pops up over typing would
@@ -3727,10 +3896,10 @@ impl App {
                 if matches!(request["action"].as_str(), Some("answer" | "dispatch"))
                     && !response.prefill.is_empty()
                     && response.questions.is_empty()
-                    && let Some(id) = request["id"].as_str()
+                    && let Some(held) = &held
                 {
                     self.kickoff_prefill
-                        .insert(id.to_string(), response.prefill.clone());
+                        .insert(held.clone(), response.prefill.clone());
                 }
                 let mut message = response.message.clone();
                 // What a change that went as shown still says: only what you'd need to find it.
@@ -3763,14 +3932,9 @@ impl App {
                     // What he picked still holds: the agent running it moves to that account once
                     // Kerdr sees it, as s on a running card does (intent 0591, K1-126).
                     let to = request["account"].as_str().filter(|a| *a != "list");
-                    let key = from.as_ref().map(|f| f.key.clone()).or_else(|| {
-                        let id = request["id"].as_str()?;
-                        self.board
-                            .cards
-                            .iter()
-                            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-                            .map(|c| c.key.clone())
-                    });
+                    // Its own card, never another source's with the same number (Codex's fifth
+                    // look).
+                    let key = held.clone();
                     match (to, key) {
                         (Some(to), Some(key)) if self.owe_move(&key, to) => {
                             let reference =
@@ -3861,15 +4025,15 @@ impl App {
                 // Started: its answers are saved, and what was kept of them is done with.
                 if request["action"] == "dispatch"
                     && response.ok
-                    && let Some(id) = request["id"].as_str()
+                    && let Some(held) = &held
                 {
-                    self.kickoff_kept.remove(id);
-                    self.kickoff_prefill.remove(id);
+                    self.kickoff_kept.remove(held);
+                    self.kickoff_prefill.remove(held);
                 }
                 if !response.ok && response.partial {
                     // Part of it happened, and the backend's words say which: not a change that
                     // didn't happen, so no "didn't" (intent 0591). The feed is read at once.
-                    let kept = self.kickoff_kept_note(&request);
+                    let kept = self.kickoff_kept_note(&request, held.as_deref());
                     let text = match request["id"].as_str() {
                         Some(id) if !message.contains(&self.reference_for(id)) => {
                             format!("{}: {message}{kept}", self.reference_for(id))
@@ -3880,7 +4044,7 @@ impl App {
                 } else if !response.ok {
                     // The card is back as it really is; say what didn't happen, and why.
                     let what = self.what_failed(&request);
-                    let kept = self.kickoff_kept_note(&request);
+                    let kept = self.kickoff_kept_note(&request, held.as_deref());
                     self.fail(short(match what {
                         Some(what) => format!("{what}: {message}{kept}"),
                         None => format!("{message}{kept}"),
@@ -3891,7 +4055,7 @@ impl App {
                 }
             }
             Err(error) => {
-                let kept = self.kickoff_kept_note(&request);
+                let kept = self.kickoff_kept_note(&request, held.as_deref());
                 // Its result unknown (no answer came, the connection dropped): named by what was
                 // asked, never as something that didn't happen. Otherwise nothing was sent, and
                 // it says what didn't happen, as a refusal does (intent 0591).

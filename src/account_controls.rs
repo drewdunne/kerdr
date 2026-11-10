@@ -2049,6 +2049,19 @@ impl App {
             }
             return Action::None;
         }
+        // A fresh agent's start or a resume goes only to a backend that still takes it, checked as
+        // it goes: a question's yes or a held offer can come long after it was asked (Codex's
+        // fifth look).
+        if !self.starts_named_account_on(machine, &request) {
+            self.say(
+                format!(
+                    "{}'s backend can't start an agent on a chosen account, so nothing was sent.",
+                    self.machines[machine].name()
+                ),
+                Tone::Warn,
+            );
+            return Action::None;
+        }
         // What the request came from is kept in its record, found by the request when its answer
         // comes, never in a slot another answer could take (Codex's third look).
         let origin = Pending {
@@ -2080,6 +2093,65 @@ impl App {
         }
         self.account_pending = Some(origin);
         Action::Mutate { machine, request }
+    }
+
+    /// The next account request that waited its turn, once none is on its way: the oldest whose
+    /// machine answers goes now, with what it was asked from. One whose machine has dropped stays
+    /// queued while the drop is a passing one (the board says nothing of those either), and the
+    /// ones after it for that machine wait behind it. Once the drop lasts, it's finished as an
+    /// answer that nothing was sent, through its own screen's failure handling: never dropped
+    /// unsaid, and never left "Starting sign-in…" with nothing on its way (Codex's fifth look).
+    fn next_later(&mut self) -> Option<Action> {
+        let now = self.now();
+        let configured = self.actions_on();
+        let mut held: Vec<usize> = vec![];
+        let mut i = 0;
+        while i < self.account_later.len() {
+            let machine = self.account_later[i].0.machine;
+            if held.contains(&machine) {
+                i += 1;
+                continue;
+            }
+            let conn = self.machines.get(machine).map(|m| &m.conn);
+            if configured && conn.is_some_and(crate::poll::Conn::is_live) {
+                let (origin, request) = self.account_later.remove(i)?;
+                self.account_pending = Some(origin);
+                return Some(Action::Mutate { machine, request });
+            }
+            let passing = configured
+                && conn.is_some_and(|c| {
+                    matches!(
+                        c,
+                        crate::poll::Conn::Connecting | crate::poll::Conn::Reconnecting { .. }
+                    ) && !c.lasting(now)
+                });
+            if passing {
+                held.push(machine);
+                i += 1;
+                continue;
+            }
+            let (origin, request) = self.account_later.remove(i)?;
+            let why = match self.machines.get(machine) {
+                Some(m) if configured => format!(
+                    "{} isn't answering, {}. Try again once it's back.",
+                    m.name(),
+                    crate::actions::NOT_SENT
+                ),
+                _ => format!(
+                    "Kerdr has no action backend for it, {}.",
+                    crate::actions::NOT_SENT
+                ),
+            };
+            // Its own answer, as if its machine had refused it: matched to it as any is.
+            self.account_pending = Some(origin);
+            self.finish_account_action(
+                machine,
+                crate::actions::request_metadata(&request),
+                Err(why),
+            );
+            return Some(Action::None);
+        }
+        None
     }
 
     /// Whether this request waits its turn behind the one on its way.
@@ -3320,14 +3392,9 @@ impl App {
             return action;
         }
         // Asked for while another was on its way: sent now, with what it was asked from (Codex's
-        // fourth look).
-        if let Some((origin, request)) = self.account_later.pop_front() {
-            let machine = origin.machine;
-            if !self.can_write(machine) {
-                return Action::None;
-            }
-            self.account_pending = Some(origin);
-            return Action::Mutate { machine, request };
+        // fourth look). Never lost to its machine dropping meanwhile (Codex's fifth look).
+        if let Some(action) = self.next_later() {
+            return action;
         }
         // The code to type ran out with the page unused: a new one, by itself, once (intent 0591).
         let now = self.now();
@@ -8812,6 +8879,81 @@ mod tests {
         let (_, last) = sent(a.account_tick());
         assert_eq!(last, json!({"action":"account-test","code":"ARK_C"}));
         assert!(a.account_later.is_empty());
+    }
+
+    #[test]
+    fn a_queued_sign_in_whose_machine_drops_before_its_turn_waits_for_it_or_fails_on_its_screen() {
+        // Codex's fifth look: queued behind another request, its machine drops before its turn.
+        // A passing drop: it stays queued and goes once the machine is back. One that lasts: its
+        // own screen says it failed, and nothing is left "Starting sign-in…" with nothing sent.
+        for lasting in [false, true] {
+            let mut a = app();
+            let other = json!({"action":"account-test","code":"KBZ_C"});
+            a.busy = true;
+            a.account_pending = Some(Pending {
+                machine: 0,
+                request: other.clone(),
+                screen: None,
+            });
+            // A sign-in made by itself meanwhile (a move's, say): keys wait while one is busy.
+            assert_eq!(a.begin_signin("ARK_C".into(), None, vec![0]), Action::None);
+            assert_eq!(a.account_later.len(), 1, "{lasting}");
+            let machine = a.account_later[0].0.machine;
+            assert_eq!(signin_screen(&a).message, "Starting sign-in…");
+            let since = a.now()
+                - chrono::Duration::seconds(if lasting {
+                    crate::poll::QUIET_FOR + 5
+                } else {
+                    1
+                });
+            a.machines[machine].conn = crate::poll::Conn::Reconnecting {
+                since,
+                attempt: 2,
+                retry_at: since,
+                detail: String::new(),
+            };
+            a.finish_action(
+                0,
+                crate::actions::with_op(other),
+                Ok(Response {
+                    ok: true,
+                    message: "KBZ_C works here.".into(),
+                    ..Default::default()
+                }),
+            );
+            assert!(!a.busy);
+            assert_eq!(a.account_tick(), Action::None);
+            if !lasting {
+                assert_eq!(
+                    a.account_later.len(),
+                    1,
+                    "dropped while its machine was away"
+                );
+                assert!(!signin_screen(&a).failed);
+                a.machines[machine].conn = crate::poll::Conn::Live {
+                    latency: Duration::from_millis(5),
+                };
+                let (to, request) = sent(a.account_tick());
+                assert_eq!(to, machine);
+                assert_eq!(request["step"], "start");
+                assert!(
+                    a.account_pending.is_some(),
+                    "sent with what it was asked from"
+                );
+                continue;
+            }
+            assert!(a.account_later.is_empty());
+            assert!(a.account_pending.is_none());
+            let s = signin_screen(&a);
+            assert!(s.failed, "left starting: {}", s.message);
+            assert!(s.message.contains("isn't answering"), "{}", s.message);
+            assert!(
+                a.message()
+                    .is_some_and(|(m, _)| m.contains("isn't answering")),
+                "{:?}",
+                a.message()
+            );
+        }
     }
 
     #[test]

@@ -37,6 +37,81 @@ pub(crate) fn is_stop_start(request: &Value) -> bool {
     request["action"] == "cancel" && request["to"] == "backlog"
 }
 
+/// A start Esc came too late for, which Kerdr asked whether to stop (intent 0591, K1-44). Bound to
+/// its own change in the action resolution tool, whose number it keeps through a resend to its
+/// record's real home and through a follow: never to its record's number, which another source's
+/// card can share (Codex's fifth look).
+#[derive(Clone, Debug)]
+pub struct StopStart {
+    /// Its start's change, by Kerdr's number for it.
+    pub n: u64,
+    pub id: String,
+    /// Its card, by key.
+    pub key: Option<String>,
+    /// He said yes before its start answered: stopped as soon as it says it started.
+    pub wanted: bool,
+    /// How its start ended, when that came while he decided.
+    pub ended: Option<StartEnd>,
+}
+
+/// How a start ended, by its own answer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StartEnd {
+    /// It started, where its answer says.
+    Started(Place),
+    /// It asked a question first, so nothing started.
+    Asked,
+    /// Refused, or done only in part: nothing of it runs.
+    Refused,
+    /// Its answer was lost: nobody can tell whether it started.
+    Unknown,
+}
+
+/// Where a start runs: the machine its workspace runs on, and that workspace, as its answer named
+/// them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Place {
+    pub machine: usize,
+    pub session: Option<String>,
+    pub workspace: Option<String>,
+    pub tab: Option<String>,
+}
+
+impl Place {
+    /// The stop of what runs there, back to the backlog: named by its workspace when the start
+    /// named one, so its backend stops that and nothing else.
+    fn stop(&self, id: &str) -> Value {
+        let mut cancel = json!({"action":"cancel","id":id,"to":"backlog"});
+        if let (Some(session), Some(workspace)) = (&self.session, &self.workspace) {
+            cancel["session"] = json!(session);
+            cancel["workspace"] = json!(workspace);
+            if let Some(tab) = &self.tab {
+                cancel["tab"] = json!(tab);
+            }
+        }
+        cancel
+    }
+
+    /// Whether the board shows this card running exactly here.
+    fn holds(&self, card: &Card) -> bool {
+        card.is_open_workspace()
+            && card.machine_index == self.machine
+            && card.session == self.session
+            && card.workspace_id == self.workspace
+            && (self.tab.is_none() || card.tab_id == self.tab)
+    }
+
+    /// Where the board shows this card running now.
+    fn of(card: &Card) -> Option<Place> {
+        card.is_open_workspace().then(|| Place {
+            machine: card.machine_index,
+            session: card.session.clone(),
+            workspace: card.workspace_id.clone(),
+            tab: card.tab_id.clone(),
+        })
+    }
+}
+
 impl App {
     /// Whether this machine's backend takes `what`, by its feed's `supports`.
     pub(crate) fn cancels_on(&self, machine: usize, what: &str) -> bool {
@@ -208,49 +283,49 @@ impl App {
         }
     }
 
-    /// Esc came a moment after a start began (K1-44): to a backend that can put it back in the
-    /// backlog, Kerdr asks whether to stop it once its workspace opens. Whether it asked; when it
-    /// didn't, the caller says it carries on, as before.
-    pub(super) fn ask_stop_start(&mut self, n: u64) -> bool {
-        let Some(job) = self.resolver.job(n) else {
-            return false;
-        };
-        let Some(id) = job.id().map(str::to_string) else {
-            return false;
-        };
-        let machine = job.machine;
-        let target = job.from.clone().or_else(|| {
-            job.key
-                .as_deref()
-                .and_then(|k| self.card(k))
-                .map(CardSnapshot::of)
-        });
-        // Only where a question is safe to put up: on a list or a card, not over typing.
-        let looking = matches!(
-            self.mode,
-            Mode::Board
-                | Mode::Backlog { .. }
-                | Mode::Misc { .. }
-                | Mode::Done { .. }
-                | Mode::Peek { .. }
-                | Mode::Card { .. }
-        ) && !self.typing_view_search();
-        if job.request["action"] != "dispatch"
-            || !looking
-            || !self.cancels_on(machine, CANCEL_BACKLOG)
-        {
-            return false;
-        }
-        let reference = self.reference_for(&id);
+    /// The stop question about this start, by its change's number, if one was asked.
+    fn stop_start_at(&self, n: u64) -> Option<usize> {
+        self.stop_starts.iter().position(|s| s.n == n)
+    }
+
+    /// Whether this start is still on its way: unanswered, or answered and still followed.
+    fn start_coming(&self, n: u64) -> bool {
+        self.resolver.job(n).is_some_and(|j| j.settled.is_none())
+            || self.follows.iter().any(|f| f.job == n)
+    }
+
+    /// The card a stop question is about, as the board shows it now: its own, by key, still that
+    /// record.
+    fn stop_card(&self, s: &StopStart, target: Option<&CardSnapshot>) -> Option<Card> {
+        s.key
+            .as_deref()
+            .or(target.map(|t| t.key.as_str()))
+            .and_then(|k| self.card(k))
+            .filter(|c| c.detail.as_ref().is_some_and(|d| d.id == s.id))
+            .cloned()
+    }
+
+    /// How a stop question names its card.
+    fn stop_reference(&self, s: &StopStart, target: Option<&CardSnapshot>) -> String {
+        self.stop_card(s, target)
+            .map(|c| c.reference)
+            .unwrap_or_else(|| self.reference_for(&s.id))
+    }
+
+    /// Puts up Kerdr's own question about stopping start `n`.
+    fn put_stop_question(
+        &mut self,
+        machine: usize,
+        s: &StopStart,
+        title: String,
+        message: String,
+        target: Option<CardSnapshot>,
+    ) {
         self.mode = Mode::Confirm {
             machine,
-            request: json!({"action": STOP_START, "id": id, "n": n}),
-            title: format!(
-                "{reference} had already begun starting. Stop it once its workspace opens, and put it back in the backlog?"
-            ),
-            message: format!(
-                "Esc came a moment after its start began. Its agent is stopped as X stops one, and {reference} goes back to the backlog, not to Won't do. Anything it hadn't committed stays as it left it."
-            ),
+            request: json!({"action": STOP_START, "id": s.id, "n": s.n}),
+            title,
+            message,
             back: Box::new(self.mode.clone()),
             target: target.map(Box::new),
             queue: false,
@@ -259,57 +334,256 @@ impl App {
             choices: vec![],
             enter_queues: false,
         };
+    }
+
+    /// Esc came a moment after a start began (K1-44): to a backend that can put it back in the
+    /// backlog, Kerdr asks whether to stop it once its workspace opens. Whether it asked; when it
+    /// didn't, the caller says it carries on, as before. What's kept for the question is bound to
+    /// this start's own change (Codex's fifth look).
+    pub(super) fn ask_stop_start(&mut self, n: u64) -> bool {
+        let Some(job) = self.resolver.job(n) else {
+            return false;
+        };
+        let Some(id) = job.id().map(str::to_string) else {
+            return false;
+        };
+        let machine = job.machine;
+        let key = job.key.clone();
+        let target = job.from.clone().or_else(|| {
+            key.as_deref()
+                .and_then(|k| self.card(k))
+                .map(CardSnapshot::of)
+        });
+        // Only where a question is safe to put up: on a list or a card, not over typing.
+        if job.request["action"] != "dispatch"
+            || !self.enter_can_land_here()
+            || !self.cancels_on(machine, CANCEL_BACKLOG)
+        {
+            return false;
+        }
+        let s = StopStart {
+            n,
+            id,
+            key,
+            wanted: false,
+            ended: None,
+        };
+        let reference = self.stop_reference(&s, target.as_ref());
+        self.put_stop_question(
+            machine,
+            &s,
+            format!(
+                "{reference} had already begun starting. Stop it once its workspace opens, and put it back in the backlog?"
+            ),
+            format!(
+                "Esc came a moment after its start began. Its agent is stopped as X stops one, and {reference} goes back to the backlog, not to Won't do. Anything it hadn't committed stays as it left it."
+            ),
+            target,
+        );
+        self.stop_starts.retain(|k| k.n != n);
+        self.stop_starts.push(s);
         true
     }
 
     /// The answer to that question. No: it carries on, as it would have. Yes: stopped once its
-    /// start says it started, or now when that answer came while he decided.
+    /// start says it started; or, when that answer came while he decided, only that start, where
+    /// its answer said it runs, and asked again if it runs somewhere else now (Codex's fifth look).
     pub(super) fn stop_start_answered(
         &mut self,
-        machine: usize,
         request: &Value,
         target: Option<CardSnapshot>,
         yes: bool,
     ) -> Action {
-        let id = request["id"].as_str().unwrap_or_default().to_string();
-        let reference = self.reference_for(&id);
-        if !yes {
+        let n = request["n"].as_u64().unwrap_or_default();
+        let Some(i) = self.stop_start_at(n) else {
+            let reference = self.reference_for(request["id"].as_str().unwrap_or_default());
             self.say(format!("{reference} carries on starting."), Tone::Info);
             return Action::None;
+        };
+        let reference = self.stop_reference(&self.stop_starts[i].clone(), target.as_ref());
+        if !yes {
+            let s = self.stop_starts.remove(i);
+            let said = match s.ended {
+                None => format!("{reference} carries on starting."),
+                Some(StartEnd::Started(_)) => format!("{reference} started, and carries on."),
+                Some(StartEnd::Asked) => {
+                    format!("{reference} asked a question before it started, so nothing started.")
+                }
+                Some(StartEnd::Refused) => format!("{reference} didn't start."),
+                Some(StartEnd::Unknown) => {
+                    format!("{reference}'s card shows how its start went.")
+                }
+            };
+            self.say(said, Tone::Info);
+            return Action::None;
         }
-        let n = request["n"].as_u64().unwrap_or_default();
-        let coming = self.resolver.job(n).is_some_and(|j| j.settled.is_none())
-            || self.following(&id).is_some();
-        if coming {
-            self.stop_after_start.insert(id);
+        match self.stop_starts[i].ended.clone() {
+            None if self.start_coming(n) => {
+                self.stop_starts[i].wanted = true;
+                self.say(
+                    format!(
+                        "Kerdr stops {reference} once its workspace opens, and puts it back in the backlog."
+                    ),
+                    Tone::Info,
+                );
+                Action::None
+            }
+            // Its answer went by without Kerdr hearing how it ended.
+            None | Some(StartEnd::Unknown) => self.late_stop_unknown(i, target),
+            Some(StartEnd::Started(place)) => self.late_stop(i, place, target),
+            Some(StartEnd::Asked) => {
+                self.stop_starts.remove(i);
+                self.say(
+                    format!(
+                        "{reference} asked a question before it started, so nothing started and there's nothing to stop."
+                    ),
+                    Tone::Info,
+                );
+                Action::None
+            }
+            Some(StartEnd::Refused) => {
+                self.stop_starts.remove(i);
+                self.say(
+                    format!("{reference} didn't start, so there's nothing to stop."),
+                    Tone::Info,
+                );
+                Action::None
+            }
+        }
+    }
+
+    /// A yes that came after its start answered that it started, at `place`: stopped there only
+    /// while the board shows it still running there; asked again where it runs now if that moved;
+    /// nothing at all if it's gone, closed, done or set aside meanwhile.
+    fn late_stop(&mut self, i: usize, place: Place, target: Option<CardSnapshot>) -> Action {
+        let s = self.stop_starts[i].clone();
+        let reference = self.stop_reference(&s, target.as_ref());
+        let Some(card) = self.stop_card(&s, target.as_ref()) else {
+            self.stop_starts.remove(i);
             self.say(
                 format!(
-                    "Kerdr stops {reference} once its workspace opens, and puts it back in the backlog."
+                    "{reference} is gone from the board while you decided, so nothing was stopped."
                 ),
-                Tone::Info,
+                Tone::Warn,
+            );
+            return Action::None;
+        };
+        if card.dismissed() || card.done() {
+            self.stop_starts.remove(i);
+            let changed = match &target {
+                Some(t) => crate::app::asking::what_changed(t, &card),
+                None => format!("{reference} changed"),
+            };
+            self.say(format!("{changed}, so nothing was stopped."), Tone::Warn);
+            return Action::None;
+        }
+        let now = Place::of(&card);
+        let here = match &now {
+            // Shown running: only where its answer said. An answer that named no workspace has
+            // nothing to tell another one from, so it's asked again.
+            Some(_) => place.workspace.is_some() && place.holds(&card),
+            // Not shown running: as its answer said while the board hasn't caught up with it yet
+            // (its change still shows), else its workspace closed meanwhile.
+            None => place.workspace.is_none() || self.resolver.job(s.n).is_some(),
+        };
+        if here {
+            self.stop_starts.remove(i);
+            return self.stop_at(&s, &place, Some(CardSnapshot::of(&card)), true);
+        }
+        let Some(now) = now else {
+            self.stop_starts.remove(i);
+            self.say(
+                format!(
+                    "{reference}'s workspace closed while you decided, so nothing was stopped."
+                ),
+                Tone::Warn,
+            );
+            return Action::None;
+        };
+        let at = describe(&now, &card);
+        self.stop_starts[i].ended = Some(StartEnd::Started(now.clone()));
+        self.put_stop_question(
+            now.machine,
+            &s,
+            format!(
+                "{reference} now runs in {at}, not where its start opened it. Stop it there and put it back in the backlog?"
+            ),
+            format!(
+                "It moved while you decided, so nothing was stopped yet. Its agent there is stopped as X stops one, and {reference} goes back to the backlog, not to Won't do."
+            ),
+            Some(CardSnapshot::of(&card)),
+        );
+        Action::None
+    }
+
+    /// A yes whose start's answer was lost: asked again about where the board shows it running,
+    /// if it does; otherwise nothing is stopped, since nobody can tell whether it started.
+    fn late_stop_unknown(&mut self, i: usize, target: Option<CardSnapshot>) -> Action {
+        let s = self.stop_starts[i].clone();
+        let reference = self.stop_reference(&s, target.as_ref());
+        let card = self
+            .stop_card(&s, target.as_ref())
+            .filter(|c| !c.dismissed() && !c.done());
+        let now = card.as_ref().and_then(Place::of);
+        let (Some(card), Some(now)) = (card, now) else {
+            self.stop_starts.remove(i);
+            self.say(
+                format!(
+                    "Kerdr can't tell whether {reference} started, so nothing was stopped: X on its card stops it once it shows running."
+                ),
+                Tone::Warn,
+            );
+            return Action::None;
+        };
+        let at = describe(&now, &card);
+        self.stop_starts[i].ended = Some(StartEnd::Started(now.clone()));
+        self.put_stop_question(
+            now.machine,
+            &s,
+            format!(
+                "{reference}'s start lost its answer, and it now shows running in {at}. Stop it there and put it back in the backlog?"
+            ),
+            format!(
+                "Nothing was stopped yet. Its agent there is stopped as X stops one, and {reference} goes back to the backlog, not to Won't do."
+            ),
+            Some(CardSnapshot::of(&card)),
+        );
+        Action::None
+    }
+
+    /// Stops a start at `place`, back to the backlog: only to a backend there that can, by its
+    /// feed; any other gets nothing, said (Codex's fifth look). `by_key` when his yes sends it, so
+    /// it goes back as the key's action; otherwise it's queued now.
+    fn stop_at(
+        &mut self,
+        s: &StopStart,
+        place: &Place,
+        from: Option<CardSnapshot>,
+        by_key: bool,
+    ) -> Action {
+        let reference = self.stop_reference(s, from.as_ref());
+        if !self.cancels_on(place.machine, CANCEL_BACKLOG) {
+            self.say(
+                format!(
+                    "{reference} started on a machine whose backend can't put it back in the backlog, so it wasn't stopped: X on its card stops it and sets it aside."
+                ),
+                Tone::Warn,
             );
             return Action::None;
         }
-        // Its answer came while he decided: stopped where the board shows it now.
-        let card = target
-            .as_ref()
-            .and_then(|t| self.card(&t.key))
-            .filter(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-            .cloned();
-        let mut cancel = json!({"action":"cancel","id":id,"to":"backlog"});
-        if let Some(c) = &card
-            && c.is_open_workspace()
-            && let (Some(session), Some(workspace)) = (&c.session, &c.workspace_id)
-        {
-            cancel["session"] = json!(session);
-            cancel["workspace"] = json!(workspace);
-            if let Some(tab) = &c.tab_id {
-                cancel["tab"] = json!(tab);
-            }
+        let cancel = place.stop(&s.id);
+        if !by_key {
+            self.say(
+                format!("{reference} started; stopping it and putting it back in the backlog…"),
+                Tone::Info,
+            );
+            self.action_from = from;
+            self.queue_action(place.machine, cancel);
+            return Action::None;
         }
-        let action = self.emit_mutation(machine, cancel);
+        let action = self.emit_mutation(place.machine, cancel);
         if matches!(action, Action::Mutate { .. }) {
-            self.action_from = card.as_ref().map(CardSnapshot::of).or(target);
+            self.action_from = from;
             self.say(
                 format!("Stopping {reference}'s start and putting it back in the backlog…"),
                 Tone::Info,
@@ -318,10 +592,11 @@ impl App {
         action
     }
 
-    /// A start he asked to stop once it started: its answer. Started, the stop goes now, to the
-    /// workspace it names, and Kerdr doesn't take him in. A question means nothing started, and
-    /// it isn't asked, since he asked for it not to start. Whether this took the answer; anything
-    /// else (a refusal, a start still followed) goes on as usual.
+    /// A start's answer, for a start he was asked about stopping: matched by its own change, never
+    /// by its record's number (Codex's fifth look). With his yes given, started means the stop goes
+    /// now, to the workspace it names, and Kerdr doesn't take him in; a question means nothing
+    /// started, and it isn't asked, since he asked for it not to start. Before his answer, how it
+    /// ended is kept for it, and the answer goes on as usual. Whether this took the answer.
     pub(super) fn stop_if_started(
         &mut self,
         machine: usize,
@@ -329,45 +604,51 @@ impl App {
         result: &Result<Response, String>,
         from: &Option<CardSnapshot>,
     ) -> bool {
-        let Some(id) = request["id"].as_str().map(str::to_string) else {
+        let Some(i) = self.answer_job.and_then(|n| self.stop_start_at(n)) else {
             return false;
         };
-        if request["action"] != "dispatch" || !self.stop_after_start.contains(&id) {
+        if request["action"] != "dispatch" {
             return false;
         }
-        let reference = self.reference_for(&id);
-        match result {
+        let end = match result {
             // Still going: its end, when it comes, is this answer again.
-            Ok(r) if r.ok && !r.confirmation && r.follow.is_some() => false,
+            Ok(r) if r.ok && !r.confirmation && r.follow.is_some() => return false,
             Ok(r) if r.ok && !r.confirmation && r.questions.is_empty() => {
-                self.stop_after_start.remove(&id);
-                if !self.cancels_on(machine, CANCEL_BACKLOG) {
-                    self.say(
-                        format!(
-                            "{reference} started on a machine whose backend can't put it back in the backlog, so it wasn't stopped: X on its card stops it and sets it aside."
-                        ),
-                        Tone::Warn,
-                    );
-                    return true;
-                }
-                let mut cancel = json!({"action":"cancel","id":id,"to":"backlog"});
-                if let (Some(session), Some(workspace)) = (&r.session, &r.workspace) {
-                    cancel["session"] = json!(session);
-                    cancel["workspace"] = json!(workspace);
-                    if let Some(tab) = &r.tab {
-                        cancel["tab"] = json!(tab);
-                    }
-                }
-                self.say(
-                    format!("{reference} started; stopping it and putting it back in the backlog…"),
-                    Tone::Info,
-                );
-                self.action_from = from.clone();
-                self.queue_action(machine, cancel);
+                // Where it runs: the machine its answer names, when it ran on another.
+                let ran = r
+                    .machine
+                    .as_deref()
+                    .filter(|m| {
+                        self.machines
+                            .get(machine)
+                            .is_some_and(|here| !here.answers_to(m))
+                    })
+                    .and_then(|m| self.machine_index(m))
+                    .unwrap_or(machine);
+                StartEnd::Started(Place {
+                    machine: ran,
+                    session: r.session.clone(),
+                    workspace: r.workspace.clone(),
+                    tab: r.tab.clone(),
+                })
+            }
+            Ok(r) if r.confirmation || !r.questions.is_empty() => StartEnd::Asked,
+            Err(e) if crate::actions::result_unknown(e) => StartEnd::Unknown,
+            // Refused, or done in part: nothing of it runs.
+            _ => StartEnd::Refused,
+        };
+        if !self.stop_starts[i].wanted {
+            self.stop_starts[i].ended = Some(end);
+            return false;
+        }
+        let s = self.stop_starts.remove(i);
+        let reference = self.stop_reference(&s, from.as_ref());
+        match end {
+            StartEnd::Started(place) => {
+                self.stop_at(&s, &place, from.clone(), false);
                 true
             }
-            Ok(r) if r.confirmation || !r.questions.is_empty() => {
-                self.stop_after_start.remove(&id);
+            StartEnd::Asked => {
                 self.say(
                     format!(
                         "{reference} asked a question before it started, so nothing started and it stays in the backlog; d asks it again."
@@ -376,26 +657,54 @@ impl App {
                 );
                 true
             }
-            Err(e) if crate::actions::result_unknown(e) => {
-                self.stop_after_start.remove(&id);
+            StartEnd::Unknown => {
+                let e = result.as_ref().err().cloned().unwrap_or_default();
                 self.fail(short(format!(
                     "Starting {reference}: {e} Kerdr can't tell whether it started, so it wasn't stopped."
                 )));
                 true
             }
-            // Refused, or done in part: nothing of it runs, and that's said as usual.
-            _ => {
-                self.stop_after_start.remove(&id);
-                false
-            }
+            StartEnd::Refused => false,
         }
+    }
+
+    /// A followed start Kerdr lost track of: nobody can tell whether it started, so a stop he
+    /// asked for isn't made, and that's said; one he hasn't answered yet keeps that for his answer.
+    pub(super) fn start_lost(&mut self, n: u64) {
+        let Some(i) = self.stop_start_at(n) else {
+            return;
+        };
+        if !self.stop_starts[i].wanted {
+            self.stop_starts[i].ended = Some(StartEnd::Unknown);
+            return;
+        }
+        let s = self.stop_starts.remove(i);
+        let reference = self.stop_reference(&s, None);
+        self.fail(format!(
+            "Kerdr can't tell whether {reference} started, so it wasn't stopped: X on its card stops it once it shows running."
+        ));
+    }
+}
+
+/// Where a card runs, in a question's words: "workspace web-41 (web)".
+fn describe(place: &Place, card: &Card) -> String {
+    let name = card
+        .workspace_label
+        .clone()
+        .or_else(|| place.workspace.clone())
+        .unwrap_or_default();
+    match &place.session {
+        Some(session) => format!("workspace {name} ({session})"),
+        None => format!("workspace {name}"),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::tests::{demo_app, press, press_code, room_in_every_session};
+    use crate::app::tests::{
+        demo_app, press, press_code, room_in_every_session, same_number_elsewhere,
+    };
     use crate::model::Stage;
     use ratatui::crossterm::event::KeyCode;
 
@@ -683,7 +992,7 @@ mod tests {
         );
         settle(&mut a);
         assert_eq!(press(&mut a, 'y'), Action::None);
-        assert!(a.stop_after_start.contains(&id));
+        assert!(a.stop_starts.iter().any(|s| s.n == n && s.wanted));
         assert!(
             said(&a).contains("once its workspace opens"),
             "{}",
@@ -701,7 +1010,7 @@ mod tests {
             cancel,
             &json!({"action":"cancel","id":id,"to":"backlog","session":"web","workspace":"w9","tab":"w9:t1"})
         );
-        assert!(!a.stop_after_start.contains(&id));
+        assert!(a.stop_starts.is_empty());
         a.finish_job(
             *c,
             cancel.clone(),
@@ -776,7 +1085,7 @@ mod tests {
     #[test]
     fn a_start_that_asks_first_starts_nothing_so_nothing_is_stopped_or_asked() {
         let mut a = demo_app();
-        let (_, id, n, _, request) = too_late(&mut a, true);
+        let (_, _, n, _, request) = too_late(&mut a, true);
         settle(&mut a);
         press(&mut a, 'y');
         a.finish_job(
@@ -798,7 +1107,7 @@ mod tests {
             "{}",
             said(&a)
         );
-        assert!(!a.stop_after_start.contains(&id));
+        assert!(a.stop_starts.is_empty());
     }
 
     #[test]
@@ -816,7 +1125,290 @@ mod tests {
             panic!("nothing sent: {:?}", a.message())
         };
         assert_eq!(to, machine);
-        assert_eq!(cancel, json!({"action":"cancel","id":id,"to":"backlog"}));
+        // Where its answer said it started, though the board hasn't caught up yet.
+        assert_eq!(
+            cancel,
+            json!({"action":"cancel","id":id,"to":"backlog","session":"web","workspace":"w9","tab":"w9:t1"})
+        );
         assert_eq!(a.action_from.as_ref().map(|f| f.key.clone()), Some(key));
+    }
+
+    /// Where a card shows running now, as the board would after a read: in workspace `id` of the
+    /// web session on `machine`.
+    fn runs_in(a: &mut App, key: &str, machine: usize, id: &str, label: &str) {
+        let card = a.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.machine_index = machine;
+        card.session = Some("web".into());
+        card.workspace_id = Some(id.into());
+        card.workspace_label = Some(label.into());
+        card.tab_id = None;
+    }
+
+    #[test]
+    fn a_stop_is_bound_to_its_own_start_when_two_sources_share_its_number() {
+        // Codex's fifth look: source A's #N and source B's #N are both starting; he asks to stop
+        // A's. B's answer comes first: B goes on untouched. Then A's: A's is stopped, where it
+        // started.
+        let mut a = demo_app();
+        room_in_every_session(&mut a);
+        a.cfg.actions.command = Some("test-adapter".into());
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                c.stage == Stage::Backlog
+                    && c.detail.as_ref().is_some_and(|d| d.kickoff.is_none())
+                    && !c.dismissed()
+                    && c.intake().is_none()
+            })
+            .expect("backlog work in the demo")
+            .clone();
+        let (ka, id, here) = (
+            card.key.clone(),
+            card.detail.as_ref().unwrap().id.clone(),
+            card.machine_index,
+        );
+        let (kb, there) = same_number_elsewhere(&mut a, &ka);
+        for m in [here, there] {
+            supports(&mut a, m, CANCEL_BACKLOG, true);
+        }
+        // A's is still being written up, so its d waits for that; B's goes at once.
+        for c in a.machines[here].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.intake = Some("pending".into());
+            }
+        }
+        a.rebuild();
+        select(&mut a, &ka);
+        press(&mut a, 'd');
+        let (na, _, ra, _) = a.resolver.ready()[0].clone();
+        select(&mut a, &kb);
+        let Action::Mutate {
+            machine: mb,
+            request: rb,
+        } = press(&mut a, 'd')
+        else {
+            panic!("B didn't start: {:?}", a.message())
+        };
+        assert_eq!(mb, there);
+        a.queue_action(mb, rb.clone());
+        let nb = a.resolver.last_added();
+        assert_eq!(sent(&mut a).len(), 1);
+        press_code(&mut a, KeyCode::Esc);
+        assert_eq!(a.resolver.take_dropped(), vec![na]);
+        a.job_started(na);
+        a.resolver.drop_answered(na, false);
+        settle(&mut a);
+        assert_eq!(asked(&a).0["n"], na);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        a.finish_job(
+            nb,
+            rb,
+            reply(
+                "Started it in workspace w7 (api).",
+                json!({"session":"api","workspace":"w7","tab":"w7:t1"}),
+            ),
+        );
+        assert!(
+            sent(&mut a).is_empty(),
+            "B's start was stopped: {:?}",
+            a.message()
+        );
+        let answer = started(&a);
+        a.finish_job(na, ra, answer);
+        let [(_, to, cancel)] = &sent(&mut a)[..] else {
+            panic!("A's start wasn't stopped: {:?}", a.message())
+        };
+        assert_eq!(*to, here);
+        assert_eq!(
+            cancel,
+            &json!({"action":"cancel","id":id,"to":"backlog","session":"web","workspace":"w9","tab":"w9:t1"})
+        );
+        assert!(a.stop_starts.is_empty());
+    }
+
+    #[test]
+    fn a_late_yes_asks_again_when_its_start_runs_somewhere_else_now() {
+        // Codex's fifth look: its start opened W9 while he decided, then the board shows it in
+        // W10. Nothing is stopped by the yes; it's asked again about W10, whose yes stops that.
+        let mut a = demo_app();
+        let (key, id, n, machine, request) = too_late(&mut a, true);
+        let answer = started(&a);
+        a.finish_job(n, request, answer);
+        runs_in(&mut a, &key, machine, "w10", "41-again");
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(sent(&mut a).is_empty());
+        let (question, title) = asked(&a);
+        assert_eq!(question["action"], STOP_START);
+        assert!(
+            title.contains("now runs in workspace 41-again (web), not where its start opened it"),
+            "{title}"
+        );
+        settle(&mut a);
+        let Action::Mutate {
+            machine: to,
+            request: cancel,
+        } = press(&mut a, 'y')
+        else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        assert_eq!(to, machine);
+        assert_eq!(
+            cancel,
+            json!({"action":"cancel","id":id,"to":"backlog","session":"web","workspace":"w10"})
+        );
+        assert!(a.stop_starts.is_empty());
+    }
+
+    #[test]
+    fn a_late_yes_stops_nothing_after_a_refused_start_and_asks_where_a_lost_one_shows() {
+        // Codex's fifth look: the yes acts on that start's own answer, kept while he decided.
+        // Refused: nothing ran, so nothing is stopped.
+        let mut a = demo_app();
+        let (_, _, n, _, request) = too_late(&mut a, true);
+        a.finish_job(
+            n,
+            request,
+            Ok(crate::actions::parse_response(
+                r#"{"ok":false,"message":"only an open backlog intent can start"}"#,
+            )
+            .unwrap()),
+        );
+        assert!(said(&a).contains("didn't start: only an open backlog intent can start"));
+        // Seen.
+        a.message = None;
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(sent(&mut a).is_empty());
+        assert!(
+            said(&a).contains("didn't start, so there's nothing to stop"),
+            "{}",
+            said(&a)
+        );
+        assert!(a.stop_starts.is_empty());
+        // Its answer lost, nothing shown running: nobody can tell, so nothing is stopped.
+        let lost = || Err("The connection dropped. Kerdr can't tell whether it happened.".into());
+        let mut a = demo_app();
+        let (_, _, n, _, request) = too_late(&mut a, true);
+        a.finish_job(n, request, lost());
+        a.message = None;
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(sent(&mut a).is_empty());
+        assert!(said(&a).contains("can't tell whether"), "{}", said(&a));
+        // Lost, and the board shows it running in W9 now: asked again about W9.
+        let mut a = demo_app();
+        let (key, id, n, machine, request) = too_late(&mut a, true);
+        a.finish_job(n, request, lost());
+        a.message = None;
+        runs_in(&mut a, &key, machine, "w9", "41-dark-mode");
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(sent(&mut a).is_empty());
+        let (_, title) = asked(&a);
+        assert!(
+            title.contains(
+                "lost its answer, and it now shows running in workspace 41-dark-mode (web)"
+            ),
+            "{title}"
+        );
+        settle(&mut a);
+        let Action::Mutate {
+            request: cancel, ..
+        } = press(&mut a, 'y')
+        else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        assert_eq!(
+            cancel,
+            json!({"action":"cancel","id":id,"to":"backlog","session":"web","workspace":"w9"})
+        );
+    }
+
+    #[test]
+    fn a_stop_sent_on_to_an_older_backend_or_answered_once_it_cant_is_never_sent() {
+        // Codex's fifth look: the stop goes to a machine that takes it, which refuses it naming
+        // another home. To an older backend there, which would read it as X and set the work
+        // aside, it isn't sent on, and that's said; to a newer one, it goes on.
+        for newer in [false, true] {
+            let mut a = demo_app();
+            let (_, id, n, machine, request) = too_late(&mut a, true);
+            let other = if machine == 0 { 1 } else { 0 };
+            supports(&mut a, other, CANCEL_BACKLOG, newer);
+            settle(&mut a);
+            press(&mut a, 'y');
+            let answer = started(&a);
+            a.finish_job(n, request, answer);
+            let [(c, to, cancel)] = &sent(&mut a)[..] else {
+                panic!("no stop: {:?}", a.message())
+            };
+            assert_eq!(*to, machine);
+            let name = a.machines[other].name();
+            a.finish_job(
+                *c,
+                cancel.clone(),
+                Ok(Response {
+                    ok: false,
+                    message: format!("{id} lives on {name} now."),
+                    home: Some(format!("{name}/web")),
+                    ..Default::default()
+                }),
+            );
+            let on = sent(&mut a);
+            if newer {
+                let [(_, to, again)] = &on[..] else {
+                    panic!("not sent on: {:?}", a.message())
+                };
+                assert_eq!((*to, again), (other, cancel));
+                continue;
+            }
+            assert!(on.is_empty(), "sent on to an older backend: {on:?}");
+            assert!(
+                said(&a).contains(&format!(
+                    "lives on {name} now, whose backend can't put it back in the backlog, so it wasn't stopped"
+                )),
+                "{}",
+                said(&a)
+            );
+        }
+        // Its backend asks first; by the yes, its feed no longer says it takes the stop: the yes
+        // isn't sent either.
+        let mut a = demo_app();
+        let (key, _, n, machine, request) = too_late(&mut a, true);
+        settle(&mut a);
+        press(&mut a, 'y');
+        let answer = started(&a);
+        a.finish_job(n, request, answer);
+        let [(c, _, cancel)] = &sent(&mut a)[..] else {
+            panic!("no stop")
+        };
+        a.finish_job(
+            *c,
+            cancel.clone(),
+            Ok(crate::actions::parse_response(
+                r#"{"ok":false,"confirmation":true,"confirm":"c-9","message":"Its agent is mid-step. Stop it anyway?"}"#,
+            )
+            .unwrap()),
+        );
+        settle(&mut a);
+        let (asked_for, _) = asked(&a);
+        assert_eq!(asked_for["confirm"], "c-9");
+        supports(&mut a, machine, CANCEL_BACKLOG, false);
+        let action = press(&mut a, 'y');
+        if let Action::Mutate { machine, request } = action {
+            a.queue_action(machine, request);
+        }
+        assert!(
+            sent(&mut a).is_empty(),
+            "its yes went to a backend that can't take it"
+        );
+        assert!(
+            said(&a).contains("can't put it back in the backlog"),
+            "{}",
+            said(&a)
+        );
+        assert!(a.card(&key).is_some());
     }
 }

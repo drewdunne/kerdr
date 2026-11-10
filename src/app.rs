@@ -686,14 +686,18 @@ pub struct App {
     /// holds only while the feed still shows that old home; fresh news of its home ends it. One
     /// for each record, since several can be refused at once (intent 0416).
     pub moved_home: Vec<(String, usize, Option<String>)>,
-    /// What's typed in a Kickoff Questions box and not saved yet, by its record's number.
+    /// What's typed in a Kickoff Questions box and not saved yet, by its card's key: never another
+    /// source's card with the same number (Codex's fifth look).
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
     /// Kickoff answers its backend gave back because their questions changed while he answered,
-    /// by its record's number: filled in on the next box d opens (intent 0591, B1-108).
+    /// by its card's key: filled in on the next box d opens (intent 0591, B1-108).
     pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
-    /// Starts Esc came too late for, which he asked to stop once their workspace opens and put
-    /// back in the backlog, by record number (intent 0591, K1-44).
-    pub stop_after_start: std::collections::HashSet<String>,
+    /// Starts Esc came too late for, each with Kerdr's question whether to stop it and put it
+    /// back in the backlog, bound to its own change (intent 0591, K1-44; Codex's fifth look).
+    pub stop_starts: Vec<cancels::StopStart>,
+    /// The change whose answer is being taken, by Kerdr's number for it: what's bound to that
+    /// change finds it by this, never by its record's number.
+    pub(crate) answer_job: Option<u64>,
     /// The tokens of questions answered from the box, whose copy in the feed is out of date until
     /// its next read: d doesn't open them again from there (intent 0491).
     pub kickoff_sent: std::collections::HashSet<String>,
@@ -785,8 +789,8 @@ pub struct App {
     pub(crate) follow_end: Option<follow::FollowEnd>,
     /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
     pub(crate) enter_sent: Option<String>,
-    /// The answer being taken is to a start ⏎ asked for; and the record whose question, up now,
-    /// such a start asked (Codex's review).
+    /// The answer being taken is to a start ⏎ asked for; and the card, by key, whose question, up
+    /// now, such a start asked (Codex's review; by key since Codex's fifth look).
     pub(crate) answer_by_enter: bool,
     pub(crate) confirm_by_enter: Option<String>,
     /// Questions that came while you were elsewhere, each waiting on its card (intent 0591).
@@ -851,7 +855,8 @@ impl App {
             moved_home: vec![],
             kickoff_kept: Default::default(),
             kickoff_prefill: Default::default(),
-            stop_after_start: Default::default(),
+            stop_starts: Vec::new(),
+            answer_job: None,
             kickoff_sent: Default::default(),
             kickoff_checks: 0,
             answered_at: None,
@@ -2104,7 +2109,7 @@ impl App {
             choices: vec![],
             enter_queues: false,
         };
-        self.confirm_by_enter = Some(detail.id);
+        self.confirm_by_enter = Some(card.key.clone());
         Action::None
     }
 
@@ -4057,7 +4062,7 @@ pub(crate) mod tests {
                     "answers":[{"num":"1","take":true},{"num":"2","text":"on the laptop"}]}),
                 saved,
             );
-            assert!(app.kickoff_prefill.contains_key(&id));
+            assert!(app.kickoff_prefill.contains_key(&key));
             // The next d's answer: the questions as they are now, with nothing given back.
             app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
             let mut now = kickoff_now();
@@ -4072,8 +4077,91 @@ pub(crate) mod tests {
                 panic!("expected the box: {:?}", app.mode)
             };
             assert_eq!(form.drafts, ["", "on the laptop"]);
-            assert!(!app.kickoff_prefill.contains_key(&id), "filled in twice");
+            assert!(!app.kickoff_prefill.contains_key(&key), "filled in twice");
         }
+    }
+
+    /// Two sources sharing a record number (Codex's fifth look): beside the card `key`, a copy of
+    /// its record on the other demo machine, whose feed is another source's, homed there. That
+    /// copy's key and machine.
+    pub(crate) fn same_number_elsewhere(app: &mut App, key: &str) -> (String, usize) {
+        let card = app.card(key).unwrap().clone();
+        let id = card.detail.as_ref().unwrap().id.clone();
+        let here = card.machine_index;
+        let there = if here == 0 { 1 } else { 0 };
+        let name = app.machines[there].name();
+        let mut copy = app.machines[here]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .clone();
+        copy.home = Some(crate::feed::Home {
+            machine: Some(name),
+            session: copy.home.as_ref().and_then(|h| h.session.clone()),
+        });
+        let feed = app.machines[there].feed.as_mut().unwrap();
+        feed.source = Some("other".into());
+        feed.cards.retain(|c| c.id != id);
+        feed.cards.push(copy);
+        app.rebuild();
+        let other = format!("other:{id}");
+        assert!(app.card(&other).is_some(), "no copy on the board");
+        assert!(app.card(key).is_some(), "the first one went");
+        (other, there)
+    }
+
+    #[test]
+    fn answers_given_back_fill_in_their_own_cards_box_when_two_sources_share_its_number() {
+        // Codex's fifth look: Esc's saves for source A's #N and source B's #N both come back with
+        // answers to fill in, B's first. Each card's next box fills in its own words, never the
+        // other's.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id) = waiting_backlog_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &a);
+        let here = app.card(&a).unwrap().machine_index;
+        let save = serde_json::json!({"action":"answer","id":id,"asked":"oldtoken00000000",
+            "answers":[{"num":"1","take":true},{"num":"2","text":"mine"}]});
+        let mut sent = vec![];
+        for (key, machine) in [(&a, here), (&b, there)] {
+            app.action_from = Some(CardSnapshot::of(app.card(key).unwrap()));
+            app.queue_action(machine, save.clone());
+            sent.push(app.resolver.last_added());
+        }
+        let given = |words: &str| {
+            Ok(crate::actions::parse_response(
+                &serde_json::json!({"ok":false,"message":"Its questions changed while you were answering.",
+                    "prefill":[{"num":"2","text":words}]})
+                .to_string(),
+            )
+            .unwrap())
+        };
+        app.finish_job(sent[1], save.clone(), given("words for B"));
+        app.finish_job(sent[0], save.clone(), given("words for A"));
+        for (key, machine, words) in [(&b, there, "words for B"), (&a, here, "words for A")] {
+            app.mode = Mode::Board;
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            app.action_from = Some(CardSnapshot::of(app.card(key).unwrap()));
+            let mut now = kickoff_now();
+            now["note"] = serde_json::Value::Null;
+            app.finish_action(
+                machine,
+                serde_json::json!({"action":"dispatch","id":id}),
+                Ok(crate::actions::parse_response(&now.to_string()).unwrap()),
+            );
+            let Mode::Kickoff { form, .. } = &app.mode else {
+                panic!("expected {key}'s box: {:?} {:?}", app.mode, app.message())
+            };
+            assert_eq!(form.drafts, ["", words], "{key}");
+        }
+        assert!(app.kickoff_prefill.is_empty());
     }
 
     /// Intent 0404: ⏎ on work nobody started starts it, sending what d sends, and past the usual
@@ -10304,6 +10392,118 @@ pub(crate) mod tests {
         assert_eq!(request["id"].as_str(), Some(id.as_str()));
         assert_eq!(request["confirm"], "00000000000000bb");
         assert_eq!(request["override"], true);
+    }
+
+    #[test]
+    fn a_step_first_request_is_never_sent_on_to_a_home_whose_backend_doesnt_do_steps() {
+        // Codex's fifth look: d on work in Won't do goes to a backend that brings it back and
+        // starts it in one request. Refused there, its record living on a machine whose backend
+        // doesn't do that, it isn't sent on, which there would be a start of work set aside; it's
+        // said, and d there again does what that backend takes.
+        for newer in [false, true] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            steps_everywhere(&mut app);
+            let (key, id) = waiting_backlog_card(&app);
+            let here = app.card(&key).unwrap().machine_index;
+            let there = if here == 0 { 1 } else { 0 };
+            for c in app.machines[here].feed.as_mut().unwrap().cards.iter_mut() {
+                if c.id == id {
+                    c.disposition = Some("wont_do".into());
+                }
+            }
+            if !newer {
+                app.machines[there].feed.as_mut().unwrap().supports = vec!["op".into()];
+            }
+            app.rebuild();
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            assert!(app.card(&key).unwrap().dismissed());
+            let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+                panic!("d sent nothing: {:?}", app.message())
+            };
+            assert_eq!(machine, here);
+            app.queue_action(machine, request.clone());
+            let n = app.resolver.last_added();
+            app.resolver.ready();
+            let name = app.machines[there].name();
+            app.finish_job(
+                n,
+                request.clone(),
+                Ok(crate::actions::Response {
+                    ok: false,
+                    message: format!("It lives on {name} now; d again starts it there."),
+                    home: Some(format!("{name}/web")),
+                    ..Default::default()
+                }),
+            );
+            let on = app.resolver.ready();
+            if newer {
+                let [(_, to, again, _)] = &on[..] else {
+                    panic!("not sent on: {:?}", app.message())
+                };
+                assert_eq!((*to, again["action"].as_str()), (there, Some("dispatch")));
+                continue;
+            }
+            assert!(on.is_empty(), "sent on to a backend without steps: {on:?}");
+            let (said, tone) = app.message().unwrap();
+            assert!(
+                said.contains(&format!(
+                    "lives on {name} now, whose backend doesn't do that step first, so nothing was sent there"
+                )),
+                "{said}"
+            );
+            assert_eq!(tone, Tone::Warn);
+            // d again goes there, as that backend takes it: u first.
+            app.message = None;
+            app.sel.key = Some(key.clone());
+            assert_eq!(press(&mut app, 'd'), Action::None);
+            assert!(
+                app.message().unwrap().0.contains("u brings it back"),
+                "{:?}",
+                app.message()
+            );
+        }
+    }
+
+    #[test]
+    fn a_start_on_a_chosen_account_goes_only_to_a_backend_that_still_starts_on_one() {
+        // Codex's fifth look, swept: a question's yes, or a held offer, can come after its
+        // backend's feed changed. Each send is checked where it goes.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        let machine = app.card(&key).unwrap().machine_index;
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .starts_on
+            .clear();
+        app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+        app.queue_action(
+            machine,
+            serde_json::json!({"action":"dispatch","id":id,"account":"ARK_C","confirm":"t-1","override":true}),
+        );
+        assert!(app.resolver.ready().is_empty(), "sent to an older backend");
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("can't start work on a chosen account"),
+            "{:?}",
+            app.message()
+        );
+        assert_eq!(
+            app.send_account(
+                machine,
+                serde_json::json!({"action":"account-resume","session":"web","conversation":"c-1","to":"ARK_C"}),
+            ),
+            Action::None
+        );
+        assert!(app.account_pending.is_none());
     }
 
     #[test]

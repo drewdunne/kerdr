@@ -585,9 +585,13 @@ that never sends `choices` gets yes and no only. A Kerdr from before this reads 
 
 ### Two more stops: `cancel-backlog` and `cancel-workspace`
 
-Each is sent only to a backend whose feed lists it in `supports`. Any other gets what Kerdr 0.33.0
-said instead, and is never sent the request: an older backend would read the first as `X` and set the
-card aside in Won't do.
+Each is sent only to a backend whose feed lists it in `supports`, checked on the machine the request
+actually goes to each time it's sent: its yes to a question you asked about it, and a resend to the
+machine a `home` refusal names, included. Any other gets what Kerdr 0.33.0 said instead, and is never
+sent the request: an older backend would read the first as `X` and set the card aside in Won't do. The
+same holds for a request Kerdr sends only because its backend lists `"steps"` (d on work in Won't do,
+say, or a question's `choice`): it isn't sent on to a home whose feed doesn't list it, and Kerdr says so;
+the same key there then does what that backend takes.
 
 - **`"cancel-backlog"`: Esc on a start that had already begun.** Esc on the board drops a start that
   waits for its write-up; when the start had begun a moment before, Kerdr asks "#41 had already begun
@@ -599,7 +603,13 @@ card aside in Won't do.
   in Won't do; with nothing of it running any more, just put it back. Kerdr says your `message`. A
   start that answered with a question started nothing, so Kerdr neither asks it nor sends the stop; a
   followed start is stopped once it ends. The question is asked only while you're on the board, a list
-  or a card, never over typing; otherwise Kerdr says it carries on, as before.
+  or a card, never over typing; otherwise Kerdr says it carries on, as before. The question and its
+  yes are bound to that one start, never to its record's number, which another source's card can
+  share. When the start answers before the yes, the yes acts on that answer: it sends the stop only
+  for a start that started, to the workspace it named, while the board shows it there or hasn't caught
+  up with it yet; when the board shows it running in another workspace by then, or the start's answer
+  was lost and the board shows it running, Kerdr asks again about where it runs now; after a refusal,
+  a question, or a lost answer with nothing shown running, it sends nothing and says why.
 - **`"cancel-workspace"`: `X` on a workspace with no intent.** Kerdr asks "Stop its Claude Code agent
   (idle) and close workspace notes (web)?", then sends `{"action":"cancel","session":"web","workspace":"w5"}`
   with no `id` to the machine the workspace runs on. Stop everything running there and close it; refuse
@@ -1223,7 +1233,10 @@ Kerdr sends one account request at a time: one asked for while another is on its
 move Kerdr makes by itself, waits its turn with what it was asked from, and each answer is matched
 to its own request. What an answer brings (a question, the box that signs an account in, an offer
 to resume a conversation) is shown over the screen it was asked from, or held with its request when
-you've gone on to type something and shown once you're back on the board, never dropped.
+you've gone on to type something and shown once you're back on the board, never dropped. One whose
+machine drops before its turn stays queued while the drop is a passing one and goes once it's back;
+once the drop lasts (30 seconds), its own screen says it wasn't sent. `account-start` and
+`account-resume` go only to a backend whose feed lists them in `starts_on`, checked as each is sent.
 Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |

@@ -99,7 +99,19 @@ impl App {
         id: &str,
         from: Option<&CardSnapshot>,
     ) -> Option<&Card> {
-        let key = match from {
+        self.card(&self.intent_key(machine, id, from))
+    }
+
+    /// The stable key of the card a request for record `id` on `machine` is about: the card it was
+    /// asked from, else its record's source and number as that machine's feed names them. Never
+    /// the number alone, which another source's card can share (Codex's fifth look).
+    pub(crate) fn intent_key(
+        &self,
+        machine: usize,
+        id: &str,
+        from: Option<&CardSnapshot>,
+    ) -> String {
+        match from {
             Some(f) => f.key.clone(),
             None => {
                 let source = self
@@ -110,8 +122,7 @@ impl App {
                     .unwrap_or_else(|| "feed".into());
                 format!("{source}:{id}")
             }
-        };
-        self.card(&key)
+        }
     }
 
     /// A question that came while you were somewhere else: it waits on its card rather than fail,
@@ -264,16 +275,15 @@ impl App {
             .map(|c| c.reference.clone())
             .unwrap_or_else(|| self.reference_for(&id));
         let title = card.as_ref().map(|c| c.title.clone()).unwrap_or_default();
-        let kept = self
-            .kickoff_kept
-            .get(request["id"].as_str().unwrap_or_default())
-            .cloned()
-            .unwrap_or_default();
+        // What's kept for this card, by its key: never another source's with the same number
+        // (Codex's fifth look).
+        let held = self.intent_key(machine, &id, from.as_ref());
+        let kept = self.kickoff_kept.get(&held).cloned().unwrap_or_default();
         // His answers given back earlier, when their questions changed while he answered, unless
         // this answer gives its own (intent 0591, B1-108).
         let mut response = response;
         if response.prefill.is_empty()
-            && let Some(prefill) = self.kickoff_prefill.get(&id)
+            && let Some(prefill) = self.kickoff_prefill.get(&held)
         {
             response.prefill = prefill.clone();
         }
@@ -285,7 +295,7 @@ impl App {
             title,
             &kept,
         ) {
-            self.kickoff_prefill.remove(&id);
+            self.kickoff_prefill.remove(&held);
             self.mode = Mode::Kickoff {
                 form,
                 back: Box::new(self.mode.clone()),
@@ -358,7 +368,7 @@ impl App {
         // A start ⏎ asked for stays ⏎'s through its yes: if that is followed too, its end goes in
         // (Codex's review).
         self.confirm_by_enter = by_enter
-            .then(|| request["id"].as_str().map(str::to_string))
+            .then(|| from.as_ref().map(|f| f.key.clone()))
             .flatten();
         self.mode = Mode::Confirm {
             machine,

@@ -371,7 +371,10 @@ impl App {
         self.follow_end = Some(FollowEnd { enter: f.enter });
         self.answer_stderr = String::new();
         self.answer_by_enter = f.enter;
+        // Its end is the answer of the change it followed (intent 0591, Codex's fifth look).
+        self.answer_job = Some(f.job);
         self.finish_action(f.machine, f.request.clone(), Ok(response));
+        self.answer_job = None;
         self.answer_by_enter = false;
         self.follow_end = None;
         self.action_from = None;
@@ -404,6 +407,8 @@ impl App {
             ),
             Tone::Warn,
         );
+        // A stop he asked for once it started can't tell whether it did (intent 0591, K1-44).
+        self.start_lost(f.job);
     }
 
     /// The machine has no record of the followed work (expired, or never its): Kerdr says so
@@ -430,6 +435,7 @@ impl App {
             ),
             Tone::Warn,
         );
+        self.start_lost(f.job);
     }
 
     /// Esc: followed work still finishes, but takes you nowhere and asks nothing where you are.
