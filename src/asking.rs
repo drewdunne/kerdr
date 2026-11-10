@@ -269,6 +269,14 @@ impl App {
             .get(request["id"].as_str().unwrap_or_default())
             .cloned()
             .unwrap_or_default();
+        // His answers given back earlier, when their questions changed while he answered, unless
+        // this answer gives its own (intent 0591, B1-108).
+        let mut response = response;
+        if response.prefill.is_empty()
+            && let Some(prefill) = self.kickoff_prefill.get(&id)
+        {
+            response.prefill = prefill.clone();
+        }
         if let Some(form) = Kickoff::from_answer(
             machine,
             &request,
@@ -277,6 +285,7 @@ impl App {
             title,
             &kept,
         ) {
+            self.kickoff_prefill.remove(&id);
             self.mode = Mode::Kickoff {
                 form,
                 back: Box::new(self.mode.clone()),

@@ -686,6 +686,9 @@ pub struct App {
     pub moved_home: Vec<(String, usize, Option<String>)>,
     /// What's typed in a Kickoff Questions box and not saved yet, by its record's number.
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
+    /// Kickoff answers its backend gave back because their questions changed while he answered,
+    /// by its record's number: filled in on the next box d opens (intent 0591, B1-108).
+    pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
     /// The tokens of questions answered from the box, whose copy in the feed is out of date until
     /// its next read: d doesn't open them again from there (intent 0491).
     pub kickoff_sent: std::collections::HashSet<String>,
@@ -836,6 +839,7 @@ impl App {
             resent: vec![],
             moved_home: vec![],
             kickoff_kept: Default::default(),
+            kickoff_prefill: Default::default(),
             kickoff_sent: Default::default(),
             kickoff_checks: 0,
             answered_at: None,
@@ -3933,6 +3937,130 @@ pub(crate) mod tests {
             "{:?}",
             last_said(&app)
         );
+    }
+
+    /// Intent 0591, B1-106 and B1-108 (r3-a's `prefill`): his Kickoff answers whose questions
+    /// changed while he answered come back, and the box fills them in again by number for him to
+    /// check, rather than have him type them again.
+    fn kickoff_reply(
+        app: &mut App,
+        home: usize,
+        request: serde_json::Value,
+        reply: serde_json::Value,
+    ) {
+        reply_to(
+            app,
+            home,
+            request,
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+
+    fn kickoff_now() -> serde_json::Value {
+        serde_json::json!({"ok":false,"message":"for an older Kerdr","asked":"newtoken00000000",
+            "note":"Some of these changed while you were answering: your answers to question 3 were saved, and yours to the rest are filled in for you to check.",
+            "questions":[
+                {"num":"1","question":"Whose is it, now that it's two sites?","pick":"Kibbelz"},
+                {"num":"2","question":"Where does it run?","pick":"The server"}]})
+    }
+
+    #[test]
+    fn a_start_whose_questions_changed_while_he_answered_fills_his_answers_in_again() {
+        for with_prefill in [true, false] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = waiting_backlog_card(&app);
+            let home = app.card(&key).unwrap().machine_index;
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            let request = serde_json::json!({"action":"dispatch","id":id,"asked":"oldtoken00000000",
+                "answers":[{"num":"1","text":"Kibbelz, the personal one"},{"num":"2","take":true},{"num":"3","text":"Soon"}]});
+            let mut reply = kickoff_now();
+            if with_prefill {
+                reply["prefill"] = serde_json::json!([
+                    {"num":"1","text":"Kibbelz, the personal one"},
+                    {"num":"2","take":true}
+                ]);
+            }
+            app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+            kickoff_reply(&mut app, home, request, reply);
+            let Mode::Kickoff { form, .. } = &mut app.mode else {
+                panic!("expected the box: {:?}", app.mode)
+            };
+            assert!(
+                form.note
+                    .as_deref()
+                    .unwrap()
+                    .contains("filled in for you to check")
+            );
+            if !with_prefill {
+                // A backend without it: as before, nothing filled in on a reworded question.
+                assert_eq!(form.drafts, ["", ""]);
+                continue;
+            }
+            assert_eq!(form.drafts, ["Kibbelz, the personal one", ""]);
+            // His to check: ⏎ takes each, his words and the recommendation he took.
+            form.ready_at = Instant::now();
+            press_code(&mut app, KeyCode::Enter);
+            let Mode::Kickoff { form, .. } = &mut app.mode else {
+                panic!("the box shut")
+            };
+            form.ready_at = Instant::now();
+            let Action::Mutate { request: sent, .. } = press_code(&mut app, KeyCode::Enter) else {
+                panic!("expected the start")
+            };
+            assert_eq!(sent["asked"], "newtoken00000000");
+            assert_eq!(
+                sent["answers"],
+                serde_json::json!([{"num":"1","text":"Kibbelz, the personal one"},{"num":"2","take":true}])
+            );
+        }
+    }
+
+    #[test]
+    fn answers_given_back_after_esc_are_filled_in_on_the_next_box() {
+        // Esc's save found some questions changed: those answers come back with no box to fill,
+        // and the next d's box fills them in, once. Refused whole or saved in part alike.
+        for saved in [
+            serde_json::json!({"ok":false,"message":"#41's questions changed while you were answering, so your answers weren't saved. d shows them as they are now, with yours filled in.","prefill":[{"num":"2","text":"on the laptop"}]}),
+            serde_json::json!({"ok":true,"partial":true,"message":"Saved your answers to question 1 of #41; the rest changed while you were answering, so d shows them as they are now, with yours filled in.","prefill":[{"num":"2","text":"on the laptop"}]}),
+        ] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = waiting_backlog_card(&app);
+            let home = app.card(&key).unwrap().machine_index;
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            let mut saved = saved;
+            saved["id"] = serde_json::json!(id);
+            kickoff_reply(
+                &mut app,
+                home,
+                serde_json::json!({"action":"answer","id":id,"asked":"oldtoken00000000",
+                    "answers":[{"num":"1","take":true},{"num":"2","text":"on the laptop"}]}),
+                saved,
+            );
+            assert!(app.kickoff_prefill.contains_key(&id));
+            // The next d's answer: the questions as they are now, with nothing given back.
+            app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+            let mut now = kickoff_now();
+            now["note"] = serde_json::Value::Null;
+            kickoff_reply(
+                &mut app,
+                home,
+                serde_json::json!({"action":"dispatch","id":id}),
+                now,
+            );
+            let Mode::Kickoff { form, .. } = &app.mode else {
+                panic!("expected the box: {:?}", app.mode)
+            };
+            assert_eq!(form.drafts, ["", "on the laptop"]);
+            assert!(!app.kickoff_prefill.contains_key(&id), "filled in twice");
+        }
     }
 
     /// Intent 0404: ⏎ on work nobody started starts it, sending what d sends, and past the usual

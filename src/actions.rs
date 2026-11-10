@@ -128,6 +128,44 @@ pub struct Response {
     pub not_running: bool,
     #[serde(default, deserialize_with = "plain_word")]
     pub why: Option<String>,
+    /// With Kickoff answers whose questions changed while he answered: his answers to those, as
+    /// Kerdr sent them, for the box to fill in again on the question with the same number, for him
+    /// to check (intent 0591, B1-108). The rest were saved.
+    #[serde(default, deserialize_with = "prefill")]
+    pub prefill: Vec<Prefill>,
+}
+
+/// One Kickoff answer that couldn't be saved, because its question changed while he answered: the
+/// question's number, and his words, or none when he took its recommendation (intent 0591).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prefill {
+    pub num: String,
+    pub text: Option<String>,
+}
+
+/// `prefill` as a backend gives it: `[{"num","text"}]` or `[{"num","take":true}]`, in its order;
+/// anything else (not a list, an entry with no number, or with neither) is passed over, never a
+/// failed answer.
+fn prefill<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Prefill>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let num = v["num"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty() && n.len() <= 16)?
+                .to_string();
+            let text = match v["text"].as_str().map(str::trim) {
+                Some(text) if !text.is_empty() => Some(text.to_string()),
+                _ if v["take"] == true => None,
+                _ => return None,
+            };
+            Some(Prefill { num, text })
+        })
+        .collect())
 }
 
 /// A short word as a backend gives it; anything else is none, never a failed answer.
@@ -1881,6 +1919,44 @@ printf '%s' '{{"ok":true,"message":"Marked #41 done."}}'
             "the same request, the same op"
         );
         assert_eq!(lines(dir.path(), "done.log").len(), 1);
+    }
+
+    #[test]
+    fn prefill_is_read_leniently_and_a_backend_without_it_gives_none() {
+        let read = |prefill: &str| {
+            parse_response(&format!(
+                r#"{{"ok":false,"message":"changed","prefill":{prefill}}}"#
+            ))
+            .unwrap()
+            .prefill
+        };
+        assert_eq!(
+            read(
+                r#"[{"num":"1","text":" mine "},{"num":"2","take":true},{"num":"3"},{"text":"x"},{"num":"4","text":"  ","take":true},"x"]"#
+            ),
+            [
+                Prefill {
+                    num: "1".into(),
+                    text: Some("mine".into())
+                },
+                Prefill {
+                    num: "2".into(),
+                    text: None
+                },
+                Prefill {
+                    num: "4".into(),
+                    text: None
+                },
+            ]
+        );
+        assert!(read(r#""x""#).is_empty());
+        assert!(read("null").is_empty());
+        assert!(
+            parse_response(r#"{"ok":true,"message":"saved"}"#)
+                .unwrap()
+                .prefill
+                .is_empty()
+        );
     }
 
     #[cfg(unix)]

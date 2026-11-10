@@ -3682,6 +3682,17 @@ impl App {
                 self.ask_now(machine, request, response, from, by_enter);
             }
             Ok(response) => {
+                // Kickoff answers whose questions changed while he answered, with no box to fill
+                // them into now (Esc's save, say): kept for the box d opens next (intent 0591,
+                // B1-108).
+                if matches!(request["action"].as_str(), Some("answer" | "dispatch"))
+                    && !response.prefill.is_empty()
+                    && response.questions.is_empty()
+                    && let Some(id) = request["id"].as_str()
+                {
+                    self.kickoff_prefill
+                        .insert(id.to_string(), response.prefill.clone());
+                }
                 let mut message = response.message.clone();
                 // What a change that went as shown still says: only what you'd need to find it.
                 let mut note = None;
@@ -3810,6 +3821,7 @@ impl App {
                     && let Some(id) = request["id"].as_str()
                 {
                     self.kickoff_kept.remove(id);
+                    self.kickoff_prefill.remove(id);
                 }
                 if !response.ok && response.partial {
                     // Part of it happened, and the backend's words say which: not a change that

@@ -297,7 +297,14 @@ After the last, the same `dispatch` goes again with `asked` and `answers`, as
 answered with `{"action":"answer","id":"0041","asked":"opaque","answers":[…]}` and starts nothing, and
 is the only request that isn't a start. Tab, offered when the answer has `confirmation`, starts it with
 you along instead: `override: true` and its `confirm`, with `asked` and `answers` when some are given.
-When the questions have changed since `asked`, save nothing, and answer with them as they are now. A
+When the questions have changed since `asked`, save the answers to those that didn't, and answer with
+the questions as they are now. Give the rest back as `"prefill"`, so he needn't type them again:
+`[{"num":"2","text":"his words"},{"num":"3","take":true}]`, one entry for each answer you couldn't
+save. Kerdr fills each in on the question with the same `num`, where nothing's typed already, for him
+to check before it goes: his words, or the recommendation he took. An Esc's `answer` gives them back
+the same way, with no questions: refused (`ok: false`) or saved in part (`ok: true`, `partial: true`),
+and the next box `d` opens for that work, from the start's answer or the feed's `kickoff`, fills them
+in once. Entries Kerdr can't read are skipped; a backend without `prefill` leaves the box as before. A
 start with answers that fails keeps what you typed: `d` opens the box again with your words in it.
 Kerdr asks it for `dispatch` and `reopen`.
 
