@@ -510,18 +510,14 @@ impl App {
         how: Leaving,
     ) -> Action {
         self.keep_kickoff(&form);
-        if !self.kickoff_still_applies(&form) {
-            self.say(
-                "That intent changed while you were answering, so nothing was sent. Select it again.",
-                Tone::Warn,
-            );
-            return Action::None;
-        }
         let answered = if matches!(how, Leaving::Start) {
             form.questions.len()
         } else {
             form.reached
         };
+        if !self.kickoff_still_applies(&form) {
+            return self.answers_for_changed_work(form, target.map(|t| *t), answered);
+        }
         // The feed still has these until its next read: d goes by the backend's answer till then.
         if answered > 0 {
             self.kickoff_sent.insert(form.asked.clone());
@@ -550,6 +546,69 @@ impl App {
         let action = self.emit_mutation(form.machine, request);
         if matches!(action, Action::Mutate { .. }) {
             self.action_from = target.map(|t| *t);
+        }
+        action
+    }
+
+    /// The card stopped being unstarted work there while he answered (it started, was set aside or
+    /// moved home): what he answered is saved on it anyway, where it lives now, and nothing starts.
+    /// The questions' token goes with them, so its backend saves none for questions that changed
+    /// (intent 0591, K1-76). A backend from before that refuses in its own words, and the box keeps
+    /// his words for the next d either way.
+    fn answers_for_changed_work(
+        &mut self,
+        form: Kickoff,
+        from: Option<CardSnapshot>,
+        answered: usize,
+    ) -> Action {
+        let id = form.request["id"].as_str().unwrap_or_default().to_string();
+        let card = self
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .cloned();
+        let Some(card) = card else {
+            self.say(
+                format!(
+                    "{} is gone from the board while you answered, so your answers weren't sent; they're kept for its next d.",
+                    form.reference
+                ),
+                Tone::Warn,
+            );
+            return Action::None;
+        };
+        // As it was when the box opened: unstarted work, not set aside, with no workspace.
+        let then = from.unwrap_or_else(|| CardSnapshot {
+            workspace: None,
+            waiting: true,
+            done: false,
+            dismissed: false,
+            ..CardSnapshot::of(&card)
+        });
+        let changed = crate::app::asking::what_changed(&then, &card);
+        if answered == 0 {
+            self.say(format!("{changed}, so nothing was sent."), Tone::Warn);
+            return Action::None;
+        }
+        let Some(machine) = self.home_machine(&card) else {
+            // Its home isn't one of Kerdr's machines: home_machine said so.
+            return Action::None;
+        };
+        self.kickoff_sent.insert(form.asked.clone());
+        let request = json!({
+            "action": "answer",
+            "id": id,
+            "asked": form.asked,
+            "answers": form.answers(answered),
+        });
+        let action = self.emit_mutation(machine, request);
+        if matches!(action, Action::Mutate { .. }) {
+            self.action_from = Some(CardSnapshot::of(&card));
+            self.say(
+                format!("{changed}; saving your answers on it, and nothing starts."),
+                Tone::Info,
+            );
         }
         action
     }
@@ -1229,7 +1288,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_for_work_that_changed_meanwhile_are_not_sent() {
+    fn answers_for_work_gone_from_the_board_are_not_sent() {
         let (mut app, _) = open_on(&answer());
         let Mode::Kickoff { form, .. } = &mut app.mode else {
             panic!()
@@ -1243,12 +1302,42 @@ mod tests {
             app.kickoff_key(press(KeyCode::Tab), form, back, target),
             Action::None
         ));
-        assert!(
-            app.message()
-                .unwrap()
-                .0
-                .contains("changed while you were answering")
+        let said = app.message().unwrap().0;
+        assert!(said.contains("gone from the board"), "{said}");
+        assert!(said.contains("kept for its next d"), "{said}");
+    }
+
+    /// Intent 0591, K1-76: work that started while he answered gets his answers anyway, saved on
+    /// it with their token, and nothing starts; never "select it again".
+    #[test]
+    fn answers_for_work_that_started_meanwhile_are_saved_on_it() {
+        let (mut app, id) = open_on(&answer());
+        key(&mut app, KeyCode::Enter);
+        for card in &mut app.board.cards {
+            if card.detail.as_ref().is_some_and(|d| d.id == id) {
+                card.stage = Stage::Build;
+                card.state = Some("active".into());
+            }
+        }
+        let request = sent(key(&mut app, KeyCode::Esc));
+        assert_eq!(
+            request,
+            json!({"action": "answer", "id": id, "asked": "fedcba9876543210", "answers": [{"num": "1", "take": true}]})
         );
+        let said = app.message().unwrap().0;
+        assert!(said.contains("saving your answers on it"), "{said}");
+        // A start from the box sends the same, never a start.
+        let (mut app, id) = open_on(&answer());
+        key(&mut app, KeyCode::Enter);
+        for card in &mut app.board.cards {
+            if card.detail.as_ref().is_some_and(|d| d.id == id) {
+                card.detail.as_mut().unwrap().disposition = Some("wont_do".into());
+            }
+        }
+        let request = sent(key(&mut app, KeyCode::Enter));
+        assert_eq!(request["action"], "answer");
+        assert_eq!(request["answers"].as_array().map(Vec::len), Some(2));
+        assert!(app.message().unwrap().0.contains("set aside meanwhile"));
     }
 
     #[test]
