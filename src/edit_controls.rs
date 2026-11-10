@@ -176,6 +176,10 @@ impl App {
         if self.still_saving(&card) || self.still_changing(&card, "edit") {
             return Action::None;
         }
+        // The question its last save asked while you were elsewhere, waiting on it (intent 0591).
+        if self.key_opens_waiting(&card.key, "edit") {
+            return Action::None;
+        }
         self.backlog_focus = Some(card.key.clone());
         let reference = card.reference.clone();
         // Its new text on its way, then written up again: the card shows ✎ meanwhile.
@@ -198,15 +202,19 @@ impl App {
             );
             return Action::None;
         }
-        let refusal = if card.dismissed() {
+        // A backend that does each key's step first edits it where it is: in Won't do it stays
+        // there, done work's save asks to become a new intent made from it, and started work's
+        // agent is told (intent 0591, K1-79 to K1-81). An older one refuses those, as Kerdr did.
+        let steps = self.does_steps(&card);
+        let refusal = if card.dismissed() && !steps {
             Some(format!(
                 "{reference} is in won't do; u brings it back before its text can be edited."
             ))
-        } else if card.done() || card.state.as_deref() == Some("closed") {
+        } else if (card.done() || card.state.as_deref() == Some("closed")) && !steps {
             Some(format!(
                 "{reference} is done, so its text can't be edited here."
             ))
-        } else if !waiting_work(&card) {
+        } else if !waiting_work(&card) && !steps {
             Some(format!(
                 "{reference} has started, so its text can't be edited here."
             ))
@@ -660,6 +668,9 @@ impl App {
                     return Action::None;
                 }
                 self.editor_trouble(&run, &reference);
+                // The card it's saved from, so a question its backend asks about the save waits on
+                // that card, and its yes holds only for the same work (intent 0591).
+                self.action_from = self.card(key).map(CardSnapshot::of);
                 Action::Mutate { machine, request }
             }
         }
@@ -1027,8 +1038,13 @@ impl App {
             // that part is said where it can't be missed.
             Ok(r) if r.ok => {
                 self.edits.remove(key);
+                // Saved somewhere other than the backlog card it shows on (as a new intent made
+                // from done work, or with its agent told): its backend's words say where.
+                let elsewhere = self.card(key).is_some_and(|c| !waiting_work(c));
                 if partial(&r) {
                     self.fail(partly_saved(reference, r));
+                } else if elsewhere && !r.message.trim().is_empty() {
+                    self.say(r.message.trim().to_string(), Tone::Good);
                 } else if let Some(left) =
                     r.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
                 {
@@ -1718,6 +1734,121 @@ mod tests {
         select(&mut app, &started);
         assert_eq!(press(&mut app, 'e'), Action::None);
         assert!(said(&app).contains("has started"), "{}", said(&app));
+    }
+
+    /// Every machine's backend does each key's step first (intent 0591): its feed says "steps".
+    fn steps_everywhere(app: &mut App) {
+        for machine in &mut app.machines {
+            if let Some(feed) = machine.feed.as_mut() {
+                feed.supports.push("steps".into());
+            }
+        }
+    }
+
+    #[test]
+    fn e_edits_done_started_and_wont_do_work_where_a_backend_does_steps() {
+        // Intent 0591, K1-79 to K1-81: the backend edits it where it is, so e reads its text
+        // rather than refuse; one still being written up is still refused.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let (key, id, reference) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        let changes: [&dyn Fn(&mut Card); 3] = [
+            &|c| {
+                c.stage = Stage::Build;
+                c.state = Some("active".into());
+            },
+            &|c| c.stage = Stage::Maintain,
+            &|c| c.detail.as_mut().unwrap().disposition = Some("wont_do".into()),
+        ];
+        for change in changes {
+            let was = app.board.cards[i].clone();
+            change(&mut app.board.cards[i]);
+            select(&mut app, &key);
+            e_reads(&mut app, &id);
+            app.edit_flights.clear();
+            app.board.cards[i] = was;
+        }
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        select(&mut app, &key);
+        assert_eq!(press(&mut app, 'e'), Action::None);
+        assert!(said(&app).contains(&format!("{reference} is still being written up")));
+    }
+
+    #[test]
+    fn a_save_its_backend_asks_about_is_asked_with_his_words_and_kept_until_answered() {
+        // Intent 0591: done work's save asks to become a new intent made from it. The question
+        // comes up on its card, a yes sends his words again with its token, and a no keeps them.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id, reference) = (
+            done.key.clone(),
+            done.detail.as_ref().unwrap().id.clone(),
+            done.reference.clone(),
+        );
+        select(&mut app, &key);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        let asked = || {
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-1".into()),
+                message: format!(
+                    "{reference} is done, so its words stay as they were. Save yours as a new intent made from {reference} instead?"
+                ),
+                ..Default::default()
+            })
+        };
+        answer(&mut app, &sent, asked());
+        let Mode::Confirm { title, request, .. } = &app.mode else {
+            panic!("no question: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(title, &format!("Save {reference}'s new words?"));
+        assert_eq!(request["text"], "New words.");
+        // No: nothing is sent, and his version is kept for e.
+        esc(&mut app);
+        assert!(app.edits.get(&key).and_then(|h| h.mine.as_ref()).is_some());
+        // Asked again, and yes: his words go with its token.
+        let sent = saves(&mut app, &key, wrote("New words."));
+        answer(&mut app, &sent, asked());
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["confirm"], "done-edit-1");
+        assert_eq!(request["override"], true);
+        let machine = app.card(&key).unwrap().machine_index;
+        let sent = send(&mut app, machine, request);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                status: Some("saved".into()),
+                message: format!(
+                    "Saved your words as #9001, a new intent made from {reference}; {reference} stays as it was."
+                ),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            said(&app).contains("a new intent made from"),
+            "{}",
+            said(&app)
+        );
+        assert!(!app.edits.contains_key(&key));
     }
 
     #[test]

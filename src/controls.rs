@@ -3512,8 +3512,22 @@ impl App {
                 }
             }
         }
+        // A save's question (done work's words made a new intent, say) is asked as any other,
+        // with his words in it again, since they came back only counted (intent 0591).
+        let mut request = request;
         if request["action"] == "edit" {
-            return self.finish_edit(machine, request, result, from);
+            let asked = matches!(&result, Ok(r) if r.confirmation
+                && r.confirm.is_some()
+                && request.get("text").is_some()
+                && (request["override"] != true
+                    || r.confirm.as_deref() != request["confirm"].as_str()));
+            if !asked {
+                return self.finish_edit(machine, request, result, from);
+            }
+            self.edit_resend(&mut request);
+            if request.get("text").is_none() {
+                return self.finish_edit(machine, request, result, from);
+            }
         }
         if request["action"] == "kickoff" {
             return self.finish_kickoff_check(machine, &request, result);
@@ -3563,7 +3577,7 @@ impl App {
                         && response.confirm.is_some()
                         && matches!(
                             request["action"].as_str(),
-                            Some("close" | "dismiss" | "cancel")
+                            Some("close" | "dismiss" | "cancel" | "edit")
                         )))
                 && (request["override"] != true
                     || response
@@ -3928,7 +3942,9 @@ impl App {
                     // Its backend's own question, whose token names what it asked about: its
                     // backend checks that, so here only that it's the same work, still done or
                     // not and in Won't do or not, as it was (intent 0591).
-                    Some("close" | "dismiss" | "cancel") if request.get("confirm").is_some() => {
+                    Some("close" | "dismiss" | "cancel" | "edit")
+                        if request.get("confirm").is_some() =>
+                    {
                         target.is_some_and(|t| {
                             let now = CardSnapshot::of(c);
                             t.same_work(c) && t.done == now.done && t.dismissed == now.dismissed
