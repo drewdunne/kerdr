@@ -1080,7 +1080,7 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
             let mut body = wrapped(message, 68, fg(FG), None);
             // More than yes and no: one answer to a line, as the board's questions list them
             // (intent 0591). Otherwise the one line it always had.
-            let hints = if choices.is_empty() {
+            let mut hints = if choices.is_empty() {
                 format!("y {yes}    n {no}    esc cancel")
             } else {
                 body.push(Line::raw(""));
@@ -1100,13 +1100,34 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 }
                 "esc cancel".to_string()
             };
+            // Longer than the screen holds: it scrolls, and y shows the rest before it answers,
+            // as the board's question box does (Codex's review). The rows modal gives its body.
+            let rows = ((body.len() as u16 + 6).max(10))
+                .min(area.height.saturating_sub(2))
+                .min(area.height.saturating_sub(1))
+                .saturating_sub(6);
+            let scroll = app.question_view.fit(
+                request["action"].as_str().unwrap_or_default(),
+                message,
+                body.len() as u16,
+                rows,
+            );
+            if body.len() as u16 > rows {
+                hints = format!("pgdn pgup the rest of it    {hints}");
+            }
+            // modal keeps its selected line in view: the last row shown, scrolled to here.
+            let shown_to = if scroll == 0 {
+                0
+            } else {
+                (scroll + rows.saturating_sub(1)) as usize
+            };
             modal(
                 f,
                 area,
                 &confirm_title(app, *machine, request, target.as_deref()),
                 body,
                 &hints,
-                0,
+                shown_to,
                 YELLOW,
             );
         }

@@ -190,6 +190,7 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             confirm(
                 f,
                 area,
+                &app.question_view,
                 Question {
                     title,
                     message,
@@ -3308,7 +3309,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
 
 /// A question, whole (intent 0591): the box grows to hold all of what its backend said, and its
 /// answers, one to a line when it offers more than yes and no, as the design's canvas shows them.
-fn confirm(f: &mut Frame, area: Rect, q: Question) {
+fn confirm(f: &mut Frame, area: Rect, view: &crate::app::QuestionView, q: Question) {
     let width = 86u16.min(area.width.saturating_sub(2));
     let w = width.saturating_sub(6).max(1) as usize;
     let mut lines = wrapped(q.title, w, bold(YELLOW), None);
@@ -3327,28 +3328,49 @@ fn confirm(f: &mut Frame, area: Rect, q: Question) {
             None,
         ));
     }
-    let keys = question_keys(&q);
+    let mut keys = question_keys(&q);
+    // More than yes and no: one answer to a line. Otherwise the one line it always had.
+    let listed = keys.len() > 2;
+    let answer_rows = if listed { keys.len() as u16 } else { 1 };
+    // Its border 2, a blank above the keys 1.
+    let height = (lines.len() as u16 + answer_rows + 3).max(16);
+    let rect = centered(area, width, height, None);
+    let inner = pad(rect, 3, 1);
+    // Longer than the screen holds: its text scrolls, with a row saying how (Codex's review).
+    let mut rows = inner.height.saturating_sub(answer_rows + 1);
+    let overflow = lines.len() as u16 > rows;
+    if overflow {
+        rows = rows.saturating_sub(1);
+    }
+    let scroll = view.fit(q.title, q.message, lines.len() as u16, rows);
+    if view.unseen()
+        && let Some(enter) = keys.iter_mut().find(|(k, _)| k.starts_with("Enter"))
+    {
+        // ⏎ never takes what couldn't be seen.
+        enter.1 = "show the rest of it".into();
+    }
+    if overflow {
+        keys.insert(0, ("PgDn PgUp".into(), "the rest of it".into()));
+    }
     let held: Vec<&str> = if q.too_soon {
         keys.iter()
             .map(|(k, _)| k.as_str())
-            .filter(|k| !k.starts_with("Esc"))
+            .filter(|k| !k.starts_with("Esc") && !k.starts_with("PgDn"))
             .collect()
     } else {
         vec![]
     };
-    // More than yes and no: one answer to a line. Otherwise the one line it always had.
-    let listed = keys.len() > 2;
-    let key_rows = if listed { keys.len() as u16 } else { 1 };
-    // Its border 2, a blank above the keys 1.
-    let height = (lines.len() as u16 + key_rows + 3).max(16);
-    let rect = centered(area, width, height, None);
+    let key_rows = if listed {
+        keys.len() as u16
+    } else {
+        1 + overflow as u16
+    };
     dialog(f, rect, YELLOW);
-    let inner = pad(rect, 3, 1);
     let body = Rect {
-        height: inner.height.saturating_sub(key_rows + 1),
+        height: rows,
         ..inner
     };
-    f.render_widget(Paragraph::new(lines), body);
+    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), body);
     let first = inner.bottom().saturating_sub(key_rows);
     if listed {
         for (row, (k, what)) in keys.iter().enumerate() {
@@ -3364,14 +3386,23 @@ fn confirm(f: &mut Frame, area: Rect, q: Question) {
             );
         }
     } else {
-        let pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-        put(
-            f.buffer_mut(),
-            inner.x,
-            first,
-            inner.width,
-            fit(key_hints_held(&pairs, &held), inner.width as usize),
-        );
+        // The scroll row, then yes and no on one line, as it always was.
+        let (scrolls, answers) = keys.split_at(overflow as usize);
+        for (row, line) in [scrolls, answers]
+            .into_iter()
+            .filter(|keys| !keys.is_empty())
+            .enumerate()
+        {
+            let pairs: Vec<(&str, &str)> =
+                line.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+            put(
+                f.buffer_mut(),
+                inner.x,
+                first + row as u16,
+                inner.width,
+                fit(key_hints_held(&pairs, &held), inner.width as usize),
+            );
+        }
     }
 }
 
@@ -6843,6 +6874,70 @@ mod tests {
         }
         assert_eq!(colour_of(&a, 120, 40, "Enter / y"), FG);
         assert_eq!(colour_of(&a, 120, 40, "w queue"), FG);
+    }
+
+    #[test]
+    fn a_question_longer_than_the_screen_scrolls_and_enter_shows_the_rest_before_it_answers() {
+        // Codex's review: on an 80×24 screen, a question with its choices that doesn't fit
+        // scrolls as the Kickoff box does, and ⏎ never answers what couldn't be seen.
+        use crate::app::Action;
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut a = App::new(Config::default(), crate::demo::machines(false));
+        a.cfg.actions.command = Some("test-adapter".into());
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| crate::app::waiting_work(c))
+            .unwrap()
+            .clone();
+        let id = card.detail.as_ref().unwrap().id.clone();
+        let words: String = (1..=60)
+            .map(|i| format!("Line {i} of what it says. "))
+            .collect();
+        a.mode = Mode::Confirm {
+            machine: card.machine_index,
+            request: serde_json::json!({"action": "dismiss", "id": id}),
+            title: format!("Won't do {}?", card.reference),
+            message: format!("{words}THE-END."),
+            back: Box::new(Mode::Board),
+            target: None,
+            queue: false,
+            ready_at: None,
+            plain: true,
+            choices: vec![crate::actions::Choice {
+                id: "wrap-up".into(),
+                key: "w".into(),
+                label: "ask it to wrap up".into(),
+            }],
+            enter_queues: false,
+        };
+        let enter = |a: &mut App| a.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let shown = rendered(&a, 80, 24);
+        assert!(!shown.contains("THE-END."), "{shown}");
+        assert!(shown.contains("PgDn PgUp"), "{shown}");
+        assert!(shown.contains("show the rest of it"), "{shown}");
+        assert!(shown.contains("ask it to wrap up"), "{shown}");
+        // PgDn scrolls it, and PgUp back.
+        assert!(shown.contains("Line 1 of"));
+        a.on_key(KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE));
+        assert!(!rendered(&a, 80, 24).contains("Line 1 of"));
+        a.on_key(KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE));
+        assert!(rendered(&a, 80, 24).contains("Line 1 of"));
+        // ⏎ shows the rest, and answers nothing.
+        assert_eq!(enter(&mut a), Action::None);
+        assert!(matches!(a.mode, Mode::Confirm { .. }));
+        let shown = rendered(&a, 80, 24);
+        assert!(shown.contains("THE-END."), "{shown}");
+        assert!(!shown.contains("show the rest of it"), "{shown}");
+        // Once its guard has passed, ⏎ answers it.
+        if let Mode::Confirm { ready_at, .. } = &mut a.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = enter(&mut a) else {
+            panic!("⏎ sent nothing: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "dismiss");
     }
 
     #[test]

@@ -656,8 +656,12 @@ impl App {
             (Some(tab), true)
         } else if !self.tabs_inside(card).is_empty() {
             // Which tab is its own can't be told: the workspace's first tab that isn't known to
-            // be another card's or a helper's, never a child's (intent 0591, K3-07).
-            (self.first_unclaimed_tab(card), false)
+            // be another card's or a helper's, never a child's (intent 0591, K3-07). Only that tab
+            // will do: if it closes on the way, herdr mustn't land on whichever tab it shows,
+            // which may be a child's (Codex's review), so tab_gone takes it from there.
+            let tab = self.first_unclaimed_tab(card);
+            let strict = tab.is_some();
+            (tab, strict)
         } else {
             (None, false)
         }
@@ -1710,7 +1714,8 @@ mod tests {
         let k = key(&app, "0256");
         assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k.clone()));
         let card = app.card(&k).cloned().unwrap();
-        assert_eq!(app.jump_tab(&card), (Some("w2K:t1".to_string()), false));
+        // Only that tab: if it closes on the way, Enter stops rather than land on a child's.
+        assert_eq!(app.jump_tab(&card), (Some("w2K:t1".to_string()), true));
     }
 
     #[test]

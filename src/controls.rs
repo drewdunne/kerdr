@@ -909,6 +909,12 @@ impl App {
             .moved_target(card)
             .or_else(|| home.and_then(|name| self.machine_index(name)))
             .unwrap_or(card.machine_index);
+        self.steps_on(machine)
+    }
+
+    /// Whether this machine's backend does each key's step first: for a request sent there rather
+    /// than to the card's home, such as X's, which goes where its workspace runs (Codex's review).
+    pub(crate) fn steps_on(&self, machine: usize) -> bool {
         self.machines
             .get(machine)
             .and_then(|m| m.feed.as_ref())
@@ -1404,7 +1410,8 @@ impl App {
         } else {
             None
         }
-        .filter(|_| card.is_open_workspace() && self.does_steps(&card));
+        // Asked of the backend where its workspace runs, which is where X's request goes.
+        .filter(|_| card.is_open_workspace() && self.steps_on(card.machine_index));
         if !card.cancellable() && stays.is_none() {
             let said = if card.dismissed() {
                 format!("{reference} is in won't do already.")
@@ -2085,14 +2092,32 @@ impl App {
         } else {
             "c brings them back once the box is empty."
         };
+        let message = format!(
+            "{} Send your new intent's words as they are, without it? n keeps them unsent, and {back}",
+            said.join(" ")
+        );
+        let machine = draft.machine;
+        self.send_without = Some(draft);
+        // He's typing other words, or answering something else: never asked over that, where a
+        // y or ⏎ meant for it would send these. Asked once he's back on the board (Codex's review).
+        if !self.enter_can_land_here() {
+            self.send_without_held = Some((machine, message));
+            self.say(
+                "Your new intent's image didn't go in, so its words weren't sent; Kerdr asks about them once you're back on the board.",
+                Tone::Info,
+            );
+            return;
+        }
+        self.ask_send_without_now(machine, message);
+    }
+
+    /// The question itself, over the board.
+    pub(super) fn ask_send_without_now(&mut self, machine: usize, message: String) {
         self.mode = Mode::Confirm {
-            machine: draft.machine,
+            machine,
             request: json!({ "action": crate::app::SEND_WITHOUT }),
             title: "Send without the image?".into(),
-            message: format!(
-                "{} Send your new intent's words as they are, without it? n keeps them unsent, and {back}",
-                said.join(" ")
-            ),
+            message,
             back: Box::new(self.mode.clone()),
             target: None,
             queue: false,
@@ -2101,7 +2126,6 @@ impl App {
             choices: vec![],
             enter_queues: false,
         };
-        self.send_without = Some(draft);
     }
 
     /// The yes to ask_send_without: the words go, taken back from where they were kept, as long as
@@ -2201,6 +2225,29 @@ impl App {
                 // A question that just appeared, or a key held down, never answers it.
                 let early = key.kind == KeyEventKind::Repeat
                     || ready_at.is_some_and(|at| Instant::now() < at);
+                // Longer than the screen holds, it scrolls; and an answer while some of it is still
+                // below shows the rest first, as the Kickoff box's ⏎ does. n and Esc still leave
+                // (Codex's review).
+                match key.code {
+                    KeyCode::PageDown | KeyCode::Down => {
+                        self.question_view.down(3);
+                        return Some(Action::None);
+                    }
+                    KeyCode::PageUp | KeyCode::Up => {
+                        self.question_view.up(3);
+                        return Some(Action::None);
+                    }
+                    _ => {}
+                }
+                let answers = matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w'))
+                    || chosen.is_some();
+                if answers && !early && self.question_view.unseen() {
+                    self.question_view.to_end();
+                    if let Mode::Confirm { ready_at, .. } = &mut self.mode {
+                        *ready_at = Some(Instant::now() + std::time::Duration::from_millis(500));
+                    }
+                    return Some(Action::None);
+                }
                 // Kerdr's own question about words whose image didn't go in (K1-37).
                 if request["action"] == crate::app::SEND_WITHOUT {
                     match key.code {
@@ -2614,6 +2661,17 @@ impl App {
             "dispatch" => Effect::Starting,
             "reopen" => Effect::Reopening,
             "close" => Effect::Close,
+            // X on done work stops its agent and leaves it done (intent 0591, K1-29): it never
+            // shows in Won't do meanwhile. Work in Won't do is there already.
+            "cancel"
+                if self.card(key).is_some_and(|c| {
+                    c.done()
+                        || c.state.as_deref() == Some("closed")
+                        || c.attention == Attention::Done
+                }) =>
+            {
+                return None;
+            }
             "dismiss" | "cancel" => Effect::SetAside,
             "restore" => Effect::Restore,
             "refresh" => Effect::Refresh(chrono::Local::now().date_naive().to_string()),

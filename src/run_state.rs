@@ -2048,4 +2048,52 @@ mod tests {
         card.workspace_id = None;
         assert!(matches!(a.run_state(&card), RunState::Unavailable(_)));
     }
+
+    /// Codex's review: the yes to a start's question, given after its card moved home, starts it
+    /// where it lives now on the account he picked, never on its owner's list.
+    #[test]
+    fn a_start_on_an_account_asked_again_after_its_card_moved_keeps_the_account() {
+        let mut a = app();
+        let k = backlog_card(&a);
+        in_feed(&mut a, &k, |c| c.kickoff = None);
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let (machine, request) = choose(&mut a, "ARK_C");
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["account"], "ARK_C");
+        on_its_way(&mut a, machine, &request);
+        answered(
+            &mut a,
+            &request,
+            json!({"ok":false,"confirmation":true,"message":"web has 3 workspaces. Start anyway?","used":3,"limit":3,"session":"web","confirm":"t-1"}),
+        );
+        assert!(matches!(a.mode, Mode::Confirm { .. }), "{:?}", a.message());
+        // Its home moved meanwhile, to another machine that starts work on its accounts.
+        let other = (0..a.machines.len())
+            .find(|&m| m != machine && a.account(m, "ARK_C").is_some())
+            .expect("another machine with ARK_C");
+        a.machines[other].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        let name = a.machines[other].name();
+        in_feed(&mut a, &k, |c| {
+            c.home = Some(crate::feed::Home {
+                machine: Some(name.clone()),
+                session: Some("web".into()),
+            })
+        });
+        if let Mode::Confirm { ready_at, .. } = &mut a.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate {
+            machine: to,
+            request: again,
+        } = press(&mut a, 'y')
+        else {
+            panic!("the yes sent nothing: {:?} {:?}", a.mode, a.message())
+        };
+        assert_eq!(to, other);
+        assert_eq!(again["action"], "dispatch");
+        assert_eq!(again["account"], "ARK_C");
+        assert!(again.get("confirm").is_none() && again.get("override").is_none());
+    }
 }

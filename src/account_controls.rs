@@ -348,6 +348,10 @@ pub struct Pending {
     pub machine: usize,
     pub request: Value,
     pub screen: Option<AccountScreen>,
+    /// The agent a move's yes was for, kept apart from the picker: a question its backend asks
+    /// again, changed, is asked at once even when the yes was given over the board (Codex's
+    /// review).
+    pub target: Option<Box<MoveTarget>>,
 }
 
 /// Names as a sentence lists them: "A", "A and B", "A, B and C".
@@ -1371,6 +1375,7 @@ impl App {
         }
         self.account_pending = Some(Pending {
             machine,
+            target: None,
             request: crate::actions::request_metadata(&request),
             screen: match &self.mode {
                 Mode::Accounts { screen, .. } => {
@@ -2318,6 +2323,19 @@ impl App {
                     self.mode = *back;
                     return Action::None;
                 }
+                // Longer than the screen holds, it scrolls (Codex's review).
+                KeyCode::PageDown | KeyCode::Down => self.question_view.down(3),
+                KeyCode::PageUp | KeyCode::Up => self.question_view.up(3),
+                // An answer while some of it is still below shows the rest first.
+                KeyCode::Char(c)
+                    if Instant::now() >= *ready_at
+                        && self.question_view.unseen()
+                        && (c == 'y'
+                            || crate::actions::choice_keys(choices).contains(&Some(c))) =>
+                {
+                    self.question_view.to_end();
+                    *ready_at = Instant::now() + Duration::from_millis(500);
+                }
                 // Yes, or one of the answers its backend offers (intent 0591): the same request
                 // with its token, and that choice.
                 KeyCode::Char(c)
@@ -2343,9 +2361,14 @@ impl App {
                                 answer["choice"] = json!(id);
                             }
                             request = Some((*machine, answer));
+                            let target = target.clone();
                             self.mode = *back;
                             if let Some((mi, r)) = request {
-                                return self.send_account(mi, r);
+                                let action = self.send_account(mi, r);
+                                if let Some(p) = self.account_pending.as_mut() {
+                                    p.target = target;
+                                }
+                                return action;
                             }
                             return Action::None;
                         }
@@ -3043,10 +3066,14 @@ impl App {
         if action == "account-move" && response.confirmation && !visible {
             // He left the picker before its question came: it's asked once he's back on the board
             // or a list, for the agent as it is then, never over typing (intent 0591, K2-27).
-            if let (Some(token), Some(AccountScreen::Move { target, .. })) = (
-                response.confirm.clone(),
-                pending.as_ref().and_then(|p| p.screen.clone()),
-            ) && request["confirm"].as_str() != Some(token.as_str())
+            // The picker it was asked from, or the agent its last yes was for when that yes was
+            // given over the board.
+            let target = match pending.as_ref().and_then(|p| p.screen.clone()) {
+                Some(AccountScreen::Move { target, .. }) => Some(target),
+                _ => pending.as_ref().and_then(|p| p.target.clone()),
+            };
+            if let (Some(token), Some(target)) = (response.confirm.clone(), target)
+                && request["confirm"].as_str() != Some(token.as_str())
             {
                 let starts = response.id.is_some() || response.session.is_some();
                 let reference = target.reference.clone();
@@ -4775,6 +4802,94 @@ mod tests {
                 ..
             }
         ));
+    }
+    #[test]
+    fn a_late_moves_question_that_changes_after_its_yes_is_asked_again_at_once() {
+        // Codex's review: its yes given over the board, with no picker under it, and its backend
+        // asking again, changed: the new question is asked at once, for the same agent, never
+        // "open the move picker again".
+        let mut a = app();
+        pick(&mut a);
+        press(&mut a, 's');
+        let action = key(&mut a, KeyCode::Enter);
+        a.busy = true;
+        key(&mut a, KeyCode::Esc);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":false,"message":"Mid-step","confirmation":"Mid-step","confirm":"ticket"}),
+        );
+        settle(&mut a);
+        let yes = press(&mut a, 'y');
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        let (_, r) = sent(yes.clone());
+        assert_eq!(r["confirm"], "ticket");
+        complete(
+            &mut a,
+            yes,
+            json!({"ok":false,"message":"Now mid-job too","confirmation":"Now mid-job too","confirm":"ticket-2"}),
+        );
+        let Mode::Accounts {
+            screen:
+                AccountScreen::Confirm {
+                    request,
+                    message,
+                    target,
+                    ..
+                },
+            ..
+        } = &a.mode
+        else {
+            panic!("not asked again: {:?} {:?}", a.mode, a.message())
+        };
+        assert_eq!(request["confirm"], "ticket-2");
+        assert_eq!(message, "Now mid-job too");
+        assert!(target.as_ref().is_some_and(|t| t.reference == "#44"));
+        settle(&mut a);
+        let (machine, r) = sent(press(&mut a, 'y'));
+        assert_eq!(machine, 1);
+        assert_eq!(
+            r,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C","confirm":"ticket-2"})
+        );
+    }
+    #[test]
+    fn an_account_question_longer_than_the_screen_scrolls_and_y_shows_the_rest_first() {
+        // Codex's review, as for the board's question box: on 80×24 it scrolls, and y never
+        // answers what couldn't be seen.
+        let mut a = app();
+        let words: String = (1..=60)
+            .map(|i| format!("Line {i} of what it says. "))
+            .collect();
+        a.push_account_screen(AccountScreen::Confirm {
+            machine: 0,
+            request: json!({"action":"account-models","owner":"studio","models":["KBZ_C"],"confirm":"t-9"}),
+            message: format!("{words}THE-END."),
+            yes: "move them".into(),
+            no: "leave them".into(),
+            target: None,
+            ready_at: Instant::now(),
+            choices: vec![crate::actions::Choice {
+                id: "later".into(),
+                key: "l".into(),
+                label: "move them later".into(),
+            }],
+        });
+        settle(&mut a);
+        let shown = crate::ui::tests_render(&a, 80, 24);
+        assert!(!shown.contains("THE-END."), "{shown}");
+        assert!(shown.contains("pgdn pgup the rest of it"), "{shown}");
+        key(&mut a, KeyCode::PageDown);
+        assert!(!crate::ui::tests_render(&a, 80, 24).contains("Line 1 of"));
+        // y shows the rest, and sends nothing.
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        let shown = crate::ui::tests_render(&a, 80, 24);
+        assert!(shown.contains("THE-END."), "{shown}");
+        assert!(shown.contains("y  move them"), "{shown}");
+        settle(&mut a);
+        let (machine, r) = sent(press(&mut a, 'y'));
+        assert_eq!(machine, 0);
+        assert_eq!(r["confirm"], "t-9");
     }
     #[test]
     fn s_uses_the_viewed_session_not_the_selected_card() {

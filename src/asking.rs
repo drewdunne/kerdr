@@ -51,6 +51,17 @@ fn asked_about(request: &Value, response: &Response) -> Option<String> {
     )
 }
 
+/// The request a waiting question's yes would send, as ask_now prepares it: with its backend's
+/// token, so it's checked as that backend's question about the card, the way its yes is (a stop of
+/// running work, an edit of done work), and not as the bare request it answered (Codex's review).
+fn asked(w: &Waiting) -> Value {
+    let mut request = w.request.clone();
+    if let Some(token) = &w.response.confirm {
+        request["confirm"] = json!(token);
+    }
+    request
+}
+
 /// What a card says while a question waits on it, from what was asked.
 fn waiting_line(request: &Value, response: &Response) -> String {
     match asked_about(request, response) {
@@ -163,7 +174,7 @@ impl App {
             .into_iter()
             .filter(|w| {
                 self.card(&w.from.key).is_some_and(|c| w.from.same_work(c))
-                    && self.confirm_still_applies(w.machine, &w.request, Some(&w.from))
+                    && self.confirm_still_applies(w.machine, &asked(w), Some(&w.from))
             })
             .collect();
         let mut kept = kept;
@@ -384,7 +395,7 @@ impl App {
     /// What no longer applies is said, and nothing is sent.
     pub(super) fn ask_again(
         &mut self,
-        _machine: usize,
+        machine: usize,
         request: Value,
         target: Option<CardSnapshot>,
     ) -> Action {
@@ -418,6 +429,47 @@ impl App {
             .as_ref()
             .map(|t| what_changed(t, &card))
             .unwrap_or_else(|| format!("{} changed", card.reference));
+        // What he asked for goes with it, never dropped for a plainer key's request (Codex's
+        // review). A save of his words goes again as it was, without its answer: its backend
+        // checks them against the card as it is now (`was`) and asks again if it needs to.
+        if request["action"] == "edit" && request.get("text").is_some() {
+            let mut again = request;
+            if let Some(fields) = again.as_object_mut() {
+                for answer in ["override", "confirm", "choice", "queue", "op"] {
+                    fields.remove(answer);
+                }
+            }
+            self.say(format!("{changed}; asking again."), Tone::Info);
+            let action = self.emit_mutation(machine, again);
+            if matches!(action, Action::Mutate { .. }) {
+                self.action_from = Some(CardSnapshot::of(&card));
+            }
+            return action;
+        }
+        // A start on the account he picked: that account goes to the card as it is now, as s
+        // applies one picked while the card changed (intent 0591): started differently, moved to
+        // it if an agent runs it now, or the picker again when it can't take it.
+        if let Some(to) = request["account"].as_str()
+            && matches!(request["action"].as_str(), Some("dispatch" | "reopen"))
+        {
+            let to = to.to_string();
+            self.sel.key = Some(card.key.clone());
+            let start = match self.run_state(&card) {
+                crate::app::run_state::RunState::Stopped(start) => start,
+                _ => Default::default(),
+            };
+            let said_before = self.message.clone();
+            let action = self.start_on_account(&card.key, &start, &to);
+            if matches!(action, Action::Mutate { .. })
+                && self
+                    .message
+                    .as_ref()
+                    .is_none_or(|m| said_before.as_ref().is_some_and(|b| b.0 == m.0))
+            {
+                self.say(format!("{changed}; asking again."), Tone::Info);
+            }
+            return action;
+        }
         let key = match request["action"].as_str() {
             Some("close") => 'C',
             Some("dismiss") => 'x',

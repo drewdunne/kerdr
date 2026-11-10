@@ -478,6 +478,50 @@ pub struct Selection {
     pub key: Option<String>,
 }
 
+/// How far a question's box is scrolled when the screen can't hold all of it (Codex's review): set
+/// as it's drawn, as the Kickoff box's is, and a new question starts at its top.
+#[derive(Clone, Debug, Default)]
+pub struct QuestionView {
+    /// Which question it's for: its title and words, hashed.
+    of: std::cell::Cell<u64>,
+    scroll: std::cell::Cell<u16>,
+    /// Its lines below what the box shows when scrolled to its top: 0 when all of it shows.
+    most: std::cell::Cell<u16>,
+}
+
+impl QuestionView {
+    /// Whether some of the question is still below the box.
+    pub fn unseen(&self) -> bool {
+        self.scroll.get() < self.most.get()
+    }
+    pub fn down(&self, by: u16) {
+        self.scroll
+            .set(self.scroll.get().saturating_add(by).min(self.most.get()));
+    }
+    pub fn up(&self, by: u16) {
+        self.scroll.set(self.scroll.get().saturating_sub(by));
+    }
+    pub fn to_end(&self) {
+        self.scroll.set(self.most.get());
+    }
+    /// As it's drawn: this question, its lines and the rows the box gives them. Where its text
+    /// starts.
+    pub fn fit(&self, title: &str, message: &str, lines: u16, rows: u16) -> u16 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (title, message).hash(&mut h);
+        let of = h.finish();
+        if self.of.get() != of {
+            self.of.set(of);
+            self.scroll.set(0);
+        }
+        let most = lines.saturating_sub(rows);
+        self.most.set(most);
+        self.scroll.set(self.scroll.get().min(most));
+        self.scroll.get()
+    }
+}
+
 /// A workspace a reopen just made, to go into as soon as its answer arrives: on the machine the
 /// action ran on, before any card claims it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -571,6 +615,11 @@ pub struct App {
     /// A new intent whose image didn't go in, while Kerdr asks whether its words go without it
     /// (intent 0591, K1-37). Its words are kept meanwhile where give_back put them.
     pub(crate) send_without: Option<Draft>,
+    /// That question, held while he typed or answered something else: its machine and words,
+    /// asked once he's back on the board (Codex's review).
+    pub(crate) send_without_held: Option<(usize, String)>,
+    /// How far the question box on screen is scrolled (Codex's review).
+    pub question_view: QuestionView,
     /// The answer being handled is for a start or reopen whose workspace Andrew already went
     /// into himself (intent 0445).
     answer_went_in: bool,
@@ -740,6 +789,8 @@ impl App {
             returned: Default::default(),
             send_after_load: None,
             send_without: None,
+            send_without_held: None,
+            question_view: QuestionView::default(),
             answer_went_in: false,
             backlog_focus: None,
             view_search: None,
@@ -1530,6 +1581,26 @@ impl App {
             self.action_from = from;
             return Action::Mutate { machine, request };
         }
+        // Words whose image didn't go in, asked about once he's back where no typing is taken.
+        if self.enter_can_land_here()
+            && let Some((machine, message)) = self.send_without_held.take()
+        {
+            // Only while they're still kept unsent: sent or thrown away meanwhile, there's no
+            // question left.
+            let kept = self.send_without.as_ref().is_some_and(|d| {
+                (self.draft == d.words && self.draft_images == d.images)
+                    || self
+                        .returned
+                        .iter()
+                        .any(|r| r.words == d.words && r.images == d.images)
+            });
+            if kept {
+                self.ask_send_without_now(machine, message);
+            } else {
+                self.send_without = None;
+            }
+            return Action::None;
+        }
         // An account action running holds none of this: card changes go their own way (intent
         // 0445).
         if self.open_after.is_some()
@@ -1659,27 +1730,23 @@ impl App {
                 id,
             });
         }
+        // An intent's card, wherever its record lives now and whichever machine's copy shows it:
+        // its key is its feed's source and its number, which a move home doesn't change, and ⏎
+        // does for it what it does now: goes in, reopens it, or asks the done-work question
+        // (intent 0591, K1-04). Never another source's card with the same number: that's other
+        // work (Codex's review).
         if self.card(&pending.key).is_some() {
             return Some(Action::Jump(pending.key));
         }
-        // An intent's card under another key now (it moved home, or another machine's copy
-        // shows it): found by its number, and ⏎ does for it what it does now: goes in, reopens
-        // it, or asks the done-work question (intent 0591, K1-04).
-        let number = pending
-            .key
-            .rsplit_once(':')
-            .map(|(_, id)| id)
-            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_digit()));
-        let found = number.and_then(|id| {
-            self.board
-                .cards
-                .iter()
-                .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-                .map(|c| c.key.clone())
-        });
-        if let Some(key) = found {
-            self.go_to(&key);
-            return Some(self.jump_action(key));
+        if !pending.key.starts_with("ws:") {
+            self.say(
+                format!(
+                    "{} closed while {} was away, and its card is no longer on this board, so Kerdr didn't go in.",
+                    pending.workspace, pending.machine
+                ),
+                Tone::Warn,
+            );
+            return None;
         }
         self.say(
             format!(
@@ -4405,26 +4472,31 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_waiting_jump_finds_its_intent_by_number_when_its_card_has_another_key_now() {
-        // Intent 0591, K1-04: it moved home, or another machine's copy shows it: ⏎ does for it
+    fn a_waiting_jump_does_for_its_intent_what_enter_does_now_and_never_takes_another_sources() {
+        // Intent 0591, K1-04: its card under its own key, its workspace closed meanwhile: ⏎ does
         // what it does now, never "it's off the board".
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, id) = closed_workspace_card(&mut app);
-        app.pending_jump = Some(PendingJump {
-            key: format!("elsewhere:{id}"),
+        let pending = |key: String| PendingJump {
+            key,
             workspace: "07-build".into(),
             machine: "gone-box".into(),
             stuck: None,
             bare: None,
-        });
-        app.mode = Mode::Board;
-        let Some(Action::Mutate { request, .. }) = app.pending_jump_ready() else {
-            panic!("nothing done: {:?}", app.message())
         };
-        assert_eq!(request["action"], "reopen");
-        assert_eq!(request["id"].as_str(), Some(id.as_str()));
-        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        app.pending_jump = Some(pending(key.clone()));
+        app.mode = Mode::Board;
+        assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
+        // Codex's review: another source's card with the same number is other work. Nothing is
+        // started or entered for it, and it's said.
+        app.pending_jump = Some(pending(format!("another-source:{id}")));
+        app.sel.key = None;
+        assert_eq!(app.pending_jump_ready(), None);
+        assert_eq!(app.sel.key, None);
+        let (said, tone) = app.message().unwrap();
+        assert!(said.contains("no longer on this board"), "{said}");
+        assert_eq!(tone, Tone::Warn);
     }
 
     #[test]
@@ -4965,12 +5037,33 @@ pub(crate) mod tests {
             why: Some("The clipboard holds no image.".into()),
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
-        let Mode::Confirm { message, back, .. } = &app.mode else {
+        // Never asked over the words he's typing, where a y or ⏎ meant for them would send these
+        // (Codex's review): held, and those keys go into his box.
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Other"),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Compose { .. }),
+            "asked over typing"
+        );
+        press(&mut app, 'y');
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Othery"),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(app.returned.len(), 1);
+        // Back on the board or a list, it's asked, and its yes sends those words, not the box's.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.enter_can_land_here(), "{:?}", app.mode);
+        assert_eq!(app.next_owed(), Action::None);
+        let Mode::Confirm { message, .. } = &app.mode else {
             panic!("no question: {:?}", app.mode)
         };
         assert!(message.contains("once the box is empty"), "{message}");
-        assert!(matches!(**back, Mode::Compose { .. }));
-        assert_eq!(app.returned.len(), 1);
         answer_now(&mut app);
         let Action::Mutate { request, .. } =
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -4979,11 +5072,7 @@ pub(crate) mod tests {
         };
         assert_eq!(request["words"], "Fix the NAS");
         assert!(app.returned.is_empty());
-        assert!(
-            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Other"),
-            "{:?}",
-            app.mode
-        );
+        assert_eq!(app.draft, "Othery", "the words typed meanwhile stay");
     }
 
     fn a_png() -> crate::images::Loaded {
@@ -9884,6 +9973,58 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_late_question_about_stopping_running_work_waits_on_its_card_and_stays_answerable() {
+        // Codex's review: C's question about work an agent is at, come after you'd moved on,
+        // waits on its card as the backend's question it is, never dropped because the card has
+        // a workspace open.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        steps_everywhere(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'C') else {
+            panic!("C sent nothing: {:?}", app.message())
+        };
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.detail.is_some())
+            .unwrap()
+            .key
+            .clone();
+        app.sel.key = Some(other);
+        let asks = crate::actions::Response {
+            ok: false,
+            message: "An agent is at it (workspace 07-build in web). Stop it and mark it done?"
+                .into(),
+            confirmation: true,
+            confirm: Some("00000000000000bb".into()),
+            session: Some("web".into()),
+            choices: vec![a_choice("wrap-up", "w", "ask it to wrap up")],
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, request, Ok(asks));
+        assert!(
+            app.waiting_on(&key).is_some(),
+            "dropped: {:?}",
+            app.message()
+        );
+        assert!(app.card(&key).unwrap().why.starts_with("asks you"));
+        // Back on it, C opens it, and its yes goes with its token.
+        app.sel.key = Some(key.clone());
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        settle(&mut app);
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "close");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["confirm"], "00000000000000bb");
+        assert_eq!(request["override"], true);
+    }
+
+    #[test]
     fn keys_on_work_in_wont_do_start_or_finish_it_where_the_backend_brings_it_back() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
@@ -10005,6 +10146,67 @@ pub(crate) mod tests {
             request,
             serde_json::json!({"action": "cancel", "id": id, "session": "web", "workspace": "w9"})
         );
+        // While it goes, the card stays done: never shown in Won't do (Codex's review).
+        assert!(app.effect_for(&key, &request).is_none());
+        app.queue_action(app.card(&key).unwrap().machine_index, request);
+        app.rebuild();
+        assert!(
+            !app.card(&key).unwrap().dismissed(),
+            "a done card showed in Won't do"
+        );
+    }
+
+    #[test]
+    fn x_upper_on_done_work_asks_the_backend_where_its_workspace_runs_about_steps() {
+        // Codex's review: X's request goes to the machine its workspace runs on, so that
+        // machine's backend, not its home's, decides whether it does the step.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = done_card(&mut app);
+        let runs = app.card(&key).unwrap().machine_index;
+        let home = (0..app.machines.len())
+            .find(|&m| m != runs && app.machines[m].feed.is_some())
+            .expect("a second machine with a feed");
+        let home_name = app.machines[home].name();
+        let set = |app: &mut App| {
+            let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+            card.workspace_id = Some("w9".into());
+            card.session = Some("web".into());
+            card.detail.as_mut().unwrap().home = Some(crate::feed::Home {
+                machine: Some(home_name.clone()),
+                session: Some("web".into()),
+            });
+        };
+        set(&mut app);
+        let steps = |app: &mut App, on: usize| {
+            for (m, machine) in app.machines.iter_mut().enumerate() {
+                if let Some(feed) = machine.feed.as_mut() {
+                    feed.supports = vec!["op".into(), "retry".into(), "follow".into()];
+                    if m == on {
+                        feed.supports.push("steps".into());
+                    }
+                }
+            }
+        };
+        // Its home does the step, but the machine its workspace runs on doesn't: as before.
+        steps(&mut app, home);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        assert!(!matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        assert!(app.message().unwrap().0.contains("done already"));
+        // The machine its workspace runs on does: X asks, and its yes goes there.
+        steps(&mut app, runs);
+        set(&mut app);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, runs);
+        assert_eq!(request["action"], "cancel");
     }
 
     #[test]

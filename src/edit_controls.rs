@@ -1852,6 +1852,117 @@ mod tests {
     }
 
     #[test]
+    fn a_save_question_on_done_work_come_after_you_moved_on_waits_on_its_card() {
+        // Codex's review: a question about saving done work's words, come once you'd moved on,
+        // waits on its card as the backend's question, not dropped as if it were backlog work's.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id) = (done.key.clone(), done.detail.as_ref().unwrap().id.clone());
+        select(&mut app, &key);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.detail.is_some())
+            .unwrap()
+            .key
+            .clone();
+        select(&mut app, &other);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-2".into()),
+                message: "It's done, so its words stay as they were. Save yours as a new intent made from it instead?".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            app.waiting_on(&key).is_some(),
+            "dropped: {:?}",
+            app.message()
+        );
+        // Back on it, e opens it, and its yes sends his words with its token.
+        select(&mut app, &key);
+        assert_eq!(press(&mut app, 'e'), Action::None);
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["confirm"], "done-edit-2");
+    }
+
+    #[test]
+    fn a_yes_to_a_save_question_after_its_card_changed_sends_his_words_again() {
+        // Codex's review: asked again for the card as it is now, it's still his save, never
+        // another key's request; its backend checks it against the card now and asks again.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id) = (done.key.clone(), done.detail.as_ref().unwrap().id.clone());
+        select(&mut app, &key);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-3".into()),
+                message: "It's done. Save yours as a new intent made from it instead?".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        // Set aside while he decided.
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'y')
+        else {
+            panic!("the yes sent nothing: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(to, machine);
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["was"], "sha256:aa");
+        assert!(request.get("confirm").is_none() && request.get("override").is_none());
+        assert!(said(&app).contains("asking again"), "{}", said(&app));
+    }
+
+    #[test]
     fn e_goes_at_once_while_other_changes_run_and_waits_as_the_other_card_keys_do() {
         let mut app = app();
         let (key, id, reference) = waiting(&mut app);
