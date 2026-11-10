@@ -415,11 +415,13 @@ pub fn run_resending(
         resends,
         tell,
         pause,
+        &Instant::now,
         deadline_for(request),
     )
 }
 
-/// As run_resending, the first send given `deadline` to answer, and each resend no more than that.
+/// As run_resending, the first send given `deadline` to answer, and each resend no more than that;
+/// `clock` tells the time (a test's own, which `pause` moves on).
 #[allow(clippy::too_many_arguments)]
 fn run_resending_within(
     machine: &Machine,
@@ -429,6 +431,7 @@ fn run_resending_within(
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
+    clock: &dyn Fn() -> Instant,
     deadline: Duration,
 ) -> Answered {
     resending(
@@ -437,15 +440,14 @@ fn run_resending_within(
         resends,
         tell,
         pause,
+        clock,
         deadline,
         &mut |handed, deadline| {
-            let began = Instant::now();
             let ran = run_with_deadline(machine, command, request, deadline, handed);
             let lost = ran.lost;
             Sent {
                 answered: keep_stderr(ran, request),
                 lost,
-                took: began.elapsed(),
             }
         },
     )
@@ -456,20 +458,22 @@ struct Sent {
     answered: Answered,
     /// Its answer was lost on the way: the request may or may not have happened.
     lost: bool,
-    /// How long it took, which comes out of RETRY_MOST once it's a resend.
-    took: Duration,
 }
 
 /// The resends themselves: `send` sends the request once, given the deadline it names. Only with
 /// `resends` is anything sent twice (intent 0591): a backend that doesn't keep ops could do a
-/// change twice. Every resend fits in RETRY_MOST from the first answer, its wait whole and at least
-/// RESEND_ROOM for it to answer in; one that doesn't isn't sent, and the last answer stands.
+/// change twice. Every resend fits in RETRY_MOST from the first answer, as `clock` tells it: its
+/// wait whole and at least RESEND_ROOM for it to answer in; one that doesn't isn't sent, and the
+/// last answer stands. What's left is told again after each wait, which can take longer than asked
+/// (a machine asleep or busy), and a resend is given no more than that.
+#[allow(clippy::too_many_arguments)]
 fn resending(
     request: &Value,
     handed: Option<transport::Handed>,
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
+    clock: &dyn Fn() -> Instant,
     deadline: Duration,
     send: &mut dyn FnMut(Option<transport::Handed>, Duration) -> Sent,
 ) -> Answered {
@@ -478,15 +482,15 @@ fn resending(
     // and a read changes nothing however often it's sent.
     let may = resends && (request.get("op").is_some() || !changes(request));
     let mut this_deadline = deadline;
-    // Retrying's time so far, from the first answer: the waits, and each resend's own time.
-    let mut spent: Option<Duration> = None;
+    // The end of retrying: RETRY_MOST from the first answer, fixed then.
+    let mut until: Option<Instant> = None;
     let mut lost = 0;
     loop {
         let sent = send(handed.take(), this_deadline);
-        let now = spent.map_or(Duration::ZERO, |s| s + sent.took);
         if !may {
             return sent.answered;
         }
+        let until = *until.get_or_insert_with(|| clock() + RETRY_MOST);
         let why = match &sent.answered.result {
             Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
                 // As long as it asked, never less; at least a second.
@@ -503,8 +507,10 @@ fn resending(
         let wait = match &why {
             Resend::Retry { wait, .. } | Resend::Lost { wait, .. } => *wait,
         };
-        let left = RETRY_MOST.saturating_sub(now + wait);
-        if left < RESEND_ROOM {
+        // The wait is set against what's left before anything is added to it, so no wait asked
+        // for, however long, can overflow.
+        let left = until.saturating_duration_since(clock());
+        if wait > left || left - wait < RESEND_ROOM {
             return sent.answered;
         }
         if matches!(why, Resend::Lost { .. }) {
@@ -512,7 +518,10 @@ fn resending(
         }
         tell(&why);
         pause(wait);
-        spent = Some(now + wait);
+        let left = until.saturating_duration_since(clock());
+        if left < RESEND_ROOM {
+            return sent.answered;
+        }
         this_deadline = deadline.min(left);
     }
 }
@@ -1005,7 +1014,7 @@ printf '%s' "$answer"
     }
 
     /// Resends as run_resending makes them, each send given `deadline`: what it told, and the
-    /// waits it asked for, which pass at once.
+    /// waits it asked for, which pass at once on its clock (real time, moved on by each wait).
     #[cfg(unix)]
     #[allow(clippy::type_complexity)]
     fn resent(
@@ -1016,6 +1025,7 @@ printf '%s' "$answer"
     ) -> (Answered, Vec<Resend>, Vec<Duration>) {
         let mut told = vec![];
         let waits = std::cell::RefCell::new(vec![]);
+        let waited = std::cell::Cell::new(Duration::ZERO);
         let answered = run_resending_within(
             &machine(),
             command,
@@ -1023,7 +1033,11 @@ printf '%s' "$answer"
             None,
             resends,
             &mut |r| told.push(r.clone()),
-            &|d| waits.borrow_mut().push(d),
+            &|d| {
+                waits.borrow_mut().push(d);
+                waited.set(waited.get() + d);
+            },
+            &|| Instant::now() + waited.get(),
             deadline,
         );
         (answered, told, waits.into_inner())
@@ -1145,8 +1159,8 @@ printf '%s' "$answer"
         (answered, told, sends.len())
     }
 
-    /// As over_ssh, with the deadline each send was given, and the waits asked for. An output that
-    /// timed out took its whole deadline, as a real one does.
+    /// As over_ssh, with the deadline each send was given, the waits asked for, and the time from
+    /// the first answer to the last.
     #[allow(clippy::type_complexity)]
     fn over_ssh_timed(
         request: &Value,
@@ -1159,17 +1173,43 @@ printf '%s' "$answer"
         Vec<Duration>,
         Duration,
     ) {
+        over_ssh_late(request, resends, outputs, &[])
+    }
+
+    /// As over_ssh_timed, on a clock of its own: each send takes its output's `took` (one that
+    /// timed out, its whole deadline, as a real one does), and each wait as long as it asked, and
+    /// then as much longer as `late` holds for it (a machine asleep, or busy).
+    #[allow(clippy::type_complexity)]
+    fn over_ssh_late(
+        request: &Value,
+        resends: bool,
+        outputs: Vec<transport::Output>,
+        late: &[Duration],
+    ) -> (
+        Answered,
+        Vec<Resend>,
+        Vec<Duration>,
+        Vec<Duration>,
+        Duration,
+    ) {
         let mut outputs = outputs.into_iter();
         let mut deadlines = vec![];
         let mut told = vec![];
         let waits = std::cell::RefCell::new(vec![]);
-        let mut took = Duration::ZERO;
+        let now = std::cell::Cell::new(Instant::now());
+        let first = std::cell::Cell::new(None);
         let answered = resending(
             request,
             None,
             resends,
             &mut |r| told.push(r.clone()),
-            &|d| waits.borrow_mut().push(d),
+            &|d| {
+                let mut waits = waits.borrow_mut();
+                let over = late.get(waits.len()).copied().unwrap_or_default();
+                waits.push(d);
+                now.set(now.get() + d + over);
+            },
+            &|| now.get(),
             deadline_for(request),
             &mut |_, deadline| {
                 deadlines.push(deadline);
@@ -1177,9 +1217,9 @@ printf '%s' "$answer"
                 if out.timed_out {
                     out.took = deadline;
                 }
-                // Only a resend's own time counts, from the first answer.
-                if deadlines.len() > 1 {
-                    took += out.took;
+                now.set(now.get() + out.took);
+                if first.get().is_none() {
+                    first.set(Some(now.get()));
                 }
                 let result = answer_of(&out, request, deadline, "arknet-one", true);
                 let lost = result.is_err() && lost(&out, true);
@@ -1189,13 +1229,11 @@ printf '%s' "$answer"
                         stderr: out.stderr.clone(),
                     },
                     lost,
-                    took: out.took,
                 }
             },
         );
-        let waits = waits.into_inner();
-        let spent = took + waits.iter().sum::<Duration>();
-        (answered, told, deadlines, waits, spent)
+        let spent = now.get() - first.get().expect("sent at least once");
+        (answered, told, deadlines, waits.into_inner(), spent)
     }
 
     fn timed_out() -> transport::Output {
@@ -1295,6 +1333,83 @@ printf '%s' "$answer"
         let (answered, told, _, waits, _) = over_ssh_timed(&close, true, vec![retry(115)]);
         assert!(told.is_empty() && waits.is_empty());
         assert_eq!(answered.result.unwrap().retry, Some(115));
+    }
+
+    #[test]
+    fn the_two_minutes_are_real_time_so_a_wait_that_runs_long_comes_out_of_them() {
+        let reopen = with_op(json!({"action":"reopen","id":"0041"}));
+        let retry = |n: u64| {
+            output(
+                0,
+                &format!(r#"{{"ok":false,"retry":{n},"message":"herdr isn't answering yet."}}"#),
+                "",
+            )
+        };
+        // 5 s asked for, and 100 s gone by the time it's over (a machine asleep, or busy): the
+        // resend is given the 20 s left of the two minutes, not 115.
+        let (answered, _, deadlines, waits, spent) = over_ssh_late(
+            &reopen,
+            true,
+            vec![retry(5), timed_out()],
+            &[Duration::from_secs(95)],
+        );
+        assert_eq!(waits, [Duration::from_secs(5)]);
+        assert_eq!(
+            deadlines,
+            [Duration::from_secs(300), Duration::from_secs(20)]
+        );
+        assert!(spent <= RETRY_MOST, "{spent:?}");
+        assert!(result_unknown(&answered.result.unwrap_err()));
+        // Waking with too little left for a resend to answer in, nothing more is sent: the last
+        // refusal stands.
+        let (answered, _, deadlines, _, _) =
+            over_ssh_late(&reopen, true, vec![retry(5)], &[Duration::from_secs(107)]);
+        assert_eq!(deadlines.len(), 1);
+        assert_eq!(answered.result.unwrap().retry, Some(5));
+    }
+
+    #[test]
+    fn a_wait_asked_for_however_long_is_set_against_what_is_left_and_never_added_up() {
+        // However many seconds an answer asks for (one built by hand, past what's read from a
+        // backend), they're set against what's left of the two minutes before anything is added:
+        // u64::MAX of them is only too long, and that refusal stands.
+        let close = with_op(json!({"action":"close","id":"0041"}));
+        let refusal = |retry: u64| Answered {
+            result: Ok(Response {
+                ok: false,
+                retry: Some(retry),
+                message: "#41 is locked by another request.".into(),
+                ..Default::default()
+            }),
+            stderr: String::new(),
+        };
+        let mut answers = vec![refusal(5), refusal(u64::MAX)].into_iter();
+        let now = std::cell::Cell::new(Instant::now());
+        let waits = std::cell::RefCell::new(vec![]);
+        let mut sends = 0;
+        let answered = resending(
+            &close,
+            None,
+            true,
+            &mut |_| {},
+            &|d| {
+                waits.borrow_mut().push(d);
+                now.set(now.get() + d);
+            },
+            &|| now.get(),
+            deadline_for(&close),
+            &mut |_, _| {
+                sends += 1;
+                now.set(now.get() + Duration::from_secs(1));
+                Sent {
+                    answered: answers.next().expect("sent more often than expected"),
+                    lost: false,
+                }
+            },
+        );
+        assert_eq!(sends, 2);
+        assert_eq!(waits.into_inner(), [Duration::from_secs(5)]);
+        assert_eq!(answered.result.unwrap().retry, Some(u64::MAX));
     }
 
     #[test]

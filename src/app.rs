@@ -7334,7 +7334,7 @@ pub(crate) mod tests {
         );
         assert!(last_said(&app).unwrap().0.contains("couldn't be matched"));
 
-        let (mut app, id, op) = yes_refused(true);
+        let (app, id, op) = yes_refused(true);
         // The same job goes again, as a new ask: no answer of the old question, and its own op.
         let n = app
             .resolver
