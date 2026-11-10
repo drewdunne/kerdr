@@ -1389,6 +1389,7 @@ esac
         assert!(run(r#"echo '{"kerdr_feed":1}'"#).is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_script_finds_running_sessions_without_jq() {
         let script = build_script("herdr", None);
