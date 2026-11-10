@@ -853,6 +853,68 @@ impl App {
             .map(|(_, to, _)| *to)
     }
 
+    /// Kerdr's own question before C on a card in Won't do (intent 0591, K1-19), or X on work with
+    /// nothing running, whose end is Won't do (K1-30, K1-31): its yes sends the request as it is,
+    /// and its backend still checks nothing runs it under its lock.
+    pub(super) fn ask_to_end(&mut self, card: &Card, action: &str) -> Action {
+        let Some(detail) = &card.detail else {
+            return Action::None;
+        };
+        let Some(machine) = self.home_machine(card) else {
+            return Action::None;
+        };
+        if !self.can_write(machine) {
+            return Action::None;
+        }
+        let reference = &card.reference;
+        let (title, message) = if action == "close" {
+            (
+                format!("Mark {reference} done?"),
+                "It's in Won't do: yes brings it back and marks it done, with nothing started. Its log says you closed it from Kerdr, and ⏎ on it later asks to reopen it.".to_string(),
+            )
+        } else {
+            (
+                format!("Won't do {reference}?"),
+                format!(
+                    "Nothing is running for {reference}, so X sets it aside in Won't do, with nothing stopped or started. Its record keeps where it was; u brings it back."
+                ),
+            )
+        };
+        self.mode = Mode::Confirm {
+            machine,
+            request: json!({"action": action, "id": detail.id}),
+            title,
+            message,
+            back: Box::new(self.mode.clone()),
+            target: Some(Box::new(CardSnapshot::of(card))),
+            queue: false,
+            ready_at: None,
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+        Action::None
+    }
+
+    /// Whether the backend where this card's record lives does each key's step first and asks its
+    /// own questions for C, x and X on work an agent may be at: its feed's `supports` has "steps"
+    /// (intent 0591). Any other gets 0.33.0's behaviour: Kerdr's own question or refusal first.
+    pub(super) fn does_steps(&self, card: &Card) -> bool {
+        let home = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.home.as_ref())
+            .and_then(|h| h.machine.as_deref());
+        let machine = self
+            .moved_target(card)
+            .or_else(|| home.and_then(|name| self.machine_index(name)))
+            .unwrap_or(card.machine_index);
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .is_some_and(|f| f.supports("steps"))
+    }
+
     /// The machine a card's record lives on, where its actions run: its home, or the machine its
     /// card came from. None, said, when its home isn't one of Kerdr's machines.
     pub(super) fn home_machine(&mut self, card: &Card) -> Option<usize> {
@@ -1095,7 +1157,15 @@ impl App {
         // is where its agent would be; the backend checks for one running elsewhere too.
         let ends = matches!(action, "close" | "dismiss");
         let started = !card.dismissed() && !waiting_work(&card);
+        // Its backend does each key's step first, asking its own questions (intent 0591).
+        let steps = self.does_steps(&card);
+        let finished = card.done() || card.state.as_deref() == Some("closed");
         if action == "close" && card.dismissed() {
+            // C on a card in Won't do means finishing it: asked as any C is, then brought back
+            // and marked done in one request (intent 0591, K1-19).
+            if steps {
+                return self.ask_to_end(&card, action);
+            }
             self.say(
                 format!(
                     "{} is in won't do; u brings it back before it can be marked done.",
@@ -1105,21 +1175,24 @@ impl App {
             );
             return Action::None;
         }
-        // d on work in a working column that no agent has run and nothing records a state for
-        // (another agent's note in its log moved it there): it does what ⏎ does, whose backend
-        // starts it when it never ran and resumes it when it did, so d and ⏎ agree (intent 0411).
-        if action == "dispatch"
-            && started
-            && card.no_agent()
-            && card.state.is_none()
-            && card.under_way()
-            && card.outside_herdr().is_none()
-        {
-            return self.reopen_action(&card);
+        // d on work under way or done does what ⏎ does: goes in when its workspace is open,
+        // reopens it when it isn't, and asks first for done work (intent 0591, K1-24, K1-25). That
+        // covers work in a working column no agent ran (intent 0411), whose reopen starts it.
+        if action == "dispatch" && started && card.intake().is_none() {
+            return self.jump_action(card.key.clone());
         }
-        if started && !(ends && card.closable()) {
+        // C or x on work an agent may be at, or x on done work: to a backend that does the step
+        // first, sent as it is, and the backend asks, naming what stops and offering to have its
+        // agent wrap up, or to move done work to Won't do (intent 0591, K1-21, K1-22).
+        let asks_itself = steps
+            && started
+            && card.intake().is_none()
+            && ((ends && card.is_open_workspace() && !finished)
+                || (action == "dismiss" && finished));
+        if started && !(ends && card.closable()) && !asks_itself {
             let reference = &card.reference;
-            let said = if ends && card.done() || card.state.as_deref() == Some("closed") {
+            let ordering = matches!(action, "move" | "refresh");
+            let said = if ends && finished {
                 if action == "close" {
                     format!("{reference} is done already.")
                 } else {
@@ -1129,8 +1202,12 @@ impl App {
                 format!(
                     "{reference} has a workspace open, so an agent may be at it: C and x are for work with none. ⏎ goes in."
                 )
-            } else if ends && card.intake() == Some("pending") {
+            } else if card.intake() == Some("pending") {
                 format!("{reference} is still being written up.")
+            } else if ordering && finished {
+                format!("{reference} is done, so it has no place in the backlog order.")
+            } else if ordering {
+                format!("{reference} has started, so it has no place in the backlog order.")
             } else if card.closable() {
                 format!(
                     "{reference} is already under way. d, y, J, K, t and B change backlog work; with no agent at it, C marks it done and x sets it aside."
@@ -1144,11 +1221,23 @@ impl App {
             return Action::None;
         }
         if card.dismissed() && action != "restore" {
-            self.say(
-                "Restore this intent before starting or reordering it.",
-                Tone::Info,
-            );
-            return Action::None;
+            let reference = &card.reference;
+            let said = match action {
+                // d on a card in Won't do means starting it: its backend brings it back and starts
+                // it in one request, with every usual check (intent 0591, K1-26).
+                "dispatch" if steps => None,
+                "dispatch" => Some(format!(
+                    "{reference} is in won't do; u brings it back, then d starts it."
+                )),
+                "dismiss" => Some(format!("{reference} is in won't do already.")),
+                _ => Some(format!(
+                    "{reference} is in won't do, so it has no place in the backlog order; u brings it back."
+                )),
+            };
+            if let Some(said) = said {
+                self.say(said, Tone::Info);
+                return Action::None;
+            }
         }
         let Some(machine) = self.home_machine(&card) else {
             return Action::None;
@@ -1169,6 +1258,10 @@ impl App {
             && let Some((_, since)) = self.outside_said(&card)
         {
             request["outside_since"] = json!(since);
+            self.action_from = Some(CardSnapshot::of(&card));
+            return Action::Mutate { machine, request };
+        }
+        if asks_itself {
             self.action_from = Some(CardSnapshot::of(&card));
             return Action::Mutate { machine, request };
         }
@@ -1296,20 +1389,31 @@ impl App {
             };
             return Action::None;
         }
-        if !card.cancellable() {
+        let finished = card.done()
+            || card.state.as_deref() == Some("closed")
+            || card.attention == Attention::Done;
+        // Done work, or work in Won't do, with a workspace still open on it: to a backend that
+        // does the step first, X stops what runs there and leaves the card as it is (intent
+        // 0591, K1-29). Any other says why there's nothing to cancel.
+        let stays = if card.dismissed() {
+            Some("in Won't do")
+        } else if finished {
+            Some("done")
+        } else {
+            None
+        }
+        .filter(|_| card.is_open_workspace() && self.does_steps(&card));
+        if !card.cancellable() && stays.is_none() {
             let said = if card.dismissed() {
                 format!("{reference} is in won't do already.")
-            } else if card.done()
-                || card.state.as_deref() == Some("closed")
-                || card.attention == Attention::Done
-            {
+            } else if finished {
                 format!("{reference} is done already; there's nothing to cancel.")
             } else if card.intake() == Some("pending") {
                 format!("{reference} is still being written up.")
-            } else if card.closable() {
-                format!(
-                    "{reference} has no workspace open, so no agent to stop: x sets it aside, C marks it done."
-                )
+            } else if card.closable() || waiting_work(&card) {
+                // Nothing to stop: X's end is Won't do, so it sets it aside, after its question
+                // (intent 0591, K1-30, K1-31).
+                return self.ask_to_end(&card, "dismiss");
             } else {
                 format!("X cancels work an agent is at; {reference} has none.")
             };
@@ -1370,9 +1474,14 @@ impl App {
         } else {
             vec![]
         };
-        let mut message = format!(
-            "Stops {what} and closes {closes}, then sets {reference} aside in Won't do. Anything it hadn't committed stays as it left it. Its log says you cancelled it; u brings it back, and ⏎ then resumes its conversation."
-        );
+        let mut message = match stays {
+            Some(stays) => format!(
+                "Stops {what} and closes {closes}. {reference} stays {stays}. Anything it hadn't committed stays as it left it."
+            ),
+            None => format!(
+                "Stops {what} and closes {closes}, then sets {reference} aside in Won't do. Anything it hadn't committed stays as it left it. Its log says you cancelled it; u brings it back, and ⏎ then resumes its conversation."
+            ),
+        };
         if !children.is_empty() {
             message.push_str(&format!(
                 " {} in a tab there {} too and {} open with no agent; x or C ends {}.",
@@ -1385,7 +1494,10 @@ impl App {
         self.mode = Mode::Confirm {
             machine,
             request,
-            title: format!("Cancel {reference}?"),
+            title: match stays {
+                Some(_) => format!("Stop {reference}'s agent?"),
+                None => format!("Cancel {reference}?"),
+            },
             message,
             back: Box::new(self.mode.clone()),
             target: Some(Box::new(CardSnapshot::of(&card))),
@@ -2406,6 +2518,19 @@ impl App {
             // nothing shows until its yes (intent 0591).
             "close" | "dismiss"
                 if request.get("outside_since").is_some() && request.get("override").is_none() =>
+            {
+                return None;
+            }
+            // C or x on work an agent may be at, or x on done work: its backend asks first, so
+            // nothing shows until the yes (intent 0591, K1-21, K1-22).
+            "close" | "dismiss"
+                if request.get("override").is_none()
+                    && self.card(key).is_some_and(|c| {
+                        !c.dismissed()
+                            && (c.is_open_workspace()
+                                || (request["action"] == "dismiss"
+                                    && (c.done() || c.state.as_deref() == Some("closed"))))
+                    }) =>
             {
                 return None;
             }
@@ -3706,6 +3831,9 @@ impl App {
                 })
                 && match request["action"].as_str() {
                     Some("restore") => c.dismissed(),
+                    Some("dispatch" | "reopen") if target.is_some_and(|t| t.dismissed) => {
+                        c.dismissed() && target.is_some_and(|t| t.same_work(c))
+                    }
                     Some("reopen") => {
                         (c.under_way() || c.done()) && target.is_some_and(|t| t.same_work(c))
                     }
@@ -3722,11 +3850,30 @@ impl App {
                             && !c.done()
                             && target.is_some_and(|t| t.same_work(c))
                     }
+                    // Its backend's own question, whose token names what it asked about: its
+                    // backend checks that, so here only that it's the same work, still done or
+                    // not and in Won't do or not, as it was (intent 0591).
+                    Some("close" | "dismiss" | "cancel") if request.get("confirm").is_some() => {
+                        target.is_some_and(|t| {
+                            let now = CardSnapshot::of(c);
+                            t.same_work(c) && t.done == now.done && t.dismissed == now.dismissed
+                        })
+                    }
+                    // Marked done from Won't do only while it's still there (intent 0591).
+                    Some("close") if target.is_some_and(|t| t.dismissed) => {
+                        c.dismissed() && target.is_some_and(|t| t.same_work(c))
+                    }
                     // Still open with no workspace, the same work (intent 0289).
                     Some("close") => c.closable() && target.is_some_and(|t| t.same_work(c)),
-                    // Still the same work, open where the yes was given (intent 0321).
+                    // Still the same work, open where the yes was given (intent 0321); done work
+                    // or work in Won't do only while it's still that (intent 0591).
                     Some("cancel") => {
-                        c.cancellable()
+                        let then = target.map(|t| (t.done, t.dismissed));
+                        let now = CardSnapshot::of(c);
+                        (c.cancellable()
+                            || (c.is_open_workspace()
+                                && (now.done || now.dismissed)
+                                && then == Some((now.done, now.dismissed))))
                             && target.is_some_and(|t| t.same_work(c))
                             && c.session.as_deref() == request["session"].as_str()
                             && c.workspace_id.as_deref() == request["workspace"].as_str()

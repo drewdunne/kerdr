@@ -212,6 +212,8 @@ impl Effect {
                 fc.no_agent = false;
             }
             Effect::Close => {
+                // From Won't do too: brought back as it's marked done (intent 0591).
+                fc.disposition = None;
                 fc.state = Some("closed".into());
                 fc.stage = Some("maintain".into());
                 fc.attention = Some("done".into());
@@ -257,7 +259,7 @@ impl Effect {
                     || fc.workspace.as_ref().is_some_and(|w| w.id.is_some())
             }
             Effect::Reopening => fc.workspace.as_ref().is_some_and(|w| w.id.is_some()),
-            Effect::Close => state == "closed",
+            Effect::Close => state == "closed" && fc.disposition.as_deref() != Some("wont_do"),
             Effect::SetAside => fc.disposition.as_deref() == Some("wont_do"),
             Effect::Restore => fc.disposition.as_deref() != Some("wont_do"),
             Effect::Refresh(date) => fc.refreshed_at.as_deref() == Some(date.as_str()),

@@ -686,6 +686,9 @@ pub struct App {
     pub(crate) confirm_by_enter: Option<String>,
     /// Questions that came while you were elsewhere, each waiting on its card (intent 0591).
     pub(crate) waiting: Vec<asking::Waiting>,
+    /// When a peek was opened from the backlog, whose ⏎ peeks: a second ⏎ held or doubled with
+    /// it never starts the work it shows (intent 0591, K1-07).
+    pub(crate) peek_opened: Option<Instant>,
 }
 
 impl App {
@@ -778,6 +781,7 @@ impl App {
             answer_by_enter: false,
             confirm_by_enter: None,
             waiting: vec![],
+            peek_opened: None,
         };
         app.rebuild();
         app
@@ -1790,6 +1794,12 @@ impl App {
             return self.by_enter(action);
         }
         if card.dismissed() {
+            // ⏎ means starting that card: to a backend that does the step first, asked once,
+            // since Won't do was his own decision, and its yes brings it back and starts or
+            // reopens it in one request, every usual check still asked (intent 0591, K1-06).
+            if self.actions_on() && self.does_steps(&card) {
+                return self.ask_to_bring_back(&card);
+            }
             self.say(
                 format!("{} is in won't do; u brings it back.", card.reference),
                 Tone::Info,
@@ -1797,14 +1807,14 @@ impl App {
             return Action::None;
         }
         // Work nobody has started: ⏎ starts it, as d does, asking past the usual limit (intent
-        // 0404). A peek opened from the backlog screen, whose ⏎ peeks, leaves that to d.
+        // 0404), from a peek opened from the backlog screen too (intent 0591, K1-07): the
+        // question's own wait keeps a doubled ⏎ from starting it by accident.
         if waiting_work(&card) && self.actions_on() {
             if matches!(&self.mode, Mode::Peek { back, .. } if matches!(**back, Mode::Backlog { .. }))
+                && self
+                    .peek_opened
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500))
             {
-                self.say(
-                    format!("{} hasn't started: d starts it.", card.reference),
-                    Tone::Info,
-                );
                 return Action::None;
             }
             if self.just_started(&card) {
@@ -1847,6 +1857,73 @@ impl App {
             )
         };
         self.say(msg, Tone::Info);
+        Action::None
+    }
+
+    /// ⏎ on a card in Won't do, to a backend that brings it back first: "Bring #41 back and start
+    /// it?", whose yes sends the start (or the reopen, for work that ran) as it is, so its backend
+    /// still asks its own questions (intent 0591, K1-06).
+    fn ask_to_bring_back(&mut self, card: &Card) -> Action {
+        let Some(detail) = card.detail.clone() else {
+            return Action::None;
+        };
+        let ran = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.resume.as_ref())
+            .is_some_and(|r| r.conversation.is_some())
+            || card.stage != Stage::Backlog
+            || matches!(
+                card.state.as_deref(),
+                Some("active" | "background" | "closed")
+            );
+        let (machine, request) = if ran {
+            match self.reopen_action(card) {
+                Action::Mutate { machine, request } => (machine, request),
+                other => return other,
+            }
+        } else {
+            let Some(machine) = self.home_machine(card) else {
+                return Action::None;
+            };
+            if !self.can_write(machine) {
+                return Action::None;
+            }
+            (
+                machine,
+                serde_json::json!({"action": "dispatch", "id": detail.id}),
+            )
+        };
+        // Nothing goes until the yes.
+        self.action_from = None;
+        let reference = &card.reference;
+        let (title, does) = if ran {
+            (
+                format!("Bring {reference} back and reopen it?"),
+                "brings it back from Won't do and reopens it, resuming its conversation",
+            )
+        } else {
+            (
+                format!("Bring {reference} back and start it?"),
+                "brings it back from Won't do and starts it",
+            )
+        };
+        self.mode = Mode::Confirm {
+            machine,
+            request,
+            title,
+            message: format!(
+                "{reference} is in Won't do. Yes {does}, with every usual check: a full session or its own questions still ask first. u only brings it back."
+            ),
+            back: Box::new(self.mode.clone()),
+            target: Some(Box::new(CardSnapshot::of(card))),
+            queue: false,
+            ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+        self.confirm_by_enter = Some(detail.id);
         Action::None
     }
 
@@ -2799,6 +2876,7 @@ impl App {
                         scroll: 0,
                         back: Box::new(Mode::Backlog { sel }),
                     };
+                    self.peek_opened = Some(Instant::now());
                 }
             }
             _ => {}
@@ -3749,9 +3827,17 @@ pub(crate) mod tests {
         assert_eq!(enter(&mut app), Action::None);
         assert!(matches!(app.mode, Mode::Peek { .. }));
         assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        // ⏎ again at once, doubled or held: it starts nothing (intent 0591, K1-07).
         assert_eq!(enter(&mut app), Action::None);
-        assert!(app.message().unwrap().0.contains("d starts it"));
         assert!(matches!(app.mode, Mode::Peek { .. }));
+        // Once the peek has been up a moment, ⏎ starts it, as it does everywhere else.
+        app.peek_opened = Some(Instant::now() - std::time::Duration::from_secs(1));
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("⏎ in the peek started nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        app.resolver = Default::default();
         app.mode = Mode::Peek {
             scroll: 0,
             back: Box::new(Mode::Board),
@@ -4349,12 +4435,17 @@ pub(crate) mod tests {
             key: Some(card.key.clone()),
         };
         assert!(app.backlog_card_for_keys().is_none());
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        let (text, _) = app.message().unwrap();
-        assert!(
-            text.contains(&card.reference) && text.contains("backlog work"),
-            "{text}"
-        );
+        // d does what ⏎ does: it goes in (intent 0591, K1-24).
+        assert_eq!(press(&mut app, 'd'), Action::Jump(card.key.clone()));
+        // The ordering keys say it has no place in the backlog order.
+        for c in ['y', 't', 'B', 'J', 'K'] {
+            assert_eq!(press(&mut app, c), Action::None, "{c}");
+            let (text, _) = app.message().unwrap();
+            assert!(
+                text.contains(&card.reference) && text.contains("no place in the backlog order"),
+                "{c}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -5384,13 +5475,20 @@ pub(crate) mod tests {
             key: Some(key),
         };
         assert!(app.backlog_card_for_keys().is_none());
-        for c in ['d', 'y', 'x', 't', 'B', 'J', 'u'] {
+        for c in ['y', 'x', 't', 'B', 'J', 'u'] {
             assert_eq!(
                 press(&mut app, c),
                 Action::None,
                 "{c} acted on finished work"
             );
         }
+        // d does what ⏎ does: a reopen, whose backend always asks first for done work (intent
+        // 0591, K1-25).
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert!(request.get("override").is_none());
     }
 
     #[test]
@@ -5785,16 +5883,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn d_on_started_work_with_no_workspace_names_c_and_x() {
+    fn d_on_started_work_with_no_workspace_reopens_it_as_enter_does() {
+        // Intent 0591, K1-24: d on work under way does what ⏎ does, never "already under way".
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        closed_workspace_card(&mut app);
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        let said = app.message().unwrap().0;
-        assert!(
-            said.contains("C marks it done and x sets it aside"),
-            "{said}"
-        );
+        let (_, id) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
     }
 
     #[test]
@@ -6018,16 +6116,19 @@ pub(crate) mod tests {
     fn x_upper_refuses_work_no_agent_is_at_and_done_work() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        let (key, _) = closed_workspace_card(&mut app);
+        let (key, id) = closed_workspace_card(&mut app);
+        // Nothing to stop: X's end is Won't do, so it asks to set it aside (intent 0591, K1-30).
         assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("X asked nothing: {:?}", app.message())
+        };
+        assert!(message.contains("Nothing is running for"), "{message}");
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "dismiss", "id": id}));
+        app.resolver = Default::default();
         assert!(matches!(app.mode, Mode::Board));
-        assert!(
-            app.message().unwrap().0.contains(
-                "has no workspace open, so no agent to stop: x sets it aside, C marks it done."
-            ),
-            "{:?}",
-            app.message()
-        );
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         app.board.cards[i].workspace_id = Some("w7".into());
         app.board.cards[i].session = Some("web".into());
@@ -7954,10 +8055,13 @@ pub(crate) mod tests {
             panic!("⏎ sent nothing")
         };
         assert_eq!(request, by_enter);
-        // Work with a state of its own is still under way to d.
+        // Work with a state of its own too: d reopens it, as ⏎ does (intent 0591, K1-24).
         app.board.cards[i].state = Some("active".into());
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        assert!(app.message().unwrap().0.contains("already under way"));
+        app.resolver = Default::default();
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
     }
 
     #[test]
@@ -9493,5 +9597,198 @@ pub(crate) mod tests {
         // Its last words, wrapped, still in the box.
         assert!(screen.contains("it shows."), "{screen}");
         assert!(app.card(&key).is_some());
+    }
+
+    /// Every machine's backend does each key's step first (intent 0591): its feed says "steps".
+    fn steps_everywhere(app: &mut App) {
+        for machine in &mut app.machines {
+            if let Some(feed) = machine.feed.as_mut() {
+                feed.supports = vec!["op".into(), "retry".into(), "follow".into(), "steps".into()];
+            }
+        }
+    }
+
+    /// A backlog card set aside in Won't do, selected on the board.
+    fn wont_do_card(app: &mut App) -> (String, String) {
+        let (key, id) = waiting_backlog_card(app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        (key, id)
+    }
+
+    #[test]
+    fn c_and_x_on_work_an_agent_may_be_at_go_to_a_backend_that_asks_itself() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        // A backend without it: refused, as 0.33.0 did.
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        assert!(app.message().unwrap().0.contains("a workspace open"));
+        steps_everywhere(&mut app);
+        for (c, action) in [('C', "close"), ('x', "dismiss")] {
+            app.resolver = Default::default();
+            let Action::Mutate { machine, request } = press(&mut app, c) else {
+                panic!("{c} sent nothing: {:?}", app.message())
+            };
+            assert_eq!(request, serde_json::json!({"action": action, "id": id}));
+            // Nothing shows on the card until its yes: the backend asks first.
+            assert!(app.effect_for(&key, &request).is_none());
+            // Its question, with wrap-up beside yes: w asks the agent to wrap up instead.
+            let asks = crate::actions::Response {
+                ok: false,
+                message: format!(
+                    "An agent is at {} (workspace 07-build in web). Stop it?",
+                    app.card(&key).unwrap().reference
+                ),
+                confirmation: true,
+                confirm: Some("00000000000000aa".into()),
+                session: Some("web".into()),
+                choices: vec![a_choice("wrap-up", "w", "ask it to wrap up")],
+                ..Default::default()
+            };
+            reply_to(&mut app, machine, request, Ok(asks));
+            settle(&mut app);
+            let Mode::Confirm { title, .. } = &app.mode else {
+                panic!("no question: {:?}", app.message())
+            };
+            assert!(
+                title.starts_with(if c == 'C' { "Mark" } else { "Won't do" }),
+                "{title}"
+            );
+            let Action::Mutate { request, .. } = press(&mut app, 'w') else {
+                panic!("w sent nothing: {:?}", app.message())
+            };
+            assert_eq!(request["choice"], "wrap-up");
+            assert_eq!(request["confirm"], "00000000000000aa");
+            assert!(request.get("override").is_none());
+        }
+    }
+
+    #[test]
+    fn keys_on_work_in_wont_do_start_or_finish_it_where_the_backend_brings_it_back() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = wont_do_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        // A backend without it: each says u brings it back, as before.
+        for c in ['d', 'C'] {
+            assert_eq!(press(&mut app, c), Action::None);
+            assert!(app.message().unwrap().0.contains("u brings it back"), "{c}");
+        }
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("u brings it back"));
+        steps_everywhere(&mut app);
+        // d means starting it: sent at once, for its backend to bring it back and start it.
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request, serde_json::json!({"action": "dispatch", "id": id}));
+        app.resolver = Default::default();
+        // ⏎ asks once, since Won't do was his own choice; its yes sends the start as it is.
+        assert_eq!(enter(&mut app), Action::None);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("⏎ asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Bring {reference} back and start it?"));
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "dispatch", "id": id}));
+        app.resolver = Default::default();
+        // C asks as any C does, and sends the close for its backend to bring it back first.
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("C asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Mark {reference} done?"));
+        assert!(message.contains("brings it back"));
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "close", "id": id}));
+        app.resolver = Default::default();
+        // Its yes waits for nothing that changed: brought back meanwhile, it asks again.
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        app.board
+            .cards
+            .iter_mut()
+            .find(|c| c.key == key)
+            .unwrap()
+            .detail
+            .as_mut()
+            .unwrap()
+            .disposition = None;
+        assert_eq!(enter(&mut app), Action::None);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("brought back meanwhile"), "{message}");
+        app.mode = Mode::Board;
+        // The ordering keys have no backlog place to change for it.
+        app.board
+            .cards
+            .iter_mut()
+            .find(|c| c.key == key)
+            .unwrap()
+            .detail
+            .as_mut()
+            .unwrap()
+            .disposition = Some("wont_do".into());
+        app.mode = Mode::Board;
+        assert_eq!(press(&mut app, 't'), Action::None);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("no place in the backlog order")
+        );
+    }
+
+    #[test]
+    fn x_on_done_work_goes_to_a_backend_that_asks_to_move_it_to_wont_do() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = done_card(&mut app);
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert!(app.message().unwrap().0.contains("is done"));
+        steps_everywhere(&mut app);
+        let Action::Mutate { request, .. } = press(&mut app, 'x') else {
+            panic!("x sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request, serde_json::json!({"action": "dismiss", "id": id}));
+        assert!(app.effect_for(&key, &request).is_none());
+    }
+
+    #[test]
+    fn x_upper_on_done_work_still_open_stops_its_agent_and_leaves_it_done() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = done_card(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.workspace_id = Some("w9".into());
+        card.session = Some("web".into());
+        let reference = card.reference.clone();
+        // A backend without it: done already, as before.
+        press(&mut app, 'X');
+        assert!(app.message().unwrap().0.contains("done already"));
+        steps_everywhere(&mut app);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("X asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Stop {reference}'s agent?"));
+        assert!(message.contains("stays done"), "{message}");
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(
+            request,
+            serde_json::json!({"action": "cancel", "id": id, "session": "web", "workspace": "w9"})
+        );
     }
 }
