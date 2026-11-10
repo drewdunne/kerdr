@@ -13,6 +13,8 @@ use crate::poll::{Conn, Event};
 
 #[path = "account_controls.rs"]
 pub mod account_controls;
+#[path = "asking.rs"]
+pub mod asking;
 #[path = "controls.rs"]
 mod controls;
 #[path = "edit_controls.rs"]
@@ -288,6 +290,11 @@ pub enum Mode {
         /// A question Kerdr asks for itself (reopening a card's own agent when its tab is gone):
         /// the yes sends the request as it is, so the backend still asks its own questions.
         plain: bool,
+        /// The answers its backend offers beyond yes and no (intent 0591): each sends the request
+        /// again with `choice` and the question's token. Empty for a backend that offers none.
+        choices: Vec<crate::actions::Choice>,
+        /// At the most its session holds, a yes can't open it there: ⏎ queues it (intent 0591).
+        enter_queues: bool,
     },
     Board,
     /// A card's own screen: the card itself, then what's inside it (`o`). `focus` is the row
@@ -677,6 +684,8 @@ pub struct App {
     /// such a start asked (Codex's review).
     pub(crate) answer_by_enter: bool,
     pub(crate) confirm_by_enter: Option<String>,
+    /// Questions that came while you were elsewhere, each waiting on its card (intent 0591).
+    pub(crate) waiting: Vec<asking::Waiting>,
 }
 
 impl App {
@@ -768,6 +777,7 @@ impl App {
             enter_sent: None,
             answer_by_enter: false,
             confirm_by_enter: None,
+            waiting: vec![],
         };
         app.rebuild();
         app
@@ -1126,6 +1136,8 @@ impl App {
         } else {
             board::build(&self.machines, &self.cfg)
         };
+        // A question that came while you were elsewhere shows its card as asking you (intent 0591).
+        self.show_waiting();
         let tabs = self.view_tabs();
         self.tab = tabs
             .iter()
@@ -1742,6 +1754,10 @@ impl App {
             return Action::None;
         };
         if self.still_saving(&card) {
+            return Action::None;
+        }
+        // The question its start asked while you were elsewhere, waiting on it (intent 0591).
+        if self.key_opens_waiting(&key, "enter") {
             return Action::None;
         }
         // A start or reopen on its way: into the workspace it opened, once one shows (intent 0445).
@@ -3038,6 +3054,10 @@ pub(crate) mod tests {
         app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
     }
 
+    pub(crate) fn press_code(app: &mut App, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
+    }
+
     /// A change's answer arriving, as the event loop takes it: through the action resolution tool
     /// when the change went there, else straight to the app.
     fn reply_to(
@@ -3321,6 +3341,8 @@ pub(crate) mod tests {
             queue: false,
             ready_at: Some(Instant::now() + Duration::from_secs(60)),
             plain: false,
+            choices: vec![],
+            enter_queues: false,
         };
         assert_eq!(app.key_wait(), KEY_WAIT_COMING);
         settle(&mut app);
@@ -5459,11 +5481,17 @@ pub(crate) mod tests {
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         app.board.cards[i].stage = Stage::Build;
         app.board.cards[i].state = Some("active".into());
+        // The yes isn't sent: x on the card as it is now asks again at once, saying what changed
+        // (intent 0591, K1-38).
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::None
         );
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("started meanwhile"), "{message}");
+        press_code(&mut app, KeyCode::Esc);
         // Still waiting: yes sends it.
         app.board.cards[i].stage = Stage::Backlog;
         app.board.cards[i].state = Some("queued".into());
@@ -5799,8 +5827,14 @@ pub(crate) mod tests {
             machine: Some(app.machines[0].name()),
             session: Some("elsewhere".into()),
         });
+        // Its yes isn't sent: the question is asked again at once, for the card as it is now, led
+        // by what changed (intent 0591, K1-38).
         assert_eq!(enter(&mut app), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("moved to"), "{message}");
+        press_code(&mut app, KeyCode::Esc);
         app.sel = Selection {
             col: Stage::Build.index(),
             key: Some(key),
@@ -5811,7 +5845,10 @@ pub(crate) mod tests {
         app.board.cards[i].stage = Stage::Backlog;
         app.board.cards[i].state = Some("queued".into());
         assert_eq!(enter(&mut app), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("went back to the backlog"), "{message}");
     }
 
     #[test]
@@ -5962,10 +5999,19 @@ pub(crate) mod tests {
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         press(&mut app, 'X');
         settle(&mut app);
-        // Its workspace closed and another opened on it while the question was up.
+        // Its workspace closed and another opened on it while the question was up: the yes stops
+        // nothing, and the question comes back at once about where it runs now (intent 0591).
         app.board.cards[i].workspace_id = Some("w9".into());
         assert_eq!(enter(&mut app), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("now runs in"), "{message}");
+        // Its yes is for the card as it is now.
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the new yes sent nothing")
+        };
+        assert_eq!(request["action"], "cancel");
     }
 
     #[test]
@@ -6366,7 +6412,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_yes_to_reopen_a_done_card_is_refused_once_it_has_a_workspace_again() {
+    fn a_yes_to_reopen_a_done_card_goes_in_once_it_has_a_workspace_again() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _) = done_card(&mut app);
@@ -6379,16 +6425,16 @@ pub(crate) mod tests {
             done_question(&reference, "0123456789ab0008"),
         );
         settle(&mut app);
-        // Opened meanwhile, from somewhere else: the yes no longer fits it.
+        // Opened meanwhile, from somewhere else: the yes reopens nothing, and Enter on the card
+        // as it is now goes in, saying why (intent 0591).
         let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
         card.workspace_id = Some("w9".into());
         card.session = Some("web".into());
-        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(press(&mut app, 'y'), Action::Jump(k) if k == key));
+        let said = app.message().unwrap().0;
         assert!(
-            app.message()
-                .unwrap()
-                .0
-                .contains("changed while you were deciding")
+            said.contains("now runs in") && said.contains("going in"),
+            "{said}"
         );
     }
 
@@ -6502,7 +6548,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_yes_is_refused_when_the_work_changed_since_it_was_asked_for() {
+    fn a_yes_asks_again_when_the_work_changed_since_it_was_asked_for() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _) = closed_workspace_card(&mut app);
@@ -6525,9 +6571,13 @@ pub(crate) mod tests {
         );
         settle(&mut app);
         assert!(!matches!(app.mode, Mode::Confirm { .. }));
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Fail));
+        assert!(app.waiting_on(&key).is_none());
+        let said = app.message().unwrap();
+        assert_eq!(said.1, Tone::Warn);
+        assert!(said.0.contains("conversation changed"), "{said:?}");
         seen(&mut app);
-        // Its agent changes while the question is up: the yes sends nothing.
+        // Its agent changes while the question is up: the yes overrides nothing, and Enter on
+        // the card as it is now sends its reopen afresh, for the backend to ask again (0591).
         let request = reopen_by_enter(&mut app);
         reply_to(
             &mut app,
@@ -6545,14 +6595,18 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .agent = Some("claude".into());
-        assert_eq!(press(&mut app, 'y'), Action::None);
-        assert_eq!(
-            app.message().map(|(_, tone)| tone),
-            Some(Tone::Warn),
-            "{:?}",
-            app.message()
+        let Action::Mutate { request: again, .. } = press(&mut app, 'y') else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert_eq!(again["action"], "reopen");
+        assert!(again.get("override").is_none() && again.get("confirm").is_none());
+        let said = app.message().unwrap().0;
+        assert!(
+            said.contains("conversation changed") && said.contains("asking again"),
+            "{said}"
         );
-        // It gets a workspace of its own while the question is up: the yes sends nothing either.
+        // It gets a workspace of its own while the question is up: the yes reopens nothing, and
+        // goes in instead, as Enter on it would now.
         let (key, _) = closed_workspace_card(&mut app);
         let request = reopen_by_enter(&mut app);
         reply_to(
@@ -6565,7 +6619,7 @@ pub(crate) mod tests {
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         app.board.cards[i].workspace_id = Some("w9".into());
         app.board.cards[i].session = Some("web".into());
-        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(press(&mut app, 'y'), Action::Jump(k) if k == key));
     }
 
     #[test]
@@ -6588,9 +6642,18 @@ pub(crate) mod tests {
         );
         settle(&mut app);
         assert!(matches!(app.mode, Mode::Search(_)));
-        assert!(app.message().unwrap().0.contains("needs a yes first"));
+        // It waits on its card, asking, not failed (intent 0591).
+        assert!(app.message().unwrap().0.contains("n goes to it"));
+        assert_eq!(app.message().unwrap().1, Tone::Info);
         press(&mut app, 'y');
         assert!(matches!(&app.mode, Mode::Search(s) if s.query == "checy"));
+        // Enter on its card asks that question now; Esc leaves it, and it stops waiting.
+        app.mode = Mode::Board;
+        app.sel.key = Some(key.clone());
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        esc(&mut app);
+        assert!(app.waiting_on(&key).is_none());
         // Reopened from the board, then into the backlog: the board's selection still names it,
         // but you're looking at the backlog, so it doesn't pull you out.
         app.mode = Mode::Board;
@@ -6817,7 +6880,8 @@ pub(crate) mod tests {
             (sent["override"].as_bool(), sent["session"].as_str()),
             (Some(true), Some("web"))
         );
-        // Its home moves while the question is up: the yes sends nothing.
+        // Its home moves while the question is up: the yes never overrides the limit where it
+        // was asked. It sends d again, as the card is now, for its new home to ask (intent 0591).
         app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
         reply_to(&mut app, machine, request, Ok(asks));
         settle(&mut app);
@@ -6826,8 +6890,13 @@ pub(crate) mod tests {
             machine: Some(app.machines[0].name()),
             session: Some("api".into()),
         });
-        assert_eq!(press(&mut app, 'y'), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Action::Mutate { request: again, .. } = press(&mut app, 'y') else {
+            panic!("the yes didn't ask again: {:?}", app.message())
+        };
+        assert_eq!(again["action"], "dispatch");
+        assert!(again.get("override").is_none() && again.get("confirm").is_none());
+        assert_ne!(again["session"].as_str(), Some("web"));
+        assert!(app.message().unwrap().0.contains("asking again"));
     }
 
     fn type_in(app: &mut App, words: &str) {
@@ -7109,7 +7178,9 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Backlog { .. }));
         assert_eq!(press(&mut app, 'y'), Action::None);
         assert!(query(&app).is_some_and(|(q, typing)| q.ends_with('y') && typing));
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Fail));
+        // It waits on its card instead, asking, never a failure (intent 0591).
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Info));
+        assert!(app.waiting_on(&key).is_some());
     }
 
     #[test]
@@ -8243,10 +8314,12 @@ pub(crate) mod tests {
         };
         app.finish_job(n, request, Ok(asks));
         assert_eq!(app.card(&key).unwrap().stage, Stage::Backlog);
+        // It names the card as the board does, #21, not its bare id (intent 0591, K1-60).
+        let reference = format!("#{}", id.trim_start_matches('0'));
         assert!(
-            matches!(&app.mode, Mode::Confirm { title, .. } if title.contains(&format!("Start {id}"))),
+            matches!(&app.mode, Mode::Confirm { title, .. } if title.contains(&format!("Start {reference}"))),
             "{:?}",
-            app.message()
+            app.mode
         );
     }
 
@@ -9234,5 +9307,191 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("Marking it done")
         );
+    }
+
+    /// The demo session a backlog card's start asks about, on the machine its d goes to.
+    fn start_question(
+        app: &mut App,
+        key: &str,
+        used: u32,
+        choices: Vec<crate::actions::Choice>,
+    ) -> (usize, serde_json::Value) {
+        select_key(app, key);
+        let Action::Mutate { machine, request } = press(app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        let session = app.machines[machine]
+            .feed
+            .as_ref()
+            .and_then(|f| f.sessions.iter().find(|(_, s)| s.max.is_some()))
+            .map(|(name, _)| name.clone())
+            .expect("a session with a most in the demo");
+        let asks = crate::actions::Response {
+            ok: false,
+            message: format!(
+                "{session} has {used} workspaces, past its usual limit. Start it anyway?"
+            ),
+            confirmation: true,
+            confirm: Some("0123456789ab0011".into()),
+            used: Some(used),
+            limit: Some(3),
+            session: Some(session),
+            choices,
+            ..Default::default()
+        };
+        reply_to(app, machine, request.clone(), Ok(asks));
+        settle(app);
+        (machine, request)
+    }
+
+    fn a_choice(id: &str, key: &str, label: &str) -> crate::actions::Choice {
+        crate::actions::Choice {
+            id: id.into(),
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn a_choice_sends_its_question_again_with_the_same_token_and_no_override() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        start_question(
+            &mut app,
+            &key,
+            3,
+            vec![
+                a_choice("queue", "w", "queue it"),
+                // y is the yes: it takes the first free digit.
+                a_choice("shelve-oldest", "y", "shelve the oldest, then start it"),
+            ],
+        );
+        let Mode::Confirm { choices, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert_eq!(choices.len(), 2);
+        // Shown beside yes and no, each with its key, one to a line.
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        for shown in [
+            "Enter / y start anyway",
+            "w queue it",
+            "1 shelve the oldest, then start it",
+            "Esc / n leave it",
+        ] {
+            assert!(screen.contains(shown), "{shown} isn't on screen");
+        }
+        let Action::Mutate { request, .. } = press(&mut app, '1') else {
+            panic!("the choice sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["choice"], "shelve-oldest");
+        assert_eq!(request["confirm"], "0123456789ab0011");
+        assert!(request.get("override").is_none() && request.get("queue").is_none());
+    }
+
+    #[test]
+    fn at_the_most_a_session_holds_enter_queues_and_there_is_no_yes() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        start_question(&mut app, &key, 5, vec![a_choice("queue", "w", "queue it")]);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert!(title.starts_with("Queue #"), "{title}");
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(!screen.contains("start anyway"), "{screen}");
+        assert!(screen.contains("Enter / w queue it"));
+        // y does nothing here; Enter queues it.
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter queued nothing: {:?}", app.message())
+        };
+        assert_eq!(request["choice"], "queue");
+        assert!(request.get("override").is_none());
+    }
+
+    #[test]
+    fn a_question_that_arrives_while_you_are_elsewhere_waits_on_its_card() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        select_key(&mut app, &key);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing")
+        };
+        // On another card when it comes.
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.stage == Stage::Backlog)
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        let asks = crate::actions::Response {
+            ok: false,
+            message: "web has 3 workspaces, its usual limit. Start it anyway?".into(),
+            confirmation: true,
+            confirm: Some("0123456789ab0012".into()),
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, request, Ok(asks));
+        assert!(matches!(app.mode, Mode::Board));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "{said}");
+        assert!(
+            said.contains("asks you first") && said.contains("n goes to it"),
+            "{said}"
+        );
+        // Its card shows it as asking, never as failed, and a read keeps it so.
+        app.rebuild();
+        let card = app.card(&key).unwrap();
+        assert_eq!(card.attention, Attention::NeedsYou);
+        assert!(card.why.starts_with("asks you:"), "{}", card.why);
+        assert!(app.needs_you_order().contains(&key));
+        // n finds it and asks.
+        for _ in 0..app.needs_you_order().len() {
+            press(&mut app, 'n');
+            if matches!(app.mode, Mode::Confirm { .. }) {
+                break;
+            }
+        }
+        let Mode::Confirm { request, .. } = &app.mode else {
+            panic!("n never asked: {:?}", app.message())
+        };
+        assert_eq!(request["confirm"], "0123456789ab0012");
+        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        assert!(app.waiting_on(&key).is_none());
+    }
+
+    #[test]
+    fn a_question_is_shown_whole() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        let long = format!(
+            "{} The end of it shows.",
+            "It was closed by its agent after the work was merged and its tab was shut. ".repeat(6)
+        );
+        let mut asks = reopen_reply("web", false, true, "0123456789ab0004").unwrap();
+        asks.message = long.clone();
+        reply_to(&mut app, 0, request, Ok(asks));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question")
+        };
+        assert_eq!(message, &long);
+        let screen = crate::ui::tests_render(&app, 120, 50);
+        // Its last words, wrapped, still in the box.
+        assert!(screen.contains("it shows."), "{screen}");
+        assert!(app.card(&key).is_some());
     }
 }

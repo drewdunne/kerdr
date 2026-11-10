@@ -474,6 +474,8 @@ impl App {
         };
         let key = order[next].clone();
         self.go_to(&key);
+        // A question that waited on it opens as you land (intent 0591).
+        self.open_waiting(&key);
         Some(key)
     }
 
@@ -768,6 +770,8 @@ impl App {
                     queue: false,
                     ready_at: None,
                     plain: true,
+                    choices: vec![],
+                    enter_queues: false,
                 };
             }
             other => return other,

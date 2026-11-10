@@ -440,6 +440,8 @@ fn main() {
         target: None,
         queue: false,
         ready_at: None,
+        choices: vec![],
+        enter_queues: false,
     };
     rasterize(
         &render(&confirmation),

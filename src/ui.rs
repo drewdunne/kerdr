@@ -181,6 +181,8 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             request,
             queue,
             ready_at,
+            choices,
+            enter_queues,
             ..
         } => {
             draw_mode(f, area, app, back);
@@ -188,11 +190,15 @@ fn draw_mode(f: &mut Frame, area: Rect, app: &App, mode: &Mode) {
             confirm(
                 f,
                 area,
-                title,
-                message,
-                request["action"].as_str(),
-                *queue,
-                ready_at.is_some_and(|at| Instant::now() < at),
+                Question {
+                    title,
+                    message,
+                    action: request["action"].as_str(),
+                    queue: *queue,
+                    choices,
+                    enter_queues: *enter_queues,
+                    too_soon: ready_at.is_some_and(|at| Instant::now() < at),
+                },
             );
         }
         Mode::Kickoff { form, back, .. } => {
@@ -1730,6 +1736,11 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
             meta = format!("in {r}");
             mcolor = CYAN;
         }
+        // A question waits on it for you (intent 0591).
+        if let Some(line) = app.waiting_line_for(&c.key) {
+            (glyph, gcolor) = (Attention::NeedsYou.glyph(), YELLOW);
+            (meta, mcolor) = (line.to_string(), YELLOW);
+        }
         let marker = if holds.count > 0 { "▸" } else { "" };
         let tag = app
             .whose_tag(c)
@@ -2041,7 +2052,11 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
     // Open work its agent left, or whose workspace closed under it: say so where it shows
     // (intent 0289). C marks it done and x sets it aside, each starting nothing.
     // Its conversation runs in a terminal outside herdr, so no workspace shows it (intent 0411).
-    let note = if let Some(outside) = c.outside_herdr().filter(|_| !cached) {
+    let note = if let Some(line) = app.waiting_line_for(&c.key) {
+        // A question waits on it for you: it says so, as asking you, never as a failure (intent
+        // 0591).
+        (line.to_string(), YELLOW)
+    } else if let Some(outside) = c.outside_herdr().filter(|_| !cached) {
         (format!("outside herdr · {}", outside.short()), CYAN)
     } else if c.no_agent() && !cached {
         ("no agent".to_string(), YELLOW)
@@ -3242,73 +3257,124 @@ fn filter_view(f: &mut Frame, area: Rect, app: &App, query: &str, sel: usize, ty
     );
 }
 
-fn confirm(
-    f: &mut Frame,
-    area: Rect,
-    title: &str,
-    message: &str,
-    action: Option<&str>,
+/// A question as its box shows it.
+struct Question<'a> {
+    title: &'a str,
+    message: &'a str,
+    action: Option<&'a str>,
+    /// A full session's w, from a backend that offers no choices.
     queue: bool,
+    /// The answers its backend offers beyond yes and no (intent 0591).
+    choices: &'a [crate::actions::Choice],
+    /// At the most its session holds: ⏎ queues it, and there's no yes.
+    enter_queues: bool,
     too_soon: bool,
-) {
-    let rect = centered(area, 86, 16, None);
-    dialog(f, rect, YELLOW);
-    let inner = pad(rect, 3, 1);
-    let w = inner.width as usize;
-    let mut lines = wrapped(title, w, bold(YELLOW), None);
+}
+
+/// The keys a question answers to, each with what it does, in the order its box lists them: yes,
+/// the backend's other answers (or a full session's w), then no.
+fn question_keys(q: &Question) -> Vec<(String, String)> {
+    let yes = match q.action {
+        Some("dispatch") => "start anyway",
+        Some("reopen") => "go ahead",
+        Some("cancel") => "stop it",
+        _ => "yes",
+    };
+    let mut keys: Vec<(String, String)> = vec![];
+    if !q.enter_queues {
+        keys.push(("Enter / y".into(), yes.into()));
+    }
+    let picks = crate::actions::choice_keys(q.choices);
+    for (choice, key) in q.choices.iter().zip(picks) {
+        let Some(key) = key else { continue };
+        let key = if q.enter_queues && choice.id == "queue" {
+            format!("Enter / {key}")
+        } else {
+            key.to_string()
+        };
+        keys.push((key, choice.label.clone()));
+    }
+    if q.queue {
+        let key = if q.enter_queues { "Enter / w" } else { "w" };
+        keys.push((key.into(), "queue it for a free slot".into()));
+    }
+    // On X's question, "cancel" would read as the yes (intent 0321).
+    let no = match q.action {
+        Some("cancel") => "keep it running",
+        _ if !q.choices.is_empty() => "leave it",
+        _ => "cancel",
+    };
+    keys.push(("Esc / n".into(), no.into()));
+    keys
+}
+
+/// A question, whole (intent 0591): the box grows to hold all of what its backend said, and its
+/// answers, one to a line when it offers more than yes and no, as the design's canvas shows them.
+fn confirm(f: &mut Frame, area: Rect, q: Question) {
+    let width = 86u16.min(area.width.saturating_sub(2));
+    let w = width.saturating_sub(6).max(1) as usize;
+    let mut lines = wrapped(q.title, w, bold(YELLOW), None);
     lines.push(Line::raw(""));
-    lines.extend(wrapped(message, w, fg(FG), None));
-    if action == Some("dispatch") {
+    lines.extend(wrapped(q.message, w, fg(FG), None));
+    if q.action == Some("dispatch") && q.choices.is_empty() {
         lines.push(Line::raw(""));
         lines.extend(wrapped(
-            "Starting more work takes another slot. At the maximum, finish or shelve one first.",
+            if q.enter_queues {
+                "Starting more work takes another slot, and this session has none left: ⏎ queues it until one frees."
+            } else {
+                "Starting more work takes another slot."
+            },
             w,
             fg(DIM),
             None,
         ));
     }
+    let keys = question_keys(&q);
+    let held: Vec<&str> = if q.too_soon {
+        keys.iter()
+            .map(|(k, _)| k.as_str())
+            .filter(|k| !k.starts_with("Esc"))
+            .collect()
+    } else {
+        vec![]
+    };
+    // More than yes and no: one answer to a line. Otherwise the one line it always had.
+    let listed = keys.len() > 2;
+    let key_rows = if listed { keys.len() as u16 } else { 1 };
+    // Its border 2, a blank above the keys 1.
+    let height = (lines.len() as u16 + key_rows + 3).max(16);
+    let rect = centered(area, width, height, None);
+    dialog(f, rect, YELLOW);
+    let inner = pad(rect, 3, 1);
     let body = Rect {
-        height: inner.height.saturating_sub(2),
+        height: inner.height.saturating_sub(key_rows + 1),
         ..inner
     };
     f.render_widget(Paragraph::new(lines), body);
-    put(
-        f.buffer_mut(),
-        inner.x,
-        inner.bottom().saturating_sub(1),
-        inner.width,
-        fit(
-            key_hints_held(
-                &[
-                    (
-                        "Enter / y",
-                        match action {
-                            Some("dispatch") => "start anyway",
-                            Some("reopen") => "go ahead",
-                            Some("cancel") => "stop it",
-                            _ => "yes",
-                        },
-                    ),
-                    ("w", "queue it for a free slot"),
-                    // On X's question, "cancel" would read as the yes (intent 0321).
-                    (
-                        "Esc / n",
-                        if action == Some("cancel") {
-                            "keep it running"
-                        } else {
-                            "cancel"
-                        },
-                    ),
-                ][..]
-                    .iter()
-                    .filter(|(k, _)| queue || *k != "w")
-                    .copied()
-                    .collect::<Vec<_>>(),
-                if too_soon { &["Enter / y", "w"] } else { &[] },
-            ),
-            w,
-        ),
-    );
+    let first = inner.bottom().saturating_sub(key_rows);
+    if listed {
+        for (row, (k, what)) in keys.iter().enumerate() {
+            put(
+                f.buffer_mut(),
+                inner.x,
+                first + row as u16,
+                inner.width,
+                fit(
+                    key_hints_held(&[(k.as_str(), what.as_str())], &held),
+                    inner.width as usize,
+                ),
+            );
+        }
+    } else {
+        let pairs: Vec<(&str, &str)> = keys.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+        put(
+            f.buffer_mut(),
+            inner.x,
+            first,
+            inner.width,
+            fit(key_hints_held(&pairs, &held), inner.width as usize),
+        );
+    }
 }
 
 /// The Kickoff Questions box (intent 0409): what it is, then one question, whole. On a screen too
@@ -5177,7 +5243,7 @@ fn backlog_view(f: &mut Frame, area: Rect, app: &App, sel: usize) {
                             o.slots.free().unwrap_or(0)
                         ),
                         None => format!(
-                            "{} is at its usual limit. Starting it with d asks before opening another slot. At the maximum, finish or shelve one first.",
+                            "{} is at its usual limit. Starting it with d asks before opening another slot.",
                             r.session
                         ),
                     }
@@ -5810,6 +5876,8 @@ mod tests {
             },
             Mode::Confirm {
                 plain: false,
+                choices: vec![],
+                enter_queues: false,
                 machine: 0,
                 request: serde_json::json!({"action":"dispatch"}),
                 title: "Start this work?".into(),
@@ -6758,6 +6826,8 @@ mod tests {
             queue: true,
             ready_at: Some(Instant::now() + Duration::from_secs(60)),
             plain: false,
+            choices: vec![],
+            enter_queues: false,
         };
         assert_eq!(colour_of(&a, 120, 40, "Enter / y"), FAINT);
         assert_eq!(colour_of(&a, 120, 40, "w queue"), FAINT);

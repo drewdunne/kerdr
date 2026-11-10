@@ -518,6 +518,10 @@ pub struct CardSnapshot {
     /// while it still is, and one asked about started work only while it isn't. Not part of
     /// same_work.
     pub waiting: bool,
+    /// Whether it was done, or set aside, then: what changed while a question was up says so
+    /// only when it wasn't already (intent 0591). Not part of same_work either.
+    pub done: bool,
+    pub dismissed: bool,
 }
 
 impl CardSnapshot {
@@ -534,6 +538,8 @@ impl CardSnapshot {
             resume_conversation: resume.and_then(|r| r.conversation.clone()),
             workspace: card.workspace_id.clone(),
             waiting: crate::app::waiting_work(card),
+            done: card.done() || card.state.as_deref() == Some("closed"),
+            dismissed: card.dismissed(),
         }
     }
 
@@ -551,10 +557,14 @@ impl CardSnapshot {
             && CardSnapshot {
                 workspace: None,
                 waiting: false,
+                done: false,
+                dismissed: false,
                 ..now
             } == CardSnapshot {
                 workspace: None,
                 waiting: false,
+                done: false,
+                dismissed: false,
                 ..self.clone()
             }
     }

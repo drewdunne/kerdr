@@ -110,6 +110,93 @@ pub struct Response {
     /// On a failed test: the sign-in is what's wrong, so the way to fix it can open (intent 0591).
     #[serde(default)]
     pub sign_in: bool,
+    /// With a question: the answers it offers beyond yes and no, each sent back as the same request
+    /// with `choice` and the question's `confirm` (intent 0591, release 3).
+    #[serde(default, deserialize_with = "choices")]
+    pub choices: Vec<Choice>,
+}
+
+/// One answer a question offers beyond yes and no (intent 0591): "queue it", "shelve the oldest",
+/// "ask it to wrap up instead". `id` is the backend's own short word, sent back as `choice`; `label`
+/// a few plain words; `key` the one lowercase letter it suggests, which Kerdr uses unless it's taken.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Choice {
+    pub id: String,
+    #[serde(default)]
+    pub key: String,
+    pub label: String,
+}
+
+/// The most choices one question shows: each takes a line of the box.
+const MOST_CHOICES: usize = 6;
+
+impl Choice {
+    /// A choice Kerdr can offer: an id that's a short plain word, sent back as it came, and a label
+    /// with something to say. Its label is kept to one line's worth.
+    fn usable(mut self) -> Option<Choice> {
+        let id_ok = !self.id.is_empty()
+            && self.id.len() <= 40
+            && self
+                .id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'));
+        self.label = self
+            .label
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if self.label.chars().count() > 80 {
+            self.label = format!(
+                "{}…",
+                self.label.chars().take(79).collect::<String>().trim_end()
+            );
+        }
+        (id_ok && !self.label.is_empty()).then_some(self)
+    }
+}
+
+/// `choices` as a backend gives them: each usable one, in its order, at most MOST_CHOICES, and no
+/// id twice; anything else (not a list, an entry of another shape) is passed over, never a failed
+/// answer, so a question still asks yes or no.
+fn choices<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Choice>, D::Error> {
+    let value = Value::deserialize(d)?;
+    let mut out: Vec<Choice> = vec![];
+    for item in value.as_array().into_iter().flatten() {
+        let Some(choice) = serde_json::from_value::<Choice>(item.clone())
+            .ok()
+            .and_then(Choice::usable)
+        else {
+            continue;
+        };
+        if out.len() < MOST_CHOICES && !out.iter().any(|c| c.id == choice.id) {
+            out.push(choice);
+        }
+    }
+    Ok(out)
+}
+
+/// The keys a question's choices answer to, in their order (intent 0591): each the letter its
+/// backend suggests, unless that's taken (y, n and q answer the question itself, and an earlier
+/// choice may have it), else the next free digit, 1 to 9. None for one that gets no key.
+pub fn choice_keys(choices: &[Choice]) -> Vec<Option<char>> {
+    let mut taken: Vec<char> = vec!['y', 'n', 'q'];
+    let mut out = vec![];
+    for choice in choices {
+        let mut letters = choice.key.chars();
+        let suggested = match (letters.next(), letters.next()) {
+            (Some(c), None) if c.is_ascii_lowercase() && !taken.contains(&c) => Some(c),
+            _ => None,
+        };
+        let key = suggested.or_else(|| ('1'..='9').find(|d| !taken.contains(d)));
+        if let Some(k) = key {
+            taken.push(k);
+        }
+        out.push(key);
+    }
+    out
 }
 
 impl Response {
