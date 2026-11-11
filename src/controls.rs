@@ -2603,6 +2603,8 @@ impl App {
         // Whether ⏎ asked for it: taken now, sent or not, so a request a check below stops can't
         // leave it for another card's (Codex's sixth look).
         let enter_sent = self.enter_sent.take();
+        // The card it's for when it goes without its snapshot: taken now, likewise.
+        let action_key = self.action_key.take();
         if request["action"] == "create" {
             return self.queue_create(machine, request);
         }
@@ -2633,35 +2635,44 @@ impl App {
             return;
         }
         let id = request["id"].as_str().unwrap_or_default().to_string();
-        // An item's new text is for the card whose text Kerdr holds (intent 0414).
-        let held = (request["action"] == "edit")
-            .then(|| self.edit_card(&id, machine))
-            .flatten();
-        // Asked with no card: the one its machine's feed names by its source and number, else the
-        // only card with that number on its machine, else the only one anywhere. Never a guess
-        // between two sources' cards with the same number (Codex's sixth look, swept).
-        let key = from.as_ref().map(|f| f.key.clone()).or(held).or_else(|| {
-            let own = self.intent_key(machine, &id, None);
-            if self.card(&own).is_some() {
-                return Some(own);
-            }
-            let mine = |c: &&Card| c.detail.as_ref().is_some_and(|d| d.id == id);
-            let only = |found: Vec<&Card>| match found.as_slice() {
-                [one] => Some(one.key.clone()),
-                _ => None,
-            };
-            let cards = &self.board.cards;
-            let here: Vec<&Card> = cards
-                .iter()
-                .filter(mine)
-                .filter(|c| c.machine_index == machine)
-                .collect();
-            if here.is_empty() {
-                only(cards.iter().filter(mine).collect())
-            } else {
-                only(here)
-            }
-        });
+        // Its card: the one it was asked from, else the one it's for though that's gone from the
+        // board, and no other (Codex's seventh look). Only a change that never had a card goes
+        // by number: an item's new text is for the card whose text Kerdr holds (intent 0414),
+        // else the one its machine's feed names by its source and number, else the only card
+        // with that number on its machine, else the only one anywhere. Never a guess between two
+        // sources' cards with the same number (Codex's sixth look, swept).
+        let held = || {
+            (request["action"] == "edit")
+                .then(|| self.edit_card(&id, machine))
+                .flatten()
+        };
+        let key = from
+            .as_ref()
+            .map(|f| f.key.clone())
+            .or(action_key)
+            .or_else(held)
+            .or_else(|| {
+                let own = self.intent_key(machine, &id, None);
+                if self.card(&own).is_some() {
+                    return Some(own);
+                }
+                let mine = |c: &&Card| c.detail.as_ref().is_some_and(|d| d.id == id);
+                let only = |found: Vec<&Card>| match found.as_slice() {
+                    [one] => Some(one.key.clone()),
+                    _ => None,
+                };
+                let cards = &self.board.cards;
+                let here: Vec<&Card> = cards
+                    .iter()
+                    .filter(mine)
+                    .filter(|c| c.machine_index == machine)
+                    .collect();
+                if here.is_empty() {
+                    only(cards.iter().filter(mine).collect())
+                } else {
+                    only(here)
+                }
+            });
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         // A workspace with no intent shows nothing until it closes: said meanwhile (K1-27).
         if crate::app::cancels::is_bare_cancel(&request)
@@ -2996,6 +3007,8 @@ impl App {
         let was_retrying = std::mem::replace(&mut job.retrying, false);
         let machine = job.machine;
         let by_enter = job.by_enter;
+        // Its card, which its answer keeps whether or not that card is still on the board.
+        let job_key = job.key.clone();
         self.action_from = job.from.clone();
         self.answer_went_in = job.entered;
         if job.asking
@@ -3101,15 +3114,19 @@ impl App {
         // answers with its workspace goes in.
         self.answer_by_enter = by_enter;
         self.answer_job = Some(n);
+        self.answer_key = job_key;
         self.finish_action(machine, request, result);
         self.answer_job = None;
+        self.answer_key = None;
         self.answer_by_enter = false;
         // Sent on to the machine its refusal named: back in its place in the queue, still shown,
         // so a later change to the same record can't overtake it (intent 0416).
         if self.resend.len() > resends
             && let Some(job) = refused
-            && let Some((to, request, from)) = self.resend.pop_back()
+            && let Some((to, request, from, key)) = self.resend.pop_back()
         {
+            let mut job = job;
+            job.key = job.key.or(key);
             self.resolver.retarget(job, to, request, from);
         } else if redirected {
             if moved_on {
@@ -3135,7 +3152,7 @@ impl App {
         if let Some(holds) = self.follow_holds(card, action) {
             return holds;
         }
-        let Some(job) = self.resolver.starting(&id) else {
+        let Some(job) = self.resolver.starting(&card.key, &id) else {
             return false;
         };
         let open = card.is_open_workspace();
@@ -3215,7 +3232,7 @@ impl App {
         if card.is_open_workspace() {
             return None;
         }
-        let asking = self.resolver.starting(&id)?.asking;
+        let asking = self.resolver.starting(&card.key, &id)?.asking;
         if let Some(action) = self.go_into_opened(card) {
             return Some(action);
         }
@@ -3232,7 +3249,7 @@ impl App {
     /// asked for. None until one has.
     fn go_into_opened(&mut self, card: &Card) -> Option<Action> {
         let id = card.detail.as_ref()?.id.clone();
-        let job = self.resolver.starting(&id)?;
+        let job = self.resolver.starting(&card.key, &id)?;
         // Where it asked, and where a start that ran on another machine runs (intent 0445).
         let mut machines = vec![self.machines.get(job.machine).map(|m| m.name())?];
         if let Some(Effect::StartingOn(there)) = &job.effect
@@ -3273,7 +3290,7 @@ impl App {
             id: opened.id.clone(),
         };
         // In by his own ⏎: its answer takes him nowhere later.
-        self.resolver.went_in(&id);
+        self.resolver.went_in(&card.key, &id);
         self.forget_enter();
         Some(action)
     }
@@ -3332,11 +3349,11 @@ impl App {
             return Some(self.jump_action(key));
         }
         let id = card.detail.as_ref()?.id.clone();
-        if self.resolver.starting(&id).is_some() {
+        if self.resolver.starting(&card.key, &id).is_some() {
             return self.go_into_opened(&card);
         }
         // Followed work still going: it goes in once the card shows it open (intent 0591).
-        if self.started_lately(&id) || self.following(&id).is_some() {
+        if self.started_lately(&card.key, &id) || self.following_card(&card).is_some() {
             return None;
         }
         self.forget_enter();
@@ -3350,11 +3367,13 @@ impl App {
         None
     }
 
-    /// Whether this record's start was answered yes lately: its workspace may yet come.
-    pub(super) fn started_lately(&self, id: &str) -> bool {
-        self.started
-            .as_ref()
-            .is_some_and(|(s, at)| s == id && at.elapsed() < Duration::from_secs(120))
+    /// Whether this card's start was answered yes lately: its workspace may yet come. Its own,
+    /// by `resolve::for_card`: another source's card with the same number isn't held up by it
+    /// (Codex's seventh look).
+    pub(super) fn started_lately(&self, key: &str, id: &str) -> bool {
+        self.started.as_ref().is_some_and(|(k, s, at)| {
+            crate::resolve::for_card(Some(k), s, key, id) && at.elapsed() < Duration::from_secs(120)
+        })
     }
 
     /// The machine to read often for the start a ⏎ is waiting on: reading its feed shows the
@@ -3393,7 +3412,7 @@ impl App {
             .and_then(|c| c.detail.as_ref())
             .map(|d| d.id.clone())
         {
-            self.resolver.went_in(&id);
+            self.resolver.went_in(key, &id);
         }
     }
 
@@ -3471,7 +3490,7 @@ impl App {
         {
             return Some(line);
         }
-        let Some(job) = self.resolver.starting(id) else {
+        let Some(job) = self.resolver.starting(&card.key, id) else {
             // Any other change still on its way: shown as done, but not yet saved.
             let job = self.resolver.unanswered_on(&card.key)?;
             let secs = job.asked.elapsed().as_secs();
@@ -3707,10 +3726,11 @@ impl App {
         }
         let id = request["id"].as_str().map(str::to_string);
         // Its card's key: what's kept for it (a resend, a move, his Kickoff answers) is its own,
-        // never another source's with the same number (Codex's fifth and sixth looks).
+        // never another source's with the same number (Codex's fifth and sixth looks), even when
+        // its card has gone from the board meanwhile (Codex's seventh look).
         let held = id
             .as_deref()
-            .map(|id| self.intent_key(machine, id, from.as_ref()));
+            .map(|id| self.answer_card_key(machine, id, from.as_ref()));
         // Only this answer's own resend: another card's, still on its way, stays guarded.
         let was_resent = match self
             .resent
@@ -3814,10 +3834,9 @@ impl App {
                         self.edit_resend(&mut request, Some(&key));
                     }
                     // Sent on quietly: the card still shows the change while it goes there. Its
-                    // answer comes from there, with the same card it was asked from.
-                    let resent = self.intent_key(to, &id, from.as_ref());
-                    self.resent.push((to, resent));
-                    self.resend.push_back((to, request, from));
+                    // answer comes from there, for the same card it was asked from.
+                    self.resent.push((to, key.clone()));
+                    self.resend.push_back((to, request, from, Some(key)));
                     return;
                 }
             }
@@ -3880,7 +3899,7 @@ impl App {
                 Tone::Info,
             );
             self.resend
-                .push_back((machine, crate::actions::with_op(again), from));
+                .push_back((machine, crate::actions::with_op(again), from, held));
             return;
         }
         // A question, or after a yes a new one: something changed, so it carries a new token.
@@ -3929,7 +3948,8 @@ impl App {
                 if request["action"] == "dispatch" && response.ok {
                     self.started = request["id"]
                         .as_str()
-                        .map(|id| (id.to_string(), Instant::now()));
+                        .zip(held.clone())
+                        .map(|(id, key)| (key, id.to_string(), Instant::now()));
                 }
                 // A start asked for on another machine says where (intent 0445).
                 if request["action"] == "dispatch"

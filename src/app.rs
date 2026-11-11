@@ -664,9 +664,10 @@ pub struct App {
     pub pending_jump: Option<PendingJump>,
     /// The workspace a reopen just made, to go into now.
     pub open_after: Option<OpenAfter>,
-    /// The record a start just went out for, and when, so a second ⏎ before the feed shows it
-    /// under way doesn't start it again (intent 0404).
-    pub started: Option<(String, Instant)>,
+    /// The card a start just went out for, by key, its record's number, and when, so a second ⏎
+    /// before the feed shows it under way doesn't start it again (intent 0404). Its own card's:
+    /// another source's card with the same number goes ahead (Codex's seventh look).
+    pub started: Option<(String, String, Instant)>,
     /// The card the running action was asked from, as it was then: its answer asks or takes you
     /// in only while you're still on that work. Esc lets it go.
     pub action_from: Option<CardSnapshot>,
@@ -676,7 +677,13 @@ pub struct App {
     /// Actions refused because their intent lives on another machine than the one asked: each
     /// request, to send there next, and the card it was asked from (intent 0411). Several can
     /// answer at once now that changes run side by side (intent 0416), so they wait in order.
-    pub resend: std::collections::VecDeque<(usize, serde_json::Value, Option<CardSnapshot>)>,
+    /// Each with the card it's for, by key, kept when that card has gone (Codex's seventh look).
+    pub resend: std::collections::VecDeque<(
+        usize,
+        serde_json::Value,
+        Option<CardSnapshot>,
+        Option<String>,
+    )>,
     /// The machine and card, by key, of each such resend still unanswered: its answer is shown as
     /// it is, never sent on again, so one ⏎ asks two machines at most. By key, never by number,
     /// which another source's card can share (Codex's sixth look, swept).
@@ -700,6 +707,14 @@ pub struct App {
     /// The change whose answer is being taken, by Kerdr's number for it: what's bound to that
     /// change finds it by this, never by its record's number.
     pub(crate) answer_job: Option<u64>,
+    /// The card the change whose answer is being taken was for, by key, kept when its card has
+    /// gone from the board or its answer takes you nowhere: that answer is that card's or no
+    /// card's, never another source's with the same number (Codex's seventh look).
+    pub(crate) answer_key: Option<String>,
+    /// The card a change about to be sent is for, by key, when it goes without the card it was
+    /// asked from (`action_from`): its card has gone, or its answer is to take you nowhere. It's
+    /// still that card's change (Codex's seventh look).
+    pub(crate) action_key: Option<String>,
     /// The tokens of questions answered from the box, whose copy in the feed is out of date until
     /// its next read: d doesn't open them again from there (intent 0491).
     pub kickoff_sent: std::collections::HashSet<String>,
@@ -861,6 +876,8 @@ impl App {
             kickoff_prefill: Default::default(),
             stop_starts: Vec::new(),
             answer_job: None,
+            answer_key: None,
+            action_key: None,
             kickoff_sent: Default::default(),
             kickoff_checks: 0,
             answered_at: None,
@@ -1616,7 +1633,7 @@ impl App {
         let starting = card
             .detail
             .as_ref()
-            .is_some_and(|d| self.started_lately(&d.id));
+            .is_some_and(|d| self.started_lately(&card.key, &d.id));
         if starting {
             self.say(
                 format!(
@@ -1635,8 +1652,9 @@ impl App {
     /// the board, a peek, a list or a card's own screen.
     pub fn next_owed(&mut self) -> Action {
         // A refusal that named the intent's home elsewhere: ask there, straight away.
-        if let Some((machine, request, from)) = self.resend.pop_front() {
+        if let Some((machine, request, from, key)) = self.resend.pop_front() {
             self.action_from = from;
+            self.action_key = key;
             return Action::Mutate { machine, request };
         }
         // Words whose image didn't go in, asked about once he's back where no typing is taken:
@@ -4117,6 +4135,22 @@ pub(crate) mod tests {
         assert!(app.card(&other).is_some(), "no copy on the board");
         assert!(app.card(key).is_some(), "the first one went");
         (other, there)
+    }
+
+    /// This card goes from the board: its record leaves every feed whose source keys it so, and
+    /// another source's card with the same number stays.
+    pub(crate) fn gone_from_board(app: &mut App, key: &str) {
+        let id = app.card(key).unwrap().detail.as_ref().unwrap().id.clone();
+        for m in &mut app.machines {
+            if let Some(feed) = m.feed.as_mut() {
+                let source = feed.source.clone().unwrap_or_else(|| "feed".into());
+                if format!("{source}:{id}") == key {
+                    feed.cards.retain(|c| c.id != id);
+                }
+            }
+        }
+        app.rebuild();
+        assert!(app.card(key).is_none(), "still on the board");
     }
 
     #[test]
@@ -9648,7 +9682,7 @@ pub(crate) mod tests {
             .unanswered_where(|r| r["action"] == "dispatch")
             .unwrap();
         app.resolver.take(n);
-        app.started = Some((id, Instant::now()));
+        app.started = Some((key.clone(), id, Instant::now()));
         assert_eq!(app.enter_when_open_due(), None);
         assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()), "lately");
         app.started = None;
@@ -9882,8 +9916,124 @@ pub(crate) mod tests {
         let mut job = app.resolver.take(n).unwrap();
         job.effect = Some(crate::resolve::Effect::StartingOn("far-box".into()));
         app.resolver.settle(job);
-        assert!(app.resolver.starting(&id).is_some());
+        assert!(app.resolver.starting(&card.key, &id).is_some());
         assert!(!app.still_changing(&card, "close"));
+    }
+
+    #[test]
+    fn d_on_another_sources_card_goes_while_one_with_its_number_starts() {
+        // Codex's seventh look: source A's #N is starting. d on A's card again still waits; going
+        // into source B's #N leaves A's start free to take you in; and d on B's card starts B's
+        // at once, sent to where B lives.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id, machine) = waiting_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &a);
+        select_key(&mut app, &a);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        select_key(&mut app, &a);
+        assert_eq!(press(&mut app, 'd'), Action::None, "A's started twice");
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("is starting up"), "{said}");
+        app.went_into(&b);
+        let job = app.resolver.starting(&a, &id).expect("A's start");
+        assert!(
+            !job.entered && job.from.is_some(),
+            "going into B let A's start's answer go"
+        );
+        select_key(&mut app, &b);
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'd')
+        else {
+            panic!("d on B waited for A's start: {:?}", app.message())
+        };
+        assert_eq!(
+            (to, request["action"].as_str(), request["id"].as_str()),
+            (there, Some("dispatch"), Some(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn a_start_answered_lately_holds_only_its_own_card() {
+        // Codex's seventh look: A's start was answered yes a moment ago, gone from the action
+        // resolution tool with no workspace shown yet. ⏎ on A's card waits for it; ⏎ on source
+        // B's card with the same number starts B's.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id, _) = waiting_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &a);
+        app.started = Some((a.clone(), id.clone(), Instant::now()));
+        select_key(&mut app, &a);
+        assert_eq!(enter(&mut app), Action::None, "A's started twice");
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("is starting"), "{said}");
+        select_key(&mut app, &b);
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = enter(&mut app)
+        else {
+            panic!("⏎ on B waited for A's start: {:?}", app.message())
+        };
+        assert_eq!(
+            (to, request["action"].as_str(), request["id"].as_str()),
+            (there, Some("dispatch"), Some(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn the_same_record_shown_from_another_machine_still_waits_for_its_start() {
+        // Codex's seventh look: the same record on two machines shares one key, so a second copy
+        // of it waits for the start on its way, whichever machine's copy the board shows now.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id, machine) = waiting_card(&app);
+        select_key(&mut app, &a);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        // Its copy on the other machine, its home now, is the one the board shows.
+        let there = if machine == 0 { 1 } else { 0 };
+        let name = app.machines[there].name();
+        let mut copy = app.machines[machine]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .clone();
+        copy.home = Some(crate::feed::Home {
+            machine: Some(name),
+            session: copy.home.as_ref().and_then(|h| h.session.clone()),
+        });
+        for m in [machine, there] {
+            let feed = app.machines[m].feed.as_mut().unwrap();
+            feed.cards.retain(|c| c.id != id);
+            feed.cards.push(copy.clone());
+        }
+        app.rebuild();
+        assert_eq!(app.card(&a).map(|c| c.machine_index), Some(there));
+        select_key(&mut app, &a);
+        assert_eq!(
+            press(&mut app, 'd'),
+            Action::None,
+            "the same record started twice"
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("is starting up"), "{said}");
+        select_key(&mut app, &a);
+        assert_eq!(enter(&mut app), Action::None, "⏎ started it twice");
     }
 
     #[test]
@@ -9929,7 +10079,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("Being written up")
         );
-        assert!(app.resolver.starting(&id).is_none());
+        assert!(app.resolver.starting(&key, &id).is_none());
         assert_eq!(app.quit_held(), None);
         assert!(
             app.quit_loses()
@@ -9953,7 +10103,7 @@ pub(crate) mod tests {
         assert!(app.resolver.started(n).shows_now);
         app.rebuild();
         assert!(!app.starts_when_written(&key));
-        assert!(app.resolver.starting(&id).is_some());
+        assert!(app.resolver.starting(&key, &id).is_some());
         app.finish_job(n, request, done("Started."));
         // Esc on the board drops one still waiting, and the runner is told.
         let mut app = demo_app();

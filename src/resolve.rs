@@ -285,6 +285,23 @@ impl Effect {
 /// the feed cut short with "…" (ark-sdlc's feed keeps 200 characters) prove nothing, since the old
 /// text may start the same way: the effect then goes as any other does, after two reads or a
 /// minute.
+/// Whether what's kept for a record, by its card's key (when it had one) and its number, is for
+/// this card. By key wherever both keys name their feed's source: the same record shares one key
+/// on every machine that shows it, and another source's card with the same number has another.
+/// By number only where a key can't tell: kept with no card, or keyed from a feed that doesn't
+/// name its source, whose copy of a record may show as a second card (Codex's seventh look).
+pub fn for_card(kept_key: Option<&str>, kept_id: &str, key: &str, id: &str) -> bool {
+    match kept_key {
+        Some(kept) if names_source(kept) && names_source(key) => kept == key,
+        _ => kept_id == id,
+    }
+}
+
+/// Whether a card's key names its feed's source: a feed that names none is keyed "feed".
+fn names_source(key: &str) -> bool {
+    !key.starts_with("feed:")
+}
+
 fn same_words(feed: &str, text: &str) -> bool {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let feed = words(feed);
@@ -396,6 +413,12 @@ impl Job {
     /// The record it changes, by id.
     pub fn id(&self) -> Option<&str> {
         self.record()
+    }
+
+    /// Whether it changes this card's record, by `for_card`.
+    pub fn is_for(&self, key: &str, id: &str) -> bool {
+        self.record()
+            .is_some_and(|record| for_card(self.key.as_deref(), record, key, id))
     }
 
     /// Whether it's a start still waiting for its intent's write-up: not started, nor shown.
@@ -794,11 +817,13 @@ impl Resolver {
         std::mem::take(&mut self.dropped)
     }
 
-    /// Andrew has gone into this record's workspace himself while its start or reopen is on its
-    /// way: its answer neither asks him anything nor takes him in again (intent 0445).
-    pub fn went_in(&mut self, id: &str) {
+    /// Andrew has gone into this card's workspace himself while its start or reopen is on its
+    /// way: its answer neither asks him anything nor takes him in again (intent 0445). Only its
+    /// own card's start, by key: another source's card's with the same number still takes him in
+    /// (Codex's seventh look).
+    pub fn went_in(&mut self, key: &str, id: &str) {
         for j in self.jobs.iter_mut().filter(|j| {
-            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.record() == Some(id)
+            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.is_for(key, id)
         }) {
             j.from = None;
             j.entered = true;
@@ -1134,12 +1159,15 @@ impl Resolver {
         any
     }
 
-    /// The change to this record that starts work, while it's on its way or answered but not yet
-    /// in the feed: another start or reopen meanwhile would be a second copy.
-    pub fn starting(&self, id: &str) -> Option<&Job> {
+    /// The change to this card's record that starts work, while it's on its way or answered but
+    /// not yet in the feed: another start or reopen meanwhile would be a second copy. By the card's
+    /// key, which the same record shares on every machine, so another source's card with the
+    /// same number goes ahead (Codex's seventh look); by number only where a key can't tell
+    /// (`for_card`).
+    pub fn starting(&self, key: &str, id: &str) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.starts() && !j.waits_for_write_up() && j.record() == Some(id))
+            .find(|j| j.starts() && !j.waits_for_write_up() && j.is_for(key, id))
     }
 
     /// The newest unanswered change shown on this card, by its key.
@@ -1175,6 +1203,26 @@ impl Resolver {
     /// yet in the feed (a failure lets go of it at once).
     pub fn holds_where(&self, matches: impl Fn(&Value) -> bool) -> bool {
         self.jobs.iter().any(|j| matches(&j.request))
+    }
+
+    /// Whether a change to this card whose request `matches` is still held, by `for_card`.
+    pub fn holds_for(&self, key: &str, id: &str, matches: impl Fn(&Value) -> bool) -> bool {
+        self.jobs
+            .iter()
+            .any(|j| j.is_for(key, id) && matches(&j.request))
+    }
+
+    /// The oldest unanswered change to this card whose request `matches`, by `for_card`.
+    pub fn unanswered_for_card(
+        &self,
+        key: &str,
+        id: &str,
+        matches: impl Fn(&Value) -> bool,
+    ) -> Option<u64> {
+        self.jobs
+            .iter()
+            .find(|j| j.settled.is_none() && j.is_for(key, id) && matches(&j.request))
+            .map(|j| j.n)
     }
 
     /// The oldest unanswered change whose request `matches`.
@@ -1384,20 +1432,20 @@ mod tests {
             Some("s:7".into()),
             Some(Effect::Starting),
         );
-        assert!(r.starting("7").is_some());
-        assert!(r.starting("8").is_none());
+        assert!(r.starting("s:7", "7").is_some());
+        assert!(r.starting("s:8", "8").is_none());
         r.ready();
         let job = r.take(n).unwrap();
         r.settle(job);
         assert!(
-            r.starting("7").is_some(),
+            r.starting("s:7", "7").is_some(),
             "answered but not in the feed yet: still no second start"
         );
         r.read(
             0,
             Some(&feed(json!([{"id":"7","title":"t","state":"active"}]))),
         );
-        assert!(r.starting("7").is_none(), "the feed has it");
+        assert!(r.starting("s:7", "7").is_none(), "the feed has it");
         let queued = json!({"id":"7","title":"t","state":"queued","stage":"backlog"});
         let mut fc: FeedCard = serde_json::from_value(queued.clone()).unwrap();
         Effect::Starting.apply(&mut fc, "s:7");
@@ -1554,14 +1602,14 @@ mod tests {
         r.settle(job);
         // A feed that names no state proves nothing.
         r.read(0, Some(&feed(json!([{"id":"7","title":"t"}]))));
-        assert!(r.starting("7").is_some());
+        assert!(r.starting("s:7", "7").is_some());
         r.read(
             0,
             Some(&feed(
                 json!([{"id":"7","title":"t","workspace":{"session":"web","id":"w3"}}]),
             )),
         );
-        assert!(r.starting("7").is_none(), "a workspace proves it");
+        assert!(r.starting("s:7", "7").is_none(), "a workspace proves it");
     }
 
     #[test]
@@ -1829,9 +1877,12 @@ mod tests {
             Some("Working"),
             "a copy under way speaks for itself"
         );
-        assert!(r.starting("7").is_some());
+        assert!(r.starting("s:7", "7").is_some());
         assert!(r.read(1, there.feed.as_ref()));
-        assert!(r.starting("7").is_none(), "the far machine's read shows it");
+        assert!(
+            r.starting("s:7", "7").is_none(),
+            "the far machine's read shows it"
+        );
     }
 
     #[test]
@@ -1856,14 +1907,14 @@ mod tests {
                 .clone()
         };
         assert_eq!(status(&r), None);
-        assert!(r.starting("7").is_none());
+        assert!(r.starting("s:7", "7").is_none());
         assert!(r.holding_quit().is_empty());
         assert!(!r.holds_you());
         assert!(r.waiting_for_write_up("s:7").is_some());
         assert!(r.ready()[0].3);
         assert!(r.started(n).shows_now, "it shows from now");
         assert_eq!(status(&r).as_deref(), Some("Starting…"));
-        assert!(r.starting("7").is_some());
+        assert!(r.starting("s:7", "7").is_some());
         assert!(
             r.drop_awaited().is_empty(),
             "started: Esc no longer drops it"
@@ -1904,6 +1955,46 @@ mod tests {
     }
 
     #[test]
+    fn a_start_guards_its_own_card_by_key_and_by_number_only_where_a_key_cant_tell() {
+        // Codex's seventh look: the same record shares one key on every machine, so a start holds
+        // its own card, and another source's card with the same number goes ahead. Only where a
+        // key can't tell, by number: a start asked with no card, or a card from a feed that names
+        // no source.
+        let mut r = Resolver::default();
+        r.add(
+            0,
+            json!({"action":"dispatch","id":"7"}),
+            Some(CardSnapshot::default()),
+            Some("s:7".into()),
+            None,
+        );
+        assert!(r.starting("s:7", "7").is_some(), "its own card");
+        assert!(r.starting("other:7", "7").is_none(), "another source's");
+        assert!(
+            r.starting("feed:7", "7").is_some(),
+            "a feed naming no source"
+        );
+        assert!(r.starting("s:8", "8").is_none());
+        let dispatch = |q: &Value| q["action"] == "dispatch";
+        assert!(r.holds_for("s:7", "7", dispatch));
+        assert!(!r.holds_for("other:7", "7", dispatch));
+        assert!(r.unanswered_for_card("s:7", "7", dispatch).is_some());
+        assert!(r.unanswered_for_card("other:7", "7", dispatch).is_none());
+        r.went_in("other:7", "7");
+        let job = r.starting("s:7", "7").unwrap();
+        assert!(
+            !job.entered && job.from.is_some(),
+            "another card's going in"
+        );
+        r.went_in("s:7", "7");
+        assert!(r.starting("s:7", "7").unwrap().entered);
+        let mut r = Resolver::default();
+        r.add(0, json!({"action":"dispatch","id":"7"}), None, None, None);
+        assert!(r.starting("other:7", "7").is_some(), "asked with no card");
+        assert!(r.starting("s:8", "8").is_none());
+    }
+
+    #[test]
     fn going_in_yourself_lets_a_start_s_answer_go() {
         let mut r = Resolver::default();
         r.add(
@@ -1914,11 +2005,11 @@ mod tests {
             Some(Effect::Reopening),
         );
         assert!(r.holds_you());
-        r.went_in("8");
+        r.went_in("s:8", "8");
         assert!(r.holds_you(), "another record's");
-        r.went_in("7");
+        r.went_in("s:7", "7");
         assert!(!r.holds_you());
-        assert!(r.starting("7").unwrap().entered);
+        assert!(r.starting("s:7", "7").unwrap().entered);
     }
 
     #[test]
@@ -2028,7 +2119,7 @@ mod tests {
             }
         );
         r.drop_answered(n, false);
-        assert!(r.starting("7").is_some());
+        assert!(r.starting("s:7", "7").is_some());
         assert!(r.take(n).is_some());
         // Taken out before it started: it goes.
         let n = start(&mut r);

@@ -729,14 +729,21 @@ impl App {
                 return Owed::Send(self.intent_action_on(card, "restore", json!({})));
             }
             // Gone: held while it's on its way (or answered yes and not in the feed yet), or sent on
-            // to the machine the record lives on (Codex's review).
+            // to the machine the record lives on (Codex's review). Its own card's restore, by key:
+            // another source's card's with the same number isn't this one coming back (Codex's
+            // seventh look).
             let restoring = self
                 .resolver
-                .holds_where(|r| r["id"] == id.as_str() && r["action"] == "restore")
-                || self
-                    .resend
-                    .iter()
-                    .any(|(_, r, _)| r["id"] == id.as_str() && r["action"] == "restore")
+                .holds_for(&card.key, &id, |r| r["action"] == "restore")
+                || self.resend.iter().any(|(_, r, _, k)| {
+                    r["action"] == "restore"
+                        && crate::resolve::for_card(
+                            k.as_deref(),
+                            r["id"].as_str().unwrap_or_default(),
+                            &card.key,
+                            &id,
+                        )
+                })
                 || self.resent.iter().any(|(_, k)| *k == card.key);
             if !restoring {
                 // It didn't happen: its own failure said why.
@@ -821,12 +828,12 @@ impl App {
         let Some(id) = card.detail.as_ref().map(|d| d.id.as_str()) else {
             return false;
         };
-        self.resolver.starting(id).is_some()
+        self.resolver.starting(&card.key, id).is_some()
             || self
                 .resolver
-                .unanswered_where(|r| r["id"] == id && r["action"] == "restore")
+                .unanswered_for_card(&card.key, id, |r| r["action"] == "restore")
                 .is_some()
-            || self.following(id).is_some()
+            || self.following_card(card).is_some()
     }
 
     /// The request that asks an old backend to bring its ark-sdlc up to date, when it's due, with

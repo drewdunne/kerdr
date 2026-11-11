@@ -2106,11 +2106,23 @@ impl App {
 
     /// An account request that wasn't sent, finished as its machine refusing it would be: matched
     /// to what it was asked from, through its own screen's failure handling, so nothing is left
-    /// waiting on it (Codex's fifth and sixth looks).
+    /// waiting on it (Codex's fifth and sixth looks). Another request on its way keeps its own
+    /// record, so its answer still finds what it was asked from and does what follows it (a saved
+    /// list's "move waiting sessions", say): only this one's is handed to its failure (Codex's
+    /// seventh look).
     fn account_not_sent(&mut self, origin: Pending, request: &Value, why: String) {
         let machine = origin.machine;
-        self.account_pending = Some(origin);
+        let on_its_way = self.account_pending.replace(origin);
         self.finish_account_action(machine, crate::actions::request_metadata(request), Err(why));
+        // Its own record, should its failure not have taken it, goes; the other's is back.
+        let ours = crate::actions::request_metadata(request);
+        self.account_pending.take_if(|p| {
+            p.machine == machine
+                && crate::actions::without_op(&p.request) == crate::actions::without_op(&ours)
+        });
+        if self.account_pending.is_none() {
+            self.account_pending = on_its_way;
+        }
     }
 
     /// The next account request that waited its turn, once none is on its way: the oldest whose
@@ -3963,6 +3975,10 @@ impl App {
                     .filter(|k| visible && self.sel.key.as_deref() == Some(*k))
                     .and_then(|k| self.card(k))
                     .map(CardSnapshot::of);
+                // Still that card's reopen, though it takes you nowhere (Codex's seventh look).
+                if self.action_from.is_none() {
+                    self.action_key = key.clone();
+                }
                 self.queue_action(machine, reopen.clone());
                 let n = self.resolver.last_added();
                 self.finish_job(n, reopen, Ok(response));
@@ -5295,6 +5311,24 @@ mod tests {
             ),
             ("api", "w9", "44-again", k.as_str())
         );
+    }
+
+    /// Codex's seventh look: the same start, made after #44 (source A) went from the board while
+    /// source B's #44 shows. The reopen is still A's, by its key: it's never queued as B's, and
+    /// B's card never shows it starting or followed.
+    #[test]
+    fn a_move_started_as_a_reopen_after_its_card_went_is_never_another_sources_with_its_number() {
+        let mut a = app();
+        let (k, id) = card_44(&a);
+        let action = move_44(&mut a);
+        let (b, _) = crate::app::tests::same_number_elsewhere(&mut a, &k);
+        crate::app::tests::gone_from_board(&mut a, &k);
+        complete(&mut a, action, started_instead(&id));
+        assert_eq!(a.follows.len(), 1, "followed");
+        assert_eq!(a.follows[0].key.as_deref(), Some(k.as_str()));
+        let card_b = a.card(&b).unwrap().clone();
+        assert!(a.following_card(&card_b).is_none(), "A's reopen shown on B");
+        assert!(a.resolver.unanswered_on(&b).is_none());
     }
 
     /// The same start answered at once with its workspace (no follow): in, as on a reopen's answer.
@@ -9031,6 +9065,46 @@ mod tests {
                 )
             );
         }
+    }
+
+    #[test]
+    fn a_start_refused_while_a_saved_list_is_on_its_way_leaves_that_lists_record_and_its_moves() {
+        // Codex's seventh look: a list saved with "move waiting sessions" ticked is on its way
+        // when a fresh agent's start goes to a backend that no longer takes it. The start is
+        // refused at once, through its own failure; the list's record stays as it was, so its
+        // answer still moves the waiting sessions.
+        let mut a = app();
+        let owner = a.account_feed(0).unwrap().owners[0].clone();
+        a.push_account_screen(AccountScreen::Models {
+            machine: 0,
+            models: vec!["KBZ_C".into()],
+            owner,
+            sel: 0,
+            move_waiting: true,
+        });
+        let action = key(&mut a, KeyCode::Enter);
+        a.busy = true;
+        let saving = a.account_pending.clone().expect("the save on its way");
+        a.machines[0].feed.as_mut().unwrap().starts_on.clear();
+        let start = json!({"action":"account-start","session":"web","workspace":"w7","to":"ARK_C"});
+        assert_eq!(a.send_account(0, start), Action::None);
+        assert!(a.account_later.is_empty(), "refused at once, not queued");
+        let said = a.message().map(|(m, _)| m.to_string()).unwrap_or_default();
+        assert!(
+            said.contains("can't start an agent on a chosen account, so nothing was sent"),
+            "{said}"
+        );
+        let kept = a.account_pending.clone().expect("the save's record");
+        assert_eq!(
+            (kept.machine, &kept.request),
+            (saving.machine, &saving.request)
+        );
+        complete(&mut a, action, json!({"ok":true,"message":"saved"}));
+        assert_eq!(
+            a.account_queue.front(),
+            Some(&(0, json!({"action":"account-move-waiting","owner":"studio"}))),
+            "the save's answer lost what follows it"
+        );
     }
 
     #[test]

@@ -350,6 +350,8 @@ impl App {
         let id = detail.id.clone();
         // In the box now: kept there, and with what's typed if he leaves it.
         self.kickoff_prefill.remove(&card.key);
+        // Its check is this card's, by key (Codex's seventh look).
+        self.action_key = Some(card.key.clone());
         self.mode = Mode::Kickoff {
             form,
             back: Box::new(self.mode.clone()),

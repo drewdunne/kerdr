@@ -72,7 +72,7 @@ know rather than guessing.
 
 | Field | What Kerdr does with it |
 |---|---|
-| `source` | Names the feed. Cards are unique by `source` and `id`, so two machines running the same feed show each card once (the copy from its `home.machine` wins). |
+| `source` | Names the feed. Cards are unique by `source` and `id`, so two machines running the same feed show each card once (the copy from its `home.machine` wins). What Kerdr keeps for a card while a change to it is on its way (a start, a read of its text, a save, a follow) goes by `source` and `id` too: another feed's card with the same `id` is never held up by it, and never takes its answer. A feed with no `source` can't be told apart from another, so for its cards Kerdr goes by `id` alone and holds up any card with that `id` while a start is on its way. |
 | `sessions` | Slot use per herdr session, when your records count slots their own way. Without it, Kerdr counts workspaces with an agent against `[board] slots`. `limit: null` means no limit. |
 | `id`, `ref` | The card's identity, and the short handle drawn first on it (default: `#` and the id without leading zeros). |
 | `tenant`, `organization`, `project` | Optional scope labels for filtering and showing where work belongs. Leave an unknown scope absent. When the feed lists `owners` (see [Owners, teams and stage lists](#owners-teams-and-stage-lists)), a card's owner is its `tenant`, else its `organization`, matched by id against that list: use the list's ids. |

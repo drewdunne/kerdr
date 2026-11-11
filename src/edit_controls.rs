@@ -676,8 +676,13 @@ impl App {
                 }
                 self.editor_trouble(&run, &reference);
                 // The card it's saved from, so a question its backend asks about the save waits on
-                // that card, and its yes holds only for the same work (intent 0591).
+                // that card, and its yes holds only for the same work (intent 0591). Gone from the
+                // board meanwhile, the save is still that card's, never another source's with the
+                // same number (Codex's seventh look).
                 self.action_from = self.card(key).map(CardSnapshot::of);
+                if self.action_from.is_none() {
+                    self.action_key = Some(key.to_string());
+                }
                 Action::Mutate { machine, request }
             }
         }
@@ -794,24 +799,25 @@ impl App {
     }
 
     /// A save sent on to the machine a refusal named: its text, which came back only counted,
-    /// goes again as you wrote it. Your words for its own card, `key`; else the only words held
-    /// for its number, never a guess between two sources' cards that share it (Codex's sixth
-    /// look, swept).
+    /// goes again as you wrote it. Your words for its own card, `key`, and only those: none held
+    /// for it, the text is asked for instead, never taken from another source's card with the
+    /// same number (Codex's sixth and seventh looks). By number only for a save that never had a
+    /// card, and then only the one held.
     pub(super) fn edit_resend(&self, request: &mut Value, key: Option<&str>) {
         if request.get("text").is_none() {
             return;
         }
         let id = request["id"].as_str().unwrap_or_default();
-        let held = key
-            .and_then(|key| self.edits.get(key))
-            .filter(|h| h.id == id)
-            .or_else(|| {
+        let held = match key {
+            Some(key) => self.edits.get(key).filter(|h| h.id == id),
+            None => {
                 let mut found = self.edits.values().filter(|h| h.id == id);
                 match (found.next(), found.next()) {
                     (Some(only), None) => Some(only),
                     _ => None,
                 }
-            });
+            }
+        };
         match held.and_then(|h| h.mine.as_ref()) {
             Some(mine) => request["text"] = json!(mine.text),
             // Nothing to send again: ask for the text instead.
@@ -833,56 +839,59 @@ impl App {
         format!(" Your version of {reference}'s text is kept: e opens it.")
     }
 
-    /// The card whose text Kerdr holds for this item, on this machine: where its save shows.
+    /// The card whose text Kerdr holds for this item, for a save that never had a card: the only
+    /// one held on this machine, else the only one held anywhere. Never a guess between two
+    /// (Codex's seventh look).
     pub(super) fn edit_card(&self, id: &str, machine: usize) -> Option<String> {
-        let mut held: Vec<(&String, &Held)> =
-            self.edits.iter().filter(|(_, h)| h.id == id).collect();
-        held.sort_by_key(|(_, h)| h.machine != machine);
-        held.first().map(|(k, _)| (*k).clone())
+        let only = |here: bool| {
+            let mut found = self
+                .edits
+                .iter()
+                .filter(|(_, h)| h.id == id && (!here || h.machine == machine))
+                .map(|(k, _)| k);
+            match (found.next(), found.next()) {
+                (Some(one), None) => Some(one.clone()),
+                _ => None,
+            }
+        };
+        only(true).or_else(|| only(false))
     }
 
-    /// The card an edit's answer is for: the one it was sent from while that's still the same
-    /// record (the card its change was asked from, or its read's), else the only card holding
-    /// words for its id, else the only card with its id. Never a guess between two sources' cards
-    /// that share its number (Codex's sixth look, swept).
-    fn edit_key(
-        &self,
-        id: &str,
-        flight: Option<&EditFlight>,
-        from: Option<&CardSnapshot>,
-    ) -> Option<String> {
-        let of = |key: &str| {
-            self.card(key)
+    /// The card an edit's answer is for. Sent for a card (`key`: the one it was asked from, its
+    /// change's, or its read's), that card and no other: once it's gone from the board with
+    /// nothing of it held, none, never another source's card with the same number (Codex's
+    /// seventh look). Only for one that never had a card: the only card holding words for its
+    /// id, else the only card with its id, never a guess between two.
+    fn edit_key(&self, id: &str, key: Option<&str>) -> Option<String> {
+        if let Some(key) = key {
+            let still = self
+                .card(key)
                 .and_then(|c| c.detail.as_ref())
                 .is_some_and(|d| d.id == id)
-                || self.edits.get(key).is_some_and(|h| h.id == id)
-        };
+                || self.edits.get(key).is_some_and(|h| h.id == id);
+            return still.then(|| key.to_string());
+        }
         let only = |mut keys: Vec<String>| match keys.len() {
             1 => keys.pop(),
             _ => None,
         };
-        from.map(|f| f.key.clone())
-            .filter(|k| of(k))
-            .or_else(|| flight.map(|f| f.key.clone()).filter(|k| of(k)))
-            .or_else(|| {
-                only(
-                    self.edits
-                        .iter()
-                        .filter(|(_, h)| h.id == id)
-                        .map(|(k, _)| k.clone())
-                        .collect(),
-                )
-            })
-            .or_else(|| {
-                only(
-                    self.board
-                        .cards
-                        .iter()
-                        .filter(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-                        .map(|c| c.key.clone())
-                        .collect(),
-                )
-            })
+        only(
+            self.edits
+                .iter()
+                .filter(|(_, h)| h.id == id)
+                .map(|(k, _)| k.clone())
+                .collect(),
+        )
+        .or_else(|| {
+            only(
+                self.board
+                    .cards
+                    .iter()
+                    .filter(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+                    .map(|c| c.key.clone())
+                    .collect(),
+            )
+        })
     }
 
     /// An edit's answer: a read opens the editor while you're still where you pressed `e`, and a
@@ -897,11 +906,18 @@ impl App {
         let id = request["id"].as_str().unwrap_or_default().to_string();
         let reference = self.reference_for(&id);
         let reads = request.get("text").is_none();
-        // Its read's own flight: by the card it was sent from, else the only one for its id, never
-        // another source's card's with the same number (Codex's sixth look, swept).
+        // The card it was sent for, kept when that card has gone from the board (Codex's seventh
+        // look).
+        let sent_for = from
+            .as_ref()
+            .map(|f| f.key.clone())
+            .or_else(|| self.answer_key.clone());
+        // Its read's own flight: by the card it was sent for, else, for a read that never had
+        // one, the only one for its id, never another source's card's with the same number
+        // (Codex's sixth and seventh looks).
         let flight = if reads {
-            let at = match from.as_ref() {
-                Some(f) => self.edit_flights.iter().position(|x| x.key == f.key),
+            let at = match sent_for.as_deref() {
+                Some(key) => self.edit_flights.iter().position(|x| x.key == key),
                 None => {
                     let mut found = self
                         .edit_flights
@@ -922,9 +938,10 @@ impl App {
         if let Some(flight) = &flight {
             self.unsay(&flight.said);
         }
-        let Some(key) = self.edit_key(&id, flight.as_ref(), from.as_ref()) else {
+        let sent_for = sent_for.or_else(|| flight.as_ref().map(|f| f.key.clone()));
+        let Some(key) = self.edit_key(&id, sent_for.as_deref()) else {
             // Its card is gone from the board, and Kerdr holds nothing of it: only a problem is
-            // worth saying.
+            // worth saying, and never on another card.
             let problem = match result {
                 Ok(r) if r.ok && partial(&r) => return self.fail(partly_saved(&reference, r)),
                 Ok(r) if r.ok => return,
@@ -2114,6 +2131,80 @@ mod tests {
             app.edits.get(&ka).map(|h| h.current.as_str()),
             Some("A's text.")
         );
+    }
+
+    #[test]
+    fn a_read_whose_card_went_from_the_board_never_lands_on_another_sources_card_with_its_number() {
+        // Codex's seventh look: source B's #N has its text held, read a moment ago. e on source
+        // A's #N, and A goes from the board before the read's answer. That answer is A's or
+        // nobody's: B's text stays as it was, and nothing opens.
+        let mut app = app();
+        let (ka, id, _) = waiting(&mut app);
+        let (kb, _) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+        for m in &mut app.machines {
+            for c in m.feed.iter_mut().flat_map(|f| f.cards.iter_mut()) {
+                if c.id == id {
+                    c.intake = None;
+                }
+            }
+        }
+        app.rebuild();
+        select(&mut app, &kb);
+        let rb = read(&mut app, &id);
+        answer(&mut app, &rb, text_answer("B's text.", "sha256:bb"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(kb.as_str()));
+        select(&mut app, &ka);
+        let ra = read(&mut app, &id);
+        crate::app::tests::gone_from_board(&mut app, &ka);
+        answer(&mut app, &ra, text_answer("A's text.", "sha256:aa"));
+        assert_eq!(app.edit_open, None, "opened on another card");
+        let b = app.edits.get(&kb).expect("B's text held");
+        assert_eq!(
+            (b.current.as_str(), b.was.as_str()),
+            ("B's text.", "sha256:bb"),
+            "A's answer landed on B"
+        );
+        assert!(!app.edits.contains_key(&ka));
+        assert!(!said(&app).contains("A's text"), "{}", said(&app));
+    }
+
+    #[test]
+    fn a_save_sent_on_for_a_card_whose_words_went_asks_for_its_text_never_takes_anothers() {
+        // Codex's seventh look: a save for source A's #N goes on to its record's home, but Kerdr
+        // no longer holds A's words, and A has gone from the board. Source B's #N still has
+        // words of yours held. The save asks for its text again; B's words never go as A's.
+        let mut app = app();
+        let (ka, id, _) = waiting(&mut app);
+        let (kb, there) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+        app.edits.insert(
+            kb.clone(),
+            Held {
+                id: id.clone(),
+                machine: there,
+                current: "B's text.".into(),
+                was: "sha256:bb".into(),
+                read_at: Instant::now(),
+                mine: Some(Mine {
+                    text: "B's words.".into(),
+                    from: "B's text.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        crate::app::tests::gone_from_board(&mut app, &ka);
+        let mut request =
+            json!({"action":"edit","id":id,"text":"counted: 9 words","was":"sha256:aa"});
+        app.edit_resend(&mut request, Some(&ka));
+        assert_eq!(
+            request,
+            json!({"action":"edit","id":id}),
+            "another source's words went as A's"
+        );
+        // A save that never had a card still takes the only words held for its number.
+        let mut request = json!({"action":"edit","id":id,"text":"counted","was":"sha256:bb"});
+        app.edit_resend(&mut request, None);
+        assert_eq!(request["text"], "B's words.");
     }
 
     #[test]

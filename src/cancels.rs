@@ -607,12 +607,19 @@ impl App {
                 format!("{reference} started; stopping it and putting it back in the backlog…"),
                 Tone::Info,
             );
+            // Its start's card, though gone from the board (Codex's seventh look).
+            if from.is_none() {
+                self.action_key = s.key.clone();
+            }
             self.action_from = from;
             self.queue_action(place.machine, cancel);
             return Action::None;
         }
         let action = self.emit_mutation(place.machine, cancel);
         if matches!(action, Action::Mutate { .. }) {
+            if from.is_none() {
+                self.action_key = s.key.clone();
+            }
             self.action_from = from;
             self.say(
                 format!("Stopping {reference}'s start and putting it back in the backlog…"),

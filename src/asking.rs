@@ -125,6 +125,23 @@ impl App {
         }
     }
 
+    /// The card an answer is for: the one it was asked from, else the card its change was
+    /// queued for, by key, which it keeps even once that card has gone from the board; by its
+    /// machine's source and number (`intent_key`) only for a change that never had a card
+    /// (Codex's seventh look).
+    pub(crate) fn answer_card_key(
+        &self,
+        machine: usize,
+        id: &str,
+        from: Option<&CardSnapshot>,
+    ) -> String {
+        match (from, &self.answer_key) {
+            (Some(f), _) => f.key.clone(),
+            (None, Some(key)) => key.clone(),
+            (None, None) => self.intent_key(machine, id, None),
+        }
+    }
+
     /// A question that came while you were somewhere else: it waits on its card rather than fail,
     /// said quietly once, and n takes you to it (intent 0591).
     pub(super) fn wait_on_card(
