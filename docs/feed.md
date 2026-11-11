@@ -367,8 +367,11 @@ there that was behind named the wrong home), answer `ok: false` with `home`, the
 When that machine is one of Kerdr's, other than the one asked, and is answering, Kerdr sends the
 same request there once (a `reopen` with `session` set to that session), and sends that record's
 later actions there too until the feed catches up, so a question that machine asks can be answered
-yes. It never sends it on a second time: when that machine's answer names yet another home, Kerdr
-says the two copies disagree. When the home is a machine Kerdr doesn't list, or one that isn't
+yes. When that machine's answer names yet another home, the two copies disagree about where it
+lives: Kerdr waits until both machines' feeds have been read again and their copies of the card give
+the same home, then sends it there once more by itself, with the same `op`, so one that already
+landed isn't done twice. It never sends it a third time: if the copies still disagree after two
+minutes, or that answer names yet another home, Kerdr says so, with the home each copy gives. When the home is a machine Kerdr doesn't list, or one that isn't
 answering, Kerdr says that in its own words instead of the message, since the message's "⏎ again"
 holds only when Kerdr sends it on. A home naming the machine asked is shown as the message.
 
@@ -690,8 +693,12 @@ Kerdr starts it once it's written up, if its card still waits to start (Kerdr ch
 since an older backend checks no `rev`). The peek (`m`) lists Kerdr's held requests and the
 backend's, and `D` drops the only one, `2D` the second. A save of an item's text (`edit`) whose machine
 stopped answering while your editor was open is held the same way, your version kept meanwhile. A
-machine whose backend doesn't list `"hold"` or `"forward"` is refused as before: "That machine is not
-answering."
+change still held after ten minutes is said once: "d on #582 still waits for LAB-Server (10 min so
+far): it goes when LAB-Server answers, and m then D on its card drops it." A machine that had stopped
+answering long enough to show it (past a drop's quiet first seconds, or unreachable) is said once it
+answers again, with what's held for it that goes now: "LAB-Server is answering again: the 2 changes
+held for it go now." A machine whose backend doesn't list `"hold"` or `"forward"` is refused as
+before: "That machine is not answering."
 
 **`"forward"` in `supports`** says the backend sends a request on to another machine it can reach.
 When a card's machine Y isn't answering, or isn't one of Kerdr's machines at all, Kerdr sends the
@@ -714,7 +721,11 @@ its `op`. A new intent's words that come back from a failed save keep Kerdr open
 words are never lost by quitting: the new-intent box's words and images, words a save gave back, and
 your unsaved versions of item texts go into `words.json` in the state folder (readable by you alone),
 and the next Kerdr puts them back (`c` brings the box's words, `e` your version, reading the text
-first to see whether a save of it landed).
+first to see whether a save of it landed). A hang-up or a request to stop (`SIGHUP`, `SIGTERM`) while
+your editor is open waits for the editor to close, then sends its save and waits for the answer when
+its machine is answering. When it can't (no answer, or the machine isn't answering), the save goes
+into the hold file with its `op` for a backend that holds, and your version stays in `words.json`
+either way; the line Kerdr ends with says which.
 
 **Older and newer, mixed.** A Kerdr that doesn't know these fields ignores `pending`, `held`, `rev`,
 `via`, `unreachable` and `dropped`, and never sends `drop`, `held`, `rev` or `forward_to`. This Kerdr
@@ -793,7 +804,10 @@ the save must refuse. Otherwise Kerdr says it's reading, and reads the text:
 {"action":"edit","id":"0414","from":"amd-lzm4"}
 ```
 
-`from` is the hostname of the machine Kerdr runs on, for the record's log. Answer with the text and
+`from` is the hostname of the machine Kerdr runs on, for the record's log. An `ok` answer with no
+`text` comes from a backend too old to edit text: Kerdr says it asked that machine to update (ark-sdlc's
+backend pulls before every request, a read included) and reads the text again once; only when that
+read has no text either does it say the text can't be opened. Answer with the text and
 `was`, a fingerprint of it that Kerdr sends back with a save (ark-sdlc's is `sha256:` and the
 text's SHA-256). Which text that is belongs to the backend (ark-sdlc's is the body of intent.md's
 first `## ` section); it never ends in a newline:

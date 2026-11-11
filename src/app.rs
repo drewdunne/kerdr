@@ -17,6 +17,8 @@ pub mod account_controls;
 pub mod asking;
 #[path = "cancels.rs"]
 pub mod cancels;
+#[path = "catch_up.rs"]
+pub mod catch_up;
 #[path = "controls.rs"]
 mod controls;
 #[path = "edit_controls.rs"]
@@ -841,6 +843,8 @@ pub struct App {
     /// When a peek was opened from the backlog, whose ⏎ peeks: a second ⏎ held or doubled with
     /// it never starts the work it shows (intent 0591, K1-07).
     pub(crate) peek_opened: Option<Instant>,
+    /// What Kerdr catches up on once something has passed (catch_up::CatchUp).
+    pub(crate) catch_up: catch_up::CatchUp,
     /// Kerdr's hold file: changes held for machines that weren't answering (intent 0591,
     /// release 4). In memory alone until open_board points it at the state folder.
     pub kept: crate::kept::Kept,
@@ -967,6 +971,7 @@ impl App {
             confirm_by_enter: None,
             waiting: vec![],
             peek_opened: None,
+            catch_up: Default::default(),
             kept: crate::kept::Kept::in_memory(),
             held_sending: Default::default(),
             held_tried: Default::default(),
@@ -1304,6 +1309,9 @@ impl App {
         if matches!(m.conn, Conn::Hidden) {
             return;
         }
+        // Stopped answering long enough to show, before this event: said once it's back (K1-117).
+        let was_away = self.was_away(ev.machine);
+        let m = &mut self.machines[ev.machine];
         m.conn = ev.conn;
         let mut read = false;
         if let Some(data) = ev.data {
@@ -1320,6 +1328,10 @@ impl App {
                 .read(ev.machine, self.machines[ev.machine].feed.as_ref());
         }
         self.rebuild();
+        // Back after it stopped answering: said once, with what's held for it that goes now
+        // (K1-117).
+        let back = self.back_line(ev.machine, was_away, read);
+        let before = self.message().map(|(t, _)| t.to_string());
         // What's held for it goes now it answers, and what its backend holds is counted (intent
         // 0591, release 4).
         if read {
@@ -1327,6 +1339,9 @@ impl App {
             // A list S or + waited for this feed to open (intent 0591, K2-08 and K2-11).
             self.account_feed_came();
         }
+        self.say_back(back, before);
+        // Copies that disagreed, and a change held long (intent 0591, release 4).
+        self.catch_up_read(ev.machine, read);
     }
 
     pub fn rebuild(&mut self) {
@@ -8489,16 +8504,40 @@ pub(crate) mod tests {
                 ..Default::default()
             })
         };
-        reply_to(&mut app, 1, again, back());
-        let said = last_said(&app).unwrap().0;
+        reply_to(&mut app, 1, again.clone(), back());
+        // Not a failure yet: it waits for both copies to be read and agree (K1-53).
         assert_eq!(
-            said,
+            last_said(&app).unwrap().0,
+            format!(
+                "{reference}'s copies on build-box and laptop disagree about where it lives: Kerdr sends it again once both have been read and agree."
+            )
+        );
+        assert!(!app.failing());
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(app.moved_home.is_empty());
+        assert!(app.resolver.ready().is_empty());
+        // Both read, both saying build-box now: it goes there once more, with its op.
+        crate::app::catch_up::tests::homes_say(&mut app, &key, "build-box");
+        app.catch_up_read(1, true);
+        assert!(app.resolver.ready().is_empty(), "only once both are read");
+        app.catch_up_read(0, true);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        let (_, machine, once_more, _) = ready[0].clone();
+        assert_eq!(machine, 1);
+        assert_eq!(once_more["op"], again["op"]);
+        // Refused there again, naming another home: said now, and never sent a third time.
+        app.busy = true;
+        reply_to(&mut app, 1, once_more, back());
+        assert_eq!(
+            last_said(&app).unwrap().0,
             format!(
                 "{reference}'s copies on build-box and laptop disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again."
             )
         );
-        assert_eq!(app.next_owed(), Action::None);
-        assert!(app.moved_home.is_empty());
+        assert!(app.resolver.ready().is_empty());
+        app.catch_up_read(0, true);
+        assert!(app.resolver.ready().is_empty());
         // A home that's the machine asked is only said; one Kerdr doesn't know, or one that isn't
         // answering, is said in Kerdr's words, never with a "⏎ again" that would ask the same copy.
         app.busy = true;

@@ -1027,13 +1027,20 @@ impl App {
             Err(problem) => return self.say(problem, Tone::Warn),
         };
         let (Some(text), Some(was)) = (response.text, response.was) else {
+            // An old backend: brought up to date, then read again, once (K1-97).
+            let away = flight.as_ref().map_or(self.away, |f| f.away);
+            if self.read_after_update(key, id, machine, away, from.clone()) {
+                return;
+            }
+            let name = self.machines[machine].name();
             return self.say(
                 format!(
-                    "{reference}'s text didn't come with the answer, so there's nothing to open: its action backend may not know edit yet."
+                    "{reference}'s text still didn't come after Kerdr asked {name} to update, so there's nothing to open: {name}'s ark-sdlc may not update, and an agent there can say why."
                 ),
                 Tone::Warn,
             );
         };
+        self.catch_up.edit_updated.remove(key);
         let held = self.edits.entry(key.to_string()).or_insert_with(|| Held {
             id: id.to_string(),
             machine,
@@ -2563,6 +2570,39 @@ mod tests {
     }
 
     #[test]
+    fn an_old_backends_read_without_the_text_is_read_again_after_it_updates_and_opens() {
+        let mut app = app();
+        let (key, id, _) = waiting(&mut app);
+        let sent = read(&mut app, &id);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                message: "".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            said(&app).contains("too old to edit text"),
+            "{}",
+            said(&app)
+        );
+        let (n, machine, request, _) = app.resolver.ready()[0].clone();
+        app.job_started(n);
+        app.resolver.handed(n);
+        let again = Sent {
+            n,
+            machine,
+            request,
+        };
+        // Brought up to date, its read gives the text: the editor opens, as for any read.
+        answer(&mut app, &again, text_answer("Words.", "sha256:aa"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(key.as_str()));
+        assert!(app.catch_up.edit_updated.is_empty());
+    }
+
+    #[test]
     fn a_read_refused_or_without_its_text_says_so_without_the_failure_box() {
         let mut app = app();
         let (key, id, reference) = waiting(&mut app);
@@ -2589,11 +2629,43 @@ mod tests {
             }),
         );
         assert_eq!(app.edit_open, None);
+        // An old backend: asked to update, and read again by itself, once (K1-97).
+        let name = app.machines[sent.machine].name();
+        assert_eq!(
+            said(&app),
+            format!(
+                "{name}'s ark-sdlc is too old to edit text; Kerdr asked it to update, and reads {reference}'s text again."
+            )
+        );
+        let (n, machine, again, _) = app.resolver.ready()[0].clone();
+        assert_eq!(machine, sent.machine);
+        assert_eq!(
+            crate::actions::without_op(&again),
+            json!({"action":"edit","id":id,"from":crate::config::hostname()})
+        );
+        let again = Sent {
+            n,
+            machine,
+            request: again,
+        };
+        app.job_started(n);
+        app.resolver.handed(n);
+        answer(
+            &mut app,
+            &again,
+            Ok(Response {
+                ok: true,
+                message: "done".into(),
+                ..Default::default()
+            }),
+        );
+        // Still without it: said, and not asked a third time.
         assert!(
-            said(&app).contains("may not know edit yet"),
+            said(&app).contains("still didn't come after Kerdr asked"),
             "{}",
             said(&app)
         );
+        assert!(app.resolver.ready().is_empty());
         let sent = read(&mut app, &id);
         answer(&mut app, &sent, Err("the action timed out; x".into()));
         assert_eq!(app.edit_open, None);

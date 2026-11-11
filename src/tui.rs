@@ -1114,7 +1114,23 @@ fn edit_text(
         })
     });
     if let Some(signal) = stops.held() {
-        anyhow::bail!("Kerdr was asked to stop (signal {signal}) while your editor was open.");
+        // Its save goes first if its machine answers, else it's held for it or kept in your words
+        // file, and the line Kerdr ends with says which: never lost (intent 0591, K3-31).
+        let action = app.edit_ended(key, ended);
+        let command = app.cfg.actions.command.clone();
+        let targets: Vec<_> = app.machines.iter().map(|m| m.machine.clone()).collect();
+        let went = app.save_before_stopping(key, action, &mut |machine, request| match (
+            &command,
+            targets.get(machine),
+        ) {
+            (Some(command), Some(target)) => crate::actions::run(target, command, request),
+            _ => Err(crate::actions::NO_BACKEND.into()),
+        });
+        app.keep_on_quit();
+        let went = went.map(|w| format!(" {w}")).unwrap_or_default();
+        anyhow::bail!(
+            "Kerdr was asked to stop (signal {signal}) while your editor was open.{went}"
+        );
     }
     drop(stops);
     if let Action::Mutate { machine, request } = app.edit_ended(key, ended) {

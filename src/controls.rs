@@ -3887,8 +3887,12 @@ impl App {
                     return;
                 }
                 Some(to) if to == machine => {}
-                Some(_) if was_resent => {
+                Some(named) if was_resent => {
                     self.moved_home.retain(|(k, ..)| *k != key);
+                    // Once more by itself, after both copies are read and agree (K1-53).
+                    if self.wait_for_agreement(machine, named, &id, &key, request, from) {
+                        return;
+                    }
                     self.fail(
                         format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again.{kept}"),
                     );
