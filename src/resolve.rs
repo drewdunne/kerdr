@@ -331,6 +331,19 @@ pub struct Started {
     pub too_late: bool,
 }
 
+/// Where a change m's D drops was (Resolver::drop_job).
+#[derive(Debug)]
+pub enum Dropping {
+    /// Still in Kerdr: taken out, and here it is.
+    Taken(Box<Job>),
+    /// With the runner, not started: asked of it, which answers whether it was in time.
+    Asked,
+    /// Its command has started, or answered: too late to drop from here.
+    Started,
+    /// No such change.
+    Gone,
+}
+
 /// One change on its way to the backend.
 #[derive(Clone, Debug)]
 pub struct Job {
@@ -489,7 +502,45 @@ struct Queued {
     /// Kept waiting whatever its write-up says: e is open on its card, and the start waits for
     /// the edit (intent 0591, K1-82).
     paused: bool,
+    /// Its card's footing when its key was pressed, for a change waiting for its write-up: it
+    /// doesn't go once the card has been set aside, finished or started meanwhile (Footing).
+    guard: Option<Footing>,
 }
+
+/// What a change waiting for its card's write-up rests on (Codex's review 60): whether the card
+/// was set aside, finished or under way when its key was pressed. The runner holds it to the
+/// card as each read of its machine shows it, and drops it, rather than send it, once any of
+/// those has come about since: a key pressed before never brings back and starts a card set aside
+/// meanwhile, as the backend's own check by `rev` can't tell, since the write-up changes that.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Footing {
+    pub set_aside: bool,
+    pub finished: bool,
+    pub under_way: bool,
+}
+
+impl Footing {
+    pub fn of(card: &crate::feed::FeedCard) -> Footing {
+        Footing {
+            set_aside: card.disposition.as_deref() == Some("wont_do"),
+            finished: card.state.as_deref() == Some("closed")
+                || matches!(card.stage.as_deref(), Some("maintain" | "done")),
+            under_way: matches!(card.state.as_deref(), Some("active" | "background"))
+                || card.workspace.is_some(),
+        }
+    }
+
+    /// Whether the card as it is `now` has been set aside, finished or started since.
+    pub fn moved(&self, now: &Footing) -> bool {
+        (now.set_aside && !self.set_aside)
+            || (now.finished && !self.finished)
+            || (now.under_way && !self.under_way)
+    }
+}
+
+/// A read of a machine's feed as the runner takes it: each record by id, with its footing and,
+/// from a backend that holds, its `rev`.
+pub type Footings = HashMap<String, (Footing, Option<String>)>;
 
 impl Queued {
     /// Whether `other` changes the same record.
@@ -516,6 +567,7 @@ impl Queue {
             started: false,
             gated: false,
             paused: false,
+            guard: None,
         };
         let writes = item.writes;
         match self.items.iter_mut().find(|j| j.n == n) {
@@ -554,6 +606,39 @@ impl Queue {
         if let Some(item) = self.items.iter_mut().find(|j| j.n == n) {
             item.gated = item.record.is_some();
         }
+    }
+
+    /// Holds a change waiting for its write-up to its card's footing when its key was pressed.
+    pub fn guard(&mut self, n: u64, guard: Option<Footing>) {
+        if let Some(item) = self.items.iter_mut().find(|j| j.n == n) {
+            item.guard = guard;
+        }
+    }
+
+    /// A read of `machine`'s feed, before `written`: each change still waiting for its write-up
+    /// whose card has been set aside, finished or started since its key was pressed is taken out
+    /// unstarted, and returned, for the board to say so (Codex's review 60).
+    pub fn moved(&mut self, machine: usize, footings: &Footings) -> Vec<u64> {
+        let moved: Vec<u64> = self
+            .items
+            .iter()
+            .filter(|q| q.gated && !q.started && q.machine == machine)
+            .filter(|q| {
+                let now = q.record.as_ref().and_then(|r| footings.get(r));
+                matches!((&q.guard, now), (Some(then), Some((now, _))) if then.moved(now))
+            })
+            .map(|q| q.n)
+            .collect();
+        self.items.retain(|q| !moved.contains(&q.n));
+        moved
+    }
+
+    /// The record a change is to, by its number, while it's here.
+    pub fn record_of(&self, n: u64) -> Option<&str> {
+        self.items
+            .iter()
+            .find(|j| j.n == n)
+            .and_then(|j| j.record.as_deref())
     }
 
     /// A read of `machine`'s feed: each record there by id, with its intake. Starts waiting for a
@@ -624,12 +709,13 @@ impl Queue {
     /// held, and nothing behind it that it would clash with is running: a change refused and sent
     /// on goes back in its place, but a later move may already be running where it now goes.
     /// A request with no record (a new intent) starts straight away, and a read holds nothing up
-    /// (intent 0414).
+    /// (intent 0414). A paused one never starts, whatever let it go meanwhile: e is open on its
+    /// card (intent 0591, Codex's review 60).
     pub fn startable(&mut self) -> Vec<u64> {
         let mut out = vec![];
         for i in 0..self.items.len() {
             let job = &self.items[i];
-            if job.started || job.gated {
+            if job.started || job.gated || job.paused {
                 continue;
             }
             // A read doesn't wait behind a change still waiting for its write-up: e reads the
@@ -778,6 +864,28 @@ impl Resolver {
             self.dropped.push(n);
         }
         None
+    }
+
+    /// m's D on a change still on its way, by where it is (Codex's review 60): one still in Kerdr
+    /// (held behind something, or not yet handed to the runner) is taken out at once; one the
+    /// runner has but hasn't started is asked of it, and its answer says whether it was in time
+    /// (`drop_answered`); one whose command has started is past dropping here.
+    pub fn drop_job(&mut self, n: u64) -> Dropping {
+        let Some(i) = self.jobs.iter().position(|j| j.n == n) else {
+            return Dropping::Gone;
+        };
+        let j = &mut self.jobs[i];
+        if j.behind.is_some() || (!j.sent && j.settled.is_none()) {
+            return Dropping::Taken(Box::new(self.jobs.remove(i)));
+        }
+        if j.running.is_some() || j.handed || j.settled.is_some() {
+            return Dropping::Started;
+        }
+        if !j.dropping {
+            j.dropping = true;
+            self.dropped.push(n);
+        }
+        Dropping::Asked
     }
 
     /// Asks the runner to keep a start waiting for its write-up (`paused`), or to let it go again:
@@ -1054,6 +1162,45 @@ impl Resolver {
     pub fn take(&mut self, n: u64) -> Option<Job> {
         let i = self.jobs.iter().position(|j| j.n == n)?;
         Some(self.jobs.remove(i))
+    }
+
+    /// New intents their backend accepted and is still saving, with no number yet: their words
+    /// are kept for a later Kerdr (Codex's review 60).
+    pub fn saving_in_background(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| {
+                j.settled.is_some()
+                    && matches!(&j.effect, Some(Effect::Saving(p)) if p.made.is_none())
+            })
+            .collect()
+    }
+
+    /// A new intent an earlier Kerdr left still being saved, back as it was: answered, saving,
+    /// with the op it was sent with.
+    pub fn restore_saving(&mut self, machine: usize, request: Value, key: String, effect: Effect) {
+        let op = request["op"].clone();
+        let n = self.add(machine, request, None, Some(key), Some(effect));
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.request["op"] = op;
+            j.sent = true;
+            j.handed = true;
+            j.settled = Some((Instant::now(), 0));
+        }
+    }
+
+    /// Whether a new intent with this op is here, saving or saved.
+    pub fn has_create(&self, op: &str) -> bool {
+        self.jobs
+            .iter()
+            .any(|j| j.request["action"] == "create" && j.request["op"].as_str() == Some(op))
+    }
+
+    /// Whether a new intent with this submission is here, with its words.
+    pub fn has_submission(&self, submission: &str) -> bool {
+        self.jobs.iter().any(|j| {
+            j.request["action"] == "create" && j.request["submission"].as_str() == Some(submission)
+        })
     }
 
     /// Takes away the card of a new intent its backend accepted but no longer saves, by the op
@@ -2163,6 +2310,25 @@ mod tests {
             r.drop_awaited().is_empty(),
             "started: Esc no longer drops it"
         );
+    }
+
+    #[test]
+    fn a_paused_start_already_written_up_waits_though_what_held_it_finishes() {
+        // Its write-up done, it waits only behind another change to its record; e opens on its
+        // card and pauses it: that change finishing doesn't start it (Codex's review 60, 14).
+        let key = || Some("s:7".to_string());
+        let intakes = |v: Option<&str>| HashMap::from([("7".to_string(), v.map(str::to_string))]);
+        let mut q = Queue::default();
+        q.push(1, 0, key(), &json!({"action":"refresh","id":"7"}));
+        assert_eq!(q.startable(), vec![1]);
+        q.push_gated(2, 0, key(), &json!({"action":"dispatch","id":"7"}));
+        assert!(q.written(0, &intakes(None)).is_empty());
+        assert!(q.startable().is_empty(), "behind the refresh");
+        q.pause(2, true);
+        q.done(1);
+        assert!(q.startable().is_empty(), "paused: the editor is open");
+        q.pause(2, false);
+        assert_eq!(q.startable(), vec![2]);
     }
 
     #[test]

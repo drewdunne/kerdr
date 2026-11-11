@@ -238,11 +238,18 @@ impl App {
         if !was_away || !m.conn.is_live() || self.demo {
             return None;
         }
+        // Only what goes from here: not what another Kerdr open now is sending, nor anything for a
+        // backend that no longer checks a held change (Codex's review 60).
         let held = self
             .kept
             .held
             .iter()
-            .filter(|h| h.after.is_none() && m.answers_to(&h.machine))
+            .filter(|h| {
+                h.after.is_none()
+                    && m.answers_to(&h.machine)
+                    && !self.kept.taken_elsewhere(h)
+                    && self.holds_on(machine)
+            })
             .count();
         let goes = match (read, held) {
             (false, _) | (true, 0) => String::new(),
@@ -377,6 +384,7 @@ impl App {
                 reference: reference.clone(),
                 pressed: self.now().timestamp(),
                 after: None,
+                by: None,
             });
             return Some(format!(
                 "Your new text for {reference} is held for {name}: the next Kerdr sends it once {name} answers."
@@ -496,6 +504,7 @@ pub(crate) mod tests {
             what: "d".into(),
             pressed,
             after: None,
+            by: None,
         });
         app.catch_up_read(0, true);
         assert_eq!(
@@ -534,8 +543,10 @@ pub(crate) mod tests {
         away(&mut app, 1, 2);
         answers(&mut app, 1);
         assert_eq!(said(&app), "");
-        // One that showed: said, with what's held for it.
+        // One that showed: said, with what's held for it, for its backend that holds.
         away(&mut app, 1, 600);
+        let feed = app.machines[1].feed.as_mut().unwrap();
+        feed.supports.push(crate::app::holding::HOLD.into());
         app.kept.hold(HeldRequest {
             machine: name.clone(),
             request: crate::actions::with_op(json!({"action":"dispatch","id":"41"})),
@@ -545,6 +556,7 @@ pub(crate) mod tests {
             what: "d".into(),
             pressed: app.now().timestamp(),
             after: None,
+            by: None,
         });
         answers(&mut app, 1);
         // Before what sending it says.
@@ -670,8 +682,8 @@ pub(crate) mod tests {
             })
             .unwrap();
         assert!(went.contains("kept in Kerdr's words file"), "{went}");
-        app.keep_on_quit();
-        let words = crate::kept::Words::take(dir.path());
+        app.keep_on_quit().unwrap();
+        let words = Kept::at(dir.path(), app.now().timestamp()).take_words();
         let mine = words.edits.iter().find(|e| e.key == card.key);
         assert_eq!(
             mine.map(|e| e.text.as_str()),

@@ -184,7 +184,20 @@ fn event_loop(
             .iter()
             .map(|c| (c.id.clone(), c.intake.clone()))
             .collect();
-        let _ = feeds.send(ToRunner::Feed { machine, intakes });
+        let holds = feed.supports(crate::app::holding::HOLD);
+        let footings = feed
+            .cards
+            .iter()
+            .map(|c| {
+                let rev = c.rev.clone().filter(|_| holds);
+                (c.id.clone(), (crate::resolve::Footing::of(c), rev))
+            })
+            .collect();
+        let _ = feeds.send(ToRunner::Feed {
+            machine,
+            intakes,
+            footings,
+        });
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
     let holds = RefCell::new(if live.is_some() && !app.demo {
@@ -225,7 +238,7 @@ fn event_loop(
                     continue;
                 }
                 Answer::Dropped(n, dropped) => {
-                    app.resolver.drop_answered(n, dropped);
+                    app.job_drop_answered(n, dropped);
                     continue;
                 }
                 // How followed work stands (intent 0591): once it has ended, its machine's feed is
@@ -252,6 +265,10 @@ fn event_loop(
                 }
                 Answer::NotWrittenUp(n) => {
                     app.starts_from_words(n);
+                    continue;
+                }
+                Answer::Changed(n) => {
+                    app.gate_changed(n);
                     continue;
                 }
                 Answer::Done(done) => *done,
@@ -282,8 +299,7 @@ fn event_loop(
             }
         }
         // q waited for a hand-over, which is done: Kerdr quits by itself (intent 0591).
-        if app.quit_due() {
-            app.keep_on_quit();
+        if app.quit_due() && app.quit_now() {
             return Ok(());
         }
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
@@ -513,7 +529,6 @@ fn event_loop(
                 // their write-up go into the hold file, and your words into the words file, so
                 // nothing else stops q (intent 0591, release 4).
                 if app.quit_key() {
-                    app.keep_on_quit();
                     return Ok(());
                 }
             }
@@ -745,6 +760,9 @@ enum Answer {
     Resending(Option<u64>, usize, crate::actions::Resend),
     /// A start that waited for its write-up goes ahead from the words as they are: it failed.
     NotWrittenUp(u64),
+    /// A change that waited for its write-up was taken out unstarted: its card was set aside,
+    /// finished or started meanwhile (Codex's review 60).
+    Changed(u64),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -762,6 +780,9 @@ enum ToRunner {
         resends: bool,
         /// Its card's `rev` when the key was pressed, which a resend carries (intent 0591).
         rev: Option<String>,
+        /// For one waiting for its write-up, its card's footing when the key was pressed: it
+        /// doesn't go once that has moved (Codex's review 60).
+        guard: Option<crate::resolve::Footing>,
     },
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
@@ -769,10 +790,12 @@ enum ToRunner {
     /// A start waiting for its write-up kept waiting whatever that says (true), or let go to it
     /// again: e is open on its card (intent 0591, K1-82).
     Pause(u64, bool),
-    /// A machine's feed as its reader brought it: each record by id, with its intake.
+    /// A machine's feed as its reader brought it: each record by id, with its intake, and with
+    /// its footing and `rev` (Codex's review 60).
     Feed {
         machine: usize,
         intakes: std::collections::HashMap<String, Option<String>>,
+        footings: crate::resolve::Footings,
     },
 }
 
@@ -807,8 +830,14 @@ impl Runner {
                 usize,
                 std::collections::HashMap<String, Option<String>>,
             > = Default::default();
+            // And each record's footing and `rev` there, which a change that waited for its
+            // write-up is held to, and goes with (Codex's review 60).
+            let mut footed: std::collections::HashMap<usize, crate::resolve::Footings> =
+                Default::default();
+            let mut gated_ones: std::collections::HashSet<u64> = Default::default();
             for msg in rx {
                 let mut failed = vec![];
+                let mut moved = vec![];
                 match msg {
                     ToRunner::Run {
                         n,
@@ -820,9 +849,15 @@ impl Runner {
                         gated,
                         resends,
                         rev,
+                        guard,
                     } => {
                         if gated {
                             queue.push_gated(n, machine, key, &request);
+                            queue.guard(n, guard);
+                            gated_ones.insert(n);
+                            if let Some(footings) = footed.get(&machine) {
+                                moved = queue.moved(machine, footings);
+                            }
                             if let Some(intakes) = seen.get(&machine) {
                                 failed = queue.written(machine, intakes);
                             }
@@ -847,18 +882,29 @@ impl Runner {
                         let dropped = queue.drop_unstarted(n);
                         if dropped {
                             waiting.remove(&n);
+                            gated_ones.remove(&n);
                         }
                         let _ = answers.send(Answer::Dropped(n, dropped));
                     }
                     ToRunner::Feed {
                         machine,
                         mut intakes,
+                        footings,
                     } => {
+                        moved = queue.moved(machine, &footings);
                         failed = queue.written(machine, &intakes);
                         queue.forget_rewriting(machine, &mut intakes);
                         queue.read_passed(machine);
                         seen.insert(machine, intakes);
+                        footed.insert(machine, footings);
                     }
+                }
+                // Its card was set aside, finished or started meanwhile: it never goes, and the
+                // board says so.
+                for n in moved {
+                    waiting.remove(&n);
+                    gated_ones.remove(&n);
+                    let _ = answers.send(Answer::Changed(n));
                 }
                 // Its write-up failed: it starts from his words as they are, and the board says
                 // so (intent 0591).
@@ -866,11 +912,23 @@ impl Runner {
                     let _ = answers.send(Answer::NotWrittenUp(n));
                 }
                 for n in queue.startable() {
-                    let Some((machine, target, command, request, resends, rev)) =
+                    let Some((machine, target, command, mut request, resends, mut rev)) =
                         waiting.remove(&n)
                     else {
                         continue;
                     };
+                    // One that waited for its write-up goes with its card's `rev` as the read
+                    // that let it go shows it, from a backend that holds: changed after that, its
+                    // backend asks rather than does it (Codex's review 60).
+                    if gated_ones.remove(&n)
+                        && request.get("rev").is_none()
+                        && let Some(now) = queue
+                            .record_of(n)
+                            .and_then(|r| footed.get(&machine)?.get(r)?.1.clone())
+                    {
+                        request["rev"] = serde_json::Value::String(now.clone());
+                        rev = Some(now);
+                    }
                     let _ = answers.send(Answer::Started(n));
                     let (answers, back) = (answers.clone(), back.clone());
                     std::thread::spawn(move || {
@@ -991,8 +1049,9 @@ fn start_action(
         return;
     };
     let tx = tx.clone();
-    // Its own op, kept for Kerdr's own resends of it (intent 0591).
-    let request = crate::actions::with_op(request);
+    // Its own op, kept for Kerdr's own resends of it (intent 0591), or the one it had when it's
+    // sent again after its answer was lost (Codex's review 60).
+    let request = app.account_op(request);
     let resends = app.resends_to(machine);
     app.busy = true;
     app.busy_id = request["id"].as_str().map(str::to_string);
@@ -1086,6 +1145,8 @@ fn run_ready(app: &mut App, runner: &Runner) {
         let key = app.resolver.key_of(n);
         let resends = app.resends_to(machine);
         let rev = app.resolver.rev_of(n);
+        // Its card's footing now, in the pass its key was taken in.
+        let guard = gated.then(|| app.gate_footing(n)).flatten();
         let _ = runner.tx.send(ToRunner::Run {
             n,
             machine,
@@ -1096,6 +1157,7 @@ fn run_ready(app: &mut App, runner: &Runner) {
             gated,
             resends,
             rev,
+            guard,
         });
     }
     // After the changes just handed over: a save of a text reaches the runner before the start it
@@ -1151,8 +1213,12 @@ fn edit_text(
             (Some(command), Some(target)) => crate::actions::run(target, command, request),
             _ => Err(crate::actions::NO_BACKEND.into()),
         });
-        app.keep_on_quit();
-        let went = went.map(|w| format!(" {w}")).unwrap_or_default();
+        let unkept = app
+            .keep_on_quit()
+            .err()
+            .map(|why| format!(" {why}, so what it keeps for the next Kerdr was lost."))
+            .unwrap_or_default();
+        let went = went.map(|w| format!(" {w}")).unwrap_or_default() + &unkept;
         anyhow::bail!(
             "Kerdr was asked to stop (signal {signal}) while your editor was open.{went}"
         );
@@ -1784,6 +1850,7 @@ mod tests {
             Answer::Progress(token, _, _) => format!("progress {token}"),
             Answer::Update(machine, n, _) => format!("update {n} on machine {machine}"),
             Answer::NotWrittenUp(n) => format!("not written up {n}"),
+            Answer::Changed(n) => format!("changed {n}"),
             Answer::Resending(n, _, why) => format!(
                 "resending {} {}",
                 n.unwrap_or(0),
@@ -1838,6 +1905,7 @@ mod tests {
                     gated: false,
                     resends: false,
                     rev: None,
+                    guard: None,
                 })
                 .unwrap();
         }
@@ -1886,6 +1954,7 @@ mod tests {
                     gated: false,
                     resends: true,
                     rev: None,
+                    guard: None,
                 })
                 .unwrap();
         }
@@ -1942,6 +2011,7 @@ mod tests {
             gated: false,
             resends: false,
             rev: None,
+            guard: None,
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
@@ -1979,6 +2049,7 @@ mod tests {
             gated,
             resends: false,
             rev: None,
+            guard: None,
         };
         let next = || heard(rx.recv_timeout(Duration::from_secs(10)).unwrap());
         // Not yet written up: taken out before it started.
@@ -1996,6 +2067,7 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: std::collections::HashMap::from([("3".to_string(), None)]),
+                footings: Default::default(),
             })
             .unwrap();
         assert_eq!(next(), "started 3");
@@ -2089,6 +2161,7 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: intakes(&[("8", None)]),
+                footings: Default::default(),
             })
             .unwrap();
         for (n, id) in [(1, "7"), (2, "8"), (3, "9")] {
@@ -2104,6 +2177,7 @@ mod tests {
                     gated: true,
                     resends: false,
                     rev: None,
+                    guard: None,
                 })
                 .unwrap();
         }
@@ -2115,6 +2189,7 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: intakes(&[("7", Some("pending")), ("9", Some("failed"))]),
+                footings: Default::default(),
             })
             .unwrap();
         // Its write-up failed: it starts from his words as they are, and that's said (intent 0591).
@@ -2126,9 +2201,83 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: intakes(&[("7", None)]),
+                footings: Default::default(),
             })
             .unwrap();
         assert_eq!(next(), "started 1");
         assert_eq!(next(), "done 1 ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_waiting_for_its_write_up_never_goes_once_its_card_is_set_aside_and_goes_with_its_rev()
+     {
+        // Codex's review 60, 5: d on #7 and #8 during their write-ups, then #7 is set aside
+        // elsewhere. Once both are written up, #7 is taken out unstarted and the board told; #8
+        // goes, with its card's rev as the read that let it go shows it, so its backend checks it.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let log_q = crate::transport::quote(log.to_str().unwrap());
+        let command = format!(
+            "cat >> {log_q}\necho >> {log_q}\nprintf '%s' '{{\"ok\":true,\"message\":\"started\"}}'\n"
+        );
+        for (n, id) in [(1, "7"), (2, "8")] {
+            runner
+                .tx
+                .send(ToRunner::Run {
+                    n,
+                    machine: 0,
+                    key: Some(format!("here:{id}")),
+                    target: machine.clone(),
+                    command: command.clone(),
+                    request: serde_json::json!({"action":"dispatch","id":id}),
+                    gated: true,
+                    resends: false,
+                    rev: None,
+                    guard: Some(crate::resolve::Footing::default()),
+                })
+                .unwrap();
+        }
+        let footing = |set_aside: bool| {
+            let footing = crate::resolve::Footing {
+                set_aside,
+                ..Default::default()
+            };
+            (footing, Some("r9".to_string()))
+        };
+        runner
+            .tx
+            .send(ToRunner::Feed {
+                machine: 0,
+                intakes: std::collections::HashMap::from([
+                    ("7".to_string(), None),
+                    ("8".to_string(), None),
+                ]),
+                footings: std::collections::HashMap::from([
+                    ("7".to_string(), footing(true)),
+                    ("8".to_string(), footing(false)),
+                ]),
+            })
+            .unwrap();
+        let seen: Vec<String> = (0..3).filter_map(|_| next_heard(&rx, 10_000)).collect();
+        assert_eq!(seen, ["changed 1", "started 2", "done 2 ok"]);
+        assert_eq!(next_heard(&rx, 300), None);
+        let sent: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["id"], "8");
+        assert_eq!(sent[0]["rev"], "r9");
     }
 }

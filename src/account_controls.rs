@@ -624,7 +624,8 @@ impl App {
                     "{}: moves its waiting sessions when it answers again",
                     m.name()
                 ));
-                self.account_cancels.push((mi, request));
+                let now = self.now().timestamp();
+                self.account_cancels.push((mi, request, now));
             }
         }
         if self.account_queue.is_empty() && !self.account_batch_messages.is_empty() {
@@ -2435,7 +2436,8 @@ impl App {
         if request["action"] == "account-signin" {
             match step {
                 Some("cancel") => {
-                    self.account_cancels.push((machine, request));
+                    let now = self.now().timestamp();
+                    self.account_cancels.push((machine, request, now));
                     return Action::None;
                 }
                 Some("start") => return self.signin_waits(machine),
@@ -2678,6 +2680,15 @@ impl App {
         true
     }
 
+    /// An account request as it goes, with its op: one of its own, unless it's sent again after
+    /// its first send's answer was lost, which keeps the op it had (Codex's review 60).
+    pub fn account_op(&mut self, request: Value) -> Value {
+        match request["op"].as_str() {
+            Some(op) if self.account_same_op.remove(op) => request,
+            _ => crate::actions::with_op(request),
+        }
+    }
+
     /// Whether two machines' backends write the same shared account catalog: by their feeds'
     /// `catalog` when both say, else by both being the same kind of backend reading the same
     /// owners (an older backend sends no `catalog`). A backend new enough to name it (one that
@@ -2753,10 +2764,16 @@ impl App {
     }
 
     /// The first account request waiting for its machine to answer, as q says it: "LAB-Server
-    /// answers and moving the agent to ARK_C is sent".
+    /// answers and moving the agent to ARK_C is sent". A sign-in's cancel or a list's "move
+    /// waiting sessions" kept for its machine counts too (Codex's review 60).
     pub(crate) fn account_away_wait(&self) -> Option<String> {
-        let (p, r) = self.account_later.iter().find(|(p, _)| p.away.is_some())?;
-        let name = self.machines.get(p.machine)?.name();
+        let (machine, r) = self
+            .account_later
+            .iter()
+            .find(|(p, _)| p.away.is_some())
+            .map(|(p, r)| (p.machine, r))
+            .or_else(|| self.account_cancels.first().map(|(m, r, _)| (*m, r)))?;
+        let name = self.machines.get(machine)?.name();
         Some(format!(
             "{name} answers and {} is sent",
             lowercase_first(&account_what(r))
@@ -2821,6 +2838,25 @@ impl App {
                 self.account_later.remove(i);
                 continue;
             }
+            // A day waiting for its machine is checked before any way of sending it: a machine
+            // answering again, or another writing the same catalog (Codex's review 60).
+            if let Some(since) = self.account_later[i].0.away
+                && now - since >= crate::kept::HOLD_MOST_SECS
+            {
+                let (origin, request) = self.account_later.remove(i)?;
+                let name = self
+                    .machines
+                    .get(machine)
+                    .map(|m| m.name())
+                    .unwrap_or_else(|| "Its machine".into());
+                let why = format!(
+                    "{name} didn't answer for a day, {}.",
+                    crate::actions::NOT_SENT
+                );
+                self.account_not_sent(origin, &request, why);
+                self.rebuild();
+                return Some(Action::None);
+            }
             let conn = self.machines.get(machine).map(|m| &m.conn);
             if configured && conn.is_some_and(crate::poll::Conn::is_live) {
                 let (origin, request) = self.account_later.remove(i)?;
@@ -2858,7 +2894,7 @@ impl App {
                     request,
                 });
             }
-            let Some(m) = self.machines.get(machine).filter(|_| configured) else {
+            if !configured || self.machines.get(machine).is_none() {
                 let (origin, request) = self.account_later.remove(i)?;
                 let why = format!(
                     "Kerdr has no action backend for it, {}.",
@@ -2866,19 +2902,8 @@ impl App {
                 );
                 self.account_not_sent(origin, &request, why);
                 return Some(Action::None);
-            };
-            let name = m.name();
-            let since = *self.account_later[i].0.away.get_or_insert(now);
-            if now - since >= crate::kept::HOLD_MOST_SECS {
-                let (origin, request) = self.account_later.remove(i)?;
-                let why = format!(
-                    "{name} didn't answer for a day, {}.",
-                    crate::actions::NOT_SENT
-                );
-                self.account_not_sent(origin, &request, why);
-                self.rebuild();
-                return Some(Action::None);
             }
+            self.account_later[i].0.away.get_or_insert(now);
             held.push(machine);
             i += 1;
         }
@@ -4201,12 +4226,39 @@ impl App {
                 .account_key(KeyEvent::new(key, KeyModifiers::NONE))
                 .unwrap_or(Action::None);
         }
+        // A list's "move waiting sessions" kept a day for its machine isn't sent: said, as one
+        // waiting its turn is (intent 0591, Codex's review 60). A sign-in's cancel goes however
+        // late: it only ends a sign-in.
+        let now = self.now().timestamp();
+        if let Some(i) = self.account_cancels.iter().position(|(_, r, since)| {
+            r["action"] != "account-signin" && now - since >= crate::kept::HOLD_MOST_SECS
+        }) {
+            let (mi, request, _) = self.account_cancels.remove(i);
+            if let Some(op) = request["op"].as_str() {
+                self.account_same_op.remove(op);
+            }
+            let name = self
+                .machines
+                .get(mi)
+                .map(|m| m.name())
+                .unwrap_or_else(|| "Its machine".into());
+            self.say(
+                format!(
+                    "{}: {name} didn't answer for a day, {}.",
+                    account_what(&request),
+                    crate::actions::NOT_SENT
+                ),
+                Tone::Warn,
+            );
+            self.rebuild();
+            return Action::None;
+        }
         if let Some(i) = self
             .account_cancels
             .iter()
-            .position(|(mi, _)| self.machines.get(*mi).is_some_and(|m| m.conn.is_live()))
+            .position(|(mi, _, _)| self.machines.get(*mi).is_some_and(|m| m.conn.is_live()))
         {
-            let (mi, request) = self.account_cancels.remove(i);
+            let (mi, request, _) = self.account_cancels.remove(i);
             return self.send_account(mi, request);
         }
         while let Some((mi, request)) = self.account_queue.pop_front() {
@@ -4215,7 +4267,7 @@ impl App {
                 && !self.machines.get(mi).is_some_and(|m| m.conn.is_live())
             {
                 // Refused now, it would be lost and leave that machine's sign-in running.
-                self.account_cancels.push((mi, request));
+                self.account_cancels.push((mi, request, now));
                 continue;
             }
             if request["action"] == "account-signin"
@@ -4513,18 +4565,35 @@ impl App {
                 // Its machine went away after the resends: kept and sent once it answers again,
                 // as when it was away to begin with (intent 0591, K2-03). Said only if it fails
                 // then.
+                // Its answer may only have been lost, after its backend moved them: sent again with
+                // the same op, so a backend that keeps ops answers from its record rather than
+                // moving them twice. One that doesn't keep ops isn't sent it again by itself
+                // (Codex's review 60).
                 if request["action"] == "account-move-waiting"
                     && self
                         .machines
                         .get(machine)
                         .is_some_and(|m| !m.conn.is_live())
                 {
-                    self.account_batch_messages.push(format!(
-                        "{}: moves its waiting sessions when it answers again",
-                        self.machines[machine].name()
-                    ));
-                    self.account_cancels
-                        .push((machine, crate::actions::without_op(&request)));
+                    let name = self.machines[machine].name();
+                    let op = request["op"].as_str().map(str::to_string);
+                    if let Some(op) = op.filter(|_| self.resends_to(machine)) {
+                        self.account_batch_messages.push(format!(
+                            "{name}: moves its waiting sessions when it answers again"
+                        ));
+                        self.account_same_op.insert(op);
+                        let now = self.now().timestamp();
+                        self.account_cancels.push((
+                            machine,
+                            crate::actions::request_metadata(&request),
+                            now,
+                        ));
+                    } else {
+                        self.account_batch_failed = true;
+                        self.account_batch_messages.push(format!(
+                            "{name} stopped answering before it said whether its waiting sessions moved, so Kerdr didn't ask it again"
+                        ));
+                    }
                     if self.account_queue.is_empty() {
                         self.say(self.account_batch_messages.join("; "), Tone::Warn);
                     }
@@ -8391,6 +8460,23 @@ mod tests {
     }
 
     #[test]
+    fn a_held_account_request_a_day_old_isnt_sent_though_its_machine_answers_again() {
+        // Codex's review 60, 13: the day is checked before it's sent, not only while it waits.
+        let mut a = app();
+        let (_, mi, name) = held_move_44(&mut a);
+        a.account_later[0].0.away = Some(a.now().timestamp() - crate::kept::HOLD_MOST_SECS);
+        back_live(&mut a, mi);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.account_later.is_empty());
+        assert_eq!(
+            said(&a),
+            format!(
+                "Moving the agent to ARK_C: {name} didn't answer for a day, so nothing was sent."
+            )
+        );
+    }
+
+    #[test]
     fn a_held_account_request_goes_no_later_than_a_day() {
         let mut a = app();
         let (_, mi, name) = held_move_44(&mut a);
@@ -9022,8 +9108,53 @@ mod tests {
 
     #[test]
     fn a_move_waiting_whose_machine_went_away_after_its_resends_is_kept_for_it() {
-        // K2-03: kept and sent once it answers again; said only if it fails then.
+        // K2-03: kept and sent once it answers again; said only if it fails then. Its answer may
+        // only have been lost after its backend moved them, so it goes again with the same op, to
+        // a backend that keeps ops (Codex's review 60, 3).
         let mut a = app();
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("op".into());
+        away(&mut a, 1, 60);
+        a.account_batch_messages.clear();
+        let first =
+            crate::actions::with_op(json!({"action":"account-move-waiting","owner":"studio"}));
+        a.finish_action(
+            1,
+            first.clone(),
+            Err("ssh: connect to host build-box: Connection timed out".into()),
+        );
+        let name = a.machines[1].name();
+        assert_eq!(
+            said(&a),
+            format!("{name}: moves its waiting sessions when it answers again")
+        );
+        assert_eq!(a.account_cancels.len(), 1);
+        assert_eq!(a.account_cancels[0].0, 1);
+        assert_eq!(a.account_cancels[0].1, first, "with its op");
+        back_live(&mut a, 1);
+        let (to, again) = sent(a.account_tick());
+        assert_eq!(to, 1);
+        assert_eq!(a.account_op(again), first, "the op it had goes with it");
+        // Any other request gets an op of its own.
+        let other = a.account_op(first.clone());
+        assert_ne!(other["op"], first["op"]);
+    }
+
+    #[test]
+    fn a_move_waiting_whose_answer_was_lost_isnt_sent_again_to_a_backend_without_ops() {
+        // Codex's review 60, 3: it may have moved them already, and a backend that keeps no ops
+        // would move them twice.
+        let mut a = app();
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .retain(|s| s != "op");
         away(&mut a, 1, 60);
         a.account_batch_messages.clear();
         a.finish_action(
@@ -9032,14 +9163,48 @@ mod tests {
             Err("ssh: connect to host build-box: Connection timed out".into()),
         );
         let name = a.machines[1].name();
+        assert!(a.account_cancels.is_empty());
         assert_eq!(
             said(&a),
-            format!("{name}: moves its waiting sessions when it answers again")
+            format!(
+                "{name} stopped answering before it said whether its waiting sessions moved, so Kerdr didn't ask it again"
+            )
         );
-        assert_eq!(
-            a.account_cancels,
-            vec![(1, json!({"action":"account-move-waiting","owner":"studio"}))]
+        back_live(&mut a, 1);
+        assert_eq!(a.account_tick(), Action::None);
+    }
+
+    #[test]
+    fn a_move_waiting_kept_a_day_for_its_machine_isnt_sent_once_it_answers() {
+        // Codex's review 60, 13.
+        let mut a = app();
+        let day = crate::kept::HOLD_MOST_SECS;
+        let now = a.now().timestamp();
+        a.account_cancels.push((
+            1,
+            json!({"action":"account-move-waiting","owner":"studio"}),
+            now - day,
+        ));
+        a.account_cancels.push((
+            1,
+            json!({"action":"account-signin","step":"cancel","ticket":"t"}),
+            now - day,
+        ));
+        back_live(&mut a, 1);
+        let name = a.machines[1].name();
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(
+            said(&a).ends_with(&format!(
+                "{name} didn't answer for a day, so nothing was sent."
+            )),
+            "{}",
+            said(&a)
         );
+        // A sign-in's cancel still goes: it only ends a sign-in.
+        let (to, request) = sent(a.account_tick());
+        assert_eq!(to, 1);
+        assert_eq!(request["step"], "cancel");
+        assert!(a.account_cancels.is_empty());
     }
 
     #[test]

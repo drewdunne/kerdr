@@ -751,8 +751,14 @@ pub struct App {
     first_selection_done: bool,
     pub account_queue: std::collections::VecDeque<(usize, serde_json::Value)>,
     /// Sign-in cancellations for a machine not answering, sent once it answers again, so Esc
-    /// during a disconnect still ends that machine's sign-in.
-    pub account_cancels: Vec<(usize, serde_json::Value)>,
+    /// during a disconnect still ends that machine's sign-in; and a list's "move waiting
+    /// sessions" kept for one, likewise (K2-01, K2-03). Each with when it was kept, in seconds
+    /// since 1970: a move a day old isn't sent (intent 0591, Codex's review 60).
+    pub account_cancels: Vec<(usize, serde_json::Value, i64)>,
+    /// The ops of account requests sent again as they were, their first send's answer lost: they
+    /// keep that op, so a backend that keeps ops answers from its record rather than doing it
+    /// twice (intent 0591, Codex's review 60).
+    pub account_same_op: std::collections::HashSet<String>,
     pub signin_open: Option<String>,
     pub account_batch_messages: Vec<String>,
     /// Some machine's part of that batch didn't happen: the summary is a warning (intent 0591).
@@ -850,14 +856,31 @@ pub struct App {
     /// Kerdr's hold file: changes held for machines that weren't answering (intent 0591,
     /// release 4). In memory alone until open_board points it at the state folder.
     pub kept: crate::kept::Kept,
-    /// Changes sent from the hold file, by job, with their op: each leaves the file once answered.
+    /// Changes sent from the hold file, by job, with their op: each leaves the file once answered,
+    /// and stays in it, marked as this Kerdr's, until then: waiting behind a start, a save or a
+    /// write-up, with the runner, or with its backend (Codex's review 60).
     pub(crate) held_sending: std::collections::HashMap<u64, String>,
+    /// The op of the hold-file record a change being queued again is (release_behind, send_held):
+    /// held again for its machine, it waits in the file as itself, never as a second record.
+    pub(crate) carrying: Option<String>,
+    /// Drops m's D asked the runner for, by job, with the change and its card in words: its
+    /// answer says whether it was in time (holding::job_drop_answered).
+    pub(crate) drops_asked: std::collections::HashMap<u64, (String, String)>,
+    /// Held changes kept in the file because their machine's backend no longer checks one again,
+    /// by op: said once each (Codex's review 60).
+    pub(crate) held_unchecked: std::collections::HashSet<String>,
     /// When a held change for a machine Kerdr doesn't have was last tried through a forwarder.
     pub(crate) held_tried: std::collections::HashMap<String, Instant>,
     /// What answers said backends hold for cards, until their feeds say so (holding::Pending).
     pub(crate) pendings: Vec<holding::Pending>,
+    /// New intents an earlier Kerdr left still being saved in their backend, from the words
+    /// file: each shows again once its machine's feed is read (Codex's review 60).
+    pub(crate) saving_restored: Vec<crate::kept::KeptSaving>,
     /// q is waiting for a hand-over to finish, since when: Kerdr quits by itself once it has.
     pub quitting: Option<Instant>,
+    /// q found that what Kerdr keeps for the next one couldn't be written: it waits for a second
+    /// q, which quits anyway, rather than quitting by itself (intent 0591, Codex's review 60).
+    pub quit_unsaved: bool,
     /// Where q keeps your words for the next Kerdr: the state folder; None keeps nothing.
     pub words_dir: Option<std::path::PathBuf>,
     /// e pressed on a card being written up or saved: its text opens once that's done (intent
@@ -939,6 +962,7 @@ impl App {
             first_selection_done: false,
             account_queue: Default::default(),
             account_cancels: Vec::new(),
+            account_same_op: Default::default(),
             signin_open: None,
             account_batch_messages: vec![],
             account_batch_failed: false,
@@ -981,9 +1005,14 @@ impl App {
             catch_up: Default::default(),
             kept: crate::kept::Kept::in_memory(),
             held_sending: Default::default(),
+            carrying: None,
+            drops_asked: Default::default(),
+            held_unchecked: Default::default(),
             held_tried: Default::default(),
             pendings: vec![],
+            saving_restored: vec![],
             quitting: None,
+            quit_unsaved: false,
             words_dir: None,
             edit_after: None,
             edit_paused: Default::default(),

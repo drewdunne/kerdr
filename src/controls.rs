@@ -2643,8 +2643,8 @@ impl App {
             ) => {
                 return Some(self.card_action(c, count));
             }
-            // In a peek, D drops what's held for its card: the only one, or with a count the one
-            // of that number, 2D the second (intent 0591, release 4).
+            // In a peek, D drops what's held for its card: the first, or with a count the one of
+            // that number, 2D the second (intent 0591, release 4).
             KeyCode::Char('D') if matches!(self.mode, Mode::Peek { .. }) => {
                 let index = counted.then(|| usize::try_from(count - 1).unwrap_or(0));
                 return Some(self.drop_held(index));
@@ -3615,7 +3615,8 @@ impl App {
     pub fn job_started(&mut self, n: u64) {
         let started = self.resolver.started(n);
         // To a backend that can put it back in the backlog, asked instead (intent 0591, K1-44).
-        if started.too_late && !self.ask_stop_start(n) {
+        // m's D came too late, not Esc: the runner's answer to it says so (job_drop_answered).
+        if started.too_late && !self.drops_asked.contains_key(&n) && !self.ask_stop_start(n) {
             let reference = self
                 .resolver
                 .job(n)

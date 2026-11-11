@@ -56,6 +56,13 @@ impl Conn {
         matches!(self, Conn::Live { .. })
     }
 
+    /// Whether it stopped answering for want of a connection alone: dropped, or never reached.
+    /// A host key or sign-in SSH refuses needs Andrew, and nothing goes around it (intent 0591,
+    /// Codex's review 60).
+    pub fn is_outage(&self) -> bool {
+        matches!(self, Conn::Reconnecting { .. } | Conn::Unreachable { .. })
+    }
+
     /// Whether what's wrong has lasted long enough to be said (intent 0591): a drop is quiet for
     /// its first QUIET_FOR seconds, since most come back within a try or two; anything that needs
     /// Andrew, or a machine that can't be reached at all, is said at once.

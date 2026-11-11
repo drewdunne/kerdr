@@ -146,8 +146,10 @@ fn open_board() -> anyhow::Result<()> {
     // machines answer, and your words are back where you left them.
     let state = kerdr::config::state_dir();
     app.kept = kerdr::kept::Kept::at(&state, chrono::Local::now().timestamp());
-    app.restore_words(kerdr::kept::Words::take(&state));
+    let words = app.kept.take_words();
+    app.restore_words(words);
     app.words_dir = Some(state);
+    app.say_kept_notes();
     app.rebuild();
     kerdr::tui::run(app, true)
 }

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use super::holding::held_what;
 use super::{App, Mode, Tone, waiting_work};
 use crate::model::{Card, CardSnapshot};
-use crate::resolve::Behind;
+use crate::resolve::{Behind, Dropping};
 
 /// What a held key comes to once what it waited for is done.
 enum Decided {
@@ -225,7 +225,14 @@ impl App {
                     if let Some(detail) = &card.detail {
                         request["id"] = Value::String(detail.id.clone());
                     }
-                    if let Some(fields) = request.as_object_mut() {
+                    // A record from the hold file stays that record, with its op, its markers
+                    // and its `rev`, until it's answered (Codex's review 60); any other key gets
+                    // an op of its own as it goes.
+                    let carried = self.held_sending.remove(&n);
+                    let rev = self.resolver.rev_of(n);
+                    if carried.is_none()
+                        && let Some(fields) = request.as_object_mut()
+                    {
                         fields.remove("op");
                     }
                     // A stop asked for before its workspace opened names it now, for a backend
@@ -245,14 +252,39 @@ impl App {
                     self.resolver.drop_held_job(n);
                     self.action_from = Some(CardSnapshot::of(&card));
                     self.action_key = Some(card.key.clone());
+                    let before = self.resolver.last_added();
+                    self.carrying = carried.clone();
                     self.queue_action(machine, request);
+                    self.carrying = None;
+                    if let Some(op) = carried {
+                        self.carry_on(before, op, rev);
+                    }
                 }
                 Decided::Drop(said) => {
                     self.resolver.drop_held_job(n);
+                    if let Some(op) = self.held_sending.remove(&n) {
+                        self.kept.release(&op);
+                    }
                     self.say_also(said);
                 }
             }
             self.rebuild();
+        }
+    }
+
+    /// After a hold-file record went the way any key's change does: the change it became carries
+    /// its op and its `rev` on, and its answer takes it out of the file. Held for its machine
+    /// again, it waits in the file still (route); not sent, and said why, it leaves the file.
+    pub(crate) fn carry_on(&mut self, before: u64, op: String, rev: Option<String>) {
+        let n = self.resolver.last_added();
+        if n != before {
+            self.resolver.keep_op(n, &op);
+            if rev.is_some() {
+                self.resolver.set_rev(n, rev);
+            }
+            self.held_sending.insert(n, op);
+        } else if self.kept.find(&op).is_some_and(|h| h.by.is_some()) {
+            self.kept.release(&op);
         }
     }
 
@@ -419,18 +451,101 @@ impl App {
         lines
     }
 
-    /// m's D on a change held behind something: taken out, and said.
+    /// m's D on a change on its way, by where it is (Codex's review 60): one still in Kerdr is
+    /// taken out, and said; one the runner has is asked of it, and its answer says whether it
+    /// was in time (job_drop_answered); one whose command has started is past dropping, and that's
+    /// said. A hold-file record it was leaves the file once it's dropped.
     pub(crate) fn drop_behind(&mut self, n: u64, card: &Card) {
-        let what = self
-            .resolver
-            .job(n)
-            .map(|j| held_what(&j.request))
-            .unwrap_or_else(|| "the change".into());
-        self.resolver.drop_held_job(n);
-        self.say(
-            format!("Dropped: {what} on {} won't be sent.", card.reference),
-            Tone::Info,
-        );
+        let Some(job) = self.resolver.job(n) else {
+            return;
+        };
+        let what = held_what(&job.request);
+        let name = self
+            .machines
+            .get(job.machine)
+            .map(|m| m.name())
+            .unwrap_or_default();
+        let reference = card.reference.clone();
+        match self.resolver.drop_job(n) {
+            Dropping::Taken(_) => {
+                if let Some(op) = self.held_sending.remove(&n) {
+                    self.kept.release(&op);
+                }
+                self.say(
+                    format!("Dropped: {what} on {reference} won't be sent."),
+                    Tone::Info,
+                );
+            }
+            Dropping::Asked => {
+                self.drops_asked.insert(n, (what, reference));
+            }
+            Dropping::Started => self.say(
+                format!(
+                    "{what} on {reference} is already with {name}, so it can't be dropped now: its card shows what it does."
+                ),
+                Tone::Info,
+            ),
+            Dropping::Gone => {}
+        }
+        self.rebuild();
+    }
+
+    /// The footing of the card a change waiting for its write-up is for, as it is now: the runner
+    /// holds it to that (crate::resolve::Footing).
+    pub fn gate_footing(&self, n: u64) -> Option<crate::resolve::Footing> {
+        let key = self.resolver.key_of(n)?;
+        let detail = self.card(&key)?.detail.as_ref()?;
+        Some(crate::resolve::Footing::of(detail))
+    }
+
+    /// The runner took out a change that waited for its write-up, unstarted: its card was set
+    /// aside, finished or started meanwhile. It goes, a hold-file record it was with it, and
+    /// that's said (Codex's review 60).
+    pub fn gate_changed(&mut self, n: u64) {
+        self.drops_asked.remove(&n);
+        let Some(job) = self.resolver.take(n) else {
+            return;
+        };
+        if let Some(op) = self.held_sending.remove(&n) {
+            self.kept.release(&op);
+        }
+        let what = held_what(&job.request);
+        let reference = job
+            .key
+            .as_deref()
+            .and_then(|k| self.card(k))
+            .map(|c| c.reference.clone())
+            .unwrap_or_else(|| self.reference_for(job.request["id"].as_str().unwrap_or_default()));
+        let said = if job.starts() {
+            format!(
+                "{reference} wasn't started: it changed since you pressed {what}, so Kerdr dropped that start."
+            )
+        } else {
+            format!("{reference} changed since you pressed {what}, so Kerdr dropped that change.")
+        };
+        self.say_also(said);
+        self.rebuild();
+    }
+
+    /// The runner's answer to a drop, Esc's on a start waiting for its write-up or m's D:
+    /// taken out before it started, it goes, and a hold-file record it was leaves the file;
+    /// otherwise its answer still comes. m's D says which (Codex's review 60).
+    pub fn job_drop_answered(&mut self, n: u64, dropped: bool) {
+        self.resolver.drop_answered(n, dropped);
+        if dropped && let Some(op) = self.held_sending.remove(&n) {
+            self.kept.release(&op);
+        }
+        let Some((what, reference)) = self.drops_asked.remove(&n) else {
+            return;
+        };
+        let said = if dropped {
+            format!("Dropped: {what} on {reference} won't be sent.")
+        } else {
+            format!(
+                "{what} on {reference} had already gone when D came, so it carries on: its card shows what it does."
+            )
+        };
+        self.say(said, Tone::Info);
         self.rebuild();
     }
 
@@ -813,15 +928,17 @@ mod tests {
             app.held_line_for(&card).as_deref(),
             Some("⧗ C goes once it's written up")
         );
-        // m, then D: dropped before it goes.
+        // m, then D: the runner is asked, and its answer says it was dropped before it went.
         select(&mut app, &key);
         press(&mut app, 'm');
         assert_eq!(press(&mut app, 'D'), Action::None);
+        assert_eq!(app.resolver.take_dropped(), vec![n]);
+        app.job_drop_answered(n, true);
         assert_eq!(
             said(&app),
             format!("Dropped: C on {reference} won't be sent.")
         );
-        assert_eq!(app.resolver.take_dropped(), vec![n]);
+        assert!(app.resolver.job(n).is_none());
         // X on it: set aside after its question, held the same way.
         let mut app = self::app();
         let (key, _, reference, _) = waiting(&mut app);
@@ -1018,7 +1135,7 @@ mod tests {
         key_move(&mut app);
         assert_eq!(app.resolver.behind_jobs().len(), 1);
         // Quit before its start is answered: the move is kept, to be decided again.
-        app.keep_on_quit();
+        app.keep_on_quit().unwrap();
         // The next Kerdr: no start is on its way there, and the card still waits, so it goes.
         let mut next = self::app();
         next.kept = Kept::at(dir.path(), next.now().timestamp());
@@ -1033,6 +1150,98 @@ mod tests {
         let ready = next.resolver.ready();
         assert_eq!(ready.len(), 1, "{}", said(&next));
         assert_eq!(ready[0].2["action"], "move");
+        // Still the same record, with its op, until it's answered (Codex's review 60).
+        assert_eq!(ready[0].2["op"], next.kept.held[0].op());
+        next.finish_job(ready[0].0, ready[0].2.clone(), ok());
         assert!(next.kept.held.is_empty());
+    }
+
+    #[test]
+    fn a_stop_held_behind_a_start_keeps_its_record_and_its_held_mark_after_a_restart() {
+        // Codex's review 60, 6: a stop that waited behind a start when Kerdr quit goes from the
+        // next one as the same record, with `held: true`, so its backend asks again before it
+        // stops anything; and it stays in the file until it's answered, so a crash meanwhile
+        // loses nothing.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = Kept::at(dir.path(), app.now().timestamp());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.is_open_workspace() && c.detail.is_some() && !c.done() && !c.dismissed())
+            .cloned()
+            .expect("a card with its workspace open in the demo");
+        let (m, id) = (card.machine_index, card.detail.as_ref().unwrap().id.clone());
+        let holds = |app: &mut App| {
+            let feed = app.machines[m].feed.as_mut().unwrap();
+            feed.supports.push(HOLD.into());
+        };
+        holds(&mut app);
+        let request = crate::actions::with_op(json!({"action":"cancel","id":id}));
+        let op = request["op"].as_str().unwrap().to_string();
+        app.kept.hold(crate::kept::HeldRequest {
+            machine: app.machines[m].name(),
+            request,
+            rev: None,
+            key: Some(card.key.clone()),
+            reference: card.reference.clone(),
+            what: "X".into(),
+            pressed: app.now().timestamp(),
+            after: Some("start".into()),
+            by: None,
+        });
+        app.feed_read(m);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        assert_eq!(ready[0].2["action"], "cancel");
+        assert_eq!(ready[0].2["held"], true);
+        assert_eq!(ready[0].2["op"], op.as_str());
+        assert_eq!(app.kept.held.len(), 1, "kept until it's answered");
+        // This Kerdr ends before the answer comes: the next sends it again, the same request.
+        drop(app);
+        let mut next = self::app();
+        next.kept = Kept::at(dir.path(), next.now().timestamp());
+        holds(&mut next);
+        next.feed_read(m);
+        let ready = next.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&next));
+        assert_eq!(ready[0].2["op"], op.as_str());
+        assert_eq!(ready[0].2["held"], true);
+    }
+
+    #[test]
+    fn a_start_waiting_for_its_write_up_goes_with_its_cards_footing_and_is_dropped_when_it_moved() {
+        // Codex's review 60, 5: the runner holds a start d asked for during a write-up to the
+        // card's footing then (crate::resolve::Footing), and takes it out, unstarted, once the
+        // card has been set aside, finished or started meanwhile. The board says so.
+        let mut app = app();
+        let (key, _, reference, _) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        key_d(&mut app);
+        let (n, _, _, gated) = app.resolver.ready()[0].clone();
+        assert!(gated);
+        let footing = app.gate_footing(n).expect("its card's footing");
+        assert!(!footing.set_aside && !footing.finished && !footing.under_way);
+        let set_aside = crate::resolve::Footing {
+            set_aside: true,
+            ..footing
+        };
+        assert!(footing.moved(&set_aside));
+        assert!(!set_aside.moved(&footing), "brought back isn't moved");
+        app.gate_changed(n);
+        assert!(app.resolver.job(n).is_none());
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference} wasn't started: it changed since you pressed d, so Kerdr dropped that start."
+            )
+        );
+    }
+
+    /// d on the selected card, as the board's loop takes it.
+    fn key_d(app: &mut App) {
+        key(app, 'd');
     }
 }
