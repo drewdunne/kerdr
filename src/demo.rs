@@ -1009,6 +1009,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             note: None,
             recheck: false,
             added: None,
+            waiting: false,
         })),
         S::Signin(Box::new(Signin {
             deferred: None,
@@ -1034,6 +1035,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             note: None,
             recheck: false,
             added: None,
+            waiting: false,
         })),
         // A saved sign-in's code box, having caught claude.ai's emailed code.
         S::Signin(Box::new(Signin {
@@ -1060,6 +1062,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             note: Some(crate::app::account_controls::EMAILED_CODE.into()),
             recheck: false,
             added: None,
+            waiting: false,
         })),
         // Codex signs in with a code typed on OpenAI's page; nothing comes back to paste.
         S::Signin(Box::new(Signin {
@@ -1086,6 +1089,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             note: None,
             recheck: false,
             added: None,
+            waiting: false,
         })),
         // Enter on an account already ready on the machine viewed.
         S::Where {
@@ -1136,6 +1140,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
             note: None,
             recheck: false,
             added: None,
+            waiting: false,
         })),
         S::PasteToken {
             machine: 1,

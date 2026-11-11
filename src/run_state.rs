@@ -548,9 +548,8 @@ impl App {
             );
             return Action::None;
         };
-        if !self.can_write(card.machine_index) {
-            return Action::None;
-        }
+        // Its machine not answering, the start waits for it (intent 0591, release 4): send_account
+        // holds it.
         // The card it's asked on goes in its own record, which its answer finds by the request,
         // through a question or a sign-in (Codex's third look).
         let machine = card.machine_index;

@@ -1047,7 +1047,18 @@ question so ("Hand #45 over to Codex?"). `S` edits the list new agents start on,
 saved unchanged while an agent there could move, it says that `s` on its card is the key and names
 those cards, those off the list's first account first. It edits the viewed session's owner's list,
 or with no session chosen, the selected card's owner's: its session's, its home session's, else the
-tenant or organization its record names.
+tenant or organization its record names, looked up in its own machine's feed first, then in any
+other machine's that names that owner, since every list lives in the one shared catalog. A session
+belongs to the owner whose `sessions` list it, else to the owner whose `code` is its name or the part
+of its name before a `-` (`P4M-Marketing` is P4M's), as the backend reads it. A viewed session no
+owner has opens no list: Kerdr says it needs an owner in the owners file first, since its backend
+starts nothing there on any list. With no card selected, `S` opens the owner of the machine on the
+board's machine tab, else of the machine Kerdr runs on, else of the machine the accounts screen
+opens on (its `machine_owner`, else its first organization), saying "Tab switches owner" when that
+machine has several; on the list, `Tab` and `Shift+Tab` go to the machine's next and previous owner
+while the list is unchanged (a changed one is saved with `Enter` or left with `Esc` first). When the
+card's machine's feed hasn't come yet and no other feed names its owner, `S` says it's waiting for
+that feed and opens the list once it comes, if you're still where you pressed it; `Esc` stops waiting.
 
 ## Starting a card on an account
 
@@ -1202,7 +1213,11 @@ while the backend takes ownership, and persistent log storage belongs to the bac
 ## Accounts
 
 All account fields are optional additions to format 1. Older feeds need no changes and older
-Kerdr ignores these fields. Each feed reports only that machine’s account state:
+Kerdr ignores these fields. Each feed reports only that machine’s account state. `A` opens the
+accounts screen on the board's machine tab, else on the machine Kerdr runs on; while that machine's
+feed hasn't come, it opens on a machine that has accounts instead and says why the first shows none
+(being read, its feed failed and with what, not answering and for how long, or no feed configured);
+`Tab` switches machine as ever. A machine with no accounts to show says the same on its screen.
 
 ```json
 {
@@ -1233,9 +1248,17 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
     "how":"next","handed_from":{"account":"KBZ_C","program":"claude","conversation":"conversation-id",
     "why":"usage_limit","at":"2026-10-21T17:44:00-05:00"}}],
   "current": {"account":"KBZ_X","name":"Personal Codex","since":"2026-10-21T16:00:00-05:00",
-    "status":"ready","until":null,"machine":"build-box"}
+    "status":"ready","until":null,"machine":"build-box"},
+  "catalog": "ark-sdlc"
 }
 ```
+
+`catalog`, optional, names the shared account catalog this backend writes: model lists, the current
+account, and the accounts themselves. Two machines whose feeds give the same `catalog` write the
+same one. Without it, Kerdr counts two feeds as sharing one only when both give the same `source`
+and the same `owners_source`, and that isn't `mock`. Kerdr uses it to send a change to the shared
+catalog to another machine when the one it's meant for can't take it (see
+[Account actions](#account-actions)). An older Kerdr ignores it.
 
 `agents` lists the agents this machine started, newest first. A card shows the account of the
 record whose `conversation` is the one herdr sees in the card's pane, and shows none when no record
@@ -1293,7 +1316,10 @@ the words another's gives. What a machine can do comes from its own feed alone: 
 `+` offers there, their code rules, how its accounts sign in and take a paste, and the programs
 `s` moves, since another machine's newer backend may know more than this one's. The add form ticks only
 machines whose own feed offers that provider, and each machine's sign-in takes a pasted token by
-its own feed's answer.
+its own feed's answer. When the viewed machine's feed names no providers (it hasn't come, or its
+backend has none to offer), `+` offers those any machine's feed names, and the account is added
+through the first machine whose own feed offers the one picked; when no feed has named any yet, `+`
+says it's waiting and opens once one does, while the accounts screen is still on that machine.
 
 An owner's optional `code` (`KBZ`) is what `+` suggests a new account's code from: the viewed
 session's owner's, else the machine owner's, else the first organization's whose code with the
@@ -1360,12 +1386,34 @@ Kerdr sends one account request at a time: one asked for while another is on its
 move Kerdr makes by itself, waits its turn with what it was asked from, and each answer is matched
 to its own request. What an answer brings (a question, the box that signs an account in, an offer
 to resume a conversation) is shown over the screen it was asked from, or held with its request when
-you've gone on to type something and shown once you're back on the board, never dropped. One whose
-machine drops before its turn stays queued while the drop is a passing one and goes once it's back;
-once the drop lasts (30 seconds), its own screen says it wasn't sent. `account-start` and
-`account-resume` go only to a backend whose feed lists them in `starts_on`, checked as each is sent,
-a queued one again as its turn comes; one that can't go is finished as its own failure, said on the
-screen it came from, and never sent.
+you've gone on to type something and shown once you're back on the board, never dropped. Keys
+pressed on an accounts screen while a request is on its way are kept and pressed in order once its
+answer comes, as long as that answer left the screen as it was; if the answer changed or closed it,
+they're dropped and Kerdr says how many. `account-start` and `account-resume` go only to a backend
+whose feed lists them in `starts_on`, checked as each is sent, a queued one again as its turn comes;
+one that can't go is finished as its own failure, said on the screen it came from, and never sent.
+
+A request for a machine that isn't answering waits for it, as a card's change does, and goes once
+it answers, while Kerdr is open, for a day at most ("Held: moving the agent to ARK_C goes when
+LAB-Server answers (it dropped 40 s ago)."). A move and a fresh agent's start show on their card as
+held ("⧗ moving the agent to ARK_C waits for LAB-Server") and in its peek, where `D` drops them; `q`
+says one is still waiting and quits on a second `q`, dropping it. They stay in Kerdr's memory, not in
+its hold file: what their answers open (a question, a sign-in, the next move of a list's round) needs
+the screen they were asked from, and a sign-in's code or a pasted token must never be written to a
+file. Each is checked again as it goes, and isn't sent if what it was about changed meanwhile: a
+move whose agent is no longer at that pane with that conversation, a start whose workspace closed
+or got an agent, a resume whose conversation is running again. A move or start always goes to the
+agent's own machine. A sign-in's steps and an `account-test` wait only while their own screen is
+open: leaving it drops them, so nothing opens a browser or sends a token unasked. A list's "move them
+now" round doesn't wait: it says that machine isn't answering and goes on.
+
+A change to the shared catalog (`account-models`, `account-current`, and `account-add`, which also
+renames) meant for a machine that isn't answering goes instead to the first other machine that
+answers and whose feed shares its [`catalog`](#accounts), and the answer adds where it went ("Sent
+through build-box, since LAB-Server isn't answering; LAB-Server has it once its copy of the account
+list updates."). One already waiting goes that way as soon as such a machine answers. `account-remove`
+never goes elsewhere: it also forgets that machine's own saved sign-in, which only that machine can
+do, so it waits for it.
 Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
@@ -1383,12 +1431,16 @@ Model lists and account metadata have one canonical writer owned by the backend.
 `c` on the accounts screen sends `account-current` with `to`, and `C` sends it with `clear`, to
 the machine being viewed, whatever its feed last said (the backend answers if it was already
 so); Kerdr shows the answer's `message`, and its `current` at once on that
-machine, while the other machines' feeds follow as their backends do.
+machine, while the other machines' feeds follow as their backends do. When the viewed machine's
+backend has no current account (its feed leaves `current` out), `c` and `C` go to an answering
+machine whose backend has one and shares its `catalog`, and the answer adds "Set on laptop and
+build-box; LAB-Server follows once its backend updates."
 
 The `S` tick runs `account-move-waiting` on configured feed machines only after the list was
 saved successfully. A machine that isn't answering is never claimed as moved: Kerdr says "LAB-Server:
 moves its waiting sessions when it answers again", keeps its request, and sends it once that machine
-answers, while Kerdr is open.
+answers, while Kerdr is open. The same goes for one whose machine stops answering while it's being
+sent again: it's kept for that machine, not said as failed, and only a failure once it answers is.
 
 ```json
 {"ok":false,"confirmation":"This agent is mid-step. Move when it next stops? Restarting ends its background job.",
@@ -1488,12 +1540,24 @@ so. `user_code` and `expires` go through the same credential scrub as the rest o
 
 Enter starts this on the machine the accounts screen is viewing, which opens on the board's
 machine tab or else on the machine Kerdr runs on, then, one after another as below, on every
-other answering machine whose feed says `sign_in` or `missing` for that code (a copy's line
-signs in that copy alone). When the account's `status` on the viewed machine is already
-`ready`, Kerdr asks first instead, offering those machines (all in turn, then each) and signing
-in again there; each `start` goes to its own machine. By each later machine's turn, one whose
-feed no longer says `sign_in` or `missing` is skipped (machines ticked when adding an account
-aren't). A `cancel` for a machine not answering is kept and sent once it answers.
+other machine whose feed says `sign_in` or `missing` for that code, answering ones first (a copy's
+line signs in that copy alone). When the account's `status` on the viewed machine is already
+`ready` and other machines need it, Enter signs it in on those, one after another, with no question
+("ARK_C is ready on laptop; signing it in on build-box and LAB-Server."), and the bottom line says
+so ("⏎ ready on laptop: sign in on build-box, then LAB-Server once it answers"). When none needs it,
+Kerdr asks first, since signing in again replaces a working sign-in; each `start` goes to its own
+machine. By each later machine's turn, one whose feed no longer says `sign_in` or `missing` is
+skipped (machines ticked when adding an account aren't). A `cancel` for a machine not answering is
+kept and sent once it answers.
+
+A sign-in whose machine isn't answering waits for it rather than fail. When a later machine of the
+same sign-in answers, that one goes first and the waiting one after ("LAB-Server isn't answering, so
+build-box signs in first, and LAB-Server after."). Otherwise the box says "Waiting for LAB-Server to
+answer: the sign-in starts once it does. Esc leaves it." and starts by itself once it answers, while
+the box is open. A token pasted meanwhile waits with it ("Waiting for LAB-Server to answer: your
+token goes once it does.") and goes in place of the browser sign-in; so does a page code typed after
+the machine stopped answering, and the box's polling waits too.
+Leaving the box drops whatever of it waits, so no browser opens and no token is sent unasked.
 
 On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK_C","step":"start","copy":"tenants"}`.
 Kerdr sends the line's `id` for every copy, the first included; a request without `copy` means

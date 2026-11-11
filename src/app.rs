@@ -751,6 +751,17 @@ pub struct App {
     /// in turn once that one has its answer: never sent over it, never dropped (Codex's fourth
     /// look).
     pub account_later: std::collections::VecDeque<(account_controls::Pending, serde_json::Value)>,
+    /// Keys pressed on an account screen while a request was on its way, with that screen as it
+    /// was then: pressed in turn once it has its answer, if the screen is still as it was; else
+    /// dropped, so none lands on a row that moved (intent 0591, K2-42).
+    pub account_keys: std::collections::VecDeque<ratatui::crossterm::event::KeyEvent>,
+    pub account_keys_on: Option<String>,
+    /// S pressed where its list's feed hadn't come yet, with where it was pressed: the list opens
+    /// once the feed comes, if he's still there (intent 0591, K2-08).
+    pub models_wanted: Option<String>,
+    /// The machine `+` was pressed on when no feed had said which providers there are yet: the
+    /// picker opens once one does, while that screen is still open (K2-11).
+    pub add_wanted: Option<usize>,
     /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
     /// your version until a save of it succeeds.
     pub edits: std::collections::HashMap<String, edit_controls::Held>,
@@ -910,6 +921,10 @@ impl App {
             refresh_behind: None,
             account_pending: None,
             account_later: Default::default(),
+            account_keys: Default::default(),
+            account_keys_on: None,
+            models_wanted: None,
+            add_wanted: None,
             edits: Default::default(),
             edit_flights: vec![],
             edit_open: None,
@@ -1296,6 +1311,8 @@ impl App {
         // 0591, release 4).
         if read {
             self.feed_read(ev.machine);
+            // A list S or + waited for this feed to open (intent 0591, K2-08 and K2-11).
+            self.account_feed_came();
         }
     }
 
@@ -2213,6 +2230,15 @@ impl App {
         }
         // Esc while q waits for a hand-over: Kerdr stays open (intent 0591, release 4).
         if key.code == KeyCode::Esc && self.stay() {
+            return Action::None;
+        }
+        // Esc while S waits for a feed, still where S was pressed: it stops waiting (intent 0591,
+        // K2-08). Elsewhere the wait has already lapsed, and Esc does what it does there.
+        if key.code == KeyCode::Esc
+            && let Some(asked) = self.models_wanted.take()
+            && asked == self.models_asked_from()
+        {
+            self.say("S stopped waiting for that feed.", Tone::Info);
             return Action::None;
         }
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).

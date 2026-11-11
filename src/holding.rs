@@ -42,6 +42,9 @@ pub enum DropOf {
     Kerdr(String),
     /// One its backend holds, by its op: dropping it asks that backend.
     Backend(String),
+    /// An account request waiting in Kerdr for its machine to answer, by the request: dropping it
+    /// only takes it out.
+    Account(Value),
 }
 
 /// What an answer said a backend holds for a card, shown until its feed says so itself, or two
@@ -234,7 +237,7 @@ impl App {
     }
 
     /// How long ago a machine stopped answering, in words: "it dropped 40 s ago".
-    fn dropped_ago(&self, machine: usize) -> Option<String> {
+    pub(crate) fn dropped_ago(&self, machine: usize) -> Option<String> {
         let since = match &self.machines.get(machine)?.conn {
             Conn::Reconnecting { since, .. } | Conn::Unreachable { since, .. } => *since,
             _ => return None,
@@ -559,6 +562,13 @@ impl App {
                 drop: Some(DropOf::Kerdr(h.op().to_string())),
             });
         }
+        for (words, since, request) in self.account_waits_for(c) {
+            lines.push(HeldLine {
+                words,
+                since,
+                drop: Some(DropOf::Account(request)),
+            });
+        }
         let mut ops: Vec<String> = vec![];
         let feed_held = c.detail.iter().flat_map(|d| d.held.iter());
         let agent_held = self
@@ -656,6 +666,10 @@ impl App {
                 super::Action::None
             }
             Some(DropOf::Backend(op)) => self.drop_backend(&card, &op, &line.words),
+            Some(DropOf::Account(request)) => {
+                self.drop_account_wait(&request);
+                super::Action::None
+            }
             None => super::Action::None,
         }
     }
@@ -817,7 +831,9 @@ impl App {
         if self.busy || !self.account_queue.is_empty() {
             return Some("the account change answers".into());
         }
-        None
+        // An account request waiting for its machine, which only this Kerdr keeps (intent 0591,
+        // release 4): a second q drops it.
+        self.account_away_wait()
     }
 
     /// q: whether Kerdr quits now. Otherwise it says what it waits for, and quits by itself
@@ -832,7 +848,12 @@ impl App {
             self.hold_unsent();
             match self.quit_waits_for() {
                 None => return true,
-                Some(w) if w == "the account change answers" => return true,
+                Some(w)
+                    if w == "the account change answers"
+                        || self.account_away_wait().as_deref() == Some(w.as_str()) =>
+                {
+                    return true;
+                }
                 Some(w) => {
                     self.say(
                         format!("Quitting once {w}: quitting before would lose it. Esc stays."),
@@ -845,6 +866,8 @@ impl App {
         self.quitting = Some(Instant::now());
         let again = if what == "the account change answers" {
             "q again quits now, "
+        } else if self.account_away_wait().as_deref() == Some(what.as_str()) {
+            "q again quits now and drops it, "
         } else {
             ""
         };

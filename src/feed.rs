@@ -38,6 +38,11 @@ pub struct Feed {
     pub owners: Vec<crate::accounts::Owner>,
     #[serde(default)]
     pub owners_source: Option<String>,
+    /// Which shared account catalog this machine's backend writes (intent 0591, release 4): the
+    /// same on every machine whose backend saves to the same central copy. A catalog change for a
+    /// machine that can't take it goes through another with the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     #[serde(default)]
     pub machine_owner: Option<String>,
     #[serde(default)]

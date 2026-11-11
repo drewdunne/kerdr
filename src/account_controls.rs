@@ -317,6 +317,9 @@ pub struct Signin {
     /// For an account just added, not in any feed yet: its provider and kind, from which each
     /// machine's own feed says whether its sign-in takes a token.
     pub added: Option<(String, String)>,
+    /// Its machine isn't answering: it starts once that machine answers, while this box is open
+    /// (intent 0591, release 4).
+    pub waiting: bool,
 }
 
 /// One way to sign an account in, offered when it's already ready on the machine viewed.
@@ -577,6 +580,12 @@ pub struct Pending {
     pub machine: usize,
     pub request: Value,
     pub screen: Option<AccountScreen>,
+    /// When it began waiting for its machine to answer, in epoch seconds (intent 0591, release
+    /// 4): None while it only waits its turn behind another request.
+    pub away: Option<i64>,
+    /// A catalog change sent through another machine: what its answer adds, saying where it went
+    /// (K2-63, K2-09).
+    pub routed: Option<String>,
 }
 
 /// Names as a sentence lists them: "A", "A and B", "A, B and C".
@@ -869,14 +878,29 @@ impl App {
     pub fn signin_order(&self, code: &str, copy: bool, machine: usize) -> Vec<usize> {
         let mut machines = vec![machine];
         if !copy {
-            machines.extend(
-                self.needing(code, machine)
-                    .into_iter()
-                    .filter(|&(_, live)| live)
-                    .map(|(i, _)| i),
-            );
+            // Answering machines first; one that isn't waits its turn for it, never left out
+            // (K2-62, K2-20).
+            let mut need = self.needing(code, machine);
+            need.sort_by_key(|&(_, live)| !live);
+            machines.extend(need.into_iter().map(|(i, _)| i));
         }
         machines
+    }
+
+    /// Enter on an account ready on the machine viewed while other machines need a sign-in: it
+    /// signs it in on those, one after another, with no question (K2-62). None when no other
+    /// machine needs one, where Enter asks first, since signing in again replaces a working
+    /// sign-in. Never for a copy, which is one machine's.
+    fn signin_elsewhere(&self, code: &str, copy: bool, machine: usize) -> Option<Vec<usize>> {
+        if copy {
+            return None;
+        }
+        let ready = self.account(machine, code).is_some_and(|a| a.ready());
+        if !ready {
+            return None;
+        }
+        let order = self.signin_order(code, false, machine);
+        (order.len() > 1).then(|| order[1..].to_vec())
     }
 
     /// What Enter offers instead of a sign-in when the account (or the copy) is already ready on
@@ -1135,7 +1159,36 @@ impl App {
         first.unwrap_or_default()
     }
 
+    /// +: the providers this machine's own feed offers; with none, the ones any machine's feed
+    /// describes, each added on the machines whose own backend takes it (K2-11).
+    fn open_providers(&mut self, machine: usize) {
+        let mut choices = self.offered(machine).list();
+        if choices.is_empty() {
+            choices = self.all_providers().list();
+        }
+        match choices.len() {
+            0 => {}
+            1 => self.open_add(machine, choices.remove(0)),
+            _ => self.push_account_screen(AccountScreen::Provider {
+                machine,
+                choices,
+                sel: 0,
+            }),
+        }
+    }
+
     fn open_add(&mut self, machine: usize, provider: Provider) {
+        // Added through a machine whose own backend offers the provider: this one when it does,
+        // else the first that does (K2-11).
+        let offers =
+            |app: &App, i: usize| app.offered(i).list().iter().any(|p| p.id == provider.id);
+        let machine = if offers(self, machine) {
+            machine
+        } else {
+            (0..self.machines.len())
+                .find(|&i| self.machines[i].is_shown() && offers(self, i))
+                .unwrap_or(machine)
+        };
         // Only machines whose own backend can add this provider: an older one can't sign in a
         // provider it doesn't know.
         let machines: Vec<_> = self
@@ -1222,6 +1275,12 @@ impl App {
         f.owners
             .iter()
             .find(|o| o.sessions.iter().any(|s| s == session))
+            // A session named for its owner's code (P4M-Marketing is P4M's), as its backend reads
+            // it, though the feed lists only CODE and CODE-Background (K2-07).
+            .or_else(|| {
+                let code = session_code(session)?;
+                f.owners.iter().find(|o| o.code.as_deref() == Some(code))
+            })
             .or_else(|| {
                 (session == "default")
                     .then(|| {
@@ -1302,7 +1361,21 @@ impl App {
     }
 
     pub fn open_accounts(&mut self) {
-        let machine = self.account_machine().unwrap_or(0);
+        let mut machine = self.account_machine().unwrap_or(0);
+        // Its feed not read yet: A opens on a machine that has accounts, saying so (K2-38).
+        if self.account_feed(machine).is_none()
+            && let Some(other) = self.machines.iter().position(|m| {
+                m.is_shown() && m.feed.as_ref().is_some_and(|f| !f.accounts.is_empty())
+            })
+        {
+            let said = format!(
+                "{} This shows {}'s; Tab switches machine.",
+                self.no_account_feed_said(machine),
+                self.machines[other].name()
+            );
+            machine = other;
+            self.say(said, Tone::Info);
+        }
         let rows = self.account_rows(machine);
         self.push_account_screen(AccountScreen::List {
             machine,
@@ -1310,6 +1383,34 @@ impl App {
             sel: 0,
             model: 0,
         });
+    }
+
+    /// Why a machine's accounts can't be shown yet, in its own case (K2-38): it's being read, its
+    /// feed failed, it isn't answering, or it has no feed. The screen fills in once it comes.
+    pub fn no_account_feed_said(&self, machine: usize) -> String {
+        let Some(m) = self.machines.get(machine) else {
+            return "No machine to show.".into();
+        };
+        let name = m.name();
+        if m.machine.feed.is_none() {
+            return format!(
+                "{name} has no feed configured, so Kerdr has no accounts to show for it."
+            );
+        }
+        if let Some(e) = m.feed_error.as_deref().filter(|e| !e.trim().is_empty()) {
+            return format!("{name}'s feed failed: {e}");
+        }
+        match &m.conn {
+            crate::poll::Conn::Connecting | crate::poll::Conn::Live { .. } => {
+                format!("Reading {name}…")
+            }
+            conn => format!(
+                "{name} isn't answering{}; its accounts show once it does.",
+                conn.briefly()
+                    .map(|b| format!(" ({b})"))
+                    .unwrap_or_default()
+            ),
+        }
     }
 
     fn viewed_owner(&self) -> Option<(usize, Owner)> {
@@ -1346,7 +1447,101 @@ impl App {
         {
             return Some(found);
         }
-        self.card_owner(self.selected_for_control()?)
+        match self.selected_for_control() {
+            Some(card) => self.card_owner(card),
+            // No card: the viewed machine's owner, else the first organization, on the machine
+            // tab, else the machine Kerdr runs on (K2-06).
+            None => self.machine_default_owner(),
+        }
+    }
+
+    /// S's list of models for this owner, on this machine.
+    fn open_models(&mut self, machine: usize, owner: Owner) {
+        let others = self
+            .account_feed(machine)
+            .is_some_and(|f| f.owners.len() > 1);
+        let name = self.machines[machine].name();
+        self.push_account_screen(AccountScreen::Models {
+            machine,
+            models: owner.models.clone(),
+            owner,
+            sel: 0,
+            move_waiting: false,
+        });
+        if others && self.selected_for_control().is_none() {
+            self.say(format!("Models on {name}: Tab switches owner."), Tone::Info);
+        }
+    }
+
+    /// Where S was pressed, which a list waiting for its feed opens only while it still is.
+    pub(crate) fn models_asked_from(&self) -> String {
+        format!("{:?} {:?} {:?}", self.mode, self.sel.key, self.scope())
+    }
+
+    /// A feed came: what S or + waited for opens now, if he's still where he pressed it.
+    pub(crate) fn account_feed_came(&mut self) {
+        self.open_wanted_models();
+        self.open_wanted_add();
+    }
+
+    /// +'s picker once a feed says which providers there are, while the accounts screen it was
+    /// pressed on is still open (K2-11).
+    fn open_wanted_add(&mut self) {
+        let Some(machine) = self.add_wanted else {
+            return;
+        };
+        let still = matches!(
+            &self.mode,
+            Mode::Accounts { screen: AccountScreen::List { machine: m, .. }, .. } if *m == machine
+        );
+        if !still {
+            self.add_wanted = None;
+            return;
+        }
+        if !self.all_providers().list().is_empty() {
+            self.add_wanted = None;
+            self.open_providers(machine);
+        }
+    }
+
+    /// S's list once the feed it waited for comes, while he's still where he pressed S (K2-08).
+    fn open_wanted_models(&mut self) {
+        let Some(asked) = &self.models_wanted else {
+            return;
+        };
+        if *asked != self.models_asked_from() {
+            self.models_wanted = None;
+            return;
+        }
+        if let Some((machine, owner)) = self.models_owner() {
+            self.models_wanted = None;
+            self.open_models(machine, owner);
+        } else if !self.no_models_owner_said().starts_with("Waiting for ") {
+            self.models_wanted = None;
+            self.say(self.no_models_owner_said(), Tone::Info);
+        }
+    }
+
+    /// The machine S opens on with no card selected, and its owner: the machine tab's, else the
+    /// machine Kerdr runs on, else the one the accounts screen opens on.
+    fn machine_default_owner(&self) -> Option<(usize, Owner)> {
+        let machine = self
+            .machine
+            .as_ref()
+            .and_then(|n| self.machine_index(n))
+            .or_else(|| {
+                self.machines
+                    .iter()
+                    .position(|m| m.machine.is_local() && m.feed.is_some())
+            })
+            .or_else(|| self.account_machine())?;
+        let f = self.account_feed(machine)?;
+        f.owners
+            .iter()
+            .find(|o| Some(&o.id) == f.machine_owner.as_ref())
+            .or_else(|| f.owners.iter().find(|o| o.kind == "organization"))
+            .or_else(|| f.owners.first())
+            .map(|o| (machine, o.clone()))
     }
 
     fn card_owner(&self, card: &Card) -> Option<(usize, Owner)> {
@@ -1371,32 +1566,64 @@ impl App {
         let machine = home_machine.unwrap_or(card.machine_index);
         let d = card.detail.as_ref()?;
         let named = [d.tenant.as_deref(), d.organization.as_deref()];
-        let feed = self.account_feed(machine)?;
+        // Its own machine's feed first, else any machine's that names that owner: lists live in
+        // the one shared catalog, so it's the same list wherever it's opened (K2-08).
+        let mut order: Vec<usize> = (0..self.machines.len()).collect();
+        order.sort_by_key(|&i| i != machine);
         named
             .into_iter()
             .flatten()
             .filter(|n| !n.is_empty())
             .find_map(|n| {
-                feed.owners
-                    .iter()
-                    .find(|o| o.id.eq_ignore_ascii_case(n) || o.name.eq_ignore_ascii_case(n))
+                order.iter().find_map(|&mi| {
+                    self.account_feed(mi)?
+                        .owners
+                        .iter()
+                        .find(|o| o.id.eq_ignore_ascii_case(n) || o.name.eq_ignore_ascii_case(n))
+                        .map(|o| (mi, o.clone()))
+                })
             })
-            .map(|o| (machine, o.clone()))
     }
 
     /// What S says when there's no list to open: never "choose a session first".
     fn no_models_owner_said(&self) -> String {
-        match self.selected_for_control() {
-            None if matches!(self.scope(), Scope::Session(..)) => {
-                "This session has no owner with a list of models yet.".into()
+        // A viewed session is S's whatever card is selected, as models_owner reads it.
+        if let Scope::Session(machine, session) = self.scope() {
+            if self
+                .machine_index(machine)
+                .is_some_and(|mi| self.account_feed(mi).is_none())
+            {
+                return self.feed_not_read_said(machine);
             }
-            None => "Select a card first: S edits the list of models its owner's agents start on."
-                .into(),
-            Some(card) => format!(
-                "{}'s machine hasn't said who owns it, so there's no list of models to edit yet.",
-                card.reference
-            ),
+            // Its backend starts nothing there on any list (it refuses a session no one owns), so
+            // no list is opened that wouldn't apply (K2-07).
+            return format!(
+                "{session} has no owner, so work started there follows no list: it needs an owner in the owners file first."
+            );
         }
+        match self.selected_for_control() {
+            None => "No machine's feed has said who owns it yet, so there's no list of models to edit yet."
+                .into(),
+            Some(card) => {
+                let name = self
+                    .machines
+                    .get(card.machine_index)
+                    .map(|m| m.name())
+                    .unwrap_or_default();
+                if self.account_feed(card.machine_index).is_none() {
+                    return self.feed_not_read_said(&name);
+                }
+                format!(
+                    "{name}'s backend sends no owners, so there's no list of models for {}; updating its backend adds them.",
+                    card.reference
+                )
+            }
+        }
+    }
+
+    /// S on a machine whose feed hasn't come yet: the list opens once it does (K2-08).
+    fn feed_not_read_said(&self, machine: &str) -> String {
+        format!("Waiting for {machine}'s feed: S's list opens once it comes. Esc stops waiting.")
     }
 
     /// Whether the machine's backend has a current account to show and set; an older one says
@@ -1405,6 +1632,13 @@ impl App {
         if self
             .account_feed(machine)
             .is_some_and(|f| f.knows_current())
+        {
+            return true;
+        }
+        // Set through a machine whose backend has one, for every machine (K2-09).
+        if self
+            .catalog_route(machine, &json!({"action":"account-current","clear":true}))
+            .is_some()
         {
             return true;
         }
@@ -2038,7 +2272,8 @@ impl App {
     /// move's own record. One made while another is on its way waits its turn with all of that,
     /// and is never sent over the one on its way.
     pub(crate) fn send_account(&mut self, machine: usize, request: Value) -> Action {
-        if !self.can_write(machine) {
+        if !self.actions_on() || self.machines.get(machine).is_none() {
+            let said = "Kerdr has no action backend here to change accounts: set [actions] command in its config.";
             if request["action"] == "account-signin"
                 && let Mode::Accounts {
                     screen: AccountScreen::Signin(s),
@@ -2047,15 +2282,23 @@ impl App {
             {
                 s.failed = true;
                 s.restart = false;
-                s.message =
-                    "This machine is not answering. Reconnect, then press r to try sign-in again."
-                        .into();
+                s.message = said.into();
             }
+            self.say(said, Tone::Info);
             return Action::None;
         }
+        // A change to the shared catalog for a machine that can't take it now goes through one
+        // that can (K2-63, K2-09).
+        let (machine, routed) = match self.catalog_route(machine, &request) {
+            Some((through, words)) => (through, Some(words)),
+            None => (machine, None),
+        };
+        let live = self.machines[machine].conn.is_live();
         // What the request came from is kept in its record, found by the request when its answer
         // comes, never in a slot another answer could take (Codex's third look).
         let origin = Pending {
+            routed,
+            away: None,
             machine,
             request: crate::actions::request_metadata(&request),
             screen: match &self.mode {
@@ -2085,12 +2328,351 @@ impl App {
             self.account_not_sent(origin, &request, why);
             return Action::None;
         }
+        // Its machine isn't answering: it waits for it, as a card's change does (intent 0591,
+        // release 4, K2-20 and K2-63).
+        if !live {
+            return self.account_away(origin, machine, request);
+        }
         if self.busy {
             self.account_later.push_back((origin, request));
             return Action::None;
         }
         self.account_pending = Some(origin);
         Action::Mutate { machine, request }
+    }
+
+    /// An account request whose machine isn't answering (intent 0591, release 4). It waits for
+    /// that machine, while Kerdr is open and for a day at most, and goes once it answers, checked
+    /// again first. A sign-in's start waits on its own box, which goes on to another machine of
+    /// the same sign-in that answers. A sign-in's poll isn't sent, and polling carries on once the
+    /// machine answers. A cancel is kept and sent then. A move to the list from "move them now?"
+    /// isn't held: that round says it wasn't sent and goes on. Nothing here goes in the hold file.
+    fn account_away(&mut self, mut origin: Pending, machine: usize, request: Value) -> Action {
+        let name = self.machines[machine].name();
+        let step = request["step"].as_str();
+        if request["action"] == "account-signin" {
+            match step {
+                Some("cancel") => {
+                    self.account_cancels.push((machine, request));
+                    return Action::None;
+                }
+                Some("start") => return self.signin_waits(machine),
+                Some("poll") => {
+                    if let Mode::Accounts {
+                        screen: AccountScreen::Signin(s),
+                        ..
+                    } = &mut self.mode
+                        && s.machines.get(s.current) == Some(&machine)
+                    {
+                        s.message = format!(
+                            "Waiting for {name} to answer; the sign-in carries on once it does."
+                        );
+                    }
+                    return Action::None;
+                }
+                _ => {}
+            }
+        }
+        if self.off_list_current(machine, &request).is_some() {
+            return Action::None;
+        }
+        let same = crate::actions::without_op(&request);
+        if self
+            .account_later
+            .iter()
+            .any(|(p, r)| p.machine == machine && crate::actions::without_op(r) == same)
+        {
+            return Action::None;
+        }
+        origin.away = Some(self.now().timestamp());
+        if request["action"] == "account-signin"
+            && let Mode::Accounts {
+                screen: AccountScreen::Signin(s),
+                ..
+            } = &mut self.mode
+        {
+            let what = if step == Some("paste") {
+                "your token"
+            } else {
+                "your code"
+            };
+            s.message = format!("Waiting for {name} to answer: {what} goes once it does.");
+        }
+        // A list's "move waiting sessions" says so with the other machines' parts.
+        if request["action"] != "account-move-waiting" {
+            let what = lowercase_first(&account_what(&request));
+            let ago = self
+                .dropped_ago(machine)
+                .map(|a| format!(" ({a})"))
+                .unwrap_or_default();
+            self.say(
+                format!("Held: {what} goes when {name} answers{ago}."),
+                Tone::Info,
+            );
+        }
+        self.account_later.push_back((origin, request));
+        self.rebuild();
+        Action::None
+    }
+
+    /// A sign-in's start whose machine isn't answering: another machine of the same sign-in that
+    /// answers goes first, and this one after (K2-20); else its box waits, saying so, and it
+    /// starts once that machine answers while the box is open.
+    fn signin_waits(&mut self, machine: usize) -> Action {
+        let live: Vec<bool> = self.machines.iter().map(|m| m.conn.is_live()).collect();
+        let names: Vec<String> = self.machines.iter().map(|m| m.name()).collect();
+        let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut self.mode
+        else {
+            return Action::None;
+        };
+        if s.machines.get(s.current) != Some(&machine) {
+            return Action::None;
+        }
+        let next = (s.current + 1..s.machines.len())
+            .find(|&j| live.get(s.machines[j]).copied().unwrap_or(false));
+        if let Some(j) = next {
+            let ahead = s.machines.remove(j);
+            let away = s.machines.remove(s.current);
+            s.machines.insert(s.current, ahead);
+            s.machines.push(away);
+            s.waiting = false;
+            s.failed = false;
+            s.message = "Starting sign-in…".into();
+            let start = s.start();
+            let added = s.added.clone();
+            let (code, copy) = (s.code.clone(), s.copy.clone());
+            let paste = match &added {
+                Some(added) => Some(self.added_takes_paste(ahead, &code, added)),
+                None => self.signin_takes_paste(ahead, &code, copy.as_ref()),
+            };
+            if let Mode::Accounts {
+                screen: AccountScreen::Signin(s),
+                ..
+            } = &mut self.mode
+                && let Some(paste) = paste
+            {
+                s.paste = paste;
+            }
+            self.say(
+                format!(
+                    "{} isn't answering, so {} signs in first, and {} after.",
+                    names[away], names[ahead], names[away]
+                ),
+                Tone::Info,
+            );
+            return self.send_account(ahead, start);
+        }
+        s.waiting = true;
+        s.failed = false;
+        s.restart = false;
+        s.message = format!(
+            "Waiting for {} to answer: the sign-in starts once it does. Esc leaves it.",
+            names[machine]
+        );
+        Action::None
+    }
+
+    /// What has changed since an account request began waiting for its machine, checked as it
+    /// goes (intent 0591, release 4): a move's agent must still be in its pane with the same
+    /// conversation, a fresh agent's workspace still open with no agent, and a resumed conversation
+    /// still not running. Why it's not sent, if one has.
+    fn account_changed(&self, machine: usize, request: &Value) -> Option<String> {
+        let name = self.machines.get(machine)?.name();
+        let agents = self
+            .account_feed(machine)
+            .map(|f| f.agents.as_slice())
+            .unwrap_or_default();
+        let s = |field: &str| request[field].as_str().unwrap_or_default();
+        match request["action"].as_str()? {
+            "account-move" => {
+                let same = agents.iter().any(|a| {
+                    a.pane == s("pane")
+                        && (s("conversation").is_empty() || a.conversation == s("conversation"))
+                });
+                (!same).then(|| {
+                    format!(
+                        "its agent changed while {name} wasn't answering, {}",
+                        crate::actions::NOT_SENT
+                    )
+                })
+            }
+            "account-start" => {
+                let open: Vec<&Card> = self
+                    .board
+                    .cards
+                    .iter()
+                    .filter(|c| {
+                        c.machine_index == machine
+                            && c.session.as_deref() == Some(s("session"))
+                            && c.workspace_id.as_deref() == Some(s("workspace"))
+                    })
+                    .collect();
+                if open.is_empty() {
+                    Some(format!(
+                        "its workspace closed while {name} wasn't answering, {}",
+                        crate::actions::NOT_SENT
+                    ))
+                } else if open.iter().any(|c| !c.agents.is_empty()) {
+                    Some(format!(
+                        "an agent started there while {name} wasn't answering, {}",
+                        crate::actions::NOT_SENT
+                    ))
+                } else {
+                    None
+                }
+            }
+            crate::app::resume::RESUME => agents
+                .iter()
+                .any(|a| a.conversation == s("conversation"))
+                .then(|| {
+                    format!(
+                        "that conversation is running again, {}",
+                        crate::actions::NOT_SENT
+                    )
+                }),
+            _ => None,
+        }
+    }
+
+    /// Account requests waiting for this card's machine to answer: a move of its agent, or a fresh
+    /// agent's start in its workspace. Each with what the card's held line says, when it began to
+    /// wait, and the request, by which m's D drops it.
+    pub(crate) fn account_waits_for(&self, c: &Card) -> Vec<(String, Option<i64>, Value)> {
+        self.account_later
+            .iter()
+            .filter(|(p, r)| {
+                p.away.is_some()
+                    && p.machine == c.machine_index
+                    && match r["action"].as_str() {
+                        Some("account-move") => {
+                            c.session.as_deref() == r["session"].as_str()
+                                && c.agents
+                                    .iter()
+                                    .any(|a| Some(a.pane_id.as_str()) == r["pane"].as_str())
+                        }
+                        Some("account-start") => {
+                            c.session.as_deref() == r["session"].as_str()
+                                && c.workspace_id.as_deref() == r["workspace"].as_str()
+                        }
+                        _ => false,
+                    }
+            })
+            .map(|(p, r)| {
+                let name = self
+                    .machines
+                    .get(p.machine)
+                    .map(|m| m.name())
+                    .unwrap_or_default();
+                (
+                    format!("{} waits for {name}", lowercase_first(&account_what(r))),
+                    p.away,
+                    r.clone(),
+                )
+            })
+            .collect()
+    }
+
+    /// m's D on an account request waiting for its machine: it's never sent.
+    pub(crate) fn drop_account_wait(&mut self, request: &Value) -> bool {
+        let Some(i) = self
+            .account_later
+            .iter()
+            .position(|(p, r)| p.away.is_some() && r == request)
+        else {
+            return false;
+        };
+        self.account_later.remove(i);
+        self.say(
+            format!(
+                "Dropped: {} won't be sent.",
+                lowercase_first(&account_what(request))
+            ),
+            Tone::Info,
+        );
+        self.rebuild();
+        true
+    }
+
+    /// Whether two machines' backends write the same shared account catalog: by their feeds'
+    /// `catalog` when both say, else by both being the same kind of backend reading the same
+    /// owners (an older backend sends no `catalog`).
+    fn same_catalog(&self, a: usize, b: usize) -> bool {
+        let (Some(fa), Some(fb)) = (self.account_feed(a), self.account_feed(b)) else {
+            return false;
+        };
+        match (&fa.catalog, &fb.catalog) {
+            (Some(x), Some(y)) => x == y,
+            _ => {
+                fa.source.is_some()
+                    && fa.source == fb.source
+                    && fa.owners_source.is_some()
+                    && fa.owners_source == fb.owners_source
+                    && fa.owners_source.as_deref() != Some("mock")
+            }
+        }
+    }
+
+    /// A change to the shared account catalog (a model list, the current account, adding or
+    /// renaming an account) meant for a machine that isn't answering, or whose backend has no
+    /// current account to set: the answering machine it goes through instead, writing the same
+    /// catalog, and what its answer adds to say so (K2-63, K2-09). None when it goes as asked.
+    /// Removing an account isn't sent elsewhere: it also forgets that machine's own saved sign-in,
+    /// which only that machine can do.
+    fn catalog_route(&self, machine: usize, request: &Value) -> Option<(usize, String)> {
+        let current = request["action"] == "account-current";
+        if !matches!(
+            request["action"].as_str(),
+            Some("account-models" | "account-current" | "account-add")
+        ) {
+            return None;
+        }
+        let live = |i: usize| self.machines.get(i).is_some_and(|m| m.conn.is_live());
+        let takes = |i: usize| !current || self.account_feed(i).is_some_and(|f| f.knows_current());
+        if live(machine) && takes(machine) {
+            return None;
+        }
+        let through = (0..self.machines.len()).find(|&i| {
+            i != machine
+                && self.machines[i].is_shown()
+                && live(i)
+                && takes(i)
+                && self.same_catalog(i, machine)
+        })?;
+        let here = self.machines[machine].name();
+        let there = self.machines[through].name();
+        let words = if live(machine) {
+            let set_on: Vec<String> = (0..self.machines.len())
+                .filter(|&i| {
+                    self.machines[i].is_shown()
+                        && takes(i)
+                        && (i == through || self.same_catalog(i, through))
+                })
+                .map(|i| self.machines[i].name())
+                .collect();
+            format!(
+                "Set on {}; {here} follows once its backend updates.",
+                and_list(&set_on)
+            )
+        } else {
+            format!(
+                "Sent through {there}, since {here} isn't answering; {here} has it once its copy of the account list updates."
+            )
+        };
+        Some((through, words))
+    }
+
+    /// The first account request waiting for its machine to answer, as q says it: "LAB-Server
+    /// answers and moving the agent to ARK_C is sent".
+    pub(crate) fn account_away_wait(&self) -> Option<String> {
+        let (p, r) = self.account_later.iter().find(|(p, _)| p.away.is_some())?;
+        let name = self.machines.get(p.machine)?.name();
+        Some(format!(
+            "{name} answers and {} is sent",
+            lowercase_first(&account_what(r))
+        ))
     }
 
     /// Why this machine's backend can't take this account request as it stands now, by its feed:
@@ -2130,13 +2712,14 @@ impl App {
     }
 
     /// The next account request that waited its turn, once none is on its way: the oldest whose
-    /// machine answers goes now, with what it was asked from. One whose machine has dropped stays
-    /// queued while the drop is a passing one (the board says nothing of those either), and the
-    /// ones after it for that machine wait behind it. Once the drop lasts, it's finished as an
-    /// answer that nothing was sent, through its own screen's failure handling: never dropped
-    /// unsaid, and never left "Starting sign-in…" with nothing on its way (Codex's fifth look).
+    /// machine answers goes now, with what it was asked from. One whose machine isn't answering
+    /// waits for it (intent 0591, release 4), and the ones after it for that machine wait behind
+    /// it: for a day at most, after which it's finished as an answer that nothing was sent,
+    /// through its own screen's failure handling. One that began waiting for its machine is
+    /// checked again as it goes. A sign-in step or a test, which only its own screen shows, is
+    /// dropped once that screen is gone.
     fn next_later(&mut self) -> Option<Action> {
-        let now = self.now();
+        let now = self.now().timestamp();
         let configured = self.actions_on();
         let mut held: Vec<usize> = vec![];
         let mut i = 0;
@@ -2144,6 +2727,10 @@ impl App {
             let machine = self.account_later[i].0.machine;
             if held.contains(&machine) {
                 i += 1;
+                continue;
+            }
+            if self.left_its_screen(&self.account_later[i].0) {
+                self.account_later.remove(i);
                 continue;
             }
             let conn = self.machines.get(machine).map(|m| &m.conn);
@@ -2155,46 +2742,75 @@ impl App {
                     self.account_not_sent(origin, &request, why);
                     return Some(Action::None);
                 }
+                if origin.away.is_some()
+                    && let Some(why) = self.account_changed(machine, &request)
+                {
+                    self.account_not_sent(origin, &request, why);
+                    self.rebuild();
+                    return Some(Action::None);
+                }
+                if origin.away.is_some() {
+                    self.rebuild();
+                }
                 self.account_pending = Some(origin);
                 return Some(Action::Mutate { machine, request });
             }
-            let passing = configured
-                && conn.is_some_and(|c| {
-                    matches!(
-                        c,
-                        crate::poll::Conn::Connecting | crate::poll::Conn::Reconnecting { .. }
-                    ) && !c.lasting(now)
+            // A catalog change waiting for its machine goes through another that answers now.
+            if configured
+                && let Some((through, words)) =
+                    self.catalog_route(machine, &self.account_later[i].1)
+            {
+                let (mut origin, request) = self.account_later.remove(i)?;
+                origin.machine = through;
+                origin.routed = Some(words);
+                self.account_pending = Some(origin);
+                self.rebuild();
+                return Some(Action::Mutate {
+                    machine: through,
+                    request,
                 });
-            if passing {
-                held.push(machine);
-                i += 1;
-                continue;
             }
-            let (origin, request) = self.account_later.remove(i)?;
-            let why = match self.machines.get(machine) {
-                Some(m) if configured => format!(
-                    "{} isn't answering, {}. Try again once it's back.",
-                    m.name(),
-                    crate::actions::NOT_SENT
-                ),
-                _ => format!(
+            let Some(m) = self.machines.get(machine).filter(|_| configured) else {
+                let (origin, request) = self.account_later.remove(i)?;
+                let why = format!(
                     "Kerdr has no action backend for it, {}.",
                     crate::actions::NOT_SENT
-                ),
+                );
+                self.account_not_sent(origin, &request, why);
+                return Some(Action::None);
             };
-            // Its own answer, as if its machine had refused it: matched to it as any is.
-            self.account_not_sent(origin, &request, why);
-            return Some(Action::None);
+            let name = m.name();
+            let since = *self.account_later[i].0.away.get_or_insert(now);
+            if now - since >= crate::kept::HOLD_MOST_SECS {
+                let (origin, request) = self.account_later.remove(i)?;
+                let why = format!(
+                    "{name} didn't answer for a day, {}.",
+                    crate::actions::NOT_SENT
+                );
+                self.account_not_sent(origin, &request, why);
+                self.rebuild();
+                return Some(Action::None);
+            }
+            held.push(machine);
+            i += 1;
         }
         None
     }
 
-    /// Whether this request waits its turn behind the one on its way.
-    fn account_waits(&self, machine: usize, request: &Value) -> bool {
-        let request = crate::actions::request_metadata(request);
-        self.account_later
-            .iter()
-            .any(|(p, _)| p.machine == machine && p.request == request)
+    /// Whether this waiting request is one only its own screen shows (a sign-in's step, a test)
+    /// and that screen is gone: it's dropped, never sent to a screen he left.
+    fn left_its_screen(&self, origin: &Pending) -> bool {
+        let bound = matches!(
+            origin.request["action"].as_str(),
+            Some("account-signin" | "account-test")
+        ) && origin.request["step"] != "cancel";
+        if !bound || origin.away.is_none() {
+            return false;
+        }
+        let Some(asked) = &origin.screen else {
+            return false;
+        };
+        !matches!(&self.mode, Mode::Accounts { screen, .. } if same_screen(asked, screen))
     }
 
     /// Whether an account reply is the answer to the request on its way: matched before anything
@@ -2245,23 +2861,12 @@ impl App {
             note: None,
             recheck: false,
             added: None,
+            waiting: false,
         };
         let request = signin.start();
         self.push_account_screen(AccountScreen::Signin(Box::new(signin)));
-        let action = self.send_account(machine, request.clone());
-        if action == Action::None
-            && !self.account_waits(machine, &request)
-            && let Mode::Accounts {
-                screen: AccountScreen::Signin(s),
-                ..
-            } = &mut self.mode
-        {
-            s.failed = true;
-            s.message =
-                "This machine is not answering. Reconnect, then press r to try sign-in again."
-                    .into();
-        }
-        action
+        // Its machine not answering, its box waits for it (intent 0591, release 4).
+        self.send_account(machine, request)
     }
 
     /// Whether p offers a pasted token for this sign-in on `machine`, by that machine's feed;
@@ -2336,16 +2941,17 @@ impl App {
         match key.code {
             KeyCode::Char('A') => self.open_accounts(),
             KeyCode::Char('S') => {
+                self.models_wanted = None;
                 if let Some((machine, owner)) = self.models_owner() {
-                    self.push_account_screen(AccountScreen::Models {
-                        machine,
-                        models: owner.models.clone(),
-                        owner,
-                        sel: 0,
-                        move_waiting: false,
-                    });
+                    self.open_models(machine, owner);
                 } else {
-                    self.say(self.no_models_owner_said(), Tone::Info);
+                    let said = self.no_models_owner_said();
+                    // A feed still to come: the list opens once it does, while he's still where he
+                    // pressed S (K2-08).
+                    if said.starts_with("Waiting for ") {
+                        self.models_wanted = Some(self.models_asked_from());
+                    }
+                    self.say(said, Tone::Info);
                 }
             }
             KeyCode::Char('s') => {
@@ -2423,8 +3029,15 @@ impl App {
                 return Action::None;
             }
             if !typing_poll {
+                // Pressed once the answer comes, on this screen as it is now (K2-42).
+                self.queue_account_key(key, &screen);
                 return Action::None;
             }
+        }
+        // Keys that waited go first, in order: this one after them.
+        if !self.account_keys.is_empty() {
+            self.queue_account_key(key, &screen);
+            return Action::None;
         }
         if key.kind == KeyEventKind::Repeat
             && !matches!(
@@ -2520,19 +3133,17 @@ impl App {
                     }
                     KeyCode::Char('+') => {
                         let machine = *machine;
-                        let mut choices = self.offered(machine).list();
                         self.mode = Mode::Accounts { screen, back };
-                        match choices.len() {
-                            0 => self.say(
-                                "This machine's feed names no provider to add an account of.",
-                                Tone::Warn,
-                            ),
-                            1 => self.open_add(machine, choices.remove(0)),
-                            _ => self.push_account_screen(AccountScreen::Provider {
-                                machine,
-                                choices,
-                                sel: 0,
-                            }),
+                        self.add_wanted = None;
+                        if self.all_providers().list().is_empty() {
+                            // No feed has said yet: the picker opens once one does (K2-11).
+                            self.add_wanted = Some(machine);
+                            self.say(
+                                "Waiting for a machine's feed to say which providers there are: + opens once one does.",
+                                Tone::Info,
+                            );
+                        } else {
+                            self.open_providers(machine);
                         }
                         return Action::None;
                     }
@@ -2563,6 +3174,26 @@ impl App {
                                             ))
                                         }
                                         KeyCode::Enter => {
+                                            if let Some(others) = self.signin_elsewhere(
+                                                &code,
+                                                copy.is_some(),
+                                                *machine,
+                                            ) {
+                                                let names: Vec<String> = others
+                                                    .iter()
+                                                    .map(|&i| self.machines[i].name())
+                                                    .collect();
+                                                let here = self.machines[*machine].name();
+                                                self.say(
+                                                    format!(
+                                                        "{code} is ready on {here}; signing it in on {}.",
+                                                        and_list(&names)
+                                                    ),
+                                                    Tone::Info,
+                                                );
+                                                return self
+                                                    .begin_needed_signin(code, copy, others);
+                                            }
                                             if let Some((message, choices)) =
                                                 self.signin_choices(&code, copy.as_ref(), *machine)
                                             {
@@ -2830,6 +3461,29 @@ impl App {
                     *sel = (*sel).min(models.len() - 1);
                 }
                 KeyCode::Char(' ') => *move_waiting = !*move_waiting,
+                // The next owner on this machine, when nothing's changed here yet (K2-06).
+                KeyCode::Tab | KeyCode::BackTab => {
+                    let owners = self
+                        .account_feed(*machine)
+                        .map(|f| f.owners.clone())
+                        .unwrap_or_default();
+                    if *models != owner.models {
+                        self.say(
+                            "Enter saves this list first, or Esc leaves it unsaved; then Tab goes to another owner.",
+                            Tone::Info,
+                        );
+                    } else if owners.len() > 1 {
+                        let at = owners.iter().position(|o| o.id == owner.id).unwrap_or(0);
+                        let n = if key.code == KeyCode::BackTab {
+                            (at + owners.len() - 1) % owners.len()
+                        } else {
+                            (at + 1) % owners.len()
+                        };
+                        *owner = owners[n].clone();
+                        *models = owner.models.clone();
+                        *sel = 0;
+                    }
+                }
                 KeyCode::Char('a') => {
                     let choices = self
                         .account_feed(*machine)
@@ -3046,6 +3700,8 @@ impl App {
                         s.url = None;
                         s.failed = true;
                         s.set_aside = true;
+                        // A token instead: no browser sign-in starts once its machine answers.
+                        s.waiting = false;
                         s.message =
                             "Browser sign-in set aside for a token. r starts it again.".into();
                         let code = s.code.clone();
@@ -3345,6 +4001,65 @@ impl App {
         false
     }
 
+    /// A key pressed on an account screen while a request is on its way, kept with the screen as
+    /// it was (K2-42). A screen of keys is plenty: past that, the rest are passed over.
+    fn queue_account_key(&mut self, key: KeyEvent, screen: &AccountScreen) {
+        if key.kind == KeyEventKind::Release || self.account_keys.len() >= 32 {
+            return;
+        }
+        if self.account_keys.is_empty() {
+            self.account_keys_on = Some(format!("{screen:?}"));
+        }
+        self.account_keys.push_back(key);
+    }
+
+    /// The next key that waited for an answer, pressed now if its screen is still as it was when
+    /// it was pressed; else every key that waited is dropped, and said (K2-42).
+    fn next_account_key(&mut self) -> Option<Action> {
+        if self.account_keys.is_empty() {
+            return None;
+        }
+        let now = match &self.mode {
+            Mode::Accounts { screen, .. } => Some(format!("{screen:?}")),
+            _ => None,
+        };
+        if now.is_none() || now != self.account_keys_on {
+            let n = self.account_keys.len();
+            self.account_keys.clear();
+            self.account_keys_on = None;
+            if now.is_some() {
+                self.say(
+                    format!(
+                        "The answer changed this screen, so the {} pressed meanwhile {} dropped.",
+                        if n == 1 {
+                            "key".to_string()
+                        } else {
+                            format!("{n} keys")
+                        },
+                        if n == 1 { "was" } else { "were" }
+                    ),
+                    Tone::Info,
+                );
+            }
+            return Some(Action::None);
+        }
+        let key = self.account_keys.pop_front()?;
+        // The next key waits on the screen this one leaves.
+        let pressed = std::mem::take(&mut self.account_keys);
+        let action = self.account_key(key).unwrap_or(Action::None);
+        self.account_keys = pressed;
+        self.account_keys_on = match &self.mode {
+            Mode::Accounts { screen, .. } if !self.account_keys.is_empty() => {
+                Some(format!("{screen:?}"))
+            }
+            _ => None,
+        };
+        if !matches!(self.mode, Mode::Accounts { .. }) {
+            self.account_keys.clear();
+        }
+        Some(action)
+    }
+
     /// Called by the event loop; only polls a visible sign-in, never retries an unknown write.
     pub fn account_tick(&mut self) -> Action {
         self.drop_left_signin();
@@ -3352,6 +4067,9 @@ impl App {
         self.settle_dropped();
         if self.busy {
             return Action::None;
+        }
+        if let Some(action) = self.next_account_key() {
+            return action;
         }
         if let Mode::Accounts {
             screen: AccountScreen::PasteToken { submit, .. },
@@ -3402,31 +4120,18 @@ impl App {
                 let away = format!("{} isn't answering", self.machines[mi].name());
                 self.off_list_ended(OffListEnd::Failed(away));
             }
-            if action == Action::None && request["action"] == "account-move-waiting" {
-                // It dropped since: sent once it answers again (intent 0591, K2-02).
+            if action == Action::None
+                && request["action"] == "account-move-waiting"
+                && self.machines.get(mi).is_some_and(|m| !m.conn.is_live())
+            {
+                // It dropped since: held, and sent once it answers again (intent 0591, K2-02).
                 self.account_batch_messages.push(format!(
                     "{}: moves its waiting sessions when it answers again",
                     self.machines[mi].name()
                 ));
-                if self.machines.get(mi).is_some_and(|m| !m.conn.is_live()) {
-                    self.account_cancels.push((mi, request.clone()));
-                }
                 if self.account_queue.is_empty() {
                     self.say(self.account_batch_messages.join("; "), Tone::Warn);
                 }
-            }
-            if action == Action::None
-                && request["action"] == "account-signin"
-                && request["step"] == "start"
-                && let Mode::Accounts {
-                    screen: AccountScreen::Signin(s),
-                    ..
-                } = &mut self.mode
-            {
-                s.failed = true;
-                s.message =
-                    "This machine is not answering. Reconnect, then press r to try sign-in again."
-                        .into();
             }
             return action;
         }
@@ -3434,6 +4139,28 @@ impl App {
         // fourth look). Never lost to its machine dropping meanwhile (Codex's fifth look).
         if let Some(action) = self.next_later() {
             return action;
+        }
+        // A sign-in whose machine wasn't answering starts once it does, or once another machine
+        // of the same sign-in does (intent 0591, release 4, K2-20).
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut self.mode
+            && s.waiting
+            && let Some(&mi) = s.machines.get(s.current)
+        {
+            if self.machines.get(mi).is_some_and(|m| m.conn.is_live()) {
+                s.waiting = false;
+                s.message = "Starting sign-in…".into();
+                let start = s.start();
+                return self.send_account(mi, start);
+            }
+            let others = s.machines[s.current + 1..]
+                .iter()
+                .any(|&j| self.machines.get(j).is_some_and(|m| m.conn.is_live()));
+            if others {
+                return self.signin_waits(mi);
+            }
         }
         // The code to type ran out with the page unused: a new one, by itself, once (intent 0591).
         let now = self.now();
@@ -3481,6 +4208,35 @@ impl App {
     }
 
     pub(super) fn finish_account_action(
+        &mut self,
+        machine: usize,
+        request: Value,
+        result: Result<Response, String>,
+    ) {
+        // Sent through another machine: its answer says where it went (K2-63, K2-09).
+        let routed = self
+            .account_pending
+            .as_ref()
+            .filter(|p| {
+                p.machine == machine
+                    && crate::actions::without_op(&p.request)
+                        == crate::actions::without_op(&crate::actions::request_metadata(&request))
+            })
+            .and_then(|p| p.routed.clone())
+            .filter(|_| result.as_ref().is_ok_and(|r| r.ok));
+        self.finish_account_routed(machine, request, result);
+        if let Some(routed) = routed {
+            match self.message.take() {
+                Some((text, tone, at)) if !text.contains(&routed) => {
+                    self.message = Some((format!("{text} {routed}"), tone, at));
+                }
+                Some(kept) => self.message = Some(kept),
+                None => self.say(routed, Tone::Info),
+            }
+        }
+    }
+
+    fn finish_account_routed(
         &mut self,
         machine: usize,
         request: Value,
@@ -3644,6 +4400,26 @@ impl App {
                     return;
                 }
                 // Named by what was asked, in words for the accounts screen (intent 0591).
+                // Its machine went away after the resends: kept and sent once it answers again,
+                // as when it was away to begin with (intent 0591, K2-03). Said only if it fails
+                // then.
+                if request["action"] == "account-move-waiting"
+                    && self
+                        .machines
+                        .get(machine)
+                        .is_some_and(|m| !m.conn.is_live())
+                {
+                    self.account_batch_messages.push(format!(
+                        "{}: moves its waiting sessions when it answers again",
+                        self.machines[machine].name()
+                    ));
+                    self.account_cancels
+                        .push((machine, crate::actions::without_op(&request)));
+                    if self.account_queue.is_empty() {
+                        self.say(self.account_batch_messages.join("; "), Tone::Warn);
+                    }
+                    return;
+                }
                 let e = account_error(&request, &e);
                 if request["action"] == "account-move-waiting" {
                     self.account_batch_failed = true;
@@ -4456,8 +5232,18 @@ fn fresh_signin_words(message: &str) -> String {
 /// An account request's error, named by what was asked: "Moving the agent to ARK_C: no answer
 /// came…". One whose result is unknown points at the accounts screen, not a card (intent 0591).
 fn account_error(request: &Value, error: &str) -> String {
+    let what = account_what(request);
+    let error = error.replace(
+        "its card shows how it stands",
+        "the accounts screen (A) shows how it stands",
+    );
+    format!("{what}: {error}")
+}
+
+/// What an account request asks for, in a few words: "Moving the agent to ARK_C".
+fn account_what(request: &Value) -> String {
     let code = |field: &str| request[field].as_str().unwrap_or("the account").to_string();
-    let what = match request["action"].as_str().unwrap_or_default() {
+    match request["action"].as_str().unwrap_or_default() {
         "account-move" => match code("to").as_str() {
             "list" => "Moving the agent to its owner's list".into(),
             to => format!("Moving the agent to {to}"),
@@ -4476,12 +5262,32 @@ fn account_error(request: &Value, error: &str) -> String {
             to => format!("Starting an agent on {to}"),
         },
         _ => "Changing accounts".into(),
+    }
+}
+
+/// The owner code a herdr session's name starts with, as ark-sdlc's owners read it: `P4M` for
+/// `P4M-Marketing` or `P4M`; None for any other name (K2-07).
+fn session_code(session: &str) -> Option<&str> {
+    let (code, rest) = match session.split_once('-') {
+        Some((code, rest)) => (code, Some(rest)),
+        None => (session, None),
     };
-    let error = error.replace(
-        "its card shows how it stands",
-        "the accounts screen (A) shows how it stands",
-    );
-    format!("{what}: {error}")
+    let mut chars = code.chars();
+    let first_ok = chars.next().is_some_and(|c| c.is_ascii_uppercase());
+    let ok = first_ok
+        && (2..=4).contains(&code.len())
+        && chars.all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        && rest.is_none_or(|r| !r.is_empty() && r.chars().all(|c| c.is_ascii_alphanumeric()));
+    ok.then_some(code)
+}
+
+/// Words with a small first letter, for the middle of a sentence.
+fn lowercase_first(words: &str) -> String {
+    let mut chars = words.chars();
+    match chars.next() {
+        Some(first) => first.to_lowercase().chain(chars).collect(),
+        None => String::new(),
+    }
 }
 
 /// A code to type on a provider's page, as sign-ins give them (`K7QD-3MPWX`): nothing else is
@@ -7178,7 +7984,8 @@ mod tests {
         let mut a = app();
         a.demo = false;
         a.error_log = log;
-        a.machines[0].conn = crate::poll::Conn::Connecting;
+        // A machine not answering is waited for now (K2-20); a box with no backend to ask fails.
+        a.cfg.actions.command = None;
         assert_eq!(token_signin(&mut a), Action::None);
         assert_eq!(press(&mut a, 'r'), Action::None);
         a.keep_box_errors();
@@ -7192,7 +7999,7 @@ mod tests {
             got[0]["message"]
                 .as_str()
                 .unwrap()
-                .contains("not answering")
+                .contains("no action backend")
         );
         assert_eq!(got[0]["machine"], a.machines[0].name().as_str());
         // Another warning meanwhile, an answer about something else: still only the once, and that
@@ -7215,25 +8022,849 @@ mod tests {
     }
 
     #[test]
-    fn offline_retry_and_token_submission_stay_retryable() {
+    fn a_sign_in_for_a_machine_not_answering_waits_for_it_and_its_token_goes_then() {
+        // K2-20: the box waits for its machine rather than fail, and a token pasted meanwhile
+        // goes once it answers, in place of a browser sign-in.
         let mut a = app();
         a.machines[0].conn = crate::poll::Conn::Connecting;
+        let name = a.machines[0].name();
         assert_eq!(token_signin(&mut a), Action::None);
-        assert_eq!(press(&mut a, 'r'), Action::None);
-        assert!(
-            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed && s.message.contains("not answering"))
+        let s = signin_screen(&a);
+        assert!(!s.failed && s.waiting, "{}", s.message);
+        assert_eq!(
+            s.message,
+            format!(
+                "Waiting for {name} to answer: the sign-in starts once it does. Esc leaves it."
+            )
         );
+        // Still away: nothing goes.
+        assert_eq!(a.account_tick(), Action::None);
         press(&mut a, 'p');
         a.on_paste("fixture-private-value");
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
-        assert!(
-            matches!(&a.mode, Mode::Accounts { screen: AccountScreen::Signin(s), .. } if s.failed)
+        let s = signin_screen(&a);
+        assert!(!s.failed && !s.waiting, "{}", s.message);
+        assert_eq!(
+            s.message,
+            format!("Waiting for {name} to answer: your token goes once it does.")
         );
         assert!(!format!("{:?}", a.mode).contains("fixture-private-value"));
         a.machines[0].conn = crate::poll::Conn::Live {
             latency: Duration::ZERO,
         };
-        assert_eq!(sent(press(&mut a, 'r')).1["step"], "start");
+        let (mi, request) = sent(a.account_tick());
+        assert_eq!(mi, 0);
+        assert_eq!(request["step"], "paste", "{request}");
+        assert_eq!(request["token"], "fixture-private-value");
+        // And no browser sign-in starts after it.
+        a.busy = true;
+        assert_eq!(a.account_tick(), Action::None);
+    }
+
+    #[test]
+    fn a_waiting_sign_in_starts_when_its_machine_answers_and_never_once_its_box_is_gone() {
+        // K2-20: no browser opens unasked. The box waits and starts once its machine answers;
+        // once Esc has left it, neither its start nor a token pasted meanwhile is sent.
+        let mut a = app();
+        a.machines[0].conn = crate::poll::Conn::Connecting;
+        token_signin(&mut a);
+        assert!(signin_screen(&a).waiting);
+        back_live(&mut a, 0);
+        let (mi, request) = sent(a.account_tick());
+        assert_eq!(
+            (mi, request["step"].as_str()),
+            (0, Some("start")),
+            "{request}"
+        );
+        assert!(!signin_screen(&a).waiting);
+        for paste in [false, true] {
+            let mut a = app();
+            a.machines[0].conn = crate::poll::Conn::Connecting;
+            token_signin(&mut a);
+            if paste {
+                press(&mut a, 'p');
+                a.on_paste("fixture-private-value");
+                assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+                assert_eq!(a.account_later.len(), 1);
+            }
+            key(&mut a, KeyCode::Esc);
+            assert!(
+                !matches!(
+                    &a.mode,
+                    Mode::Accounts {
+                        screen: AccountScreen::Signin(_),
+                        ..
+                    }
+                ),
+                "{:?}",
+                a.mode
+            );
+            back_live(&mut a, 0);
+            for _ in 0..4 {
+                if let Action::Mutate { request, .. } = a.account_tick() {
+                    panic!("sent after its box was left: {request}");
+                }
+            }
+            assert!(a.account_later.is_empty(), "{paste}");
+        }
+    }
+
+    fn away(a: &mut App, machine: usize, secs: i64) {
+        let since = a.now() - chrono::Duration::seconds(secs);
+        a.machines[machine].conn = crate::poll::Conn::Reconnecting {
+            since,
+            attempt: 1,
+            retry_at: since,
+            detail: String::new(),
+        };
+    }
+
+    fn back_live(a: &mut App, machine: usize) {
+        a.machines[machine].conn = crate::poll::Conn::Live {
+            latency: Duration::ZERO,
+        };
+    }
+
+    fn said(a: &App) -> String {
+        a.message().map(|(m, _)| m.to_string()).unwrap_or_default()
+    }
+
+    /// s on #44 picking ARK_C while its machine isn't answering: held. Its card's key, machine
+    /// and the machine's name.
+    fn held_move_44(a: &mut App) -> (String, usize, String) {
+        let (key, _) = card_44(a);
+        let mi = a.card(&key).unwrap().machine_index;
+        away(a, mi, 40);
+        pick(a);
+        press(a, 's');
+        assert_eq!(key_enter(a), Action::None, "{}", said(a));
+        (key, mi, a.machines[mi].name())
+    }
+
+    fn key_enter(a: &mut App) -> Action {
+        key(a, KeyCode::Enter)
+    }
+
+    #[test]
+    fn a_feeds_catalog_is_read_and_one_without_it_still_reads() {
+        let mut feed = json!({"kerdr_feed": 1, "cards": []});
+        let f: crate::feed::Feed = serde_json::from_value(feed.clone()).unwrap();
+        assert_eq!(f.catalog, None);
+        feed["catalog"] = json!("ark-sdlc@central");
+        let f: crate::feed::Feed = serde_json::from_value(feed).unwrap();
+        assert_eq!(f.catalog.as_deref(), Some("ark-sdlc@central"));
+    }
+
+    #[test]
+    fn machines_share_a_catalog_only_when_their_feeds_say_so() {
+        let mut a = app();
+        a.machines[1].feed = a.machines[0].feed.clone();
+        let set = |a: &mut App,
+                   m: usize,
+                   catalog: Option<&str>,
+                   source: Option<&str>,
+                   owners: Option<&str>| {
+            let f = a.machines[m].feed.as_mut().unwrap();
+            f.catalog = catalog.map(str::to_string);
+            f.source = source.map(str::to_string);
+            f.owners_source = owners.map(str::to_string);
+        };
+        // Named the same: shared, whatever else differs.
+        set(&mut a, 0, Some("c"), Some("/a"), Some("x"));
+        set(&mut a, 1, Some("c"), Some("/b"), Some("y"));
+        assert!(a.same_catalog(0, 1));
+        set(&mut a, 1, Some("d"), Some("/a"), Some("x"));
+        assert!(!a.same_catalog(0, 1), "named differently: not shared");
+        // An older backend names none: the same source and owners file, never a demo's.
+        set(&mut a, 0, None, Some("/a"), Some("x"));
+        set(&mut a, 1, None, Some("/a"), Some("x"));
+        assert!(a.same_catalog(0, 1));
+        set(&mut a, 1, None, Some("/a"), Some("mock"));
+        set(&mut a, 0, None, Some("/a"), Some("mock"));
+        assert!(!a.same_catalog(0, 1));
+        set(&mut a, 0, None, None, None);
+        set(&mut a, 1, None, None, None);
+        assert!(!a.same_catalog(0, 1));
+    }
+
+    #[test]
+    fn a_move_for_a_machine_not_answering_is_held_on_its_card_and_goes_when_it_answers() {
+        // K2-63: a move waits for the agent's own machine, shown on its card, and goes once it
+        // answers, as asked.
+        let mut a = app();
+        let (key, mi, name) = held_move_44(&mut a);
+        assert_eq!(a.account_later.len(), 1);
+        assert_eq!(
+            said(&a),
+            format!(
+                "Held: moving the agent to ARK_C goes when {name} answers (it dropped 40 s ago)."
+            )
+        );
+        let card = a.card(&key).unwrap().clone();
+        assert_eq!(
+            a.held_line_for(&card).as_deref(),
+            Some(format!("⧗ moving the agent to ARK_C waits for {name}").as_str())
+        );
+        // Away for longer than a passing drop: still held, never failed.
+        away(&mut a, mi, 3600);
+        assert_eq!(a.account_tick(), Action::None);
+        assert_eq!(a.account_later.len(), 1);
+        back_live(&mut a, mi);
+        let (to, request) = sent(a.account_tick());
+        assert_eq!(to, mi);
+        assert_eq!(
+            request,
+            json!({"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C"})
+        );
+        let card = a.card(&key).unwrap().clone();
+        assert_eq!(a.held_line_for(&card), None);
+    }
+
+    #[test]
+    fn a_held_move_whose_agent_changed_meanwhile_is_not_sent() {
+        let mut a = app();
+        let (_, mi, name) = held_move_44(&mut a);
+        for agent in a.machines[mi].feed.as_mut().unwrap().agents.iter_mut() {
+            if agent.pane == "w1:p1" {
+                agent.conversation = "a-newer-one".into();
+            }
+        }
+        back_live(&mut a, mi);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.account_later.is_empty());
+        assert_eq!(
+            said(&a),
+            format!(
+                "Moving the agent to ARK_C: its agent changed while {name} wasn't answering, so nothing was sent"
+            )
+        );
+    }
+
+    #[test]
+    fn a_held_account_request_is_dropped_with_m_and_q_says_quitting_drops_it() {
+        let mut a = app();
+        let (key, _, name) = held_move_44(&mut a);
+        // q: it's only in this Kerdr, so a second q drops it.
+        assert!(!a.quit_key());
+        assert_eq!(
+            said(&a),
+            format!(
+                "Quitting once {name} answers and moving the agent to ARK_C is sent… q again quits now and drops it, Esc stays."
+            )
+        );
+        a.quitting = None;
+        // m, then D: never sent.
+        a.mode = Mode::Board;
+        a.sel.key = Some(key.clone());
+        press(&mut a, 'm');
+        assert_eq!(press(&mut a, 'D'), Action::None);
+        assert!(a.account_later.is_empty());
+        assert_eq!(
+            said(&a),
+            "Dropped: moving the agent to ARK_C won't be sent."
+        );
+        assert!(a.quit_key(), "nothing left to wait for");
+    }
+
+    #[test]
+    fn a_held_account_request_goes_no_later_than_a_day() {
+        let mut a = app();
+        let (_, mi, name) = held_move_44(&mut a);
+        a.account_later[0].0.away = Some(a.now().timestamp() - crate::kept::HOLD_MOST_SECS);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.account_later.is_empty());
+        assert_eq!(
+            said(&a),
+            format!(
+                "Moving the agent to ARK_C: {name} didn't answer for a day, so nothing was sent."
+            )
+        );
+        back_live(&mut a, mi);
+        assert_eq!(a.account_tick(), Action::None);
+    }
+
+    #[test]
+    fn a_fresh_agents_start_waits_for_its_machine_and_is_checked_again() {
+        // K2-63: a start belongs to its own machine, and goes only into the workspace it was
+        // asked for, still with no agent in it.
+        let setup = || {
+            let mut a = app();
+            a.machines[0].feed.as_mut().unwrap().starts_on = vec!["account-start".into()];
+            let card = a
+                .board
+                .cards
+                .iter()
+                .find(|c| c.machine_index == 0 && c.workspace_id.is_some() && c.session.is_some())
+                .expect("a card with a workspace on machine 0")
+                .clone();
+            let start = json!({"action":"account-start","session":card.session,"workspace":card.workspace_id,"to":"ARK_C"});
+            away(&mut a, 0, 5);
+            assert_eq!(a.send_account(0, start.clone()), Action::None);
+            assert_eq!(a.account_later.len(), 1, "{}", said(&a));
+            let held = a.held_line_for(&card).unwrap_or_default();
+            assert!(
+                held.starts_with("⧗ ")
+                    && held.ends_with(&format!("waits for {}", a.machines[0].name())),
+                "{held}"
+            );
+            back_live(&mut a, 0);
+            (a, card.key, start)
+        };
+        let name = app().machines[0].name();
+        // Still empty when it answers: sent.
+        let (mut a, key, start) = setup();
+        for c in a.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.agents.clear();
+        }
+        assert_eq!(sent(a.account_tick()), (0, start));
+        // An agent started there meanwhile: not sent.
+        let (mut a, key, _) = setup();
+        for c in a.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.agents = vec![crate::model::AgentInfo {
+                agent: "claude".into(),
+                status: "working".into(),
+                pane_id: "w9:p1".into(),
+                title: None,
+                conversation: None,
+            }];
+        }
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(a.account_later.is_empty());
+        assert!(
+            said(&a).ends_with(&format!(
+                "an agent started there while {name} wasn't answering, so nothing was sent"
+            )),
+            "{}",
+            said(&a)
+        );
+        // Its workspace closed meanwhile: not sent.
+        let (mut a, key, _) = setup();
+        a.board.cards.retain(|c| c.key != key);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(
+            said(&a).ends_with(&format!(
+                "its workspace closed while {name} wasn't answering, so nothing was sent"
+            )),
+            "{}",
+            said(&a)
+        );
+    }
+
+    #[test]
+    fn keys_pressed_while_an_account_request_is_on_its_way_are_pressed_once_it_answers() {
+        // K2-42: queued, not dropped; dropped if the answer changed the screen.
+        let mut a = app();
+        a.open_accounts();
+        let before = match &a.mode {
+            Mode::Accounts {
+                screen: AccountScreen::List { sel, .. },
+                ..
+            } => *sel,
+            _ => panic!("no list"),
+        };
+        a.busy = true;
+        assert_eq!(key(&mut a, KeyCode::Down), Action::None);
+        assert_eq!(key(&mut a, KeyCode::Down), Action::None);
+        assert_eq!(a.account_keys.len(), 2);
+        let sel_now = |a: &App| match &a.mode {
+            Mode::Accounts {
+                screen: AccountScreen::List { sel, .. },
+                ..
+            } => *sel,
+            _ => usize::MAX,
+        };
+        assert_eq!(sel_now(&a), before, "not pressed yet");
+        a.busy = false;
+        a.account_tick();
+        a.account_tick();
+        assert_eq!(sel_now(&a), before + 2);
+        assert!(a.account_keys.is_empty());
+        // The answer changes the screen meanwhile: they're dropped, and said.
+        a.busy = true;
+        key(&mut a, KeyCode::Down);
+        if let Mode::Accounts {
+            screen: AccountScreen::List { rows, .. },
+            ..
+        } = &mut a.mode
+        {
+            rows.pop();
+        }
+        a.busy = false;
+        a.account_tick();
+        assert!(a.account_keys.is_empty());
+        assert_eq!(
+            said(&a),
+            "The answer changed this screen, so the key pressed meanwhile was dropped."
+        );
+    }
+
+    #[test]
+    fn a_list_for_a_machine_not_answering_is_saved_through_one_that_shares_its_catalog() {
+        // K2-63: a catalog change goes through another machine that answers, and says so.
+        let mut a = app();
+        a.machines[1].feed = a.machines[0].feed.clone();
+        for m in [0, 1] {
+            let f = a.machines[m].feed.as_mut().unwrap();
+            f.catalog = Some("ark-sdlc".into());
+        }
+        back_live(&mut a, 1);
+        away(&mut a, 0, 5);
+        let save = json!({"action":"account-models","owner":"studio","models":["KBZ_C"]});
+        let action = a.send_account(0, save.clone());
+        let (to, request) = sent(action.clone());
+        assert_eq!((to, &request), (1, &save));
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"Saved Studio's list."}),
+        );
+        let (here, there) = (a.machines[0].name(), a.machines[1].name());
+        assert_eq!(
+            said(&a),
+            format!(
+                "Saved Studio's list. Sent through {there}, since {here} isn't answering; {here} has it once its copy of the account list updates."
+            )
+        );
+        // Not the same catalog: it waits for its own machine.
+        let mut a = app();
+        a.machines[1].feed = a.machines[0].feed.clone();
+        a.machines[0].feed.as_mut().unwrap().catalog = Some("ark-sdlc".into());
+        a.machines[1].feed.as_mut().unwrap().catalog = Some("elsewhere".into());
+        back_live(&mut a, 1);
+        away(&mut a, 0, 5);
+        assert_eq!(a.send_account(0, save.clone()), Action::None);
+        assert_eq!(a.account_later.len(), 1);
+        // Removing an account forgets that machine's own sign-in: never sent elsewhere.
+        let remove = json!({"action":"account-remove","code":"ARK_C"});
+        a.machines[1].feed.as_mut().unwrap().catalog = Some("ark-sdlc".into());
+        assert_eq!(a.send_account(0, remove), Action::None);
+        assert_eq!(a.account_later.len(), 2);
+        // Once one that shares it answers, the waiting list goes through it; the remove waits.
+        let (to, request) = sent(a.account_tick());
+        assert_eq!((to, request), (1, save));
+    }
+
+    #[test]
+    fn the_current_account_on_an_older_backend_is_set_through_one_that_has_it() {
+        // K2-09: set through a machine whose backend has a current account, saying the older one
+        // follows once it's updated.
+        let mut a = app();
+        a.machines[1].feed = a.machines[0].feed.clone();
+        back_live(&mut a, 0);
+        back_live(&mut a, 1);
+        for m in [0, 1] {
+            a.machines[m].feed.as_mut().unwrap().catalog = Some("ark-sdlc".into());
+        }
+        a.machines[0].feed.as_mut().unwrap().current = None;
+        a.machines[1].feed.as_mut().unwrap().current = Some(None);
+        a.open_accounts();
+        if let Mode::Accounts {
+            screen: AccountScreen::List { machine, .. },
+            ..
+        } = &mut a.mode
+        {
+            *machine = 0;
+        }
+        let action = press(&mut a, 'C');
+        let (to, request) = sent(action.clone());
+        assert_eq!(
+            (to, request),
+            (1, json!({"action":"account-current","clear":true}))
+        );
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"No current account now.","current":null}),
+        );
+        let (old, new) = (a.machines[0].name(), a.machines[1].name());
+        let set_on: Vec<String> = (0..a.machines.len())
+            .filter(|&i| {
+                a.machines[i]
+                    .feed
+                    .as_ref()
+                    .is_some_and(|f| f.knows_current())
+            })
+            .map(|i| a.machines[i].name())
+            .collect();
+        assert!(set_on.contains(&new));
+        assert_eq!(
+            said(&a),
+            format!(
+                "No current account now. Set on {}; {old} follows once its backend updates.",
+                and_list(&set_on)
+            )
+        );
+    }
+
+    #[test]
+    fn s_opens_the_viewed_machines_owner_with_no_card_and_tab_switches_owner() {
+        // K2-06.
+        let mut a = app();
+        a.sel.key = None;
+        a.mode = Mode::Board;
+        assert_eq!(press(&mut a, 'S'), Action::None);
+        let Mode::Accounts {
+            screen: AccountScreen::Models { owner, machine, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("no list: {}", said(&a))
+        };
+        let f = a.account_feed(*machine).unwrap();
+        assert_eq!(Some(&owner.id), f.machine_owner.as_ref());
+        let first = owner.id.clone();
+        assert!(f.owners.len() > 1, "the demo machine has several owners");
+        assert_eq!(
+            said(&a),
+            "Models on laptop: Tab switches owner.".replace("laptop", &a.machines[*machine].name())
+        );
+        key(&mut a, KeyCode::Tab);
+        let Mode::Accounts {
+            screen: AccountScreen::Models { owner, models, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!()
+        };
+        assert_ne!(owner.id, first);
+        assert_eq!(*models, owner.models);
+        // A list changed here is saved or left first.
+        let now = owner.id.clone();
+        if let Mode::Accounts {
+            screen: AccountScreen::Models { models, .. },
+            ..
+        } = &mut a.mode
+        {
+            models.reverse();
+            models.push("ARK_X".into());
+        }
+        key(&mut a, KeyCode::Tab);
+        let Mode::Accounts {
+            screen: AccountScreen::Models { owner, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!()
+        };
+        assert_eq!(owner.id, now);
+        assert_eq!(
+            said(&a),
+            "Enter saves this list first, or Esc leaves it unsaved; then Tab goes to another owner."
+        );
+    }
+
+    #[test]
+    fn a_session_named_for_its_owners_code_has_that_owners_list() {
+        // K2-07: P4M-Marketing is P4M's, as its backend reads it.
+        let mut a = app();
+        let f = a.machines[0].feed.as_mut().unwrap();
+        let code = f.owners[0].code.clone().unwrap_or_else(|| "KBZ".into());
+        f.owners[0].code = Some(code.clone());
+        let id = f.owners[0].id.clone();
+        let session = format!("{code}-Marketing");
+        assert_eq!(a.account_owner(0, &session).map(|o| o.id.clone()), Some(id));
+        assert_eq!(a.account_owner(0, "stray"), None);
+        assert_eq!(session_code("P4M-Marketing"), Some("P4M"));
+        assert_eq!(session_code("P4M"), Some("P4M"));
+        assert_eq!(session_code("web"), None);
+        assert_eq!(session_code("P4M-"), None);
+    }
+
+    #[test]
+    fn s_on_a_session_no_one_owns_says_it_needs_an_owner() {
+        // K2-07: its backend refuses a session no one owns, so no machine's list opens for it.
+        let mut a = app();
+        pick(&mut a);
+        a.machine = Some("laptop".into());
+        a.rebuild();
+        for o in a.machines[0].feed.as_mut().unwrap().owners.iter_mut() {
+            o.sessions.retain(|s| s != "web");
+        }
+        a.tab = a
+            .tabs
+            .iter()
+            .position(|s| matches!(s, Scope::Session(_, s) if s == "web"))
+            .unwrap();
+        assert_eq!(press(&mut a, 'S'), Action::None);
+        assert!(!matches!(a.mode, Mode::Accounts { .. }));
+        assert_eq!(
+            said(&a),
+            "web has no owner, so work started there follows no list: it needs an owner in the owners file first."
+        );
+    }
+
+    #[test]
+    fn s_on_a_card_whose_feed_hasnt_come_waits_for_it_or_finds_its_owner_elsewhere() {
+        // K2-08.
+        let mut a = app();
+        let (key, _) = card_44(&a);
+        let mi = a.card(&key).unwrap().machine_index;
+        let other = (0..a.machines.len())
+            .find(|&i| i != mi && a.machines[i].feed.is_some())
+            .unwrap();
+        // Its tenant is named in another machine's feed: that list opens there.
+        let owner = a.machines[other].feed.as_ref().unwrap().owners[0].clone();
+        let saved = a.machines[mi].feed.take();
+        a.machines[mi].conn = crate::poll::Conn::Connecting;
+        for c in a.board.cards.iter_mut() {
+            if c.key == key {
+                let d = c.detail.as_mut().unwrap();
+                d.tenant = Some(owner.id.clone());
+                d.home = None;
+            }
+        }
+        a.mode = Mode::Board;
+        a.sel.key = Some(key.clone());
+        press(&mut a, 'S');
+        let Mode::Accounts {
+            screen: AccountScreen::Models {
+                owner: o, machine, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("no list: {}", said(&a))
+        };
+        assert_eq!((o.id.clone(), *machine), (owner.id.clone(), other));
+        // Named nowhere and its feed not come: S waits, and opens once it comes.
+        let mut a = app();
+        let saved_feed = a.machines[mi].feed.take();
+        for i in 0..a.machines.len() {
+            if i != mi
+                && let Some(f) = a.machines[i].feed.as_mut()
+            {
+                f.owners.clear();
+            }
+        }
+        a.machines[mi].conn = crate::poll::Conn::Connecting;
+        a.mode = Mode::Board;
+        a.sel.key = Some(key.clone());
+        assert_eq!(press(&mut a, 'S'), Action::None);
+        let name = a.machines[mi].name();
+        assert_eq!(
+            said(&a),
+            format!("Waiting for {name}'s feed: S's list opens once it comes. Esc stops waiting.")
+        );
+        assert!(a.models_wanted.is_some());
+        let feed = saved_feed.clone();
+        a.machines[mi].feed = saved_feed;
+        a.account_feed_came();
+        assert!(
+            matches!(
+                &a.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::Models { .. },
+                    ..
+                }
+            ),
+            "{}",
+            said(&a)
+        );
+        drop(saved);
+        // Esc stops waiting: the feed coming later opens nothing.
+        let mut a = app();
+        a.machines[mi].feed = None;
+        for i in 0..a.machines.len() {
+            if let Some(f) = a.machines[i].feed.as_mut() {
+                f.owners.clear();
+            }
+        }
+        a.machines[mi].conn = crate::poll::Conn::Connecting;
+        a.mode = Mode::Board;
+        a.sel.key = Some(key.clone());
+        press(&mut a, 'S');
+        assert!(a.models_wanted.is_some());
+        assert_eq!(super::tests::key(&mut a, KeyCode::Esc), Action::None);
+        assert_eq!(said(&a), "S stopped waiting for that feed.");
+        a.machines[mi].feed = feed;
+        a.account_feed_came();
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        // Esc somewhere else does what it does there: the wait has lapsed.
+        a.machines[mi].feed = None;
+        press(&mut a, 'S');
+        assert!(a.models_wanted.is_some());
+        a.open_accounts();
+        super::tests::key(&mut a, KeyCode::Esc);
+        assert!(matches!(a.mode, Mode::Board), "{:?}", a.mode);
+        assert_ne!(said(&a), "S stopped waiting for that feed.");
+    }
+
+    #[test]
+    fn plus_offers_any_feeds_providers_and_adds_through_a_machine_that_takes_them() {
+        // K2-11.
+        let mut a = app();
+        let providers = a.machines[0].feed.as_ref().unwrap().providers.clone();
+        assert!(!providers.is_empty(), "the demo feed describes providers");
+        // Machine 1's backend names none: + offers machine 0's, added through machine 0.
+        a.machines[1].feed.as_mut().unwrap().providers.clear();
+        a.machines[1].feed.as_mut().unwrap().accounts.clear();
+        a.open_accounts();
+        if let Mode::Accounts {
+            screen: AccountScreen::List { machine, rows, .. },
+            ..
+        } = &mut a.mode
+        {
+            *machine = 1;
+            rows.clear();
+        }
+        press(&mut a, '+');
+        let add = match &a.mode {
+            Mode::Accounts {
+                screen: AccountScreen::Add(add),
+                ..
+            } => add.machine,
+            Mode::Accounts {
+                screen: AccountScreen::Provider { choices, .. },
+                ..
+            } => {
+                assert!(!choices.is_empty());
+                key(&mut a, KeyCode::Enter);
+                match &a.mode {
+                    Mode::Accounts {
+                        screen: AccountScreen::Add(add),
+                        ..
+                    } => add.machine,
+                    other => panic!("{other:?}"),
+                }
+            }
+            other => panic!("nothing offered: {other:?} {}", said(&a)),
+        };
+        assert_eq!(add, 0, "added through the machine whose backend offers it");
+        // No feed names any: + waits, and opens once one does.
+        let mut a = app();
+        let saved = a.machines[0].feed.as_ref().unwrap().providers.clone();
+        for m in a.machines.iter_mut() {
+            if let Some(f) = m.feed.as_mut() {
+                f.providers.clear();
+                f.accounts.clear();
+            }
+        }
+        a.open_accounts();
+        press(&mut a, '+');
+        assert_eq!(
+            said(&a),
+            "Waiting for a machine's feed to say which providers there are: + opens once one does."
+        );
+        assert!(a.add_wanted.is_some());
+        a.machines[0].feed.as_mut().unwrap().providers = saved;
+        a.account_feed_came();
+        assert!(
+            matches!(
+                &a.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::Add(_) | AccountScreen::Provider { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            a.mode
+        );
+    }
+
+    #[test]
+    fn accounts_open_on_a_machine_with_accounts_and_say_why_one_shows_none() {
+        // K2-38.
+        let mut a = app();
+        a.machine = Some(a.machines[1].name());
+        a.machines[1].feed = None;
+        a.machines[1].conn = crate::poll::Conn::Connecting;
+        let name = a.machines[1].name();
+        assert_eq!(a.no_account_feed_said(1), format!("Reading {name}…"));
+        a.machines[1].feed_error = Some("no JSON came back".into());
+        assert_eq!(
+            a.no_account_feed_said(1),
+            format!("{name}'s feed failed: no JSON came back")
+        );
+        a.open_accounts();
+        let Mode::Accounts {
+            screen: AccountScreen::List { machine, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!()
+        };
+        assert_ne!(*machine, 1, "opens on one that has accounts");
+        assert!(
+            said(&a).starts_with(&format!(
+                "{name}'s feed failed: no JSON came back This shows "
+            )),
+            "{}",
+            said(&a)
+        );
+        a.machines[1].feed_error = None;
+        away(&mut a, 1, 60);
+        assert!(
+            a.no_account_feed_said(1)
+                .starts_with(&format!("{name} isn't answering")),
+            "{}",
+            a.no_account_feed_said(1)
+        );
+    }
+
+    #[test]
+    fn a_move_waiting_whose_machine_went_away_after_its_resends_is_kept_for_it() {
+        // K2-03: kept and sent once it answers again; said only if it fails then.
+        let mut a = app();
+        away(&mut a, 1, 60);
+        a.account_batch_messages.clear();
+        a.finish_action(
+            1,
+            crate::actions::with_op(json!({"action":"account-move-waiting","owner":"studio"})),
+            Err("ssh: connect to host build-box: Connection timed out".into()),
+        );
+        let name = a.machines[1].name();
+        assert_eq!(
+            said(&a),
+            format!("{name}: moves its waiting sessions when it answers again")
+        );
+        assert_eq!(
+            a.account_cancels,
+            vec![(1, json!({"action":"account-move-waiting","owner":"studio"}))]
+        );
+    }
+
+    #[test]
+    fn a_sign_in_waiting_for_one_machine_goes_on_to_another_that_answers_and_comes_back() {
+        // K2-20: across several machines, one that isn't answering goes last.
+        let mut a = app();
+        a.machines[2].feed = a.machines[1].feed.clone();
+        a.machines[2].conn = a.machines[1].conn.clone();
+        set_status(&mut a, 0, "KBZ_C", "sign_in");
+        set_status(&mut a, 2, "KBZ_C", "missing");
+        a.machines[0].conn = crate::poll::Conn::Connecting;
+        a.open_accounts();
+        let (mi, start) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(mi, 2, "the one that answers first");
+        assert_eq!(start["step"], "start");
+        assert_eq!(signin_screen(&a).machines, vec![2, 0]);
+        let said = a.message().map(|(m, _)| m.to_string()).unwrap_or_default();
+        let (here, there) = (a.machines[0].name(), a.machines[2].name());
+        assert_eq!(
+            said,
+            format!("{here} isn't answering, so {there} signs in first, and {here} after.")
+        );
+        complete(
+            &mut a,
+            Action::Mutate {
+                machine: mi,
+                request: start,
+            },
+            started(),
+        );
+        let action = key(&mut a, KeyCode::Enter);
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"status":"done","message":"signed in"}),
+        );
+        // Its turn, still away: the box waits for it.
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(signin_screen(&a).waiting);
+        a.machines[0].conn = crate::poll::Conn::Live {
+            latency: Duration::ZERO,
+        };
+        let (mi, request) = sent(a.account_tick());
+        assert_eq!((mi, request["step"].as_str()), (0, Some("start")));
     }
 
     #[test]
@@ -7613,31 +9244,13 @@ mod tests {
     }
 
     #[test]
-    fn enter_on_an_account_ready_here_offers_the_machines_that_need_one() {
+    fn enter_on_an_account_ready_here_signs_it_in_where_its_needed_without_asking() {
+        // K2-62: ready here and needed elsewhere, Enter means sign it in there, at once.
         let mut a = app();
         set_status(&mut a, 1, "KBZ_C", "ready");
         set_status(&mut a, 0, "KBZ_C", "sign_in");
         a.machine = Some("build-box".into());
         a.open_accounts();
-        assert_eq!(
-            key(&mut a, KeyCode::Enter),
-            Action::None,
-            "nothing starts by itself"
-        );
-        let (message, choices) = where_screen(&a);
-        assert!(
-            message.contains("KBZ_C is already signed in and ready on build-box"),
-            "{message}"
-        );
-        assert_eq!(choices.len(), 2);
-        assert!(choices[0].label.starts_with("laptop") && choices[0].label.contains("✕ sign in"));
-        assert_eq!(choices[0].machines, vec![0]);
-        assert_eq!(
-            choices[1].machines,
-            vec![1],
-            "signing in again here is offered last"
-        );
-        assert!(choices[1].label.contains("though it's ready"));
         let (mi, start) = sent(key(&mut a, KeyCode::Enter));
         assert_eq!(mi, 0, "the machine that needed it");
         assert_eq!(
@@ -7645,6 +9258,11 @@ mod tests {
             json!({"action":"account-signin","code":"KBZ_C","step":"start"})
         );
         assert_eq!(signin_screen(&a).machines, vec![0]);
+        let said = a.message().map(|(m, _)| m.to_string()).unwrap_or_default();
+        assert_eq!(
+            said,
+            "KBZ_C is ready on build-box; signing it in on laptop."
+        );
         a.busy = false;
         a.account_pending = None;
         key(&mut a, KeyCode::Esc);
@@ -7656,7 +9274,7 @@ mod tests {
                     ..
                 }
             ),
-            "Esc from the sign-in goes back to the list, not the question: {:?}",
+            "Esc from the sign-in goes back to the list: {:?}",
             a.mode
         );
     }
@@ -7678,41 +9296,31 @@ mod tests {
         assert_eq!(choices.len(), 1);
         assert_eq!(choices[0].machines, vec![0]);
         key(&mut a, KeyCode::Esc);
-        // Two more signed out: all of them in turn comes first, then each, then here again.
+        // Two more signed out: Enter signs it in on both, one after another, with no question
+        // (K2-62).
         a.machines[2].feed = a.machines[1].feed.clone();
         a.machines[2].conn = a.machines[1].conn.clone();
         set_status(&mut a, 1, "KBZ_C", "sign_in");
         set_status(&mut a, 2, "KBZ_C", "missing");
         a.open_accounts();
-        key(&mut a, KeyCode::Enter);
-        let (message, choices) = where_screen(&a);
-        assert!(
-            message.contains("These 2 machines need a sign-in"),
-            "{message}"
-        );
-        let machines: Vec<Vec<usize>> = choices.iter().map(|c| c.machines.clone()).collect();
-        assert_eq!(machines, vec![vec![1, 2], vec![1], vec![2], vec![0]]);
-        assert!(choices[0].label.starts_with("All 2, one after another"));
         let (mi, _) = sent(key(&mut a, KeyCode::Enter));
         assert_eq!(mi, 1);
         assert_eq!(signin_screen(&a).machines, vec![1, 2]);
-        // One not answering is offered, said so, and left out of all in turn.
+        // One not answering isn't a dead choice: it waits its turn, after the ones that answer
+        // (K2-62, K2-20).
         let mut a = app();
         a.machines[2].feed = a.machines[1].feed.clone();
         set_status(&mut a, 0, "KBZ_C", "ready");
         set_status(&mut a, 1, "KBZ_C", "sign_in");
         set_status(&mut a, 2, "KBZ_C", "sign_in");
         a.machines[2].conn = crate::poll::Conn::Connecting;
+        a.machines[1].conn = crate::poll::Conn::Live {
+            latency: Duration::ZERO,
+        };
         a.open_accounts();
-        key(&mut a, KeyCode::Enter);
-        let (_, choices) = where_screen(&a);
-        let machines: Vec<Vec<usize>> = choices.iter().map(|c| c.machines.clone()).collect();
-        assert_eq!(machines, vec![vec![1], vec![2], vec![0]]);
-        assert!(
-            choices[1].label.ends_with(", not answering"),
-            "{}",
-            choices[1].label
-        );
+        let (mi, _) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(mi, 1);
+        assert_eq!(signin_screen(&a).machines, vec![1, 2]);
     }
 
     /// Andrew: "I didn't realize I had to 'tab' through the various machines at the top. I thought
@@ -7728,7 +9336,8 @@ mod tests {
         set_status(&mut a, 2, "KBZ_C", "missing");
         set_status(&mut a, 3, "KBZ_C", "sign_in");
         a.machines[3].conn = crate::poll::Conn::Connecting;
-        assert_eq!(a.signin_order("KBZ_C", false, 0), vec![0, 2]);
+        // One not answering waits its turn at the end, never left out (K2-62).
+        assert_eq!(a.signin_order("KBZ_C", false, 0), vec![0, 2, 3]);
         assert_eq!(
             a.signin_order("KBZ_C", true, 0),
             vec![0],
@@ -7741,7 +9350,7 @@ mod tests {
             start,
             json!({"action":"account-signin","code":"KBZ_C","step":"start"})
         );
-        assert_eq!(signin_screen(&a).machines, vec![0, 2]);
+        assert_eq!(signin_screen(&a).machines, vec![0, 2, 3]);
         let action = Action::Mutate {
             machine: mi,
             request: start,
@@ -8985,7 +10594,7 @@ mod tests {
     }
 
     #[test]
-    fn a_queued_sign_in_whose_machine_drops_before_its_turn_waits_for_it_or_fails_on_its_screen() {
+    fn a_queued_sign_in_whose_machine_drops_before_its_turn_waits_for_it() {
         // Codex's fifth look: queued behind another request, its machine drops before its turn.
         // A passing drop: it stays queued and goes once the machine is back. One that lasts: its
         // own screen says it failed, and nothing is left "Starting sign-in…" with nothing sent.
@@ -8994,6 +10603,8 @@ mod tests {
             let other = json!({"action":"account-test","code":"KBZ_C"});
             a.busy = true;
             a.account_pending = Some(Pending {
+                routed: None,
+                away: None,
                 machine: 0,
                 request: other.clone(),
                 screen: None,
@@ -9026,35 +10637,22 @@ mod tests {
             );
             assert!(!a.busy);
             assert_eq!(a.account_tick(), Action::None);
-            if !lasting {
-                assert_eq!(
-                    a.account_later.len(),
-                    1,
-                    "dropped while its machine was away"
-                );
-                assert!(!signin_screen(&a).failed);
-                a.machines[machine].conn = crate::poll::Conn::Live {
-                    latency: Duration::from_millis(5),
-                };
-                let (to, request) = sent(a.account_tick());
-                assert_eq!(to, machine);
-                assert_eq!(request["step"], "start");
-                assert!(
-                    a.account_pending.is_some(),
-                    "sent with what it was asked from"
-                );
-                continue;
-            }
-            assert!(a.account_later.is_empty());
-            assert!(a.account_pending.is_none());
-            let s = signin_screen(&a);
-            assert!(s.failed, "left starting: {}", s.message);
-            assert!(s.message.contains("isn't answering"), "{}", s.message);
+            // A drop that lasts is waited for too, while its box is open (K2-20).
+            assert_eq!(
+                a.account_later.len(),
+                1,
+                "dropped while its machine was away ({lasting})"
+            );
+            assert!(!signin_screen(&a).failed);
+            a.machines[machine].conn = crate::poll::Conn::Live {
+                latency: Duration::from_millis(5),
+            };
+            let (to, request) = sent(a.account_tick());
+            assert_eq!(to, machine);
+            assert_eq!(request["step"], "start");
             assert!(
-                a.message()
-                    .is_some_and(|(m, _)| m.contains("isn't answering")),
-                "{:?}",
-                a.message()
+                a.account_pending.is_some(),
+                "sent with what it was asked from"
             );
         }
     }
@@ -9071,6 +10669,8 @@ mod tests {
             let other = json!({"action":"account-test","code":"KBZ_C"});
             a.busy = true;
             a.account_pending = Some(Pending {
+                routed: None,
+                away: None,
                 machine: 0,
                 request: other.clone(),
                 screen: None,

@@ -6027,6 +6027,56 @@ mod tests {
         }
     }
 
+    /// K2-62: Enter on an account ready here names the machines it signs it in on, with no
+    /// question, and one not answering signs in once it answers.
+    #[test]
+    fn enter_on_a_ready_account_names_where_it_still_needs_a_sign_in() {
+        use crate::app::account_controls::{AccountScreen as S, Row};
+        let mut a = demo(false);
+        a.open_accounts();
+        if let Mode::Accounts {
+            screen: S::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = 1;
+        }
+        let code = match &a.mode {
+            Mode::Accounts {
+                screen: S::List { rows, sel, .. },
+                ..
+            } => match &rows[*sel] {
+                Row::Account(code) => code.clone(),
+                other => panic!("{other:?}"),
+            },
+            _ => panic!(),
+        };
+        for f in a.machines[1].feed.iter_mut() {
+            f.accounts
+                .iter_mut()
+                .find(|x| x.code == code)
+                .unwrap()
+                .status = "sign_in".into();
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("⏎ ready on laptop: sign in on build-box · t test"),
+            "{text}"
+        );
+        let since = a.now();
+        a.machines[1].conn = crate::poll::Conn::Reconnecting {
+            since,
+            attempt: 1,
+            retry_at: since,
+            detail: String::new(),
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("⏎ ready on laptop: sign in on build-box once it answers"),
+            "{text}"
+        );
+    }
+
     /// Intent 0327: the accounts screen names the machine Enter signs in on, the sign-in box names
     /// it in its title, says which code it wants, and offers a pasted token only where one works.
     #[test]
@@ -6070,10 +6120,7 @@ mod tests {
             *sel = 1;
         }
         let text = rendered(&a, 176, 44);
-        assert!(
-            text.contains("⏎ ready on laptop: choose where to sign in"),
-            "{text}"
-        );
+        assert!(text.contains("⏎ ready on laptop: sign in again?"), "{text}");
         let screens = crate::demo::account_screens(&a);
         let find = |f: &dyn Fn(&S) -> bool| {
             screens
