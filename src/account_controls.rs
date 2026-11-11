@@ -8351,6 +8351,38 @@ mod tests {
     }
 
     #[test]
+    fn a_held_resume_goes_only_while_its_conversation_still_isnt_running() {
+        // K2-63: a resume that waited isn't sent over the same conversation running again.
+        for running in [false, true] {
+            let mut a = app();
+            let f = a.machines[0].feed.as_mut().unwrap();
+            f.starts_on = vec![crate::app::resume::RESUME.into()];
+            let resume = json!({"action":crate::app::resume::RESUME,"session":"web","conversation":"closed-one","label":"api"});
+            away(&mut a, 0, 5);
+            assert_eq!(a.send_account(0, resume.clone()), Action::None);
+            assert_eq!(a.account_later.len(), 1, "{}", said(&a));
+            if running {
+                let f = a.machines[0].feed.as_mut().unwrap();
+                let mut agent = f.agents[0].clone();
+                agent.conversation = "closed-one".into();
+                f.agents.push(agent);
+            }
+            back_live(&mut a, 0);
+            let action = a.account_tick();
+            if running {
+                assert_eq!(action, Action::None);
+                assert!(
+                    said(&a).ends_with("that conversation is running again, so nothing was sent"),
+                    "{}",
+                    said(&a)
+                );
+            } else {
+                assert_eq!(sent(action), (0, resume));
+            }
+        }
+    }
+
+    #[test]
     fn keys_pressed_while_an_account_request_is_on_its_way_are_pressed_once_it_answers() {
         // K2-42: queued, not dropped; dropped if the answer changed the screen.
         let mut a = app();
