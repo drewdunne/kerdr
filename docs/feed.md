@@ -686,7 +686,8 @@ request to a machine X that's answering and lists `"forward"`, with `"forward_to
 further, after checking that Y and the card's owner match its own record; a host-key or sign-in
 refusal stops it there. The answer carries `"via": "X"`, and Kerdr says "Sent through X, since Y isn't
 answering here." When no allowed route reaches Y, X answers `{"ok": false, "unreachable": "Y",
-"message": "…"}` with no `retry`, and Kerdr holds the request in its file for Y, with its `op`. A
+"message": "…"}` with no `retry`, and Kerdr holds the request in its file for Y, with its `op`. For a Y that isn't one of Kerdr's
+machines, Kerdr tries it again through a machine that forwards, at most every two minutes. A
 refusal naming a home Kerdr can't reach goes the same way: through a machine that forwards, else held
 for that home when its backend holds.
 
@@ -1371,7 +1372,9 @@ so); Kerdr shows the answer's `message`, and its `current` at once on that
 machine, while the other machines' feeds follow as their backends do.
 
 The `S` tick runs `account-move-waiting` on configured feed machines only after the list was
-saved successfully. Unreachable machines are reported rather than silently claimed as moved.
+saved successfully. A machine that isn't answering is never claimed as moved: Kerdr says "LAB-Server:
+moves its waiting sessions when it answers again", keeps its request, and sends it once that machine
+answers, while Kerdr is open.
 
 ```json
 {"ok":false,"confirmation":"This agent is mid-step. Move when it next stops? Restarting ends its background job.",
