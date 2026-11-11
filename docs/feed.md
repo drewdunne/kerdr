@@ -676,8 +676,10 @@ open. One older than a day isn't sent: the card says "⧗ d dropped: LAB-Server 
 day". A start that waited for its intent's write-up when you quit is kept the same way, and the next
 Kerdr starts it once it's written up, if its card still waits to start (Kerdr checks this itself,
 since an older backend checks no `rev`). The peek (`m`) lists Kerdr's held requests and the
-backend's, and `D` drops the only one, `2D` the second. A machine whose backend doesn't list
-`"hold"` or `"forward"` is refused as before: "That machine is not answering."
+backend's, and `D` drops the only one, `2D` the second. A save of an item's text (`edit`) whose machine
+stopped answering while your editor was open is held the same way, your version kept meanwhile. A
+machine whose backend doesn't list `"hold"` or `"forward"` is refused as before: "That machine is not
+answering."
 
 **`"forward"` in `supports`** says the backend sends a request on to another machine it can reach.
 When a card's machine Y isn't answering, or isn't one of Kerdr's machines at all, Kerdr sends the
