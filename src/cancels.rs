@@ -389,6 +389,14 @@ impl App {
         );
         self.stop_starts.retain(|k| k.n != n);
         self.stop_starts.push(s);
+        // Esc said it won't start, before anyone knew it had begun: the line now reads as the
+        // question it is, never as settled before he answers (the end-to-end check's S8a).
+        self.say(
+            format!(
+                "{reference} had begun starting a moment before Esc: stop it and put it back in the backlog, or let it start?"
+            ),
+            Tone::Info,
+        );
         true
     }
 
@@ -1047,6 +1055,10 @@ mod tests {
             title.starts_with(&format!("{reference} had already begun starting.")),
             "{title}"
         );
+        // Esc's "won't start after all" doesn't stand beside the question as if it were settled
+        // (the end-to-end check's S8a): the line asks it too.
+        assert!(!said(&a).contains("won't start"), "{}", said(&a));
+        assert!(said(&a).ends_with("or let it start?"), "{}", said(&a));
         settle(&mut a);
         assert_eq!(press(&mut a, 'y'), Action::None);
         assert!(a.stop_starts.iter().any(|s| s.n == n && s.wanted));

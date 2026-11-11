@@ -3267,7 +3267,7 @@ struct Question<'a> {
     queue: bool,
     /// The answers its backend offers beyond yes and no (intent 0591).
     choices: &'a [crate::actions::Choice],
-    /// At the most its session holds: ⏎ queues it, and there's no yes.
+    /// At the most its session holds: ⏎ queues it, and there's no yes beside its queue.
     enter_queues: bool,
     too_soon: bool,
 }
@@ -3286,6 +3286,9 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
     let mut keys: Vec<(String, String)> = vec![];
     if !q.enter_queues {
         keys.push(("Enter / y".into(), yes.into()));
+    } else if !q.queue && !q.choices.iter().any(|c| c.id == "queue") {
+        // At the most, with no queue offered beside it: its yes is the queue.
+        keys.push(("Enter / y".into(), "queue it".into()));
     }
     let picks = crate::actions::choice_keys(q.choices);
     for (choice, key) in q.choices.iter().zip(picks) {

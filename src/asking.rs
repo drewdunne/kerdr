@@ -178,6 +178,11 @@ impl App {
         };
         let card_key = from.key.clone();
         let then = from.clone();
+        // What it asked, with its token: a change its own first step made isn't one to name.
+        let mut asked_with = request.clone();
+        if let Some(token) = &response.confirm {
+            asked_with["confirm"] = json!(token);
+        }
         self.waiting.retain(|w| w.from.key != card_key);
         self.waiting.push(Waiting {
             machine,
@@ -198,7 +203,10 @@ impl App {
         let text = match self.card(&card_key) {
             Some(now) => format!(
                 "{}, so its question no longer fits; {key} on it asks again.",
-                what_changed(&then, now)
+                what_changed(
+                    &self.as_its_steps_left_it(machine, &asked_with, &then, now),
+                    now
+                )
             ),
             None => format!("{reference} is gone from the board, so its question was dropped."),
         };
@@ -337,13 +345,12 @@ impl App {
         let action = request["action"].as_str().unwrap_or_default().to_string();
         let starts = matches!(action.as_str(), "dispatch" | "reopen");
         let choices = response.choices.clone();
-        let offers_queue = choices.iter().any(|c| c.id == "queue");
         // A full session's queue, from a backend that offers no choices: w, as before.
         let queue = action == "reopen" && response.used.is_some() && choices.is_empty();
         // At the most a session holds, a yes can't open it there: its queue is the answer, so the
-        // title says so and ⏎ queues it (intent 0591, K2-54).
+        // title says so and ⏎ queues it (intent 0591, K2-54). That holds whether or not the backend
+        // offers its queue as a choice: at the most, its own yes queues it (the end-to-end check).
         let at_most = starts
-            && (queue || offers_queue)
             && response.used.is_some_and(|used| {
                 self.machines
                     .get(machine)
@@ -481,7 +488,12 @@ impl App {
         };
         let changed = target
             .as_ref()
-            .map(|t| what_changed(t, &card))
+            .map(|t| {
+                what_changed(
+                    &self.as_its_steps_left_it(machine, &request, t, &card),
+                    &card,
+                )
+            })
             .unwrap_or_else(|| format!("{} changed", card.reference));
         // What he asked for goes with it, never dropped for a plainer key's request (Codex's
         // review). A save of his words goes again as it was, without its answer: its backend

@@ -10479,6 +10479,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn at_the_most_with_no_queue_offered_the_question_is_still_the_queue_and_its_yes_queues() {
+        // The backend's own at-the-most question has no queue choice: its yes queues it (the
+        // end-to-end check's first failure). It still reads as the queue it is.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        start_question(&mut app, &key, 5, vec![]);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert!(title.starts_with("Queue #"), "{title}");
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(!screen.contains("start anyway"), "{screen}");
+        assert!(screen.contains("Enter / y queue it"), "{screen}");
+        assert!(screen.contains("⏎ queues"), "{screen}");
+        // y is that same yes, as Enter is.
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("y queued nothing: {:?}", app.message())
+        };
+        assert_eq!(request["override"], true);
+        assert_eq!(request["confirm"], "0123456789ab0011");
+        assert!(request.get("choice").is_none());
+        // And with only shelve-oldest offered beside it, Enter is the yes that queues.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        start_question(
+            &mut app,
+            &key,
+            5,
+            vec![a_choice(
+                "shelve-oldest",
+                "o",
+                "shelve the oldest, then start it",
+            )],
+        );
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(screen.contains("Queue #"), "{screen}");
+        assert!(screen.contains("Enter / y queue it"), "{screen}");
+        assert!(screen.contains("o shelve the oldest"), "{screen}");
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter queued nothing: {:?}", app.message())
+        };
+        assert_eq!(request["override"], true);
+        assert!(request.get("choice").is_none());
+    }
+
+    #[test]
     fn a_question_that_arrives_while_you_are_elsewhere_waits_on_its_card() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
@@ -10626,6 +10674,81 @@ pub(crate) mod tests {
             assert_eq!(request["confirm"], "00000000000000aa");
             assert!(request.get("override").is_none());
         }
+    }
+
+    #[test]
+    fn x_on_work_an_agent_is_at_goes_as_c_and_x_do_so_its_backend_offers_wrap_up() {
+        // The end-to-end check's fourth failure: Kerdr's own X question named the place, which
+        // its backend took as the yes, so the backend's question with wrap-up never came.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        let card = app.card(&key).unwrap().clone();
+        let reference = card.reference.clone();
+        // A backend without it: Kerdr's own question, naming the place, as before.
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { title, request, .. } = &app.mode else {
+            panic!("X asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {reference}?"));
+        assert_eq!(request["workspace"].as_str(), card.workspace_id.as_deref());
+        app.mode = Mode::Board;
+        steps_everywhere(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'X') else {
+            panic!("X sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, card.machine_index);
+        assert_eq!(request, serde_json::json!({"action": "cancel", "id": id}));
+        // Nothing shows on the card until its yes: the backend asks first.
+        assert!(app.effect_for(&key, &request).is_none());
+        // Only a backend that does the step first gets it.
+        assert_eq!(
+            controls::needs(&request, None, false),
+            Some(controls::STEPS)
+        );
+        let asks = crate::actions::Response {
+            ok: false,
+            message: format!(
+                "An agent is at {reference} (workspace 07-build in web). Stop it and set {reference} aside in Won't do?"
+            ),
+            confirmation: true,
+            confirm: Some("00000000000000cc".into()),
+            session: Some("web".into()),
+            choices: vec![a_choice("wrap-up", "w", "ask it to wrap up")],
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, request.clone(), Ok(asks.clone()));
+        settle(&mut app);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {reference}?"));
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(screen.contains("w ask it to wrap up"), "{screen}");
+        // w asks its agent to wrap up instead.
+        let Action::Mutate { request: wrap, .. } = press(&mut app, 'w') else {
+            panic!("w sent nothing: {:?}", app.message())
+        };
+        assert_eq!(wrap["choice"], "wrap-up");
+        assert_eq!(wrap["confirm"], "00000000000000cc");
+        assert!(wrap.get("override").is_none() && wrap.get("workspace").is_none());
+        assert!(app.effect_for(&key, &wrap).is_none());
+        // Its yes stops it, by the token, and shows it set aside.
+        app.resolver = Default::default();
+        reply_to(&mut app, machine, request, Ok(asks));
+        settle(&mut app);
+        let Action::Mutate { request: yes, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(yes["action"], "cancel");
+        assert_eq!(yes["id"].as_str(), Some(id.as_str()));
+        assert_eq!(yes["confirm"], "00000000000000cc");
+        assert_eq!(yes["override"], true);
+        assert!(yes.get("workspace").is_none());
+        assert!(matches!(
+            app.effect_for(&key, &yes),
+            Some(crate::resolve::Effect::SetAside)
+        ));
     }
 
     #[test]
@@ -10955,6 +11078,124 @@ pub(crate) mod tests {
                 .0
                 .contains("no place in the backlog order")
         );
+    }
+
+    #[test]
+    fn a_question_after_its_own_step_brought_the_card_back_is_still_asked() {
+        // d on work in Won't do: its backend brings it back first, then asks (the end-to-end
+        // check's second failure). A board read between the key and the slow answer shows it
+        // back; that's its own first step, not a change while he decided.
+        let asks = |reference: &str| crate::actions::Response {
+            ok: false,
+            message: format!(
+                "Brought {reference} back from Won't do. {reference} can't start on its own. Say yes to start it with you along."
+            ),
+            confirmation: true,
+            confirm: Some("0123456789ab0031".into()),
+            session: Some("web".into()),
+            ..Default::default()
+        };
+        let restored = |app: &mut App, key: &str| {
+            app.board
+                .cards
+                .iter_mut()
+                .find(|c| c.key == key)
+                .unwrap()
+                .detail
+                .as_mut()
+                .unwrap()
+                .disposition = None;
+        };
+        // Somewhere else when it comes: it waits on its card, and n opens it.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, id) = wont_do_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.stage == Stage::Backlog && !c.dismissed())
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        restored(&mut app, &key);
+        reply_to(&mut app, machine, request, Ok(asks(&reference)));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "{said}");
+        assert!(said.contains("asks you first"), "{said}");
+        assert!(app.waiting_on(&key).is_some());
+        app.rebuild();
+        assert!(app.waiting_on(&key).is_some());
+        for _ in 0..app.needs_you_order().len() {
+            press(&mut app, 'n');
+            if matches!(app.mode, Mode::Confirm { .. }) {
+                break;
+            }
+        }
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["override"], true);
+        assert_eq!(request["confirm"], "0123456789ab0031");
+        // On it when it comes: asked at once, and its yes isn't asked again.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, _) = wont_do_card(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        restored(&mut app, &key);
+        reply_to(&mut app, machine, request, Ok(asks(&reference)));
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes was asked again: {:?}", app.mode)
+        };
+        assert_eq!(request["override"], true);
+        // Started somewhere meanwhile is a change, though: that yes asks again, saying so.
+        let (key, _) = wont_do_card(&mut app);
+        app.mode = Mode::Board;
+        app.resolver = Default::default();
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        restored(&mut app, &key);
+        reply_to(&mut app, machine, request, Ok(asks(&reference)));
+        settle(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.workspace_id = Some("w9".into());
+        card.workspace_label = Some("21-elsewhere".into());
+        card.session = Some("web".into());
+        assert_eq!(enter(&mut app), Action::None);
+        let said = match &app.mode {
+            Mode::Confirm { message, .. } => message.clone(),
+            _ => app
+                .message()
+                .map(|(t, _)| t)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        assert!(said.contains("now runs in 21-elsewhere"), "{said}");
+        assert!(!said.contains("brought back"), "{said}");
     }
 
     #[test]

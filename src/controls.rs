@@ -42,6 +42,11 @@ pub(crate) fn needs(
         return Some(CANCEL_BACKLOG);
     }
     let action = request["action"].as_str().unwrap_or_default();
+    // X on work an agent is at, naming no place for its backend to ask about (the end-to-end
+    // check's fourth failure): only a backend that does the step first asks it.
+    if names_no_place(request) {
+        return Some(STEPS);
+    }
     if forwarded
         && (request.get("choice").is_some()
             || (action == "edit" && request.get("confirm").is_some()))
@@ -61,6 +66,16 @@ pub(crate) fn needs(
         _ => false,
     };
     steps.then_some(STEPS)
+}
+
+/// X's cancel of a card that names no place: neither the workspace Kerdr's own question named, nor
+/// the window outside herdr, nor Esc's stop of a start. Its backend asks where its agent is.
+pub(crate) fn names_no_place(request: &Value) -> bool {
+    request["action"] == "cancel"
+        && request.get("id").is_some()
+        && request.get("workspace").is_none()
+        && request.get("outside_since").is_none()
+        && request.get("to").is_none()
 }
 
 /// An action's answer cut to what the board shows, ending in "…" when it was longer.
@@ -1568,6 +1583,18 @@ impl App {
         if !self.can_write(machine) {
             return Action::None;
         }
+        // Work an agent is at, to a backend that does the step first: sent as C and x send theirs,
+        // naming no place, so its backend asks its own question, naming where its agent is, with
+        // `wrap-up` beside yes (the end-to-end check's fourth failure). Kerdr's question named the
+        // place, which its backend took as the yes, so its wrap-up was never offered. An older
+        // backend gets Kerdr's own question, as before.
+        if stays.is_none() && self.steps_on(machine) {
+            self.action_from = Some(CardSnapshot::of(&card));
+            return Action::Mutate {
+                machine,
+                request: json!({"action":"cancel","id":detail.id}),
+            };
+        }
         let (Some(session), Some(workspace)) = (card.session.clone(), card.workspace_id.clone())
         else {
             return Action::None;
@@ -2447,7 +2474,8 @@ impl App {
                         return Some(self.answer_queue(machine, request, target, by_enter));
                     }
                     // At the most a session holds, a yes can't open it: only its queue is offered.
-                    KeyCode::Char('y') if enter_queues => {
+                    // When the queue is the question's own yes, y is that yes, as ⏎ is.
+                    KeyCode::Char('y') if enter_queues && (queue || queue_choice.is_some()) => {
                         self.confirm_by_enter = asked_by_enter;
                     }
                     KeyCode::Enter | KeyCode::Char('y') => {
@@ -2874,6 +2902,11 @@ impl App {
                 if crate::app::cancels::is_stop_start(request)
                     || crate::app::cancels::is_bare_cancel(request) =>
             {
+                return None;
+            }
+            // X on work an agent is at, naming no place: its backend asks first, so nothing shows
+            // until the yes (the end-to-end check's fourth failure).
+            "cancel" if names_no_place(request) && request.get("override").is_none() => {
                 return None;
             }
             // X on done work stops its agent and leaves it done (intent 0591, K1-29): it never
@@ -4261,6 +4294,47 @@ impl App {
         }
     }
 
+    /// Whether a request's own first step brought this card back from Won't do (intent 0591): a
+    /// step-first d, ⏎, s or C on a card there restores it before anything else, so the question
+    /// its backend asks after that is about the card as restored. That isn't a change made while
+    /// he decided (the end-to-end check's second failure). Only for a backend's own question, by
+    /// its token, from a backend that does steps.
+    pub(super) fn restored_by_its_steps(
+        &self,
+        machine: usize,
+        request: &Value,
+        then: &CardSnapshot,
+        now: &Card,
+    ) -> bool {
+        then.dismissed
+            && !now.dismissed()
+            && request.get("confirm").is_some()
+            && matches!(
+                request["action"].as_str(),
+                Some("dispatch" | "reopen" | "close")
+            )
+            && self.steps_on(machine)
+    }
+
+    /// The card a question was asked about, as its request's own first step left it: back from
+    /// Won't do when that step brought it back, else as it was.
+    pub(super) fn as_its_steps_left_it(
+        &self,
+        machine: usize,
+        request: &Value,
+        then: &CardSnapshot,
+        now: &Card,
+    ) -> CardSnapshot {
+        if self.restored_by_its_steps(machine, request, then, now) {
+            CardSnapshot {
+                dismissed: false,
+                ..then.clone()
+            }
+        } else {
+            then.clone()
+        }
+    }
+
     /// Whether a confirmed change still fits the card it asked about, as it was: a refresh while
     /// the question was open may have started, finished, restored or rehomed it.
     pub(super) fn confirm_still_applies(
@@ -4288,6 +4362,16 @@ impl App {
                 })
                 && match request["action"].as_str() {
                     Some("restore") => c.dismissed(),
+                    // Back from Won't do by its own first step: its token names the rest, which
+                    // its backend checks, so here only that it's the same work, still back, and
+                    // done or not as it was.
+                    Some("dispatch" | "reopen" | "close")
+                        if target.is_some_and(|t| {
+                            self.restored_by_its_steps(machine, request, t, c)
+                        }) =>
+                    {
+                        target.is_some_and(|t| t.same_work(c) && t.done == CardSnapshot::of(c).done)
+                    }
                     Some("dispatch" | "reopen") if target.is_some_and(|t| t.dismissed) => {
                         c.dismissed() && target.is_some_and(|t| t.same_work(c))
                     }

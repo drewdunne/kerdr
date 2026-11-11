@@ -1180,10 +1180,11 @@ fn confirm_title(
         );
     }
     if request["action"] == crate::app::resume::RESUME {
-        return format!(
-            "Resume {}?",
-            request["label"].as_str().unwrap_or("its conversation")
-        );
+        // `label` is the workspace's own name (the end-to-end check's third failure).
+        return match request["label"].as_str().filter(|l| !l.is_empty()) {
+            Some(label) => format!("Resume workspace {label}?"),
+            None => "Resume its conversation?".into(),
+        };
     }
     "Account change".into()
 }

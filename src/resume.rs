@@ -16,7 +16,8 @@ pub struct BareResume {
     pub machine: usize,
     pub session: String,
     pub conversation: String,
-    /// The closed workspace's name, which the new one takes.
+    /// The closed workspace's own name, which the new one takes: never "Workspace …", the board's
+    /// words for it (the end-to-end check's third failure). Empty when it has none.
     pub label: String,
     /// herdr's name for the program it ran, for the words.
     pub program: String,
@@ -31,8 +32,11 @@ impl BareResume {
             "action": RESUME,
             "session": self.session,
             "conversation": self.conversation,
-            "label": self.label,
         });
+        // With no name of its own, its backend names the new one.
+        if !self.label.is_empty() {
+            request["label"] = json!(self.label);
+        }
         if let Some(to) = to.filter(|t| *t != "list") {
             request["to"] = json!(to);
         }
@@ -74,7 +78,7 @@ impl App {
             machine: card.machine_index,
             session,
             conversation,
-            label: card.workspace_name(),
+            label: card.reference.clone(),
             program,
             key: card.key.clone(),
         })
@@ -261,7 +265,7 @@ mod tests {
     }
 
     fn opened(card: &Card) -> Value {
-        json!({"ok":true,"session":card.session,"workspace":"w77","label":card.workspace_name(),"message":"Resumed that Claude Code conversation in a new workspace."})
+        json!({"ok":true,"session":card.session,"workspace":"w77","label":card.reference,"message":"Resumed that Claude Code conversation in a new workspace."})
     }
 
     /// Takes the card off the board, as a read once its workspace closed does.
@@ -280,7 +284,15 @@ mod tests {
         let (request, message) = asked(&a);
         assert_eq!(
             request,
-            json!({"action":"account-resume","session":card.session,"conversation":"c-0123","label":card.workspace_name()})
+            json!({"action":"account-resume","session":card.session,"conversation":"c-0123","label":card.reference})
+        );
+        // The workspace's own name, as its backend names the new one: never the board's
+        // "Workspace …" (the end-to-end check's third failure).
+        assert!(!card.reference.is_empty() && !card.reference.starts_with("Workspace "));
+        let title = crate::ui::tests_render(&a, 120, 40);
+        assert!(
+            title.contains(&format!("Resume workspace {}?", card.reference)),
+            "{title}"
         );
         assert!(message.contains("Resume its"), "{message}");
         assert_eq!(

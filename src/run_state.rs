@@ -488,7 +488,14 @@ impl App {
             );
             return Action::None;
         }
-        // In won't do: brought back first; its start goes once that's answered (intent 0591).
+        // In won't do, to a backend that does the step first: one start with the account, as d
+        // sends it, which its backend brings back first and answers saying each step, `partial`
+        // when the start fails after the restore stood (the end-to-end check's fifth failure).
+        if start.restore && self.steps_on(start.machine) {
+            return self.send_start(card, &start, to);
+        }
+        // In won't do, to an older backend: brought back first; its start goes once that's
+        // answered (intent 0591).
         if start.restore {
             let mut owed = OwedAccount::new(&card.key, to);
             owed.restore = true;
@@ -713,8 +720,27 @@ impl App {
             o.update = None;
             o.since = Instant::now();
         }
-        // 2. Brought back from won't do.
+        // 2. Brought back from won't do: by its start itself, where its backend now does the step
+        // first (the end-to-end check's fifth failure), else by a restore of its own first.
         if owed.restore && card.dismissed() {
+            if !owed.restore_sent
+                && let RunState::Stopped(start) = self.run_state(&card)
+                && start.restore
+                && !start.update
+                && self.steps_on(start.machine)
+            {
+                if owed.to != "list" && !self.start_choices(&start).contains(&owed.to) {
+                    self.say(
+                        format!(
+                            "{reference} can't start on {} as it is now: s on it offers what can.",
+                            owed.to
+                        ),
+                        Tone::Info,
+                    );
+                    return Owed::Done(Action::None);
+                }
+                return Owed::Done(self.send_start(card, &start, &owed.to));
+            }
             if !owed.restore_sent {
                 let o = &mut self.owed_accounts[i];
                 o.restore_sent = true;
@@ -1509,6 +1535,70 @@ mod tests {
         assert_eq!(a.account_owed(), Action::None);
         assert!(a.owed_accounts.is_empty());
         assert_eq!(a.account_owed(), Action::None, "and nothing later either");
+    }
+
+    /// Every machine's backend does each key's step first: its feed says "steps".
+    fn steps(a: &mut App) {
+        for m in a.machines.iter_mut() {
+            if let Some(f) = m.feed.as_mut()
+                && !f.supports.iter().any(|s| s == "steps")
+            {
+                f.supports.push("steps".into());
+            }
+        }
+    }
+
+    /// The end-to-end check's fifth failure: to a backend that does the step first, s on a card in
+    /// won't do is one start with the account, as d sends it, which its backend brings back first
+    /// and answers saying each step. Never a restore of its own and then a start.
+    #[test]
+    fn s_on_a_card_in_wont_do_is_one_start_with_the_account_where_its_backend_does_steps() {
+        let mut a = app();
+        steps(&mut a);
+        let k = set_aside(&mut a);
+        let id = a.card(&k).unwrap().detail.as_ref().unwrap().id.clone();
+        select(&mut a, &k);
+        press(&mut a, 's');
+        assert!(start_screen(&a).0.restore);
+        let (machine, request) = choose(&mut a, "ARK_C");
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty(), "nothing owed after it");
+        on_its_way(&mut a, machine, &request);
+        assert_eq!(a.account_owed(), Action::None, "and nothing sent after it");
+        // An older backend brought up to date, that now does the step first: one start too.
+        let mut a = app();
+        let k = set_aside(&mut a);
+        let mi = a.card(&k).unwrap().machine_index;
+        a.machines[mi].feed.as_mut().unwrap().starts_on.clear();
+        a.machines[mi]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .retain(|s| s != "steps");
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let at = start_screen(&a)
+            .1
+            .iter()
+            .position(|c| c == "ARK_C")
+            .unwrap();
+        for _ in 0..at {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert_eq!(a.update_due().map(|(m, ..)| m), Some(mi));
+        a.machines[mi].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        steps(&mut a);
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("nothing started: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty(), "paid once");
     }
 
     /// Codex's review: an old backend and won't do at once. The update comes first, then the
