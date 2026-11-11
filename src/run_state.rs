@@ -233,7 +233,7 @@ impl App {
         };
         if !self.actions_on() {
             return RunState::Unavailable(format!(
-                "{reference} has no agent running; with [actions] configured, s starts it on an account."
+                "{reference} has no agent running, and Kerdr has no action backend here to start it (set [actions] command in its config)."
             ));
         }
         // Where the start goes, as ⏎ and d send it (home_machine): where a refusal said it lives

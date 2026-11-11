@@ -133,6 +133,35 @@ pub struct Response {
     /// to check (intent 0591, B1-108). The rest were saved.
     #[serde(default, deserialize_with = "prefill")]
     pub prefill: Vec<Prefill>,
+    /// With `ok`: the backend took the request and holds it, to do when it can, and these words
+    /// say what it waits for, for the card until the feed says otherwise ("moves to ARK_C at
+    /// 02:00") (intent 0591, release 4).
+    #[serde(default, deserialize_with = "plain_line")]
+    pub pending: Option<String>,
+    /// The machine that sent the request on to its home, when Kerdr asked it to (`forward_to`).
+    #[serde(default, deserialize_with = "plain_line")]
+    pub via: Option<String>,
+    /// The home a forwarded request couldn't reach by any route allowed: nothing was done, and Kerdr
+    /// holds it until that machine answers.
+    #[serde(default, deserialize_with = "plain_line")]
+    pub unreachable: Option<String>,
+    /// On a `drop`: false when the held request had already run, or was running.
+    #[serde(default)]
+    pub dropped: Option<bool>,
+}
+
+/// A line of words for the board: control characters out, trimmed; nothing left (or not a
+/// string) reads as none.
+fn plain_line<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value.as_str().and_then(|s| {
+        let line: String = s
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let line = line.trim();
+        (!line.is_empty()).then(|| line.to_string())
+    }))
 }
 
 /// One Kickoff answer that couldn't be saved, because its question changed while he answered: the
@@ -1102,6 +1131,43 @@ mod tests {
             took: Duration::from_millis(5),
         };
         answer_of(&output, request, deadline_for(request), "arknet-one", true)
+    }
+
+    #[test]
+    fn an_answer_says_what_its_backend_holds_and_where_it_went() {
+        // Intent 0591, release 4.
+        let r = answered(
+            &json!({"action":"dispatch","id":"0041"}),
+            r#"{"ok":true,"message":"Queued #41 in pick4me.","pending":"queued in pick4me:\nstarts when a workspace there frees up","via":"LAB-Server"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.pending.as_deref(),
+            Some("queued in pick4me: starts when a workspace there frees up")
+        );
+        assert_eq!(r.via.as_deref(), Some("LAB-Server"));
+        let r = answered(
+            &json!({"action":"close","id":"0041"}),
+            r#"{"ok":false,"message":"arknet-one isn't reachable from LAB-Server.","unreachable":"arknet-one","via":"LAB-Server"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.unreachable.as_deref(), Some("arknet-one"));
+        let r = answered(
+            &json!({"action":"drop","id":"0041","held":"k-0000000000000001"}),
+            r#"{"ok":true,"message":"It had already started.","dropped":false}"#,
+        )
+        .unwrap();
+        assert_eq!(r.dropped, Some(false));
+        // Words that aren't any are none, and an older backend sends none of it.
+        let r = answered(
+            &json!({"action":"close","id":"0041"}),
+            r#"{"ok":true,"message":"Done.","pending":"  ","via":7}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.pending, r.via, r.unreachable, r.dropped),
+            (None, None, None, None)
+        );
     }
 
     #[test]

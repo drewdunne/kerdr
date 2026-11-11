@@ -139,6 +139,24 @@ pub struct FeedConfig {
     pub every: u64,
 }
 
+impl FeedConfig {
+    /// The actions command of the same system as this feed, for a config that names none (intent
+    /// 0591, K1-12): ark-sdlc's `ark-card-action` beside its `ark-cards`, whose feed it answers
+    /// for. Any other feed's backend is never guessed.
+    pub fn ark_card_action(&self) -> Option<String> {
+        let command = self.command.as_deref()?.trim();
+        let program = command.split_whitespace().next()?;
+        let (dir, name) = match program.rsplit_once('/') {
+            Some((dir, name)) => (Some(dir), name),
+            None => (None, program),
+        };
+        (name == "ark-cards").then(|| match dir {
+            Some(dir) => format!("{dir}/ark-card-action"),
+            None => "ark-card-action".into(),
+        })
+    }
+}
+
 impl Default for FeedConfig {
     fn default() -> Self {
         FeedConfig {
@@ -295,11 +313,14 @@ impl Config {
     pub fn load_from(path: &Path) -> Result<Config, String> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
-                let cfg: Config =
+                let mut cfg: Config =
                     toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
                 cfg.board
                     .check_hidden()
                     .map_err(|e| format!("{}: {e}", path.display()))?;
+                if cfg.actions.command.is_none() {
+                    cfg.actions.command = cfg.feed.ark_card_action();
+                }
                 Ok(cfg)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -448,6 +469,40 @@ mod tests {
         );
         std::fs::write(&path, "[board]\nsplit = 'sideways'\n").unwrap();
         assert!(Config::load_from(&path).is_err());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn an_ark_cards_feed_with_no_actions_command_uses_the_ark_card_action_beside_it() {
+        // Intent 0591, K1-12: the backend of the same system, and only that one.
+        let dir = std::env::temp_dir().join(format!("kerdr-actions-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.toml");
+        let actions = |text: &str| {
+            std::fs::write(&path, text).unwrap();
+            Config::load_from(&path).unwrap().actions.command
+        };
+        assert_eq!(
+            actions("[feed]\ncommand = \"~/Projects/ark-sdlc/bin/ark-cards --json\"\n"),
+            Some("~/Projects/ark-sdlc/bin/ark-card-action".into())
+        );
+        assert_eq!(
+            actions("[feed]\ncommand = \"ark-cards --json\"\n"),
+            Some("ark-card-action".into())
+        );
+        // Another feed's backend is never guessed, and a command he set is his.
+        assert_eq!(actions("[feed]\ncommand = \"my-tracker --json\"\n"), None);
+        assert_eq!(actions("[feed]\ncommand = \"not-ark-cards\"\n"), None);
+        assert_eq!(actions(""), None);
+        assert_eq!(
+            actions("[feed]\ncommand = \"ark-cards\"\n[actions]\ncommand = \"mine\"\n"),
+            Some("mine".into())
+        );
+        // An empty one turns actions off on purpose.
+        assert_eq!(
+            actions("[feed]\ncommand = \"ark-cards\"\n[actions]\ncommand = \"\"\n"),
+            Some(String::new())
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -7633,7 +7633,7 @@ pub(crate) mod tests {
             app.message()
                 .unwrap()
                 .0
-                .contains("with [actions] configured"),
+                .contains("no action backend here to reopen it"),
             "{:?}",
             app.message()
         );

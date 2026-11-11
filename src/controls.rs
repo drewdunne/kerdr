@@ -877,7 +877,7 @@ impl App {
             .is_none_or(|s| s.trim().is_empty())
         {
             self.say(
-                "Intent controls are not configured for this board.",
+                "Kerdr has no action backend here to change intents: set [actions] command in its config.",
                 Tone::Info,
             );
             return false;
@@ -1123,7 +1123,7 @@ impl App {
             };
             self.say(
                 format!(
-                    "{} {what}; with [actions] configured, ⏎ reopens it. m peeks at it.",
+                    "{} {what}, and Kerdr has no action backend here to reopen it (set [actions] command in its config). m peeks at it.",
                     card.reference
                 ),
                 Tone::Info,

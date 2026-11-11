@@ -512,7 +512,9 @@ impl App {
     /// machine stopped answering while it was open.
     fn cant_send(&self, machine: usize) -> Option<String> {
         if !self.actions_on() {
-            return Some("intent controls are not configured for this board.".into());
+            return Some(
+                "Kerdr has no action backend here (set [actions] command in its config).".into(),
+            );
         }
         match self.machines.get(machine) {
             Some(m) if m.conn.is_live() => None,

@@ -790,6 +790,7 @@ pub fn machines(away: bool) -> Vec<MachineState> {
                         .into(),
                         how: if handed { "next" } else { "list" }.into(),
                         programs: vec![],
+                        held: vec![],
                         problem: None,
                         waiting: waiting.then(|| crate::accounts::Waiting {
                             why: "usage".into(),

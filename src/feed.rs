@@ -368,6 +368,62 @@ pub struct FeedCard {
     /// which terminal, and since when (intent 0411).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside_herdr: Option<OutsideHerdr>,
+    /// A short hash of what a decision about it rests on, from a backend that holds requests
+    /// (intent 0591, release 4): a request that waited before it went carries the one its card had
+    /// when the key was pressed, and the backend does nothing when it's changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// What its backend holds for it, to do when it can: shown on the card and listed in its
+    /// peek, where each can be dropped (intent 0591, release 4).
+    #[serde(
+        default,
+        deserialize_with = "held_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub held: Vec<Held>,
+}
+
+/// One request a backend holds for a card (intent 0591, release 4): its `op`, the action it is,
+/// what the card says meanwhile, when it was taken, and, for one that runs at a set time, when.
+/// Both times are epoch seconds.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Held {
+    pub op: String,
+    #[serde(default)]
+    pub action: String,
+    pub pending: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub until: Option<i64>,
+}
+
+/// A `held` list, its entries Kerdr can't read left out: one with no `op` or no words for the
+/// card can't be shown or dropped. Anything that isn't a list reads as none.
+pub fn held_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Held>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let mut out: Vec<Held> = vec![];
+    for item in value.as_array().into_iter().flatten() {
+        let Ok(held) = serde_json::from_value::<Held>(item.clone()) else {
+            continue;
+        };
+        let pending: String = held
+            .pending
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if held.op.trim().is_empty()
+            || pending.trim().is_empty()
+            || out.iter().any(|h| h.op == held.op)
+        {
+            continue;
+        }
+        out.push(Held {
+            pending: pending.trim().to_string(),
+            ..held
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -588,6 +644,39 @@ mod tests {
             Some("no account was free")
         );
         assert_eq!(feed.cards[1].intake_why, None);
+    }
+
+    #[test]
+    fn a_card_says_what_its_backend_holds_for_it_and_its_rev() {
+        // Intent 0591, release 4: what Kerdr can't read is left out, never a failed feed.
+        let feed = parse(
+            r#"{"kerdr_feed":1,"supports":["op","hold","forward"],"cards":[
+                {"id":"41","title":"a","rev":"r-1a2b","held":[
+                  {"op":"k-0000000000000001","action":"dispatch","pending":"queued in pick4me: starts when a workspace there frees up","since":1794400000},
+                  {"op":"k-0000000000000002","action":"account-move","pending":"moves to\nARK_C at 02:00","since":1794400000,"until":1794430000},
+                  {"op":"","action":"x","pending":"no op"},
+                  {"op":"k-0000000000000003","action":"x"},
+                  {"op":"k-0000000000000001","action":"dispatch","pending":"twice"},
+                  "nonsense", 7]},
+                {"id":"42","title":"b","held":"oops"},
+                {"id":"43","title":"c"}],
+              "agents":[{"pane":"w1:p1","session":"web","conversation":"c1","account":"KBZ_C",
+                 "held":[{"op":"k-0000000000000004","action":"account-move","pending":"moves to ARK_C at 02:00","until":1794430000}]}]}"#,
+        )
+        .unwrap();
+        assert!(feed.supports("hold") && feed.supports("forward"));
+        let card = &feed.cards[0];
+        assert_eq!(card.rev.as_deref(), Some("r-1a2b"));
+        assert_eq!(card.held.len(), 2, "{:?}", card.held);
+        assert_eq!(card.held[0].action, "dispatch");
+        assert_eq!(card.held[1].pending, "moves to ARK_C at 02:00");
+        assert_eq!(card.held[1].until, Some(1794430000));
+        assert!(feed.cards[1].held.is_empty() && feed.cards[2].held.is_empty());
+        assert_eq!(feed.cards[2].rev, None);
+        assert_eq!(feed.agents[0].held[0].op, "k-0000000000000004");
+        // An older feed says none of it.
+        let old = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"a"}]}"#).unwrap();
+        assert!(!old.supports("hold") && old.cards[0].held.is_empty());
     }
 
     #[test]
