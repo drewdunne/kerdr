@@ -322,6 +322,13 @@ impl App {
             return;
         }
         let before = self.resolver.last_added();
+        // Its card as it is now: a question its backend asks (a held stop always asks again)
+        // waits on that card unless you're on it.
+        self.action_from = entry
+            .key
+            .as_deref()
+            .and_then(|k| self.card(k))
+            .map(crate::model::CardSnapshot::of);
         self.action_key = entry.key.clone();
         self.queue_action(machine, request);
         let n = self.resolver.last_added();
@@ -1530,5 +1537,62 @@ mod tests {
             app.held_line_for(&card).as_deref(),
             Some("⧗ moves to ARK_C at 02:00")
         );
+    }
+
+    #[test]
+    fn a_held_stop_that_asks_again_waits_on_its_card() {
+        let mut app = app();
+        let (key, id, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        supports(&mut app, m, "cancel-backlog");
+        supports(&mut app, m, "steps");
+        app.kept.hold(HeldRequest {
+            machine: app.machines[m].name(),
+            request: crate::actions::with_op(json!({"action":"cancel","id":id})),
+            rev: Some("r1".into()),
+            key: Some(key.clone()),
+            reference: reference.clone(),
+            what: "X".into(),
+            pressed: app.now().timestamp(),
+            after: None,
+        });
+        // Andrew is elsewhere meanwhile.
+        app.sel.key = None;
+        back(&mut app, m);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{} {:?}", said(&app), app.kept.held);
+        let (n, _, request, _) = ready[0].clone();
+        assert_eq!(request["held"], true);
+        app.finish_job(
+            n,
+            request,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("tok".into()),
+                message: format!("Stop {reference}'s agent? It changed since you asked."),
+                ..Default::default()
+            }),
+        );
+        assert!(app.waiting_line_for(&key).is_some(), "{}", said(&app));
+        assert!(app.kept.held.is_empty());
+    }
+
+    #[test]
+    fn only_a_backend_that_holds_gets_rev_on_a_resend() {
+        for holds in [false, true] {
+            let mut app = app();
+            let (_, _, _, m) = waiting(&mut app);
+            if holds {
+                supports(&mut app, m, HOLD);
+            }
+            d(&mut app);
+            let (n, _, request, _) = app.resolver.ready()[0].clone();
+            // Sent at once, it carries none; its resends carry the card's rev only to a backend
+            // that holds.
+            assert!(request.get("rev").is_none());
+            assert!(request.get("held").is_none());
+            assert_eq!(app.resolver.rev_of(n).is_some(), holds);
+        }
     }
 }
