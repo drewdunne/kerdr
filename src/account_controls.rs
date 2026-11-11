@@ -598,12 +598,16 @@ impl App {
             .enumerate()
             .filter(|(_, m)| m.is_shown() && m.machine.feed.is_some())
         {
+            let request = json!({"action":"account-move-waiting","owner":owner});
             if m.conn.is_live() {
-                self.account_queue
-                    .push_back((mi, json!({"action":"account-move-waiting","owner":owner})));
+                self.account_queue.push_back((mi, request));
             } else {
-                self.account_batch_messages
-                    .push(format!("{}: offline, not moved", m.name()));
+                // Sent once it answers again, as a sign-in's cancel is (intent 0591, K2-01).
+                self.account_batch_messages.push(format!(
+                    "{}: moves its waiting sessions when it answers again",
+                    m.name()
+                ));
+                self.account_cancels.push((mi, request));
             }
         }
         if self.account_queue.is_empty() && !self.account_batch_messages.is_empty() {
@@ -3399,10 +3403,14 @@ impl App {
                 self.off_list_ended(OffListEnd::Failed(away));
             }
             if action == Action::None && request["action"] == "account-move-waiting" {
+                // It dropped since: sent once it answers again (intent 0591, K2-02).
                 self.account_batch_messages.push(format!(
-                    "{}: disconnected, not moved",
+                    "{}: moves its waiting sessions when it answers again",
                     self.machines[mi].name()
                 ));
+                if self.machines.get(mi).is_some_and(|m| !m.conn.is_live()) {
+                    self.account_cancels.push((mi, request.clone()));
+                }
                 if self.account_queue.is_empty() {
                     self.say(self.account_batch_messages.join("; "), Tone::Warn);
                 }
@@ -6194,6 +6202,48 @@ mod tests {
                 }),
             );
         }
+    }
+    #[test]
+    fn a_machine_away_when_the_list_is_saved_moves_its_waiting_sessions_when_it_answers() {
+        // Intent 0591, K2-01: kept, and sent once that machine answers again.
+        let mut a = app();
+        let owner = a.account_feed(0).unwrap().owners[0].clone();
+        a.machines[1].conn = Conn::Connecting;
+        let name = a.machines[1].name();
+        a.push_account_screen(AccountScreen::Models {
+            machine: 0,
+            models: vec!["KBZ_C".into(), "ARK_C".into()],
+            owner,
+            sel: 0,
+            move_waiting: true,
+        });
+        let action = key(&mut a, KeyCode::Enter);
+        complete(&mut a, action, json!({"ok":true,"message":"saved"}));
+        let (m, r) = sent(a.account_tick());
+        assert_eq!(m, 0);
+        a.finish_action(
+            m,
+            r,
+            Ok(Response {
+                ok: true,
+                message: "moved".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            a.account_batch_messages.contains(&format!(
+                "{name}: moves its waiting sessions when it answers again"
+            )),
+            "{:?}",
+            a.account_batch_messages
+        );
+        assert_eq!(a.account_tick(), Action::None, "not while it's away");
+        a.machines[1].conn = Conn::Live {
+            latency: Default::default(),
+        };
+        let (m, r) = sent(a.account_tick());
+        assert_eq!(m, 1);
+        assert_eq!(r, json!({"action":"account-move-waiting","owner":"studio"}));
     }
     #[test]
     fn a_failed_model_save_does_not_move_sessions() {

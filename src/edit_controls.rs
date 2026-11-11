@@ -518,6 +518,8 @@ impl App {
         }
         match self.machines.get(machine) {
             Some(m) if m.conn.is_live() => None,
+            // Held for it, or sent through a machine that forwards (intent 0591, release 4, K1-93).
+            Some(_) if self.holds_on(machine) || self.forwarder(machine).is_some() => None,
             Some(m) => Some(format!("{} isn't answering.", m.name())),
             None => Some("its machine isn't on this board.".into()),
         }
@@ -2782,6 +2784,38 @@ mod tests {
         assert!(text.contains("nvim: not found; vim: not found"), "{text}");
         assert!(text.contains("editor in Kerdr's config"), "{text}");
         assert!(app.edits.contains_key(&key));
+    }
+
+    #[test]
+    fn a_save_for_a_machine_that_isnt_answering_is_held_when_its_backend_holds() {
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        app.machines[machine].conn = crate::poll::Conn::Connecting;
+        let name = app.machines[machine].name();
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = app.edit_ended(&key, wrote("Mine."))
+        else {
+            panic!("not sent: {}", said(&app))
+        };
+        app.queue_action(to, request);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].request["text"], "Mine.");
+        assert_eq!(
+            said(&app),
+            format!("Held: your new text on {reference} goes when {name} answers.")
+        );
+        // Your version stays yours until a save of it lands.
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
     }
 
     #[test]
