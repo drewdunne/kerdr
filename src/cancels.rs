@@ -59,6 +59,9 @@ pub struct StopStart {
 pub enum StartEnd {
     /// It started, where its answer says.
     Started(Place),
+    /// It started on the machine its answer names, which Kerdr isn't set up to reach: nothing of
+    /// it can be stopped from here, and no other machine stands in for it (Codex's sixth look).
+    Unreachable(String),
     /// It asked a question first, so nothing started.
     Asked,
     /// Refused, or done only in part: nothing of it runs.
@@ -79,11 +82,15 @@ pub struct Place {
 
 impl Place {
     /// The stop of what runs there, back to the backlog: named by its workspace when the start
-    /// named one, so its backend stops that and nothing else.
+    /// named one, with as much of where as it said, so its backend stops that and nothing else.
+    /// A workspace named without its session is still named, never dropped for a stop by number
+    /// alone (Codex's sixth look, swept).
     fn stop(&self, id: &str) -> Value {
         let mut cancel = json!({"action":"cancel","id":id,"to":"backlog"});
-        if let (Some(session), Some(workspace)) = (&self.session, &self.workspace) {
-            cancel["session"] = json!(session);
+        if let Some(workspace) = &self.workspace {
+            if let Some(session) = &self.session {
+                cancel["session"] = json!(session);
+            }
             cancel["workspace"] = json!(workspace);
             if let Some(tab) = &self.tab {
                 cancel["tab"] = json!(tab);
@@ -406,6 +413,9 @@ impl App {
             let said = match s.ended {
                 None => format!("{reference} carries on starting."),
                 Some(StartEnd::Started(_)) => format!("{reference} started, and carries on."),
+                Some(StartEnd::Unreachable(on)) => {
+                    format!("{reference} started on {on}, and carries on.")
+                }
                 Some(StartEnd::Asked) => {
                     format!("{reference} asked a question before it started, so nothing started.")
                 }
@@ -431,6 +441,11 @@ impl App {
             // Its answer went by without Kerdr hearing how it ended.
             None | Some(StartEnd::Unknown) => self.late_stop_unknown(i, target),
             Some(StartEnd::Started(place)) => self.late_stop(i, place, target),
+            Some(StartEnd::Unreachable(on)) => {
+                self.stop_starts.remove(i);
+                self.say(unreachable_said(&reference, &on), Tone::Warn);
+                Action::None
+            }
             Some(StartEnd::Asked) => {
                 self.stop_starts.remove(i);
                 self.say(
@@ -453,8 +468,11 @@ impl App {
     }
 
     /// A yes that came after its start answered that it started, at `place`: stopped there only
-    /// while the board shows it still running there; asked again where it runs now if that moved;
-    /// nothing at all if it's gone, closed, done or set aside meanwhile.
+    /// while the board shows it still running there, or hasn't caught up with its start yet;
+    /// asked again where it runs now if that moved; nothing at all if it's gone, closed, done, set
+    /// aside or running outside herdr meanwhile. An answer that named no workspace is never taken
+    /// as leave to stop it by its number once its start's change has left the board (Codex's
+    /// sixth look).
     fn late_stop(&mut self, i: usize, place: Place, target: Option<CardSnapshot>) -> Action {
         let s = self.stop_starts[i].clone();
         let reference = self.stop_reference(&s, target.as_ref());
@@ -477,29 +495,41 @@ impl App {
             self.say(format!("{changed}, so nothing was stopped."), Tone::Warn);
             return Action::None;
         }
-        let now = Place::of(&card);
-        let here = match &now {
-            // Shown running: only where its answer said. An answer that named no workspace has
-            // nothing to tell another one from, so it's asked again.
-            Some(_) => place.workspace.is_some() && place.holds(&card),
-            // Not shown running: as its answer said while the board hasn't caught up with it yet
-            // (its change still shows), else its workspace closed meanwhile.
-            None => place.workspace.is_none() || self.resolver.job(s.n).is_some(),
+        let Some(now) = Place::of(&card) else {
+            self.stop_starts.remove(i);
+            // Its conversation runs in a terminal outside herdr now: not what its start opened,
+            // and not something a stop back to the backlog reaches.
+            if let Some(outside) = card.outside_herdr() {
+                self.say(
+                    format!(
+                        "{reference} now runs in {} outside herdr, not where its start opened it, so nothing was stopped: X on its card stops it there and sets it aside.",
+                        outside.place()
+                    ),
+                    Tone::Warn,
+                );
+                return Action::None;
+            }
+            // Shown nowhere: as its answer said only while its start's change still shows, so the
+            // board hasn't caught up with it yet. A missing workspace is no sign of that.
+            if self.resolver.job(s.n).is_some() {
+                return self.stop_at(&s, &place, Some(CardSnapshot::of(&card)), true);
+            }
+            let said = if place.workspace.is_some() {
+                format!("{reference}'s workspace closed while you decided, so nothing was stopped.")
+            } else {
+                format!(
+                    "{reference} shows nowhere running now, and its start didn't say where it opened, so nothing was stopped: X on its card stops it once it shows running."
+                )
+            };
+            self.say(said, Tone::Warn);
+            return Action::None;
         };
-        if here {
+        // Shown running: only where its answer said. An answer that named no workspace has
+        // nothing to tell another one from, so it's asked again.
+        if place.workspace.is_some() && place.holds(&card) {
             self.stop_starts.remove(i);
             return self.stop_at(&s, &place, Some(CardSnapshot::of(&card)), true);
         }
-        let Some(now) = now else {
-            self.stop_starts.remove(i);
-            self.say(
-                format!(
-                    "{reference}'s workspace closed while you decided, so nothing was stopped."
-                ),
-                Tone::Warn,
-            );
-            return Action::None;
-        };
         let at = describe(&now, &card);
         self.stop_starts[i].ended = Some(StartEnd::Started(now.clone()));
         self.put_stop_question(
@@ -614,23 +644,32 @@ impl App {
             // Still going: its end, when it comes, is this answer again.
             Ok(r) if r.ok && !r.confirmation && r.follow.is_some() => return false,
             Ok(r) if r.ok && !r.confirmation && r.questions.is_empty() => {
-                // Where it runs: the machine its answer names, when it ran on another.
-                let ran = r
+                // Where it runs: the machine its answer names, when it ran on another. One Kerdr
+                // can't reach is kept as that, never stood in for by the machine that answered,
+                // whose workspaces aren't the ones named (Codex's sixth look).
+                let elsewhere = r
                     .machine
                     .as_deref()
+                    .map(str::trim)
+                    .filter(|m| !m.is_empty())
                     .filter(|m| {
                         self.machines
                             .get(machine)
                             .is_some_and(|here| !here.answers_to(m))
-                    })
-                    .and_then(|m| self.machine_index(m))
-                    .unwrap_or(machine);
-                StartEnd::Started(Place {
-                    machine: ran,
-                    session: r.session.clone(),
-                    workspace: r.workspace.clone(),
-                    tab: r.tab.clone(),
-                })
+                    });
+                let ran = match elsewhere {
+                    None => Ok(machine),
+                    Some(on) => self.machine_index(on).ok_or(on),
+                };
+                match ran {
+                    Ok(ran) => StartEnd::Started(Place {
+                        machine: ran,
+                        session: r.session.clone(),
+                        workspace: r.workspace.clone(),
+                        tab: r.tab.clone(),
+                    }),
+                    Err(on) => StartEnd::Unreachable(on.to_string()),
+                }
             }
             Ok(r) if r.confirmation || !r.questions.is_empty() => StartEnd::Asked,
             Err(e) if crate::actions::result_unknown(e) => StartEnd::Unknown,
@@ -646,6 +685,10 @@ impl App {
         match end {
             StartEnd::Started(place) => {
                 self.stop_at(&s, &place, from.clone(), false);
+                true
+            }
+            StartEnd::Unreachable(on) => {
+                self.say(unreachable_said(&reference, &on), Tone::Warn);
                 true
             }
             StartEnd::Asked => {
@@ -684,6 +727,13 @@ impl App {
             "Kerdr can't tell whether {reference} started, so it wasn't stopped: X on its card stops it once it shows running."
         ));
     }
+}
+
+/// What a stop says for a start that ran on a machine Kerdr isn't set up to reach.
+fn unreachable_said(reference: &str, on: &str) -> String {
+    format!(
+        "{reference} started on {on}, which Kerdr isn't set up to reach, so it wasn't stopped: it carries on there."
+    )
 }
 
 /// Where a card runs, in a question's words: "workspace web-41 (web)".
@@ -1410,5 +1460,150 @@ mod tests {
             said(&a)
         );
         assert!(a.card(&key).is_some());
+    }
+
+    #[test]
+    fn a_start_on_a_machine_kerdr_cant_reach_is_never_stopped_on_the_one_that_answered() {
+        // Codex's sixth look: the answer says the start opened W9 on a machine Kerdr isn't set up
+        // for. Nothing is sent, before his yes or after it, to the machine that answered, whose
+        // W9 isn't that one; that's said.
+        let far = || {
+            reply(
+                "Started #41 on far-away in workspace w9 (web).",
+                json!({"machine":"far-away","session":"web","workspace":"w9","tab":"w9:t1"}),
+            )
+        };
+        let unreachable = "started on far-away, which Kerdr isn't set up to reach, so it wasn't stopped: it carries on there.";
+        // His yes came first.
+        let mut a = demo_app();
+        let (_, _, n, _, request) = too_late(&mut a, true);
+        settle(&mut a);
+        press(&mut a, 'y');
+        a.finish_job(n, request, far());
+        assert!(sent(&mut a).is_empty(), "stopped on the wrong machine");
+        assert!(said(&a).contains(unreachable), "{}", said(&a));
+        assert!(a.stop_starts.is_empty());
+        // Its answer came first.
+        let mut a = demo_app();
+        let (_, _, n, _, request) = too_late(&mut a, true);
+        a.finish_job(n, request, far());
+        a.message = None;
+        settle(&mut a);
+        assert_eq!(press(&mut a, 'y'), Action::None);
+        assert!(sent(&mut a).is_empty(), "stopped on the wrong machine");
+        assert!(said(&a).contains(unreachable), "{}", said(&a));
+        assert!(a.stop_starts.is_empty());
+        // A machine Kerdr does reach: stopped there, where its answer said.
+        let mut a = demo_app();
+        let (_, id, n, machine, request) = too_late(&mut a, true);
+        let other = if machine == 0 { 1 } else { 0 };
+        supports(&mut a, other, CANCEL_BACKLOG, true);
+        let name = a.machines[other].name();
+        a.finish_job(
+            n,
+            request,
+            reply(
+                &format!("Started #41 on {name} in workspace w9 (web)."),
+                json!({"machine":name,"session":"web","workspace":"w9","tab":"w9:t1"}),
+            ),
+        );
+        settle(&mut a);
+        let Action::Mutate {
+            machine: to,
+            request: cancel,
+        } = press(&mut a, 'y')
+        else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        assert_eq!(
+            (to, cancel),
+            (
+                other,
+                json!({"action":"cancel","id":id,"to":"backlog","session":"web","workspace":"w9","tab":"w9:t1"})
+            )
+        );
+    }
+
+    #[test]
+    fn a_late_yes_after_an_answer_naming_no_workspace_stops_by_number_only_while_its_start_shows() {
+        // Codex's sixth look: a start's answer may name no workspace. While its change still
+        // shows, the board hasn't caught up with it, and the stop goes by its number, as its
+        // answer said. Once that's gone, a card with nothing shown running isn't taken as that
+        // start still running: its workspace may have closed, or it may have been resumed
+        // outside herdr since. Nothing is stopped by number then; that's said.
+        let bare = || reply("Started #41.", json!({}));
+        let mut a = demo_app();
+        let (_, id, n, machine, request) = too_late(&mut a, true);
+        a.finish_job(n, request, bare());
+        assert!(a.resolver.job(n).is_some());
+        settle(&mut a);
+        let Action::Mutate {
+            machine: to,
+            request: cancel,
+        } = press(&mut a, 'y')
+        else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        assert_eq!(
+            (to, cancel),
+            (machine, json!({"action":"cancel","id":id,"to":"backlog"}))
+        );
+        for outside in [false, true] {
+            let mut a = demo_app();
+            let (_, id, n, machine, request) = too_late(&mut a, true);
+            a.finish_job(n, request, bare());
+            // Two reads go by: its change has left the board.
+            for _ in 0..2 {
+                a.resolver.read(machine, None);
+            }
+            assert!(a.resolver.job(n).is_none());
+            if outside {
+                for c in a.machines[machine].feed.as_mut().unwrap().cards.iter_mut() {
+                    if c.id == id {
+                        c.outside_herdr = Some(crate::feed::OutsideHerdr {
+                            terminal: Some("foot".into()),
+                            since: Some("2026-11-01T13:02:00-06:00".into()),
+                        });
+                    }
+                }
+            }
+            a.rebuild();
+            a.message = None;
+            settle(&mut a);
+            assert_eq!(press(&mut a, 'y'), Action::None, "{outside}");
+            assert!(sent(&mut a).is_empty(), "stopped by number: {outside}");
+            let expected = if outside {
+                "now runs in a foot window outside herdr, not where its start opened it, so nothing was stopped: X on its card stops it there and sets it aside."
+            } else {
+                "shows nowhere running now, and its start didn't say where it opened, so nothing was stopped"
+            };
+            assert!(said(&a).contains(expected), "{}", said(&a));
+            assert!(a.stop_starts.is_empty());
+        }
+    }
+
+    #[test]
+    fn a_stop_names_the_workspace_its_start_named_even_without_its_session() {
+        // Codex's sixth look, swept: an answer naming its workspace but not its session. The stop
+        // still names that workspace, never falling back to a stop by number alone.
+        let mut a = demo_app();
+        let (_, id, n, machine, request) = too_late(&mut a, true);
+        settle(&mut a);
+        press(&mut a, 'y');
+        a.finish_job(
+            n,
+            request,
+            reply("Started #41 in workspace w9.", json!({"workspace":"w9"})),
+        );
+        let [(_, to, cancel)] = &sent(&mut a)[..] else {
+            panic!("no stop: {:?}", a.message())
+        };
+        assert_eq!(
+            (*to, cancel),
+            (
+                machine,
+                &json!({"action":"cancel","id":id,"to":"backlog","workspace":"w9"})
+            )
+        );
     }
 }

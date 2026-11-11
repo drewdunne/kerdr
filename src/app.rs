@@ -677,14 +677,16 @@ pub struct App {
     /// request, to send there next, and the card it was asked from (intent 0411). Several can
     /// answer at once now that changes run side by side (intent 0416), so they wait in order.
     pub resend: std::collections::VecDeque<(usize, serde_json::Value, Option<CardSnapshot>)>,
-    /// The machine and record of each such resend still unanswered: its answer is shown as it
-    /// is, never sent on again, so one ⏎ asks two machines at most.
+    /// The machine and card, by key, of each such resend still unanswered: its answer is shown as
+    /// it is, never sent on again, so one ⏎ asks two machines at most. By key, never by number,
+    /// which another source's card can share (Codex's sixth look, swept).
     pub resent: Vec<(usize, String)>,
-    /// Each record a refusal said lives on another machine, that machine, and the home the
-    /// board's feed still showed for it when the refusal came: its actions go there, and a
-    /// question that machine asks can be answered yes, even before the board catches up. Each
-    /// holds only while the feed still shows that old home; fresh news of its home ends it. One
-    /// for each record, since several can be refused at once (intent 0416).
+    /// Each card, by key, whose record a refusal said lives on another machine, that machine, and
+    /// the home the board's feed still showed for it when the refusal came: its actions go there,
+    /// and a question that machine asks can be answered yes, even before the board catches up.
+    /// Each holds only while the feed still shows that old home; fresh news of its home ends it.
+    /// One for each card, since several can be refused at once (intent 0416). By key: another
+    /// source's card with the same number and home never follows it (Codex's sixth look, swept).
     pub moved_home: Vec<(String, usize, Option<String>)>,
     /// What's typed in a Kickoff Questions box and not saved yet, by its card's key: never another
     /// source's card with the same number (Codex's fifth look).
@@ -787,7 +789,9 @@ pub struct App {
     pub update_asks: u64,
     /// The end of followed work being taken as its request's answer.
     pub(crate) follow_end: Option<follow::FollowEnd>,
-    /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
+    /// The card, by key, whose start or reopen ⏎ just asked for, for its change to note it was
+    /// ⏎'s: taken by the very next change Kerdr takes in, sent or not, and matched by its card,
+    /// never by its record's number, which another source's card can share (Codex's sixth look).
     pub(crate) enter_sent: Option<String>,
     /// The answer being taken is to a start ⏎ asked for; and the card, by key, whose question, up
     /// now, such a start asked (Codex's review; by key since Codex's fifth look).
@@ -2137,8 +2141,9 @@ impl App {
 
     /// Notes that a start or reopen was ⏎'s: when it's followed, its end takes you in (intent 0591).
     pub(crate) fn by_enter(&mut self, action: Action) -> Action {
-        if let Action::Mutate { request, .. } = &action {
-            self.enter_sent = request["id"].as_str().map(str::to_string);
+        if let Action::Mutate { machine, request } = &action {
+            let id = request["id"].as_str().unwrap_or_default();
+            self.enter_sent = Some(self.intent_key(*machine, id, self.action_from.as_ref()));
         }
         action
     }
@@ -8253,7 +8258,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(i, t, _)| (i.clone(), *t))
                 .collect::<Vec<_>>(),
-            vec![(id.clone(), 1)]
+            vec![(key.clone(), 1)]
         );
         let card = app.card(&key).cloned().unwrap();
         assert_eq!(app.home_machine(&card), Some(1));
@@ -8335,8 +8340,89 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(i, t, _)| (i.clone(), *t))
                 .collect::<Vec<_>>(),
-            vec![(id.clone(), 1)],
+            vec![(key.clone(), 1)],
             "⏎ goes there once it's back"
+        );
+    }
+
+    #[test]
+    fn a_move_one_sources_card_was_refused_with_never_redirects_anothers_with_its_number() {
+        // Codex's sixth look, swept: source A's #N and source B's #N, both homed on the same
+        // machine. A refusal says A's lives on another machine now: A's actions go there, and
+        // B's stay where B's own home says. Its resend is A's alone.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        room_in_every_session(&mut app);
+        let (ka, id) = waiting_backlog_card(&app);
+        let (kb, there) = same_number_elsewhere(&mut app, &ka);
+        let here = app.card(&ka).unwrap().machine_index;
+        let home = app.machines[here].name();
+        for m in [here, there] {
+            for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+                if c.id == id {
+                    c.home = Some(crate::feed::Home {
+                        machine: Some(home.clone()),
+                        session: None,
+                    });
+                }
+            }
+        }
+        app.rebuild();
+        app.sel = Selection {
+            col: app.card(&ka).unwrap().stage.index(),
+            key: Some(ka.clone()),
+        };
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, here);
+        app.queue_action(machine, request);
+        let n = app.resolver.last_added();
+        let request = app.resolver.job_request(n).unwrap().clone();
+        let name = app.machines[there].name();
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                message: format!("It lives on {name} now; ⏎ again opens it there."),
+                home: Some(format!("{name}/web")),
+                ..Default::default()
+            }),
+        );
+        let a = app.card(&ka).cloned().unwrap();
+        let b = app.card(&kb).cloned().unwrap();
+        assert_eq!(app.moved_target(&a), Some(there));
+        assert_eq!(app.moved_target(&b), None, "B's actions follow A's move");
+        assert_eq!(app.resent.len(), 1);
+        assert_eq!(app.resent[0].1, ka);
+    }
+
+    #[test]
+    fn a_change_asked_with_no_card_is_its_machines_own_never_another_sources_with_its_number() {
+        // Codex's sixth look, swept: a change sent to a machine with no card it was asked from
+        // is about that machine's own record, by its feed's source: never another source's card
+        // that only shows on that machine, with the same number.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (ka, id) = waiting_backlog_card(&app);
+        let (kb, there) = same_number_elsewhere(&mut app, &ka);
+        let here = app.card(&ka).unwrap().machine_index;
+        // Each shows on the other's machine, where its workspace would run.
+        for (k, m) in [(&ka, there), (&kb, here)] {
+            app.board
+                .cards
+                .iter_mut()
+                .find(|c| &c.key == k)
+                .unwrap()
+                .machine_index = m;
+        }
+        app.queue_action(here, serde_json::json!({"action":"close","id":id}));
+        let n = app.resolver.last_added();
+        assert_eq!(
+            app.resolver.job(n).unwrap().key.as_deref(),
+            Some(ka.as_str()),
+            "taken as another source's card"
         );
     }
 
@@ -10504,6 +10590,90 @@ pub(crate) mod tests {
             Action::None
         );
         assert!(app.account_pending.is_none());
+    }
+
+    #[test]
+    fn a_yes_by_enter_that_isnt_sent_never_marks_another_sources_start_with_its_number() {
+        // Codex's sixth look, swept: ⏎ asked to bring source A's #N back and start it. By the
+        // yes, A's backend no longer does steps, so nothing is sent. Then d on source B's #N:
+        // its start is d's, not ⏎'s, so its answer doesn't take him in as ⏎'s would.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        room_in_every_session(&mut app);
+        steps_everywhere(&mut app);
+        let (ka, id) = waiting_backlog_card(&app);
+        let (kb, _) = same_number_elsewhere(&mut app, &ka);
+        let here = app.card(&ka).unwrap().machine_index;
+        for c in app.machines[here].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.disposition = Some("wont_do".into());
+            }
+        }
+        app.rebuild();
+        app.sel = Selection {
+            col: app.card(&ka).unwrap().stage.index(),
+            key: Some(ka.clone()),
+        };
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        settle(&mut app);
+        app.machines[here]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .retain(|s| s != "steps");
+        // As the board sends it: stopped by its check, so nothing goes.
+        if let Action::Mutate { machine, request } = enter(&mut app) {
+            app.queue_action(machine, request);
+        }
+        assert!(app.resolver.ready().is_empty(), "sent without steps");
+        app.sel = Selection {
+            col: app.card(&kb).unwrap().stage.index(),
+            key: Some(kb.clone()),
+        };
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d on B sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        let n = app.resolver.last_added();
+        let job = app.resolver.job(n).expect("B's start");
+        assert_eq!(job.key.as_deref(), Some(kb.as_str()));
+        assert!(!job.by_enter, "B's start taken as ⏎'s");
+        assert!(app.enter_sent.is_none());
+    }
+
+    #[test]
+    fn a_home_kerdr_cant_reach_never_borrows_the_cards_machine_for_steps() {
+        // Codex's sixth look, swept: the card's record lives on a machine Kerdr isn't set up for.
+        // Whether its backend does each key's step first isn't answered by the machine the card
+        // shows on: d on it in Won't do says what 0.33.0 said, and nothing is sent.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, _) = wont_do_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        assert!(app.does_steps(&app.board.cards[i].clone()));
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some("far-away".into()),
+            session: None,
+        });
+        let card = app.board.cards[i].clone();
+        assert!(
+            !app.does_steps(&card),
+            "the card's own machine answered for its home"
+        );
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert!(app.resolver.ready().is_empty());
+        assert!(
+            app.message().unwrap().0.contains("u brings it back"),
+            "{:?}",
+            app.message()
+        );
     }
 
     #[test]

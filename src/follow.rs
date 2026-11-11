@@ -222,12 +222,15 @@ impl App {
         self.follows.iter().find(|f| f.id == id)
     }
 
-    /// The followed work shown on this card, if any.
+    /// The followed work shown on this card, if any: by its card's key, and by its record's number
+    /// only for work asked with no card. Another source's card with the same number never shows
+    /// it or waits on it (Codex's sixth look, swept).
     pub fn following_card(&self, card: &Card) -> Option<&Following> {
         let id = card.detail.as_ref()?.id.as_str();
-        self.follows
-            .iter()
-            .find(|f| f.key.as_deref() == Some(card.key.as_str()) || f.id == id)
+        self.follows.iter().find(|f| match &f.key {
+            Some(key) => *key == card.key,
+            None => f.id == id,
+        })
     }
 
     /// The progress requests due now, each with its token and machine, marked as on their way.
@@ -1526,5 +1529,31 @@ mod tests {
         );
         assert!(app.follows.is_empty());
         assert!(app.open_after.is_some());
+    }
+
+    #[test]
+    fn another_sources_card_with_the_same_number_never_shows_or_waits_on_this_follow() {
+        // Codex's sixth look, swept: #39's reopen is followed. Another source's #39, other work,
+        // shows no progress of it, and its keys don't wait for it.
+        let mut app = demo_app();
+        let (k, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back on its machine…"),
+        );
+        let (other, _) = crate::app::tests::same_number_elsewhere(&mut app, &k);
+        let a = app.card(&k).cloned().unwrap();
+        let b = app.card(&other).cloned().unwrap();
+        assert!(app.following_card(&a).is_some());
+        assert!(app.following_card(&b).is_none(), "A's follow shown on B");
+        assert_eq!(
+            app.follow_holds(&b, "close"),
+            None,
+            "B's keys wait on A's follow"
+        );
     }
 }

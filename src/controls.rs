@@ -892,7 +892,7 @@ impl App {
         let home = detail.home.as_ref().and_then(|h| h.machine.as_deref());
         self.moved_home
             .iter()
-            .find(|(id, _, from)| *id == detail.id && from.as_deref() == home)
+            .find(|(key, _, from)| *key == card.key && from.as_deref() == home)
             .map(|(_, to, _)| *to)
     }
 
@@ -941,18 +941,21 @@ impl App {
 
     /// Whether the backend where this card's record lives does each key's step first and asks its
     /// own questions for C, x and X on work an agent may be at: its feed's `supports` has "steps"
-    /// (intent 0591). Any other gets 0.33.0's behaviour: Kerdr's own question or refusal first.
+    /// (intent 0591). Any other gets 0.33.0's behaviour: Kerdr's own question or refusal first. A
+    /// home on a machine Kerdr isn't set up for is no backend that does steps: the card's own
+    /// machine never answers for it (Codex's sixth look, swept).
     pub(crate) fn does_steps(&self, card: &Card) -> bool {
         let home = card
             .detail
             .as_ref()
             .and_then(|d| d.home.as_ref())
             .and_then(|h| h.machine.as_deref());
-        let machine = self
-            .moved_target(card)
-            .or_else(|| home.and_then(|name| self.machine_index(name)))
-            .unwrap_or(card.machine_index);
-        self.steps_on(machine)
+        let machine = match (self.moved_target(card), home) {
+            (Some(to), _) => Some(to),
+            (None, Some(name)) => self.machine_index(name),
+            (None, None) => Some(card.machine_index),
+        };
+        machine.is_some_and(|m| self.steps_on(m))
     }
 
     /// Whether this machine's backend does each key's step first: for a request sent there rather
@@ -2419,9 +2422,8 @@ impl App {
                     .confirm_by_enter
                     .take()
                     .filter(|k| target.as_ref().is_some_and(|t| t.key == *k));
-                let by_enter = asked_by_enter
-                    .as_ref()
-                    .and_then(|_| request["id"].as_str().map(str::to_string));
+                // The yes it sends is ⏎'s for that same card, by its key (Codex's sixth look).
+                let by_enter = asked_by_enter.clone();
                 let queues = key.code == KeyCode::Enter && enter_queues;
                 match key.code {
                     KeyCode::Esc | KeyCode::Char('n' | 'q') => {
@@ -2466,9 +2468,9 @@ impl App {
                         {
                             request["override"] = json!(true);
                         }
-                        self.enter_sent = by_enter;
                         let action = self.emit_mutation(machine, request);
                         if matches!(action, Action::Mutate { .. }) {
+                            self.enter_sent = by_enter;
                             self.action_from = target.map(|t| *t);
                         }
                         return Some(action);
@@ -2598,6 +2600,9 @@ impl App {
     /// Takes a change to a card into the action resolution tool (intent 0416): the board shows it
     /// at once, and its command runs in the background.
     pub fn queue_action(&mut self, machine: usize, request: Value) {
+        // Whether ⏎ asked for it: taken now, sent or not, so a request a check below stops can't
+        // leave it for another card's (Codex's sixth look).
+        let enter_sent = self.enter_sent.take();
         if request["action"] == "create" {
             return self.queue_create(machine, request);
         }
@@ -2632,15 +2637,30 @@ impl App {
         let held = (request["action"] == "edit")
             .then(|| self.edit_card(&id, machine))
             .flatten();
+        // Asked with no card: the one its machine's feed names by its source and number, else the
+        // only card with that number on its machine, else the only one anywhere. Never a guess
+        // between two sources' cards with the same number (Codex's sixth look, swept).
         let key = from.as_ref().map(|f| f.key.clone()).or(held).or_else(|| {
+            let own = self.intent_key(machine, &id, None);
+            if self.card(&own).is_some() {
+                return Some(own);
+            }
             let mine = |c: &&Card| c.detail.as_ref().is_some_and(|d| d.id == id);
+            let only = |found: Vec<&Card>| match found.as_slice() {
+                [one] => Some(one.key.clone()),
+                _ => None,
+            };
             let cards = &self.board.cards;
-            cards
+            let here: Vec<&Card> = cards
                 .iter()
                 .filter(mine)
-                .find(|c| c.machine_index == machine)
-                .or_else(|| cards.iter().find(mine))
-                .map(|c| c.key.clone())
+                .filter(|c| c.machine_index == machine)
+                .collect();
+            if here.is_empty() {
+                only(cards.iter().filter(mine).collect())
+            } else {
+                only(here)
+            }
         });
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         // A workspace with no intent shows nothing until it closes: said meanwhile (K1-27).
@@ -2653,7 +2673,7 @@ impl App {
         let shows = effect.is_some();
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
         let asking = (!shows).then(|| self.asking_line(&request)).flatten();
-        let by_enter = self.enter_sent.take().is_some_and(|e| e == id);
+        let by_enter = enter_sent.is_some_and(|e| key.as_deref() == Some(e.as_str()));
         let n = self.resolver.add(machine, request, from, key, effect);
         if by_enter {
             self.resolver.mark_by_enter(n);
@@ -3686,11 +3706,16 @@ impl App {
             return self.bare_cancel_answered(machine, request, result, from);
         }
         let id = request["id"].as_str().map(str::to_string);
-        // Only this answer's own resend: another record's, still on its way, stays guarded.
+        // Its card's key: what's kept for it (a resend, a move, his Kickoff answers) is its own,
+        // never another source's with the same number (Codex's fifth and sixth looks).
+        let held = id
+            .as_deref()
+            .map(|id| self.intent_key(machine, id, from.as_ref()));
+        // Only this answer's own resend: another card's, still on its way, stays guarded.
         let was_resent = match self
             .resent
             .iter()
-            .position(|(m, r)| *m == machine && Some(r) == id.as_ref())
+            .position(|(m, k)| *m == machine && Some(k) == held.as_ref())
         {
             Some(i) => {
                 self.resent.remove(i);
@@ -3706,6 +3731,7 @@ impl App {
             && !response.ok
             && !response.confirmation
             && let Some(id) = id
+            && let Some(key) = held.clone()
             && let Some(home) = response.home.as_deref()
         {
             let (host, session) = home.split_once('/').unwrap_or((home, ""));
@@ -3726,23 +3752,21 @@ impl App {
                 }
                 Some(to) if to == machine => {}
                 Some(_) if was_resent => {
-                    self.moved_home.retain(|(i, ..)| *i != id);
+                    self.moved_home.retain(|(k, ..)| *k != key);
                     self.fail(
                         format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again.{kept}"),
                     );
                     return;
                 }
                 Some(to) => {
+                    // The home its own card shows, never another source's with its number.
                     let old_home = self
-                        .board
-                        .cards
-                        .iter()
-                        .filter_map(|c| c.detail.as_ref())
-                        .find(|d| d.id == id)
+                        .card(&key)
+                        .and_then(|c| c.detail.as_ref())
                         .and_then(|d| d.home.as_ref())
                         .and_then(|h| h.machine.clone());
-                    self.moved_home.retain(|(i, ..)| *i != id);
-                    self.moved_home.push((id.clone(), to, old_home));
+                    self.moved_home.retain(|(k, ..)| *k != key);
+                    self.moved_home.push((key.clone(), to, old_home));
                     let name = self.machines[to].name();
                     if !self.machines[to].conn.is_live() {
                         self.fail(
@@ -3784,12 +3808,15 @@ impl App {
                     if request["action"] == "reopen" && !session.is_empty() {
                         request["session"] = json!(session);
                     }
-                    // A save's text came back only counted: it goes again as he wrote it.
+                    // A save's text came back only counted: it goes again as he wrote it, his
+                    // words for this card.
                     if request["action"] == "edit" {
-                        self.edit_resend(&mut request);
+                        self.edit_resend(&mut request, Some(&key));
                     }
-                    // Sent on quietly: the card still shows the change while it goes there.
-                    self.resent.push((to, id));
+                    // Sent on quietly: the card still shows the change while it goes there. Its
+                    // answer comes from there, with the same card it was asked from.
+                    let resent = self.intent_key(to, &id, from.as_ref());
+                    self.resent.push((to, resent));
                     self.resend.push_back((to, request, from));
                     return;
                 }
@@ -3807,7 +3834,7 @@ impl App {
             if !asked {
                 return self.finish_edit(machine, request, result, from);
             }
-            self.edit_resend(&mut request);
+            self.edit_resend(&mut request, held.as_deref());
             if request.get("text").is_none() {
                 return self.finish_edit(machine, request, result, from);
             }
@@ -3872,11 +3899,6 @@ impl App {
                         .as_deref()
                         .is_some_and(|t| request["confirm"].as_str() != Some(t)))
         };
-        // Its card's key: what's kept of his Kickoff answers is its own, never another source's
-        // with the same number (Codex's fifth look).
-        let held = request["id"]
-            .as_str()
-            .map(|id| self.intent_key(machine, id, from.as_ref()));
         match result {
             Ok(response) if asks(&response) => {
                 // Only while you're still on that work: a question that pops up over typing would

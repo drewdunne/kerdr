@@ -737,7 +737,7 @@ impl App {
                     .resend
                     .iter()
                     .any(|(_, r, _)| r["id"] == id.as_str() && r["action"] == "restore")
-                || self.resent.iter().any(|(_, r)| *r == id);
+                || self.resent.iter().any(|(_, k)| *k == card.key);
             if !restoring {
                 // It didn't happen: its own failure said why.
                 return Owed::Drop;

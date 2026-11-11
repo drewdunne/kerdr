@@ -2049,19 +2049,6 @@ impl App {
             }
             return Action::None;
         }
-        // A fresh agent's start or a resume goes only to a backend that still takes it, checked as
-        // it goes: a question's yes or a held offer can come long after it was asked (Codex's
-        // fifth look).
-        if !self.starts_named_account_on(machine, &request) {
-            self.say(
-                format!(
-                    "{}'s backend can't start an agent on a chosen account, so nothing was sent.",
-                    self.machines[machine].name()
-                ),
-                Tone::Warn,
-            );
-            return Action::None;
-        }
         // What the request came from is kept in its record, found by the request when its answer
         // comes, never in a slot another answer could take (Codex's third look).
         let origin = Pending {
@@ -2087,12 +2074,43 @@ impl App {
             let target = target.clone();
             self.keep_asked(machine, &request, Some(target), None, None);
         }
+        // A fresh agent's start or a resume goes only to a backend that still takes it, checked as
+        // it goes: a question's yes or a held offer can come long after it was asked (Codex's
+        // fifth look). One that can't go is finished as its own refusal (Codex's sixth look).
+        if let Some(why) = self.account_unsendable(machine, &request) {
+            self.account_not_sent(origin, &request, why);
+            return Action::None;
+        }
         if self.busy {
             self.account_later.push_back((origin, request));
             return Action::None;
         }
         self.account_pending = Some(origin);
         Action::Mutate { machine, request }
+    }
+
+    /// Why this machine's backend can't take this account request as it stands now, by its feed:
+    /// a fresh agent's start or a resume it no longer lists in `starts_on`.
+    fn account_unsendable(&self, machine: usize, request: &Value) -> Option<String> {
+        (!self.starts_named_account_on(machine, request)).then(|| {
+            format!(
+                "{}'s backend can't start an agent on a chosen account, {}.",
+                self.machines
+                    .get(machine)
+                    .map(|m| m.name())
+                    .unwrap_or_else(|| "That machine".into()),
+                crate::actions::NOT_SENT
+            )
+        })
+    }
+
+    /// An account request that wasn't sent, finished as its machine refusing it would be: matched
+    /// to what it was asked from, through its own screen's failure handling, so nothing is left
+    /// waiting on it (Codex's fifth and sixth looks).
+    fn account_not_sent(&mut self, origin: Pending, request: &Value, why: String) {
+        let machine = origin.machine;
+        self.account_pending = Some(origin);
+        self.finish_account_action(machine, crate::actions::request_metadata(request), Err(why));
     }
 
     /// The next account request that waited its turn, once none is on its way: the oldest whose
@@ -2115,6 +2133,12 @@ impl App {
             let conn = self.machines.get(machine).map(|m| &m.conn);
             if configured && conn.is_some_and(crate::poll::Conn::is_live) {
                 let (origin, request) = self.account_later.remove(i)?;
+                // Checked again as it goes: its backend's feed may have changed while it waited
+                // (Codex's sixth look).
+                if let Some(why) = self.account_unsendable(machine, &request) {
+                    self.account_not_sent(origin, &request, why);
+                    return Some(Action::None);
+                }
                 self.account_pending = Some(origin);
                 return Some(Action::Mutate { machine, request });
             }
@@ -2143,12 +2167,7 @@ impl App {
                 ),
             };
             // Its own answer, as if its machine had refused it: matched to it as any is.
-            self.account_pending = Some(origin);
-            self.finish_account_action(
-                machine,
-                crate::actions::request_metadata(&request),
-                Err(why),
-            );
+            self.account_not_sent(origin, &request, why);
             return Some(Action::None);
         }
         None
@@ -8952,6 +8971,64 @@ mod tests {
                     .is_some_and(|(m, _)| m.contains("isn't answering")),
                 "{:?}",
                 a.message()
+            );
+        }
+    }
+
+    #[test]
+    fn a_queued_start_on_a_chosen_account_is_checked_again_as_it_goes() {
+        // Codex's sixth look: a fresh agent's start waits behind another request; meanwhile its
+        // backend's feed stops listing account-start. It isn't sent: it's finished as refused,
+        // through its own failure handling, and nothing is left waiting on it. Still listed, it
+        // goes.
+        for listed in [true, false] {
+            let mut a = app();
+            a.machines[0].feed.as_mut().unwrap().starts_on = vec!["account-start".into()];
+            let other = json!({"action":"account-test","code":"KBZ_C"});
+            a.busy = true;
+            a.account_pending = Some(Pending {
+                machine: 0,
+                request: other.clone(),
+                screen: None,
+            });
+            let start =
+                json!({"action":"account-start","session":"web","workspace":"w7","to":"ARK_C"});
+            assert_eq!(a.send_account(0, start.clone()), Action::None);
+            assert_eq!(a.account_later.len(), 1);
+            if !listed {
+                a.machines[0].feed.as_mut().unwrap().starts_on.clear();
+            }
+            a.finish_action(
+                0,
+                crate::actions::with_op(other),
+                Ok(Response {
+                    ok: true,
+                    message: "KBZ_C works here.".into(),
+                    ..Default::default()
+                }),
+            );
+            assert!(!a.busy);
+            let action = a.account_tick();
+            assert!(a.account_later.is_empty(), "{listed}");
+            if listed {
+                let (to, request) = sent(action);
+                assert_eq!((to, request), (0, start));
+                assert!(a.account_pending.is_some());
+                continue;
+            }
+            assert_eq!(
+                action,
+                Action::None,
+                "sent to a backend that no longer takes it"
+            );
+            assert!(a.account_pending.is_none(), "left waiting on it");
+            let said = a.message().map(|(m, _)| m.to_string()).unwrap_or_default();
+            assert_eq!(
+                said,
+                format!(
+                    "Starting an agent on ARK_C: {}'s backend can't start an agent on a chosen account, so nothing was sent.",
+                    a.machines[0].name()
+                )
             );
         }
     }

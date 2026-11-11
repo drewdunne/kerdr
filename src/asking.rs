@@ -404,9 +404,9 @@ impl App {
             fields.remove("queue");
         }
         request["choice"] = json!(choice.id);
-        self.enter_sent = by_enter;
         let action = self.emit_mutation(machine, request);
         if matches!(action, Action::Mutate { .. }) {
+            self.enter_sent = by_enter;
             self.action_from = target.map(|t| *t);
         }
         action
@@ -425,9 +425,9 @@ impl App {
             return self.ask_again(machine, request, target.map(|t| *t));
         }
         request["queue"] = json!(true);
-        self.enter_sent = by_enter;
         let action = self.emit_mutation(machine, request);
         if matches!(action, Action::Mutate { .. }) {
+            self.enter_sent = by_enter;
             self.action_from = target.map(|t| *t);
         }
         action
