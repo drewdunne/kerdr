@@ -1153,13 +1153,6 @@ fn jump_workspace(
     tab: Option<String>,
 ) -> Option<Outcome> {
     let machine = app.machines[mi].name();
-    if !app.machines[mi].conn.is_live() {
-        app.say(
-            format!("{machine} isn't answering; r tries it now."),
-            Tone::Warn,
-        );
-        return None;
-    }
     let label = label
         .or_else(|| {
             app.board
@@ -1169,6 +1162,14 @@ fn jump_workspace(
                 .map(|w| w.label.clone())
         })
         .unwrap_or_else(|| id.clone());
+    // Its machine isn't answering: Kerdr waits for it and goes in then, as ⏎ on a card does
+    // (intent 0591, K3-09).
+    if app.wait_for_workspace(mi, &session, &id, &label, tab.clone()) {
+        if let Some(l) = live.as_deref() {
+            l.wake(mi);
+        }
+        return None;
+    }
     // Its session didn't answer its last read: Kerdr waits for it rather than refuse (intent 0591).
     if app.stuck_refusal(mi, &session, &label).is_some() {
         app.wait_for_stuck(mi, &session.clone(), &label, None, Some((session, id, tab)));
@@ -1187,7 +1188,26 @@ fn jump_workspace(
         l.wake(mi);
         l.wake_feed(mi);
     }
+    // Only a jump that got no answer again remembers that it waited once (K3-12).
+    if !matches!(outcome, Outcome::Unanswered(_)) {
+        app.answer_waited = None;
+    }
     match &outcome {
+        // herdr there, or its machine, didn't answer: Kerdr waits for it and goes in then
+        // (intent 0591, K3-12, K3-13).
+        Outcome::Unanswered(why) => {
+            app.wait_for_answer(
+                mi,
+                &j.session,
+                &j.label,
+                None,
+                Some((j.session.clone(), j.workspace.clone(), j.tab.clone())),
+                why,
+            );
+            if let Some(l) = live.as_deref() {
+                l.wake(mi);
+            }
+        }
         Outcome::Failed(e) => app.say(e.clone(), Tone::Warn),
         Outcome::Closed => app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn),
         Outcome::Stopped => app.say(stopped(&j.session, &j.machine.name), Tone::Warn),
@@ -1256,15 +1276,12 @@ fn run_jump(
             workspace: j.workspace.clone(),
         },
     );
-    // While you're in there the board keeps up, unseen, so what's held follows what waits on you
-    // and the minute after you left another session still ends on time.
-    let mut keep_up = || {
-        for ev in bg.inbox.take() {
-            app.apply(ev);
-        }
-        bg.holds.borrow_mut().sync(app);
-    };
     let mut opened = false;
+    let mut keep_up = KeepUp {
+        app,
+        bg,
+        said: None,
+    };
     let outcome = jump::run(
         terminal,
         flags,
@@ -1276,12 +1293,45 @@ fn run_jump(
         &mut keep_up,
         &mut opened,
     );
+    let waited = keep_up.said.take();
     bg.holds.borrow_mut().left(app, opened);
     app.unsay(&opening);
+    if let Some(line) = waited {
+        app.unsay(&line);
+    }
     if let Some(note) = jump::take_note() {
         app.say(note, Tone::Info);
     }
     outcome
+}
+
+/// The board while a jump runs. While you're in there it keeps up, unseen, so what's held follows
+/// what waits on you and the minute after you left another session still ends on time; while
+/// herdr is asked again, it says why, and Esc stops it (intent 0591, K3-12).
+struct KeepUp<'a, 'b> {
+    app: &'a mut App,
+    bg: &'a Bg<'b>,
+    /// The last line said while it waited, taken down once the jump is over.
+    said: Option<String>,
+}
+
+impl jump::Meanwhile for KeepUp<'_, '_> {
+    fn tick(&mut self) {
+        for ev in self.bg.inbox.take() {
+            self.app.apply(ev);
+        }
+        self.bg.holds.borrow_mut().sync(self.app);
+    }
+
+    fn waiting(&mut self, terminal: &mut DefaultTerminal, line: &str) -> bool {
+        if let Some(before) = self.said.replace(line.to_string()) {
+            self.app.unsay(&before);
+        }
+        self.app.say(line, Tone::Info);
+        let app = &*self.app;
+        let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        jump::esc_pressed()
+    }
 }
 
 /// Whether Kerdr's two keys are installed in that machine's herdr config.
@@ -1421,6 +1471,17 @@ fn jump_cards(
             keys: keys_on(app, mi),
         };
         let outcome = run_jump(terminal, flags, app, mi, &j, client_config, bg);
+        // herdr there, or its machine, didn't answer however many times it was asked: Kerdr waits
+        // for it and goes in then, as for a machine that isn't answering (intent 0591, K3-12,
+        // K3-13). Only a jump that got no answer again remembers that it waited once.
+        if let Outcome::Unanswered(why) = &outcome {
+            app.wait_for_answer(mi, &j.session, &card.reference, Some(&key), None, why);
+            if let Some(l) = live.as_deref() {
+                l.wake(mi);
+            }
+            return;
+        }
+        app.answer_waited = None;
         // The next card is chosen only on ctrl+space space, or when one Kerdr picked has gone.
         let choosing_next = matches!(outcome, Outcome::Next)
             || (!yours && matches!(outcome, Outcome::Closed | Outcome::Stopped));
@@ -1488,6 +1549,8 @@ fn jump_cards(
             }
             Outcome::TabGone => closed_on_the_way.push(key.clone()),
             Outcome::Next => {}
+            // Taken above: Kerdr waits for an answer.
+            Outcome::Unanswered(_) => return,
         }
         match app.next_needs_you_after(&key, &closed_on_the_way) {
             Some(next) => {

@@ -1368,6 +1368,21 @@ fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
         .map(|_| card.machine_index)
         .map(|i| app.machines[i].conn.short(app.now()))
         .unwrap_or_default();
+    // Its machine answers, but herdr there, or the connection, didn't answer ⏎ just now (intent
+    // 0591, K3-12, K3-13).
+    if pending.after.is_some() && app.machines[card.machine_index].conn.is_live() {
+        return Some(vec![
+            Span::styled(format!("{} ", card.reference), bold(CYAN)),
+            Span::styled(
+                format!("is on {}, which didn't answer just now. ", card.machine),
+                fg(FG),
+            ),
+            Span::styled(
+                "Kerdr jumps in when it answers again · esc stops waiting",
+                fg(DIM),
+            ),
+        ]);
+    }
     Some(vec![
         Span::styled(format!("{} ", card.reference), bold(CYAN)),
         Span::styled(format!("is on {}, which is {conn}. ", card.machine), fg(FG)),
