@@ -573,6 +573,9 @@ pub struct PendingJump {
     /// A bare workspace's conversation, as the board saw it when ⏎ began to wait: offered to
     /// resume if the workspace has closed by the time its machine answers (intent 0591, K1-03).
     pub resume: Option<resume::BareResume>,
+    /// Waiting for a read of this session newer than this, since herdr there, or its machine,
+    /// didn't answer ⏎'s tries just now (intent 0591, K3-12, K3-13).
+    pub after: Option<(String, DateTime<Local>)>,
 }
 
 /// How long ⏎ waits for a herdr session that didn't answer its last read before saying it's still
@@ -664,6 +667,14 @@ pub struct App {
     pub held: Vec<(String, Tone)>,
     /// A card to jump into as soon as its machine answers.
     pub pending_jump: Option<PendingJump>,
+    /// The row a card's screen last had chosen while it was still there: its focus, its place
+    /// among the rows, and its card's number. Once that piece leaves the card, ⏎ goes to the row
+    /// nearest where it was (intent 0591, K3-32).
+    pub(crate) card_row_at: Option<(String, usize, String)>,
+    /// The card or workspace whose jump already waited once for herdr, or its machine, to answer
+    /// again: a second jump there that gets no answer says so, rather than wait again (intent 0591,
+    /// K3-12). Any other way a jump ends forgets it.
+    pub answer_waited: Option<String>,
     /// The workspace a reopen just made, to go into now.
     pub open_after: Option<OpenAfter>,
     /// The card a start just went out for, by key, its record's number, and when, so a second ⏎
@@ -891,6 +902,8 @@ impl App {
             message: None,
             held: vec![],
             pending_jump: None,
+            card_row_at: None,
+            answer_waited: None,
             open_after: None,
             started: None,
             action_from: None,
@@ -1762,7 +1775,88 @@ impl App {
             stuck: None,
             bare: None,
             resume: self.bare_resume_of(card),
+            after: None,
         });
+    }
+
+    /// ⏎ into a workspace by its id (a workspace's row, the workspace a reopen opened, a ⏎
+    /// remembered on a start) on a machine that isn't answering: Kerdr waits for it and goes in
+    /// once it answers, as ⏎ on a card does, rather than ask for r (intent 0591, K3-09). Whether
+    /// it waits. pending_jump_ready's rules hold: never while you're typing, and Esc on the board,
+    /// or going into something else, stops it.
+    pub fn wait_for_workspace(
+        &mut self,
+        machine: usize,
+        session: &str,
+        id: &str,
+        label: &str,
+        tab: Option<String>,
+    ) -> bool {
+        if self.machines[machine].conn.is_live() {
+            return false;
+        }
+        let name = self.machines[machine].name();
+        self.pending_jump = Some(PendingJump {
+            key: String::new(),
+            workspace: label.to_string(),
+            machine: name.clone(),
+            stuck: None,
+            bare: Some((machine, session.to_string(), id.to_string(), tab)),
+            resume: None,
+            after: None,
+        });
+        self.say(
+            format!(
+                "{label} is on {name}, which isn't answering: Kerdr goes in when it answers. Esc on the board stops waiting."
+            ),
+            Tone::Info,
+        );
+        true
+    }
+
+    /// A jump that herdr, or its machine, didn't answer however many times it was asked (`why`):
+    /// Kerdr waits for a read of that session newer than now, then goes in, as ⏎ on a card whose
+    /// machine isn't answering does (intent 0591, K3-12, K3-13). A second jump to the same place
+    /// that gets no answer says so instead, so a herdr that answers reads but not focuses never
+    /// keeps Kerdr going round. `bare` is a workspace by its id, as wait_for_stuck takes it.
+    pub fn wait_for_answer(
+        &mut self,
+        machine: usize,
+        session: &str,
+        what: &str,
+        key: Option<&str>,
+        bare: Option<(String, String, Option<String>)>,
+        why: &str,
+    ) {
+        let name = self.machines[machine].name();
+        let place = match (key, &bare) {
+            (Some(k), _) => k.to_string(),
+            (None, Some((s, id, _))) => format!("ws:{name}/{s}/{id}"),
+            (None, None) => format!("ws:{name}/{session}/{what}"),
+        };
+        if self.answer_waited.take().as_deref() == Some(place.as_str()) {
+            self.say(format!("{why}; ⏎ tries again."), Tone::Warn);
+            return;
+        }
+        self.answer_waited = Some(place);
+        let resume = key
+            .and_then(|k| self.card(k))
+            .and_then(|c| self.bare_resume_of(c));
+        self.pending_jump = Some(PendingJump {
+            key: key.unwrap_or_default().to_string(),
+            workspace: what.to_string(),
+            machine: name.clone(),
+            stuck: None,
+            bare: bare.map(|(s, id, tab)| (machine, s, id, tab)),
+            resume,
+            after: Some((session.to_string(), self.now())),
+        });
+        self.say(
+            format!(
+                "{why}. Kerdr goes into {what} once {session} on {name} answers again. Esc on the board stops waiting."
+            ),
+            Tone::Info,
+        );
     }
 
     /// ⏎ into a card or workspace whose herdr session didn't answer its last read: rather than
@@ -1788,6 +1882,7 @@ impl App {
             stuck: Some((session.to_string(), Instant::now())),
             bare: bare.map(|(s, id, tab)| (machine, s, id, tab)),
             resume,
+            after: None,
         });
         self.say(
             format!(
@@ -1824,6 +1919,17 @@ impl App {
         if let Some(mi) = machine {
             if !self.machines[mi].conn.is_live() {
                 return None;
+            }
+            // Only once a read of its session since herdr, or its machine, didn't answer has come
+            // in whole (K3-12, K3-13).
+            if let Some((session, since)) = &pending.after {
+                let m = &self.machines[mi];
+                let answered = m.last_ok.is_some_and(|ok| ok > *since)
+                    && !m.snapshot_errors.contains_key(session)
+                    && !m.read_at.contains_key(session);
+                if !answered {
+                    return None;
+                }
             }
             if let Some((session, since)) = &pending.stuck
                 && let Some(why) = self.session_stuck(mi, session).map(str::to_string)
@@ -2450,6 +2556,7 @@ impl App {
                     self.message = None;
                 }
                 if self.pending_jump.take().is_some() {
+                    self.answer_waited = None;
                     self.say("Stopped waiting.", Tone::Info);
                 }
                 // s waiting for accounts, or for a card to be brought back or its backend brought
@@ -4866,6 +4973,7 @@ pub(crate) mod tests {
             stuck: None,
             bare: None,
             resume: None,
+            after: None,
         };
         app.pending_jump = Some(pending(key.clone()));
         app.mode = Mode::Board;
@@ -7680,6 +7788,7 @@ pub(crate) mod tests {
             stuck: None,
             bare: None,
             resume: None,
+            after: None,
         };
         app.pending_jump = Some(pending(&app));
         assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
@@ -8805,6 +8914,114 @@ pub(crate) mod tests {
             Some(("41-checkout".into(), Some("w7:t3".into()))),
             "in to the tab it named"
         );
+        assert!(app.pending_jump.is_none());
+    }
+
+    /// Intent 0591, K3-12, K3-13: a jump herdr there, or the connection, didn't answer after its
+    /// tries waits for a read of that session newer than then, and goes in once one comes; a second
+    /// jump there that gets no answer says so rather than wait again.
+    #[test]
+    fn a_jump_herdr_didnt_answer_waits_for_its_session_to_answer_again_once() {
+        let mut app = demo_app();
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.is_open_workspace() && app.machines[c.machine_index].conn.is_live())
+            .unwrap()
+            .clone();
+        let (mi, session) = (card.machine_index, card.session.clone().unwrap());
+        let name = app.machines[mi].name();
+        let why = format!("herdr on {name} didn't answer in 12 s, three times in a row");
+        app.machines[mi].last_ok = Some(app.now());
+        app.wait_for_answer(mi, &session, &card.reference, Some(&card.key), None, &why);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info);
+        assert_eq!(
+            said,
+            format!(
+                "{why}. Kerdr goes into {} once {session} on {name} answers again. Esc on the board stops waiting.",
+                card.reference
+            )
+        );
+        app.mode = Mode::Board;
+        // The read it had already isn't an answer, nor is a newer one where the session failed.
+        assert_eq!(app.pending_jump_ready(), None);
+        app.machines[mi].last_ok = Some(app.now() + chrono::Duration::seconds(5));
+        app.machines[mi]
+            .snapshot_errors
+            .insert(session.clone(), "timed out".into());
+        assert_eq!(app.pending_jump_ready(), None);
+        app.machines[mi].snapshot_errors.remove(&session);
+        assert_eq!(
+            app.pending_jump_ready(),
+            Some(Action::Jump(card.key.clone()))
+        );
+        // No answer again: said, with nothing left waiting.
+        app.wait_for_answer(mi, &session, &card.reference, Some(&card.key), None, &why);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(
+            (said, tone),
+            (format!("{why}; ⏎ tries again.").as_str(), Tone::Warn)
+        );
+        assert!(app.pending_jump.is_none());
+        // And the next ⏎ waits once more.
+        app.wait_for_answer(mi, &session, &card.reference, Some(&card.key), None, &why);
+        assert!(app.pending_jump.is_some());
+    }
+
+    /// Intent 0591, K3-09: ⏎ into a workspace by its id on a machine that isn't answering waits for
+    /// it and goes in once it answers, to the tab it was going to, rather than ask for r.
+    #[test]
+    fn a_workspace_on_a_machine_that_isnt_answering_is_gone_into_once_it_answers() {
+        let mut app = demo_app();
+        let mi = app.machine_index("build-box").unwrap();
+        let machine = app.machines[mi].name();
+        // Answering: nothing waits, it goes in now.
+        assert!(!app.wait_for_workspace(mi, "web", "w7", "41-checkout", None));
+        assert!(app.pending_jump.is_none());
+        let since = app.now();
+        app.machines[mi].conn = Conn::Reconnecting {
+            since,
+            attempt: 1,
+            retry_at: since,
+            detail: "no answer".into(),
+        };
+        assert!(app.wait_for_workspace(mi, "web", "w7", "41-checkout", Some("w7:t3".into())));
+        let said = app.message().unwrap().0.to_string();
+        assert_eq!(
+            said,
+            format!(
+                "41-checkout is on {machine}, which isn't answering: Kerdr goes in when it answers. Esc on the board stops waiting."
+            )
+        );
+        assert!(!said.contains("r tries"), "{said}");
+        assert_eq!(app.pending_jump_ready(), None, "still waiting");
+        app.machines[mi].conn = Conn::Live {
+            latency: Default::default(),
+        };
+        assert_eq!(
+            app.pending_jump_ready(),
+            Some(Action::JumpWorkspace {
+                machine,
+                session: "web".into(),
+                id: "w7".into(),
+            })
+        );
+        assert_eq!(
+            app.pending_go,
+            Some(("41-checkout".into(), Some("w7:t3".into())))
+        );
+        // Esc on the board stops waiting.
+        app.machines[mi].conn = Conn::Reconnecting {
+            since,
+            attempt: 1,
+            retry_at: since,
+            detail: "no answer".into(),
+        };
+        app.wait_for_workspace(mi, "web", "w7", "41-checkout", None);
+        app.mode = Mode::Board;
+        press_code(&mut app, KeyCode::Esc);
         assert!(app.pending_jump.is_none());
     }
 

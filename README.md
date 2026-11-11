@@ -85,7 +85,9 @@ each piece, and names the one that needs you, and its border turns yellow while 
 card with work still open inside stays at the top of Maintain (and of Done), saying "3 open". `o` opens the card's
 own screen: the card itself first, then what's inside, grouped as needs you, under way, not started
 and done, with the selected row's details beside it. `Enter` on a row goes where that work runs: a
-child's tab, a follow-up's own workspace, or another machine. `Enter` on the board goes to the
+child's tab, a follow-up's own workspace, or another machine. A piece that has left the card since
+you chose it is gone into where it is now, if it's still on the board; one that has finished leaves
+the row nearest it chosen instead, opening nothing. `Enter` on the board goes to the
 card's own agent, in its own tab, never a child's. `n` and `prefix Space` stop on a piece that needs
 you too. Feeds say which card a record sits in with `parent`, `undertaker_for` or `from`; see
 [docs/feed.md](docs/feed.md#work-inside-a-card).
@@ -160,7 +162,9 @@ connection per machine. It never answers a prompt for you. Jumping into a card o
 machine uses `herdr --remote`, so herdr draws on your machine and the agents keep running on
 theirs. If that session was started by an older herdr than yours, `herdr --remote` would stop to
 ask whether to restart it, which stops its agents, so Kerdr runs herdr there over plain SSH
-instead until the versions match.
+instead until the versions match. If this machine's herdr can't be started for `herdr --remote` (it
+isn't installed here, say), Kerdr goes in the same way, that machine's own herdr over SSH, on the
+same session; for a session on this machine with no herdr, it says where it looked.
 
 Going into a card on another machine has no wait when its session is held. `herdr --remote` takes
 seconds, since it starts from a new SSH connection and checks the other machine first. So Kerdr
@@ -177,7 +181,14 @@ on the other machine changes. On Windows, whose OpenSSH has no shared connection
 When a connection drops (a laptop on a train, a server rebooting), its cards stay on the board,
 dimmed, with the time they were last seen. Kerdr retries with longer and longer waits, up to
 15 seconds, so a laptop back from sleep has them again within seconds. `Enter` on one of those
-cards waits for the machine, then jumps in, or says so if its workspace closed in the meantime.
+cards waits for the machine, then jumps in, or says so if its workspace closed in the meantime; so
+does `Enter` on a workspace's row, and a reopen's new workspace. When herdr there, or the
+connection to the machine, doesn't answer as Kerdr goes in, it's asked again by itself: three
+times, 12 seconds each, for herdr, and with longer pauses for about 20 seconds for a connection
+that keeps dropping. The board says it's still waiting between tries, and `Esc` stops it. Still no
+answer, Kerdr waits for the next read of that session to come in whole and goes in then; a second
+time with no answer, it says so and `Enter` tries again. SSH asking for a host key or a password is
+never tried again: the board says so, and `M` then `Enter` on that machine answers it.
 
 Work that's still under way never leaves you at a dead end. When a card in a working column has
 no workspace any more (its pane closed, the machine restarted, or an agent worked it outside

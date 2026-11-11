@@ -190,6 +190,10 @@ pub enum Outcome {
     /// so the workspace is gone with it, as `Closed`, but for a reason worth saying.
     Stopped,
     Failed(String),
+    /// herdr there, or the connection to its machine, didn't answer however many times Kerdr
+    /// asked (intent 0591, K3-12, K3-13): the board waits for it to answer again and goes in then.
+    /// The words say why, as "herdr on build-box didn't answer in 12 s, three times in a row".
+    Unanswered(String),
 }
 
 pub fn target(machine: &Machine) -> Target {
@@ -240,13 +244,13 @@ fn why(out: &transport::Output) -> String {
     }
 }
 
-/// What the board says when herdr on a machine didn't answer a focus in time, after `tries`
-/// tries (intent 0591).
-fn no_answer(machine: &str, tries: usize) -> String {
+/// Why the board didn't go in when herdr on a machine didn't answer a focus in time, after
+/// `tries` tries (intent 0591).
+pub fn no_answer(machine: &str, tries: usize) -> String {
     match tries {
-        0 | 1 => format!("herdr on {machine} didn't answer in 12 s; ⏎ tries again."),
+        0 | 1 => format!("herdr on {machine} didn't answer in 12 s"),
         n => format!(
-            "herdr on {machine} didn't answer in 12 s, {} times in a row, so it's very slow or stuck there; ⏎ tries again.",
+            "herdr on {machine} didn't answer in 12 s, {} times in a row, so it's very slow or stuck there",
             match n {
                 2 => "two".to_string(),
                 3 => "three".into(),
@@ -254,6 +258,46 @@ fn no_answer(machine: &str, tries: usize) -> String {
             }
         ),
     }
+}
+
+/// What the board says while it asks herdr, or its machine, again (intent 0591, K3-12, K3-13).
+fn still_waiting(machine: &str, unreachable: Option<&str>) -> String {
+    match unreachable {
+        Some(detail) => {
+            format!("{machine} didn't answer ({detail}); trying again… Esc stops waiting.")
+        }
+        None => format!("Still waiting on herdr on {machine}… Esc stops waiting."),
+    }
+}
+
+/// What the board says when SSH stopped a focus for something only Andrew can answer: as the
+/// machine's own banner says it, with where to answer it (intent 0591, K3-13).
+fn ssh_needs_you(machine: &str, problem: &transport::Problem) -> String {
+    let detail = problem.detail().trim_end_matches('.');
+    match problem {
+        transport::Problem::HostKey(_) => format!(
+            "SSH wants a decision about {machine}'s host key: {detail}. On the machines screen (M), ⏎ on it answers it."
+        ),
+        _ => format!(
+            "SSH wants a password or another key for {machine}: {detail}. On the machines screen (M), ⏎ on it lets you type it."
+        ),
+    }
+}
+
+/// Reads the keys pressed meanwhile, dropping them all so none reaches an agent or starts a second
+/// jump: whether Esc was one of them (intent 0591, K3-12).
+pub fn esc_pressed() -> bool {
+    use ratatui::crossterm::event::{Event, KeyCode, KeyEventKind};
+    let mut esc = false;
+    while crossterm_event::poll(Duration::ZERO).unwrap_or(false) {
+        if let Ok(Event::Key(k)) = crossterm_event::read()
+            && k.code == KeyCode::Esc
+            && k.kind != KeyEventKind::Release
+        {
+            esc = true;
+        }
+    }
+    esc
 }
 
 /// Something to say on the board once a jump is over (intent 0591): `take_note` gets it.
@@ -264,11 +308,19 @@ pub fn take_note() -> Option<String> {
     NOTE.lock().unwrap_or_else(|e| e.into_inner()).take()
 }
 
-/// How many times more a focus herdr didn't answer in time is asked, and one it refused or one
-/// whose connection failed (intent 0591): herdr may be slow, or reloading.
+/// How many times more a focus herdr didn't answer in time is asked (about 36 s in all), and one
+/// herdr refused (intent 0591): herdr may be slow, or reloading.
 const FOCUS_TIMEOUTS_AGAIN: usize = 2;
 const FOCUS_REFUSALS_AGAIN: usize = 1;
 const FOCUS_PAUSE: Duration = Duration::from_secs(1);
+/// The pauses before each new try of a focus whose connection to its machine failed: about 20 s
+/// in all with the tries themselves (intent 0591, K3-13).
+const FOCUS_BACKOFF: [Duration; 4] = [
+    Duration::from_secs(1),
+    Duration::from_secs(2),
+    Duration::from_secs(4),
+    Duration::from_secs(8),
+];
 
 /// The workspace herdr says a tab it focused is in, from `tab focus`'s answer.
 fn tab_workspace(text: &str) -> Option<String> {
@@ -283,28 +335,57 @@ fn tab_workspace(text: &str) -> Option<String> {
 /// None when herdr is ready to attach. Unless herdr answers that it focused the tab in the card's
 /// workspace, the workspace is focused again: a tab that has closed leaves it on its own without
 /// an error, and a tab herdr finds in another workspace, or an answer lost on the way, may have
-/// taken herdr to another workspace.
+/// taken herdr to another workspace. Before each new try, `wait` shows why on the board and says
+/// whether Andrew pressed Esc meanwhile, which stops it (`Outcome::Board`).
 fn focus(
     t: &Target,
     jump: &Jump,
     mut run: impl FnMut(&[String]) -> transport::Output,
     pause: &dyn Fn(Duration),
+    wait: &mut dyn FnMut(&str) -> bool,
 ) -> Option<Outcome> {
     let workspace = herdr_args(&jump.session, &["workspace", "focus", &jump.workspace]);
+    let machine = jump.machine.name.as_str();
     // Asked again by itself before anything is said: herdr slow under load, or reloading, or a
     // connection that dropped for a moment (intent 0591). What it says for sure (the workspace or
-    // its session gone, SSH wanting Andrew) is taken at once.
-    let (mut timeouts, mut refusals) = (0, 0);
+    // its session gone, SSH wanting Andrew) is taken at once. Still no answer after that, the
+    // board waits for one and goes in then (K3-12, K3-13).
+    let (mut timeouts, mut refusals, mut drops) = (0, 0, 0);
     loop {
         let out = run(&workspace);
+        let problem = transport::classify(t, &out);
+        // SSH needs Andrew (a host key, a password): never tried again, nor answered for him.
+        if let Some(p) = problem.as_ref().filter(|p| p.needs_you()) {
+            return Some(Outcome::Failed(ssh_needs_you(machine, p)));
+        }
         let refused = focus_refused(t, jump, &out, timeouts + 1);
-        let passing = matches!(refused, Some(Outcome::Failed(_)))
-            && !transport::classify(t, &out).is_some_and(|p| p.needs_you());
-        if passing && out.timed_out && timeouts < FOCUS_TIMEOUTS_AGAIN {
+        let passing = matches!(refused, Some(Outcome::Failed(_)));
+        if passing && out.timed_out {
+            if timeouts >= FOCUS_TIMEOUTS_AGAIN {
+                return Some(Outcome::Unanswered(no_answer(machine, timeouts + 1)));
+            }
             timeouts += 1;
+            if wait(&still_waiting(machine, None)) {
+                return Some(Outcome::Board);
+            }
             continue;
         }
-        if passing && !out.timed_out && refusals < FOCUS_REFUSALS_AGAIN {
+        // Its connection failed on the way (reset, refused, no route): asked again with longer
+        // pauses, then the board waits for the machine to answer (K3-13).
+        if let (true, Some(transport::Problem::Unreachable(detail))) = (passing, &problem) {
+            let Some(gap) = FOCUS_BACKOFF.get(drops) else {
+                return Some(Outcome::Unanswered(format!(
+                    "Couldn't reach {machine}: {detail}"
+                )));
+            };
+            drops += 1;
+            if wait(&still_waiting(machine, Some(detail))) {
+                return Some(Outcome::Board);
+            }
+            pause(*gap);
+            continue;
+        }
+        if passing && refusals < FOCUS_REFUSALS_AGAIN {
             refusals += 1;
             pause(FOCUS_PAUSE);
             continue;
@@ -341,12 +422,14 @@ fn focus(
             // it elsewhere, but nothing is opened.
             let _ = run(&workspace);
             if out.timed_out {
-                return Some(Outcome::Failed(no_answer(&jump.machine.name, 1)));
+                return Some(Outcome::Unanswered(no_answer(machine, 1)));
             }
             if let Some(problem) = transport::classify(t, &out) {
-                return Some(Outcome::Failed(format!(
-                    "Couldn't reach {}: {}",
-                    jump.machine.name,
+                if problem.needs_you() {
+                    return Some(Outcome::Failed(ssh_needs_you(machine, &problem)));
+                }
+                return Some(Outcome::Unanswered(format!(
+                    "Couldn't reach {machine}: {}",
                     problem.detail()
                 )));
             }
@@ -378,7 +461,10 @@ fn focus_refused(
     tries: usize,
 ) -> Option<Outcome> {
     if out.timed_out {
-        return Some(Outcome::Failed(no_answer(&jump.machine.name, tries)));
+        return Some(Outcome::Failed(format!(
+            "{}; ⏎ tries again.",
+            no_answer(&jump.machine.name, tries)
+        )));
     }
     if let Some(problem) = transport::classify(t, out) {
         return Some(Outcome::Failed(format!(
@@ -747,9 +833,19 @@ fn attach(
     })
 }
 
+/// What a jump asks of the board while it runs.
+pub trait Meanwhile {
+    /// Now and then while herdr's window is open: the board keeps up, unseen.
+    fn tick(&mut self);
+    /// Between tries while herdr, or its machine, doesn't answer: `line` shows on the board.
+    /// Whether Andrew pressed Esc meanwhile, to stop waiting (intent 0591, K3-12).
+    fn waiting(&mut self, terminal: &mut DefaultTerminal, line: &str) -> bool;
+}
+
 /// Goes into herdr on the card's workspace. `held` is the socket of a connection Kerdr holds for
-/// this session, when it has one; `tick` runs now and then while you're in there. `opened` says
-/// whether a window really opened, whatever way it ended.
+/// this session, when it has one; `meanwhile` keeps the board up to date while you're in there,
+/// and says why while herdr is asked again. `opened` says whether a window really opened,
+/// whatever way it ended.
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     terminal: &mut DefaultTerminal,
@@ -757,7 +853,7 @@ pub fn run(
     jump: &Jump,
     client_config: &Path,
     held: Option<&crate::hold::HeldWay>,
-    tick: &mut dyn FnMut(),
+    meanwhile: &mut dyn Meanwhile,
     opened: &mut bool,
 ) -> Outcome {
     let t = target(&jump.machine);
@@ -772,77 +868,23 @@ pub fn run(
             transport::run_herdr(&t, &herdr_bin, &refs, Duration::from_secs(12))
         },
         &std::thread::sleep,
+        &mut |line| meanwhile.waiting(terminal, line),
     );
     if let Some(outcome) = focused {
+        // Esc while it waited: back on the board, saying so.
+        if outcome == Outcome::Board {
+            *NOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
+                "Stopped waiting for herdr on {}.",
+                jump.machine.name
+            ));
+        }
         // Keys pressed while herdr didn't answer (another ⏎) mustn't start a second try before
         // the reason is read.
         drop_pending_keys();
         return outcome;
     }
 
-    let session_args: Vec<&str> = if jump.session == "default" {
-        vec![]
-    } else {
-        vec!["--session", &jump.session]
-    };
-    let mut cmd = match (&jump.machine.ssh, jump.via) {
-        (Some(host), Via::Ssh) => {
-            let mut out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
-            if !out.ok() {
-                std::thread::sleep(FOCUS_PAUSE);
-                out = transport::run_script(&t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
-            }
-            // Only a cosmetic setting failed: the card opens with herdr's own settings, and the
-            // board says so after (intent 0591).
-            let own_settings = !out.ok();
-            if own_settings {
-                *NOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
-                    "herdr's window on {} opened with its own settings, so its sidebar shows: Kerdr couldn't prepare its usual ones ({}).",
-                    jump.machine.name,
-                    first_line(&out)
-                ));
-            }
-            let config = if own_settings {
-                String::new()
-            } else {
-                "HERDR_CONFIG_PATH=\"${XDG_CACHE_HOME:-$HOME/.cache}/kerdr/herdr-client.toml\" "
-                    .to_string()
-            };
-            let words: Vec<String> = session_args.iter().map(|a| transport::quote(a)).collect();
-            let script = format!(
-                "{}; unset {}; {config}KERDR=1 exec {} {}",
-                transport::PATH_PREFIX,
-                HERDR_VARS.join(" "),
-                transport::herdr_word(&herdr_bin),
-                words.join(" ")
-            );
-            let mut c = Command::new("ssh");
-            c.args(transport::ssh_args().iter().filter(|a| *a != "-T"))
-                .arg("-t")
-                .arg("--")
-                .arg(host)
-                .arg(format!("sh -c {}", transport::quote(&script)));
-            c
-        }
-        (Some(host), _) => {
-            let mut c = Command::new("herdr");
-            c.args(["--remote", host, "--remote-keybindings", "server"]);
-            c.args(&session_args);
-            c
-        }
-        (None, _) => {
-            let mut c = Command::new(expand_home(&herdr_bin));
-            c.args(&session_args);
-            c
-        }
-    };
-    for var in HERDR_VARS {
-        cmd.env_remove(var);
-    }
-    if !client_config.as_os_str().is_empty() {
-        cmd.env("HERDR_CONFIG_PATH", client_config);
-    }
-    cmd.env("KERDR", "1");
+    let mut cmd = client_command(&t, jump, jump.via, &herdr_bin, client_config);
 
     // A held connection first, if its machine answers through it; when that window never really
     // opens, the usual way.
@@ -867,9 +909,10 @@ pub fn run(
     let tty = TtyModes::capture();
     #[cfg(windows)]
     let console_modes = crate::windows::ConsoleModes::capture();
+    let mut tick = || meanwhile.tick();
     let first = through_held
         .as_mut()
-        .and_then(|c| attach(c, &t, jump, tick).ok())
+        .and_then(|c| attach(c, &t, jump, &mut tick).ok())
         .filter(|a| !a.failed_at_once());
     tty.restore();
     let attached = match first {
@@ -880,13 +923,34 @@ pub fn run(
                 leave(flags);
                 let _ = execute!(stdout(), DisableFocusChange);
             }
-            match attach(&mut cmd, &t, jump, tick) {
+            match attach(&mut cmd, &t, jump, &mut tick) {
                 Ok(a) => a,
                 Err(e) => {
-                    #[cfg(windows)]
-                    drop(console_modes);
-                    enter(terminal, flags);
-                    return Outcome::Failed(format!("Couldn't start herdr: {e}"));
+                    // This machine's herdr can't be started: another machine's session goes the
+                    // other way in, its own herdr drawn over SSH, the same machine and session
+                    // (intent 0591, K3-17).
+                    let again = other_way_in(&jump.machine, jump.via, &e).map(|via| {
+                        let mut c = client_command(&t, jump, via, &herdr_bin, client_config);
+                        (via, attach(&mut c, &t, jump, &mut tick))
+                    });
+                    match again {
+                        Some((_, Ok(a))) => a,
+                        again => {
+                            let (via, e) = match again {
+                                Some((via, Err(e))) => (via, e),
+                                _ => (jump.via, e),
+                            };
+                            #[cfg(windows)]
+                            drop(console_modes);
+                            enter(terminal, flags);
+                            return Outcome::Failed(couldnt_start(
+                                &jump.machine,
+                                via,
+                                &herdr_bin,
+                                &e,
+                            ));
+                        }
+                    }
                 }
             }
         }
@@ -914,6 +978,126 @@ pub fn run(
     enter(terminal, flags);
     drop(ctrl_c);
     outcome
+}
+
+/// herdr's window for `jump` the way `via` names: herdr here, `herdr --remote`, or that machine's
+/// own herdr over SSH (its settings prepared there first), with herdr's variables left out.
+fn client_command(
+    t: &Target,
+    jump: &Jump,
+    via: Via,
+    herdr_bin: &str,
+    client_config: &Path,
+) -> Command {
+    let session_args: Vec<&str> = if jump.session == "default" {
+        vec![]
+    } else {
+        vec!["--session", &jump.session]
+    };
+    let mut cmd = match (&jump.machine.ssh, via) {
+        (Some(host), Via::Ssh) => {
+            let mut out = transport::run_script(t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
+            if !out.ok() {
+                std::thread::sleep(FOCUS_PAUSE);
+                out = transport::run_script(t, REMOTE_CLIENT_CONFIG, Duration::from_secs(12));
+            }
+            // Only a cosmetic setting failed: the card opens with herdr's own settings, and the
+            // board says so after (intent 0591).
+            let own_settings = !out.ok();
+            if own_settings {
+                *NOTE.lock().unwrap_or_else(|e| e.into_inner()) = Some(format!(
+                    "herdr's window on {} opened with its own settings, so its sidebar shows: Kerdr couldn't prepare its usual ones ({}).",
+                    jump.machine.name,
+                    first_line(&out)
+                ));
+            }
+            let config = if own_settings {
+                String::new()
+            } else {
+                "HERDR_CONFIG_PATH=\"${XDG_CACHE_HOME:-$HOME/.cache}/kerdr/herdr-client.toml\" "
+                    .to_string()
+            };
+            ssh_client(host, herdr_bin, &session_args, &config)
+        }
+        (Some(host), _) => {
+            let mut c = Command::new("herdr");
+            c.args(["--remote", host, "--remote-keybindings", "server"]);
+            c.args(&session_args);
+            c
+        }
+        (None, _) => {
+            let mut c = Command::new(expand_home(herdr_bin));
+            c.args(&session_args);
+            c
+        }
+    };
+    for var in HERDR_VARS {
+        cmd.env_remove(var);
+    }
+    if !client_config.as_os_str().is_empty() {
+        cmd.env("HERDR_CONFIG_PATH", client_config);
+    }
+    cmd.env("KERDR", "1");
+    cmd
+}
+
+/// That machine's own herdr, drawn here over `ssh -t`, on `host`'s session: `config` sets its
+/// window's settings there, or is empty for herdr's own.
+fn ssh_client(host: &str, herdr_bin: &str, session_args: &[&str], config: &str) -> Command {
+    let words: Vec<String> = session_args.iter().map(|a| transport::quote(a)).collect();
+    let script = format!(
+        "{}; unset {}; {config}KERDR=1 exec {} {}",
+        transport::PATH_PREFIX,
+        HERDR_VARS.join(" "),
+        transport::herdr_word(herdr_bin),
+        words.join(" ")
+    );
+    let mut c = Command::new("ssh");
+    c.args(transport::ssh_args().iter().filter(|a| *a != "-T"))
+        .arg("-t")
+        .arg("--")
+        .arg(host)
+        .arg(format!("sh -c {}", transport::quote(&script)));
+    c
+}
+
+/// The other way into another machine's session when this machine's herdr couldn't be started
+/// for `herdr --remote` (not installed, not on the path, not allowed): that machine's own herdr
+/// over SSH, which reaches the same machine and the same session (intent 0591, K3-17). Never a
+/// herdr here in its place. None for this machine's own sessions, and for a window already going
+/// over SSH: `herdr --remote` there could ask to restart the other machine's older server, which
+/// stops every agent in it.
+fn other_way_in(machine: &Machine, via: Via, error: &std::io::Error) -> Option<Via> {
+    use std::io::ErrorKind;
+    let missing = matches!(
+        error.kind(),
+        ErrorKind::NotFound | ErrorKind::PermissionDenied
+    );
+    (machine.ssh.is_some() && via == Via::Remote && missing).then_some(Via::Ssh)
+}
+
+/// What the board says when herdr's window couldn't be started at all, in the words of what was
+/// missing (intent 0591, K3-17): this machine's herdr, or ssh to reach another.
+fn couldnt_start(machine: &Machine, via: Via, herdr_bin: &str, error: &std::io::Error) -> String {
+    use std::io::ErrorKind;
+    let missing = error.kind() == ErrorKind::NotFound;
+    match (&machine.ssh, via) {
+        (None, _) if missing => {
+            let path = expand_home(herdr_bin);
+            if path.contains('/') || path.contains('\\') {
+                format!("herdr isn't installed here (looked for {path}).")
+            } else {
+                format!("herdr isn't installed here (looked for {path} on this machine's PATH).")
+            }
+        }
+        (Some(_), Via::Ssh) if missing => format!(
+            "Couldn't reach {}: ssh isn't installed here, and herdr's window on another machine needs it.",
+            machine.name
+        ),
+        (Some(_), Via::Ssh) => format!("Couldn't start ssh to reach {}: {error}", machine.name),
+        (Some(_), _) => format!("Couldn't start herdr to reach {}: {error}", machine.name),
+        (None, _) => format!("Couldn't start herdr: {error}"),
+    }
 }
 
 /// What a herdr window's end means. `exit` is None when its status couldn't be read, and
@@ -1329,11 +1513,24 @@ esac
     /// the outcome and the commands it was given.
     fn focus_with(
         jump: &Jump,
-        mut answer: impl FnMut(&str) -> transport::Output,
+        answer: impl FnMut(&str) -> transport::Output,
     ) -> (Option<Outcome>, Vec<String>) {
+        let (outcome, calls, _) = focus_on(&Target::Local, jump, answer, &mut |_| false);
+        (outcome, calls)
+    }
+
+    /// As focus_with, on `t`, with `wait` told each line the board shows between tries (it says
+    /// whether Esc was pressed): also the pauses between tries.
+    fn focus_on(
+        t: &Target,
+        jump: &Jump,
+        mut answer: impl FnMut(&str) -> transport::Output,
+        wait: &mut dyn FnMut(&str) -> bool,
+    ) -> (Option<Outcome>, Vec<String>, Vec<Duration>) {
         let mut calls = Vec::new();
+        let pauses = std::cell::RefCell::new(Vec::new());
         let outcome = focus(
-            &Target::Local,
+            t,
             jump,
             |args| {
                 let line = args.join(" ");
@@ -1341,9 +1538,10 @@ esac
                 calls.push(line);
                 out
             },
-            &|_| {},
+            &|d| pauses.borrow_mut().push(d),
+            wait,
         );
-        (outcome, calls)
+        (outcome, calls, pauses.into_inner())
     }
 
     fn says(status: i32, stdout: &str) -> transport::Output {
@@ -1604,14 +1802,15 @@ esac
     }
 
     #[test]
-    fn a_focus_that_times_out_says_herdr_didnt_answer_and_enter_tries_again() {
+    fn a_focus_that_times_out_says_herdr_didnt_answer_and_waits_for_it() {
         let lost = || transport::Output {
             timed_out: true,
             ..Default::default()
         };
         // Asked three times before anything is said: herdr may be slow under load (intent 0591).
+        // Then the board waits for it to answer, rather than leave ⏎ to him (K3-12).
         let (outcome, calls) = focus_with(&jump(None), |_| lost());
-        let Some(Outcome::Failed(m)) = outcome else {
+        let Some(Outcome::Unanswered(m)) = outcome else {
             panic!("{outcome:?}")
         };
         assert_eq!(calls, [FOCUS_W4, FOCUS_W4, FOCUS_W4]);
@@ -1619,7 +1818,7 @@ esac
             m.contains("didn't answer in 12 s, three times in a row"),
             "{m}"
         );
-        assert!(m.contains("⏎ tries again"), "{m}");
+        assert!(!m.contains("⏎ tries again"), "{m}");
         // Answered the second time: it goes on as if nothing had happened.
         let mut first = true;
         let (outcome, calls) = focus_with(&jump(None), |_| {
@@ -1656,12 +1855,161 @@ esac
             ..jump(Some("w4:t2"))
         };
         let (outcome, calls) = focus_with(&strict, answer);
-        let Some(Outcome::Failed(m)) = outcome else {
+        let Some(Outcome::Unanswered(m)) = outcome else {
             panic!("{outcome:?}")
         };
         assert!(m.contains("didn't answer in 12 s"), "{m}");
         assert!(!m.contains("no answer"), "{m}");
         assert_eq!(calls, [FOCUS_W4, FOCUS_T2, FOCUS_W4]);
+    }
+
+    /// Intent 0591, K3-12: between tries the board says it's still waiting, with Esc to stop; Esc
+    /// takes him back to the board at once, asking nothing more.
+    #[test]
+    fn a_focus_herdr_doesnt_answer_says_it_waits_between_tries_and_esc_stops_it() {
+        let lost = || transport::Output {
+            timed_out: true,
+            ..Default::default()
+        };
+        let mut lines = Vec::new();
+        let (outcome, calls, _) = focus_on(&Target::Local, &jump(None), |_| lost(), &mut |l| {
+            lines.push(l.to_string());
+            false
+        });
+        assert!(
+            matches!(outcome, Some(Outcome::Unanswered(_))),
+            "{outcome:?}"
+        );
+        assert_eq!(calls.len(), 3);
+        assert_eq!(
+            lines,
+            ["Still waiting on herdr on m… Esc stops waiting."; 2]
+        );
+        // Esc at the first wait: nothing more is asked.
+        let (outcome, calls, _) = focus_on(&Target::Local, &jump(None), |_| lost(), &mut |_| true);
+        assert_eq!(outcome, Some(Outcome::Board));
+        assert_eq!(calls, [FOCUS_W4]);
+    }
+
+    /// Intent 0591, K3-13: a focus whose connection fails on the way is asked again with longer
+    /// pauses, about 20 s in all, then the board waits for its machine; SSH wanting Andrew is said
+    /// at once, never tried again.
+    #[test]
+    fn a_focus_whose_connection_fails_is_tried_for_a_while_then_waits_for_its_machine() {
+        let t = Target::Ssh("m".into());
+        let ssh_said = |stderr: &str| transport::Output {
+            status: Some(255),
+            stderr: stderr.into(),
+            ..Default::default()
+        };
+        let refused = "ssh: connect to host m port 22: Connection refused";
+        let mut lines = Vec::new();
+        let (outcome, calls, pauses) = focus_on(&t, &jump(None), |_| ssh_said(refused), &mut |l| {
+            lines.push(l.to_string());
+            false
+        });
+        assert_eq!(
+            outcome,
+            Some(Outcome::Unanswered(format!("Couldn't reach m: {refused}")))
+        );
+        assert_eq!(calls.len(), 5);
+        assert_eq!(pauses, FOCUS_BACKOFF);
+        assert_eq!(
+            lines[0],
+            format!("m didn't answer ({refused}); trying again… Esc stops waiting.")
+        );
+        // Back on the third try: it goes on as if nothing had happened.
+        let mut n = 0;
+        let (outcome, calls, _) = focus_on(
+            &t,
+            &jump(None),
+            |_| {
+                n += 1;
+                if n < 3 {
+                    ssh_said(refused)
+                } else {
+                    says(0, WORKSPACE_FOCUSED)
+                }
+            },
+            &mut |_| false,
+        );
+        assert_eq!(outcome, None);
+        assert_eq!(calls.len(), 3);
+        // A host key or a password: said at once, where to answer it, and never tried again.
+        for (stderr, words) in [
+            (
+                "Host key verification failed.",
+                "SSH wants a decision about m's host key: Host key verification failed. On the machines screen (M), ⏎ on it answers it.",
+            ),
+            (
+                "m: Permission denied (publickey).",
+                "SSH wants a password or another key for m: m: Permission denied (publickey). On the machines screen (M), ⏎ on it lets you type it.",
+            ),
+        ] {
+            let mut waited = false;
+            let (outcome, calls, pauses) =
+                focus_on(&t, &jump(None), |_| ssh_said(stderr), &mut |_| {
+                    waited = true;
+                    false
+                });
+            assert_eq!(outcome, Some(Outcome::Failed(words.into())));
+            assert_eq!(calls.len(), 1);
+            assert!(pauses.is_empty() && !waited);
+        }
+    }
+
+    /// Intent 0591, K3-17: when this machine's herdr can't be started for `herdr --remote`,
+    /// another machine's session is reached the other way, that machine's own herdr over SSH, on
+    /// the same machine and session; never a herdr here in its place.
+    #[test]
+    fn a_herdr_that_cant_start_here_goes_the_other_way_in_to_the_same_session() {
+        use std::io::{Error, ErrorKind};
+        let away = machine(Some("build-box"));
+        let missing = Error::from(ErrorKind::NotFound);
+        assert_eq!(other_way_in(&away, Via::Remote, &missing), Some(Via::Ssh));
+        assert_eq!(
+            other_way_in(
+                &away,
+                Via::Remote,
+                &Error::from(ErrorKind::PermissionDenied)
+            ),
+            Some(Via::Ssh)
+        );
+        // Not for this machine's own session, nor from a window already over SSH (herdr --remote
+        // could ask to restart an older server there), nor for another failure.
+        assert_eq!(other_way_in(&machine(None), Via::Local, &missing), None);
+        assert_eq!(other_way_in(&away, Via::Ssh, &missing), None);
+        assert_eq!(
+            other_way_in(&away, Via::Remote, &Error::other("busy")),
+            None
+        );
+        // The other way: ssh to that same machine, running its own herdr on the same session.
+        let c = ssh_client("build-box", "herdr", &["--session", "web"], "");
+        assert_eq!(c.get_program(), "ssh");
+        let args: Vec<String> = c
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let at = args.iter().position(|a| a == "--").unwrap();
+        assert_eq!(args[at + 1], "build-box");
+        assert!(
+            args[at + 2].contains("exec herdr --session web"),
+            "{args:?}"
+        );
+        assert!(args.contains(&"-t".to_string()));
+        // What's said when there's no other way: what was missing, and where Kerdr looked.
+        assert_eq!(
+            couldnt_start(&machine(None), Via::Local, "herdr", &missing),
+            "herdr isn't installed here (looked for herdr on this machine's PATH)."
+        );
+        assert_eq!(
+            couldnt_start(&machine(None), Via::Local, "/opt/herdr/herdr", &missing),
+            "herdr isn't installed here (looked for /opt/herdr/herdr)."
+        );
+        assert_eq!(
+            couldnt_start(&away, Via::Ssh, "herdr", &missing),
+            "Couldn't reach m: ssh isn't installed here, and herdr's window on another machine needs it."
+        );
     }
 
     #[test]
