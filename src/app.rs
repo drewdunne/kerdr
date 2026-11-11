@@ -873,6 +873,9 @@ pub struct App {
     /// Held changes kept in the file because their machine's backend no longer checks one again,
     /// by op: said once each (Codex's review 60).
     pub(crate) held_unchecked: std::collections::HashSet<String>,
+    /// Held changes whose claim the hold file couldn't record, by op: said once each (Codex's
+    /// review 62, 3).
+    pub(crate) held_unsure: std::collections::HashSet<String>,
     /// When a held change for a machine Kerdr doesn't have was last tried through a forwarder.
     pub(crate) held_tried: std::collections::HashMap<String, Instant>,
     /// What answers said backends hold for cards, until their feeds say so (holding::Pending).
@@ -887,6 +890,9 @@ pub struct App {
     pub quit_unsaved: bool,
     /// Where q keeps your words for the next Kerdr: the state folder; None keeps nothing.
     pub words_dir: Option<std::path::PathBuf>,
+    /// Your words as this Kerdr last wrote them to the words file while open (holding::
+    /// keep_words_now), so an unchanged set isn't written again.
+    pub(crate) words_kept: Option<crate::kept::Words>,
     /// e pressed on a card being written up or saved: its text opens once that's done (intent
     /// 0591, K1-78).
     pub(crate) edit_after: Option<behind::EditAfter>,
@@ -1013,12 +1019,14 @@ impl App {
             redirecting: None,
             drops_asked: Default::default(),
             held_unchecked: Default::default(),
+            held_unsure: Default::default(),
             held_tried: Default::default(),
             pendings: vec![],
             saving_restored: vec![],
             quitting: None,
             quit_unsaved: false,
             words_dir: None,
+            words_kept: None,
             edit_after: None,
             edit_paused: Default::default(),
         };

@@ -465,21 +465,45 @@ impl App {
     /// marked as this Kerdr's, until it's answered.
     pub(crate) fn send_held(&mut self, machine: usize, entry: HeldRequest) {
         let op = entry.op().to_string();
-        if self.kept.claim(&op) != crate::kept::Claim::Mine {
-            self.rebuild();
-            return;
+        match self.kept.claim(&op) {
+            crate::kept::Claim::Mine => {}
+            // Its claim couldn't be recorded: another Kerdr may be sending it, so it waits, said
+            // once (Codex's review 62, 3).
+            crate::kept::Claim::Unsure => {
+                if let Some(why) = self.kept.held_trouble()
+                    && self.held_unsure.insert(op)
+                {
+                    self.say(
+                        format!(
+                            "{} on {} waits: {why}, so it can't tell whether another Kerdr is sending it. It goes once the file can be written.",
+                            entry.what, entry.reference
+                        ),
+                        Tone::Warn,
+                    );
+                }
+                return;
+            }
+            crate::kept::Claim::Taken | crate::kept::Claim::Gone => {
+                self.rebuild();
+                return;
+            }
         }
+        self.held_unsure.remove(&op);
         let Some(request) = self.held_marked(machine, &entry) else {
             self.kept.unclaim(&op);
             if self.held_unchecked.insert(op) {
                 let name = self.machines[machine].name();
-                self.say(
+                let (what, reference) = (&entry.what, &entry.reference);
+                let said = if entry.after.is_some() {
                     format!(
-                        "{} on {} stays held: {name}'s backend no longer checks a held change again, so Kerdr won't send it unchecked. Press {} again to send it now, or m then D drops it.",
-                        entry.what, entry.reference, entry.what
-                    ),
-                    Tone::Warn,
-                );
+                        "{what} on {reference} stays held: {name}'s backend wouldn't ask again before stopping it, so Kerdr won't send the yes you gave before it last closed. Press {what} again to be asked now, or m then D drops it."
+                    )
+                } else {
+                    format!(
+                        "{what} on {reference} stays held: {name}'s backend no longer checks a held change again, so Kerdr won't send it unchecked. Press {what} again to send it now, or m then D drops it."
+                    )
+                };
+                self.say(said, Tone::Warn);
             }
             return;
         };
@@ -567,12 +591,16 @@ impl App {
     /// None when its machine's backend no longer checks a held change and nothing in Kerdr
     /// decides it again: it isn't sent unchecked. One that waited behind a start, a save or a
     /// write-up too is decided again by Kerdr, so it goes all the same, and with no `rev` from
-    /// before, since what it waited for changed the card.
+    /// before, since what it waited for changed the card. Except a stop: Kerdr deciding it still
+    /// makes sense isn't the question its backend asks again, so one goes only to a backend that
+    /// asks its own first (`"steps"`), and otherwise stays held (Codex's review 62, 1).
     fn held_marked(&self, machine: usize, entry: &HeldRequest) -> Option<Value> {
         let mut request = entry.request.clone();
         let through = request.get("forward_to").is_some();
         if !through && !self.holds_on(machine) {
-            return entry.after.is_some().then_some(request);
+            let stops = request["action"] == "cancel";
+            let decided = entry.after.is_some() && (!stops || self.steps_on(machine));
+            return decided.then_some(request);
         }
         request["held"] = Value::Bool(true);
         if entry.after.is_none()
@@ -1070,6 +1098,13 @@ impl App {
                     crate::kept::Claim::Gone => format!(
                         "{what} on {reference} isn't held any more: another Kerdr sent it or dropped it."
                     ),
+                    // Nothing recorded, so nothing dropped (Codex's review 62, 3).
+                    crate::kept::Claim::Unsure => format!(
+                        "{what} on {reference} wasn't dropped: {}. Press D again once it can be written.",
+                        self.kept
+                            .held_trouble()
+                            .unwrap_or_else(|| "Kerdr couldn't write its hold file".into())
+                    ),
                 };
                 self.say(said, Tone::Info);
                 self.rebuild();
@@ -1390,8 +1425,10 @@ impl App {
 
     /// Changes not yet in their command's hands, for a machine whose backend holds requests,
     /// go into the hold file with their op, for the next Kerdr to send. So does one whose copies
-    /// disagreed, for the home its last refusal named (Codex's review 60).
+    /// disagreed, for the home its last refusal named (Codex's review 60). Each is this Kerdr's
+    /// until it has gone (Codex's review 62, 6).
     fn hold_unsent(&mut self) {
+        let me = self.kept.me().to_string();
         let disagreed = std::mem::take(&mut self.catch_up.disagreed);
         for d in disagreed {
             if !self.holds_on(d.named) || d.request["op"].as_str().is_none_or(str::is_empty) {
@@ -1404,7 +1441,6 @@ impl App {
             if self.kept.find(&op).is_some() {
                 let request = self.record_request(&op, &d.request);
                 self.kept.retarget(&op, &machine, request);
-                self.kept.unclaim(&op);
                 continue;
             }
             self.kept.hold(HeldRequest {
@@ -1416,7 +1452,7 @@ impl App {
                 key: Some(d.key),
                 pressed: self.epoch_now(),
                 after: None,
-                by: None,
+                by: Some(me.clone()),
             });
         }
         let unsent: Vec<u64> = self
@@ -1428,11 +1464,10 @@ impl App {
             .collect();
         for n in unsent {
             if let Some(job) = self.resolver.take(n) {
-                // One from the hold file waits there again as itself (Codex's review 60).
+                // One from the hold file is there already, as itself (Codex's review 60).
                 if let Some(op) = self.held_sending.remove(&n)
                     && self.kept.find(&op).is_some()
                 {
-                    self.kept.unclaim(&op);
                     continue;
                 }
                 let machine = self.machines[job.machine].name();
@@ -1448,7 +1483,7 @@ impl App {
                     key: job.key,
                     pressed: self.epoch_now(),
                     after: None,
-                    by: None,
+                    by: Some(me.clone()),
                 });
             }
         }
@@ -1467,10 +1502,12 @@ impl App {
     /// As Kerdr quits: starts waiting for their write-up go into the hold file, for the next
     /// Kerdr to send once that's done, and your words into the words file. Err, saying what
     /// couldn't be written, when either can't be: what it added to the hold file is taken out
-    /// again, since Kerdr stays open with it (Codex's review 60).
+    /// again, since Kerdr stays open with it (Codex's review 60). Each stays this Kerdr's in the
+    /// file until it has really gone: its lock then lets go, and the next Kerdr takes them. So no
+    /// other Kerdr sends one while this one may still (Codex's review 62, 6).
     pub fn keep_on_quit(&mut self) -> Result<(), String> {
         let before: Vec<String> = self.kept.held.iter().map(|h| h.op().to_string()).collect();
-        let unclaimed = self.hold_for_next();
+        self.hold_for_next();
         let added: Vec<String> = self
             .kept
             .held
@@ -1490,19 +1527,15 @@ impl App {
         for op in added {
             self.kept.release(&op);
         }
-        // Still this Kerdr's to send, since it stays open with them.
-        for op in unclaimed {
-            self.kept.claim(&op);
-        }
         Err(why)
     }
 
     /// What waits in Kerdr itself goes into the hold file as Kerdr quits: starts and changes
     /// waiting for their write-up, and keys held behind a start or a save, which the next Kerdr
-    /// decides again (intent 0591, release 4). One that came from the hold file waits there again
-    /// as itself (Codex's review 60). The ops of those, for keep_on_quit to take back should it
-    /// stay open.
-    fn hold_for_next(&mut self) -> Vec<String> {
+    /// decides again (intent 0591, release 4). One that came from the hold file is there already,
+    /// as itself (Codex's review 60). Each is this Kerdr's until it has gone (Codex's review 62,
+    /// 6).
+    fn hold_for_next(&mut self) {
         let mut waiting: Vec<(u64, String, &'static str)> = self
             .resolver
             .write_ups_awaited()
@@ -1518,16 +1551,13 @@ impl App {
                     crate::resolve::Behind::Save(s) => (n, format!("save:{s}"), "save"),
                 }),
         );
-        let mut unclaimed = vec![];
+        let me = self.kept.me().to_string();
         for (n, after, kind) in waiting {
-            if let Some(op) = self
+            if self
                 .held_sending
                 .get(&n)
-                .filter(|op| self.kept.find(op).is_some())
-                .cloned()
+                .is_some_and(|op| self.kept.find(op).is_some())
             {
-                self.kept.unclaim(&op);
-                unclaimed.push(op);
                 continue;
             }
             let Some(j) = self.resolver.job(n) else {
@@ -1554,10 +1584,9 @@ impl App {
                 reference,
                 pressed: self.epoch_now(),
                 after: Some(after),
-                by: None,
+                by: Some(me.clone()),
             });
         }
-        unclaimed
     }
 
     /// The send words came back from, as the words file keeps it.
@@ -1625,6 +1654,37 @@ impl App {
                 .returned
                 .push(kept(&draft.words, &draft.images, draft.came_back.as_ref()));
         }
+        // A new intent on its way, unanswered: given back as the send it is, so sent again it
+        // finds what that send may have made rather than making a second (Codex's review 62, 2).
+        for job in self.resolver.unanswered_creates() {
+            let request = &job.request;
+            let Some(submission) = request["submission"].as_str().filter(|s| !s.is_empty()) else {
+                continue;
+            };
+            let Some(machine) = self.machines.get(job.machine).map(|m| m.name()) else {
+                continue;
+            };
+            let sent = self.submissions.iter().find(|s| s.id == submission);
+            let field = |name: &str| request[name].as_str().map(str::to_string);
+            words.returned.push(KeptWords {
+                words: sent
+                    .map(|s| s.words.clone())
+                    .or_else(|| field("words"))
+                    .unwrap_or_default(),
+                images: sent
+                    .map(|s| s.images.iter().map(KeptImage::of).collect())
+                    .unwrap_or_default(),
+                from: Some(KeptSubmission {
+                    id: submission.to_string(),
+                    machine,
+                    session: field("session").unwrap_or_else(|| "default".into()),
+                    organization: field("organization"),
+                    tenant: field("tenant"),
+                    team: field("team"),
+                    unknown: true,
+                }),
+            });
+        }
         for job in self.resolver.saving_in_background() {
             let Some(machine) = self.machines.get(job.machine).map(|m| m.name()) else {
                 continue;
@@ -1662,6 +1722,24 @@ impl App {
         edits.sort_by(|a, b| a.key.cmp(&b.key));
         words.edits = edits;
         words
+    }
+
+    /// Your words into the words file as they are now, while this Kerdr is open, when they've
+    /// changed since it last wrote them: a new intent sent goes as the send it is, one saved or
+    /// dropped goes from it, and the words this Kerdr took when it opened are replaced. So a crash
+    /// never gives back words already saved as new words, which would make a second intent
+    /// (Codex's review 62, 2).
+    pub(crate) fn keep_words_now(&mut self) {
+        if !self.kept.on_disk() {
+            return;
+        }
+        let words = self.words();
+        if self.words_kept.as_ref() == Some(&words) {
+            return;
+        }
+        if self.kept.hold_words(&words).is_ok() {
+            self.words_kept = Some(words);
+        }
     }
 
     /// Words the last Kerdr kept: the box's draft back in the box (c), words given back after it,
@@ -3433,12 +3511,143 @@ mod tests {
         assert!(app.catch_up.disagreed.is_empty());
         assert!(app.kept.held.is_empty());
 
-        let (mut app, m, op, _dir) = disagreeing();
+        let (mut app, m, op, dir) = disagreeing();
         assert!(!app.quit_key());
         assert!(app.quit_key(), "{}", said(&app));
         assert_eq!(app.kept.held.len(), 1);
         assert_eq!(app.kept.held[0].op(), op);
         assert_eq!(app.kept.held[0].machine, app.machines[m].name());
-        assert_eq!(app.kept.held[0].by, None);
+        // This Kerdr's until it has gone (Codex's review 62, 6), then the next one's.
+        assert_eq!(app.kept.held[0].by.as_deref(), Some(app.kept.me()));
+        drop(app);
+        let mut next = Kept::at(dir.path(), 0);
+        assert_eq!(next.claim(&op), crate::kept::Claim::Mine);
+    }
+
+    /// A Kerdr with its own state folder carrying two starts waiting for their write-up: one
+    /// from the hold file, and one d asked for. That folder, and the first one's op.
+    fn carrying_two(app: &mut App) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        app.kept = Kept::at(dir.path(), app.now().timestamp());
+        let (key, id, reference, m) = waiting(app);
+        app.kept.hold(HeldRequest {
+            machine: app.machines[m].name(),
+            request: crate::actions::with_op(json!({"action":"dispatch","id":id})),
+            rev: None,
+            key: Some(key),
+            reference,
+            what: "d".into(),
+            pressed: app.now().timestamp(),
+            after: Some("write-up".into()),
+            by: None,
+        });
+        let carried = app.kept.held[0].op().to_string();
+        back(app, m);
+        assert!(
+            app.held_sending.values().any(|op| *op == carried),
+            "{}",
+            said(app)
+        );
+        app.resolver.add_gated(
+            m,
+            json!({"action":"dispatch","id":"0999"}),
+            None,
+            None,
+            None,
+        );
+        (dir, carried)
+    }
+
+    #[test]
+    fn what_a_quitting_kerdr_keeps_stays_its_own_until_it_has_gone() {
+        // Codex's review 62, 6: another Kerdr that looks while this one puts what it carries in
+        // the file for the next can't take any of it, nor after a quit whose words couldn't be
+        // written leaves this one open. Once this one has gone, it can.
+        use crate::kept::Claim;
+        let mut app = app();
+        let (dir, carried) = carrying_two(&mut app);
+        app.hold_for_next();
+        let fresh = app
+            .kept
+            .held
+            .iter()
+            .map(|h| h.op().to_string())
+            .find(|op| *op != carried)
+            .expect("the d asked for, kept for the next Kerdr");
+        let mut other = Kept::at(dir.path(), app.now().timestamp());
+        assert_eq!(other.claim(&carried), Claim::Taken);
+        assert_eq!(other.claim(&fresh), Claim::Taken);
+
+        let mut app = self::app();
+        let (dir, carried) = carrying_two(&mut app);
+        app.draft = "Words not yet sent".into();
+        std::fs::create_dir(dir.path().join("words.json")).unwrap();
+        assert!(app.keep_on_quit().is_err());
+        let mut other = Kept::at(dir.path(), app.now().timestamp());
+        assert_eq!(
+            other.held.len(),
+            1,
+            "what it added for the next is gone again"
+        );
+        assert_eq!(other.claim(&carried), Claim::Taken);
+        assert!(app.held_sending.values().any(|op| *op == carried));
+        std::fs::remove_dir(dir.path().join("words.json")).unwrap();
+        app.keep_on_quit().unwrap();
+        let fresh = app
+            .kept
+            .held
+            .iter()
+            .map(|h| h.op().to_string())
+            .find(|op| *op != carried)
+            .unwrap();
+        assert_eq!(other.claim(&fresh), Claim::Taken);
+        drop(app);
+        assert_eq!(other.claim(&carried), Claim::Mine);
+        assert_eq!(other.claim(&fresh), Claim::Mine);
+    }
+
+    #[test]
+    fn words_sent_from_a_restored_draft_never_come_back_as_new_words_after_a_crash() {
+        // Codex's review 62, 2: the draft the last Kerdr kept, restored and sent. A crash before
+        // its answer gives the words back as that send, with its submission, so sending them
+        // again finds what it made; a crash after it was saved gives nothing back.
+        let restored_and_sent = || {
+            let dir = tempfile::tempdir().unwrap();
+            let draft = Words {
+                draft: Some(KeptWords {
+                    words: "Fix the banner".into(),
+                    ..KeptWords::default()
+                }),
+                ..Words::default()
+            };
+            Kept::at(dir.path(), 0).keep_words(&draft).unwrap();
+            let mut app = app();
+            app.kept = Kept::at(dir.path(), app.now().timestamp());
+            let words = app.kept.take_words();
+            app.restore_words(words);
+            assert_eq!(app.draft, "Fix the banner");
+            press(&mut app, 'c');
+            let Action::Mutate { machine, request } = press_code(&mut app, KeyCode::Enter) else {
+                panic!("not sent: {}", said(&app))
+            };
+            app.queue_action(machine, request);
+            let (n, _, request, _) = app.resolver.ready()[0].clone();
+            (app, dir, n, request)
+        };
+        let (app, dir, _, request) = restored_and_sent();
+        drop(app);
+        let back = Kept::at(dir.path(), 0).take_words();
+        assert!(back.draft.is_none(), "{back:?}");
+        assert_eq!(back.returned.len(), 1, "{back:?}");
+        assert_eq!(back.returned[0].words, "Fix the banner");
+        assert_eq!(
+            back.returned[0].from.as_ref().map(|f| f.id.as_str()),
+            request["submission"].as_str()
+        );
+        let (mut app, dir, n, request) = restored_and_sent();
+        app.finish_job(n, request, ok(json!({"id": "0700"})));
+        drop(app);
+        let back = Kept::at(dir.path(), 0).take_words();
+        assert!(back.is_empty(), "{back:?}");
     }
 }

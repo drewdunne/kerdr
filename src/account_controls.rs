@@ -4259,6 +4259,22 @@ impl App {
             .position(|(mi, _, _)| self.machines.get(*mi).is_some_and(|m| m.conn.is_live()))
         {
             let (mi, request, _) = self.account_cancels.remove(i);
+            // Sent again after its answer was lost, so it may have moved them already: only to a
+            // backend that still keeps ops, checked now, as it goes (Codex's review 62, 7).
+            if let Some(op) = request["op"].as_str()
+                && self.account_same_op.contains(op)
+                && !self.resends_to(mi)
+            {
+                self.account_same_op.remove(op);
+                let name = self.machines[mi].name();
+                self.say(
+                    format!(
+                        "{name} stopped answering before it said whether its waiting sessions moved, and its backend no longer keeps track of a request sent twice, so Kerdr didn't ask it again."
+                    ),
+                    Tone::Warn,
+                );
+                return Action::None;
+            }
             return self.send_account(mi, request);
         }
         while let Some((mi, request)) = self.account_queue.pop_front() {
@@ -9142,6 +9158,44 @@ mod tests {
         // Any other request gets an op of its own.
         let other = a.account_op(first.clone());
         assert_ne!(other["op"], first["op"]);
+    }
+
+    #[test]
+    fn a_move_waiting_whose_answer_was_lost_isnt_sent_again_once_its_backend_stops_keeping_ops() {
+        // Codex's review 62, 7: kept for a backend that kept ops, it's checked again as it goes.
+        // Back with a backend that no longer lists "op", which would move them a second time.
+        let mut a = app();
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("op".into());
+        away(&mut a, 1, 60);
+        a.account_batch_messages.clear();
+        a.finish_action(
+            1,
+            crate::actions::with_op(json!({"action":"account-move-waiting","owner":"studio"})),
+            Err("ssh: connect to host build-box: Connection timed out".into()),
+        );
+        assert_eq!(a.account_cancels.len(), 1);
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .retain(|s| s != "op");
+        back_live(&mut a, 1);
+        assert_eq!(a.account_tick(), Action::None, "sent again");
+        assert!(a.account_cancels.is_empty());
+        let name = a.machines[1].name();
+        assert_eq!(
+            said(&a),
+            format!(
+                "{name} stopped answering before it said whether its waiting sessions moved, and its backend no longer keeps track of a request sent twice, so Kerdr didn't ask it again."
+            )
+        );
+        assert_eq!(a.account_tick(), Action::None);
     }
 
     #[test]

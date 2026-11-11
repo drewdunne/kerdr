@@ -503,8 +503,13 @@ struct Queued {
     /// the edit (intent 0591, K1-82).
     paused: bool,
     /// Its card's footing when its key was pressed, for a change waiting for its write-up: it
-    /// doesn't go once the card has been set aside, finished or started meanwhile (Footing).
+    /// doesn't go once the card has been set aside, finished or started meanwhile (Footing), up to
+    /// the moment it starts, whatever it still waits behind (Codex's review 62, 4).
     guard: Option<Footing>,
+    /// It waited for its write-up, and the card's `rev` as the read that let it go showed it: it
+    /// goes with that, not a later read's, so its backend asks about anything changed since.
+    was_gated: bool,
+    released: Option<Option<String>>,
 }
 
 /// What a change waiting for its card's write-up rests on (Codex's review 60): whether the card
@@ -568,6 +573,8 @@ impl Queue {
             gated: false,
             paused: false,
             guard: None,
+            was_gated: false,
+            released: None,
         };
         let writes = item.writes;
         match self.items.iter_mut().find(|j| j.n == n) {
@@ -605,6 +612,7 @@ impl Queue {
         self.push(n, machine, key, request);
         if let Some(item) = self.items.iter_mut().find(|j| j.n == n) {
             item.gated = item.record.is_some();
+            item.was_gated = item.gated;
         }
     }
 
@@ -615,14 +623,16 @@ impl Queue {
         }
     }
 
-    /// A read of `machine`'s feed, before `written`: each change still waiting for its write-up
-    /// whose card has been set aside, finished or started since its key was pressed is taken out
-    /// unstarted, and returned, for the board to say so (Codex's review 60).
+    /// A read of `machine`'s feed, before `written`: each change that waited for its write-up,
+    /// not yet started, whose card has been set aside, finished or started since its key was
+    /// pressed is taken out unstarted, and returned, for the board to say so (Codex's review 60).
+    /// That holds after its write-up too, while it waits behind another change (Codex's review
+    /// 62, 4).
     pub fn moved(&mut self, machine: usize, footings: &Footings) -> Vec<u64> {
         let moved: Vec<u64> = self
             .items
             .iter()
-            .filter(|q| q.gated && !q.started && q.machine == machine)
+            .filter(|q| q.guard.is_some() && !q.started && q.machine == machine)
             .filter(|q| {
                 let now = q.record.as_ref().and_then(|r| footings.get(r));
                 matches!((&q.guard, now), (Some(then), Some((now, _))) if then.moved(now))
@@ -631,6 +641,29 @@ impl Queue {
             .collect();
         self.items.retain(|q| !moved.contains(&q.n));
         moved
+    }
+
+    /// After `written`, with the same read's footings: each change that read let go notes its
+    /// card's `rev` then, which it goes with.
+    pub fn released(&mut self, machine: usize, footings: &Footings) {
+        for q in self.items.iter_mut().filter(|q| {
+            q.was_gated && !q.gated && !q.started && q.released.is_none() && q.machine == machine
+        }) {
+            q.released = Some(
+                q.record
+                    .as_ref()
+                    .and_then(|r| footings.get(r))
+                    .and_then(|(_, rev)| rev.clone()),
+            );
+        }
+    }
+
+    /// The `rev` the read that let this change go showed its card with, if it had one.
+    pub fn released_rev(&self, n: u64) -> Option<String> {
+        self.items
+            .iter()
+            .find(|j| j.n == n)
+            .and_then(|j| j.released.clone().flatten())
     }
 
     /// The record a change is to, by its number, while it's here.
@@ -1617,6 +1650,14 @@ impl Resolver {
     }
 
     /// The oldest unanswered change whose request `matches`.
+    /// New intents sent and not yet answered.
+    pub fn unanswered_creates(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| j.settled.is_none() && j.request["action"] == "create")
+            .collect()
+    }
+
     pub fn unanswered_where(&self, matches: impl Fn(&Value) -> bool) -> Option<u64> {
         self.jobs
             .iter()

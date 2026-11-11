@@ -99,8 +99,9 @@ struct HeldFile {
 enum Change {
     Hold(HeldRequest),
     Release(String),
-    /// Who has it now, by its op.
-    By(String, Option<String>),
+    /// Back to waiting in the file, by its op: only while the Kerdr named still has it, so a
+    /// change written late never undoes another Kerdr's later claim (Codex's review 62, 3).
+    Unclaim(String, String),
     /// The machine it's for now, and the request as it goes there, by its op: its card lives
     /// there, a refusal said.
     Moved(String, String, Value),
@@ -116,9 +117,11 @@ impl Change {
                 }
             }
             Change::Release(op) => file.held.retain(|h| h.op() != op),
-            Change::By(op, by) => {
+            Change::Unclaim(op, me) => {
                 for h in file.held.iter_mut().filter(|h| h.op() == op) {
-                    h.by = by.clone();
+                    if h.by.as_deref() == Some(me.as_str()) {
+                        h.by = None;
+                    }
                 }
             }
             Change::Moved(op, machine, request) => {
@@ -146,6 +149,9 @@ pub enum Claim {
     Taken,
     /// It's gone from the file: answered, or dropped, by another Kerdr.
     Gone,
+    /// The hold file couldn't be read or written, so nothing was decided: it isn't sent, or
+    /// dropped, until that can be recorded (Codex's review 62, 3).
+    Unsure,
 }
 
 /// This Kerdr's own lock file, held while it runs.
@@ -245,6 +251,17 @@ impl Kept {
         Some(format!("Kerdr couldn't write {file} ({e})"))
     }
 
+    /// Why the hold file couldn't be read or written the last time Kerdr tried, while that's so.
+    pub fn held_trouble(&self) -> Option<String> {
+        let e = self.held_failed.as_ref()?;
+        let file = self
+            .dir
+            .as_ref()
+            .map(|d| d.join(HELD_FILE).display().to_string())
+            .unwrap_or_else(|| HELD_FILE.to_string());
+        Some(format!("Kerdr couldn't write {file} ({e})"))
+    }
+
     /// Why what Kerdr keeps couldn't be written, while that's so: quitting would lose it.
     pub fn unsaved(&self) -> Option<String> {
         let file = |name: &str| {
@@ -272,7 +289,9 @@ impl Kept {
     }
 
     /// Drops what has waited over a day, from the file too: not one a Kerdr open now has handed
-    /// on, whose answer is still to come.
+    /// on, whose answer is still to come. Checked and taken out under the lock, as the file is
+    /// then, so one another Kerdr claimed a moment ago isn't dropped under it (Codex's review 62,
+    /// 8). When the file can't be read or written, nothing is dropped now.
     pub fn expire(&mut self, now: i64) -> Vec<Dropped> {
         let dir = self.dir.clone();
         let me = self.me.clone();
@@ -280,23 +299,39 @@ impl Kept {
             h.by.as_deref()
                 .is_some_and(|by| by == me || dir.as_deref().is_some_and(|d| alive(d, by)))
         };
-        let old: Vec<HeldRequest> = self
-            .held
+        let old: Vec<HeldRequest> = match self.dir {
+            None => {
+                let old: Vec<HeldRequest> = self
+                    .held
+                    .iter()
+                    .filter(|h| h.expired(now) && !busy(h))
+                    .cloned()
+                    .collect();
+                self.held.retain(|h| !old.iter().any(|o| o.op() == h.op()));
+                old
+            }
+            Some(_) => {
+                let taken = self.update(|f| {
+                    let (old, keep): (Vec<HeldRequest>, Vec<HeldRequest>) =
+                        std::mem::take(&mut f.held)
+                            .into_iter()
+                            .partition(|h| h.expired(now) && !busy(h));
+                    f.held = keep;
+                    old
+                });
+                let old = taken.unwrap_or_default();
+                self.held.retain(|h| !old.iter().any(|o| o.op() == h.op()));
+                old
+            }
+        };
+        let dropped: Vec<Dropped> = old
             .iter()
-            .filter(|h| h.expired(now) && !busy(h))
-            .cloned()
-            .collect();
-        let mut dropped = vec![];
-        for h in old {
-            self.held.retain(|e| e.op() != h.op());
-            self.write(Change::Release(h.op().to_string()));
-            let said = format!("{} dropped: {} didn't answer for a day", h.what, h.machine);
-            dropped.push(Dropped {
+            .map(|h| Dropped {
                 key: h.key.clone(),
                 reference: h.reference.clone(),
-                said,
-            });
-        }
+                said: format!("{} dropped: {} didn't answer for a day", h.what, h.machine),
+            })
+            .collect();
         self.dropped.extend(dropped.clone());
         dropped
     }
@@ -342,15 +377,19 @@ impl Kept {
         });
         let claim = match found {
             Some(claim) => claim,
-            // The file can't be read: this Kerdr's own list decides, and the mark goes later.
-            None => {
-                self.unwritten
-                    .push(Change::By(op.to_string(), Some(me.clone())));
-                match self.held.iter().any(|h| h.op() == op) {
-                    true => Claim::Mine,
-                    false => Claim::Gone,
+            // The file can't be read or written: only one this Kerdr held that never reached it
+            // is its own, and goes into it as being sent by this one. Any other may be another
+            // Kerdr's to send by now, so nothing is decided (Codex's review 62, 3).
+            None => match self.unwritten.iter_mut().find_map(|c| match c {
+                Change::Hold(e) if e.op() == op => Some(e),
+                _ => None,
+            }) {
+                Some(e) => {
+                    e.by = Some(me.clone());
+                    Claim::Mine
                 }
-            }
+                None => Claim::Unsure,
+            },
         };
         match claim {
             Claim::Mine => {
@@ -359,7 +398,7 @@ impl Kept {
                 }
             }
             Claim::Gone => self.held.retain(|h| h.op() != op),
-            Claim::Taken => {}
+            Claim::Taken | Claim::Unsure => {}
         }
         claim
     }
@@ -387,16 +426,19 @@ impl Kept {
         });
         let claim = match found {
             Some(claim) => claim,
-            // The file can't be read: this Kerdr's own list decides, and it goes later.
+            // The file can't be read or written: only one that never reached it is dropped now;
+            // any other may be on its way from another Kerdr (Codex's review 62, 3).
             None => {
-                self.unwritten.push(Change::Release(op.to_string()));
-                match self.held.iter().any(|h| h.op() == op) {
-                    true => Claim::Mine,
-                    false => Claim::Gone,
+                let local = |c: &Change| matches!(c, Change::Hold(e) if e.op() == op);
+                if self.unwritten.iter().any(local) {
+                    self.unwritten.retain(|c| !local(c));
+                    Claim::Mine
+                } else {
+                    Claim::Unsure
                 }
             }
         };
-        if claim != Claim::Taken {
+        if matches!(claim, Claim::Mine | Claim::Gone) {
             self.held.retain(|h| h.op() != op);
         }
         claim
@@ -405,10 +447,13 @@ impl Kept {
     /// A change this Kerdr handed on that waits in the file again: its machine couldn't be
     /// reached after all, or Kerdr quits before handing it over whole.
     pub fn unclaim(&mut self, op: &str) {
+        let me = self.me.clone();
         for h in self.held.iter_mut().filter(|h| h.op() == op) {
-            h.by = None;
+            if h.by.as_deref() == Some(me.as_str()) {
+                h.by = None;
+            }
         }
-        self.write(Change::By(op.to_string(), None));
+        self.write(Change::Unclaim(op.to_string(), me));
     }
 
     /// A held change whose card, a refusal said, lives on another machine: it's for that one now,
@@ -551,6 +596,22 @@ impl Kept {
     /// Keeps this Kerdr's words for the next one, in place of what it took, adding to what other
     /// Kerdrs keep there. The error, in words, when it can't: nothing in the file changed.
     pub fn keep_words(&mut self, words: &Words) -> Result<(), String> {
+        self.put_words(words, true)
+    }
+
+    /// Keeps this Kerdr's words in the file as they are now, while it's open, in place of what it
+    /// kept or took before: as its own, so no other Kerdr takes them meanwhile, and the next one
+    /// does once this one has gone, however it ended (Codex's review 62, 2).
+    pub fn hold_words(&mut self, words: &Words) -> Result<(), String> {
+        self.put_words(words, false)
+    }
+
+    /// Whether what Kerdr keeps goes to files at all (not in the demo, or a test's memory).
+    pub fn on_disk(&self) -> bool {
+        self.dir.is_some()
+    }
+
+    fn put_words(&mut self, words: &Words, leaving: bool) -> Result<(), String> {
         let Some(dir) = self.dir.clone() else {
             return Ok(());
         };
@@ -563,8 +624,8 @@ impl Kept {
             file.sets.retain(|s| !mine(&s.by) && !mine(&s.left_by));
             if !words.is_empty() {
                 file.sets.push(WordSet {
-                    by: None,
-                    left_by: Some(me.clone()),
+                    by: (!leaving).then(|| me.clone()),
+                    left_by: leaving.then(|| me.clone()),
                     words: words.clone(),
                 });
             }
@@ -1028,6 +1089,66 @@ mod tests {
         let e = kept.keep_words(&words).unwrap_err();
         assert!(e.contains("words.json"), "{e}");
         assert!(kept.unsaved().is_some());
+    }
+
+    #[test]
+    fn a_claim_or_drop_the_hold_file_cant_record_decides_nothing() {
+        // Codex's review 62, 3: two Kerdrs with the same change and a hold file neither can
+        // write. Neither sends it, neither says it was dropped, and nothing written late undoes a
+        // later claim. One held meanwhile, which never reached the file, is this Kerdr's alone.
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join(HELD_FILE);
+        let away = dir.path().join("held-away.json");
+        let mut one = Kept::at(dir.path(), 1000);
+        let mut two = Kept::at(dir.path(), 1000);
+        one.hold(entry("op-1", 1000));
+        two.sync();
+        std::fs::rename(&held, &away).unwrap();
+        std::fs::create_dir(&held).unwrap();
+        assert_ne!(one.claim("op-1"), Claim::Mine);
+        assert_ne!(two.claim("op-1"), Claim::Mine);
+        assert_ne!(one.drop_waiting("op-1"), Claim::Mine);
+        assert!(one.find("op-1").is_some(), "said dropped though it isn't");
+        assert!(!one.hold(entry("op-2", 1000)));
+        assert_eq!(one.claim("op-2"), Claim::Mine);
+        // The file back: two claims op-1, and what one writes after never undoes that.
+        std::fs::remove_dir(&held).unwrap();
+        std::fs::rename(&away, &held).unwrap();
+        assert_eq!(two.claim("op-1"), Claim::Mine);
+        assert_eq!(one.flush(), None);
+        assert_eq!(one.claim("op-1"), Claim::Taken);
+        let file: HeldFile =
+            serde_json::from_str(&std::fs::read_to_string(&held).unwrap()).unwrap();
+        let by = |op: &str| {
+            file.held
+                .iter()
+                .find(|h| h.op() == op)
+                .and_then(|h| h.by.clone())
+        };
+        assert_eq!(by("op-1").as_deref(), Some(two.me()));
+        assert_eq!(
+            by("op-2").as_deref(),
+            Some(one.me()),
+            "written as on its way from the Kerdr sending it"
+        );
+    }
+
+    #[test]
+    fn a_change_another_kerdr_claimed_a_moment_ago_isnt_dropped_as_a_day_old() {
+        // Codex's review 62, 8: who has it is checked in the file, under the lock, as it's
+        // dropped. Here another Kerdr claims it after this one last read the file.
+        let dir = tempfile::tempdir().unwrap();
+        let mut one = Kept::at(dir.path(), 1000);
+        one.hold(entry("op-1", 1000));
+        let mut two = Kept::at(dir.path(), 1000);
+        assert_eq!(two.claim("op-1"), Claim::Mine);
+        assert!(one.expire(1001 + HOLD_MOST_SECS).is_empty());
+        assert!(one.dropped.is_empty());
+        assert_eq!(ops(dir.path()), ["op-1"]);
+        // Once that Kerdr has gone, its day counts.
+        drop(two);
+        assert_eq!(one.expire(1001 + HOLD_MOST_SECS).len(), 1);
+        assert!(ops(dir.path()).is_empty());
     }
 
     #[test]

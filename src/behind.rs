@@ -1134,8 +1134,10 @@ mod tests {
         select(&mut app, &key);
         key_move(&mut app);
         assert_eq!(app.resolver.behind_jobs().len(), 1);
-        // Quit before its start is answered: the move is kept, to be decided again.
+        // Quit before its start is answered: the move is kept, to be decided again, and stays this
+        // Kerdr's until it has gone (Codex's review 62, 6).
         app.keep_on_quit().unwrap();
+        drop(app);
         // The next Kerdr: no start is on its way there, and the card still waits, so it goes.
         let mut next = self::app();
         next.kept = Kept::at(dir.path(), next.now().timestamp());
@@ -1208,6 +1210,64 @@ mod tests {
         assert_eq!(ready.len(), 1, "{}", said(&next));
         assert_eq!(ready[0].2["op"], op.as_str());
         assert_eq!(ready[0].2["held"], true);
+    }
+
+    #[test]
+    fn a_stop_kept_from_before_a_restart_isnt_sent_to_a_backend_that_wouldnt_ask_again() {
+        // Codex's review 62, 1: "Cancel #N once it opens?" answered yes, then Kerdr closed. Its
+        // machine's backend now lists neither "hold" nor "steps", so nothing there would ask
+        // again before stopping it: it stays held, and that's said. A backend that asks its own
+        // question first ("steps") is sent it, naming no workspace, for it to ask.
+        let stop_kept = |steps: bool| {
+            let mut app = app();
+            let card = app
+                .board
+                .cards
+                .iter()
+                .find(|c| {
+                    c.is_open_workspace() && c.detail.is_some() && !c.done() && !c.dismissed()
+                })
+                .cloned()
+                .expect("a card with its workspace open in the demo");
+            let (m, id) = (card.machine_index, card.detail.as_ref().unwrap().id.clone());
+            let feed = app.machines[m].feed.as_mut().unwrap();
+            feed.supports.retain(|s| s != HOLD && s != "steps");
+            if steps {
+                feed.supports.push("steps".into());
+            }
+            app.kept.hold(crate::kept::HeldRequest {
+                machine: app.machines[m].name(),
+                request: crate::actions::with_op(json!({"action":"cancel","id":id})),
+                rev: None,
+                key: Some(card.key.clone()),
+                reference: card.reference.clone(),
+                what: "X".into(),
+                pressed: app.now().timestamp(),
+                after: Some("start".into()),
+                by: None,
+            });
+            app.feed_read(m);
+            (app, card, m)
+        };
+        let (mut app, card, m) = stop_kept(false);
+        assert!(
+            app.resolver.ready().is_empty(),
+            "sent without being asked again"
+        );
+        assert_eq!(app.kept.held.len(), 1);
+        let name = app.machines[m].name();
+        assert_eq!(
+            said(&app),
+            format!(
+                "X on {} stays held: {name}'s backend wouldn't ask again before stopping it, so Kerdr won't send the yes you gave before it last closed. Press X again to be asked now, or m then D drops it.",
+                card.reference
+            )
+        );
+        let (mut app, _, _) = stop_kept(true);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        assert_eq!(ready[0].2["action"], "cancel");
+        assert!(ready[0].2.get("workspace").is_none(), "{}", ready[0].2);
     }
 
     #[test]

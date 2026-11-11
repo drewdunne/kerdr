@@ -861,6 +861,9 @@ impl Runner {
                             if let Some(intakes) = seen.get(&machine) {
                                 failed = queue.written(machine, intakes);
                             }
+                            if let Some(footings) = footed.get(&machine) {
+                                queue.released(machine, footings);
+                            }
                         } else {
                             queue.push(n, machine, key, &request);
                         }
@@ -875,6 +878,9 @@ impl Runner {
                             && let Some(intakes) = seen.get(&machine)
                         {
                             failed = queue.written(machine, intakes);
+                            if let Some(footings) = footed.get(&machine) {
+                                queue.released(machine, footings);
+                            }
                         }
                     }
                     // Said either way, so the board keeps a start Esc came too late for.
@@ -893,6 +899,7 @@ impl Runner {
                     } => {
                         moved = queue.moved(machine, &footings);
                         failed = queue.written(machine, &intakes);
+                        queue.released(machine, &footings);
                         queue.forget_rewriting(machine, &mut intakes);
                         queue.read_passed(machine);
                         seen.insert(machine, intakes);
@@ -918,16 +925,15 @@ impl Runner {
                         continue;
                     };
                     // One that waited for its write-up goes with its card's `rev` as the read
-                    // that let it go shows it, from a backend that holds: changed after that, its
-                    // backend asks rather than does it (Codex's review 60).
+                    // that let it go shows it, from a backend that holds, never a later read's:
+                    // changed after that, its backend asks rather than does it (Codex's reviews
+                    // 60 and 62).
                     if gated_ones.remove(&n)
                         && request.get("rev").is_none()
-                        && let Some(now) = queue
-                            .record_of(n)
-                            .and_then(|r| footed.get(&machine)?.get(r)?.1.clone())
+                        && let Some(then) = queue.released_rev(n)
                     {
-                        request["rev"] = serde_json::Value::String(now.clone());
-                        rev = Some(now);
+                        request["rev"] = serde_json::Value::String(then.clone());
+                        rev = Some(then);
                     }
                     let _ = answers.send(Answer::Started(n));
                     let (answers, back) = (answers.clone(), back.clone());
@@ -2278,6 +2284,98 @@ mod tests {
             .collect();
         assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["id"], "8");
+        assert_eq!(sent[0]["rev"], "r9");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_let_go_by_its_write_up_but_waiting_behind_another_change_is_still_held_to_its_card()
+    {
+        // Codex's review 62, 4: d on #7 during its write-up, behind a y on #7 that's still
+        // running. A read shows #7 written up, so the start no longer waits for that, only for y.
+        // A later read shows #7 set aside: the start is taken out unstarted. Shown changed in any
+        // other way, it goes once y is done, with the rev of the read that let it go, so its
+        // backend asks about what changed since.
+        let run = |later_set_aside: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("requests.log");
+            let gate = dir.path().join("y-may-finish");
+            let (tx, rx) = mpsc::channel();
+            let runner = Runner::spawn(tx);
+            let machine = Machine {
+                name: "here".into(),
+                ssh: None,
+                herdr: "herdr".into(),
+                feed: None,
+                hidden: false,
+            };
+            let log_q = crate::transport::quote(log.to_str().unwrap());
+            let gate_q = crate::transport::quote(gate.to_str().unwrap());
+            let send = |n: u64, request: serde_json::Value, gated: bool, command: String| {
+                runner
+                    .tx
+                    .send(ToRunner::Run {
+                        n,
+                        machine: 0,
+                        key: Some("here:7".into()),
+                        target: machine.clone(),
+                        command,
+                        request,
+                        gated,
+                        resends: false,
+                        rev: None,
+                        guard: gated.then(crate::resolve::Footing::default),
+                    })
+                    .unwrap();
+            };
+            let answer = "printf '%s' '{\"ok\":true,\"message\":\"done\"}'\n";
+            send(
+                1,
+                serde_json::json!({"action":"refresh","id":"7"}),
+                false,
+                format!("cat >/dev/null\nwhile [ ! -e {gate_q} ]; do sleep 0.05; done\n{answer}"),
+            );
+            assert_eq!(next_heard(&rx, 10_000).as_deref(), Some("started 1"));
+            send(
+                2,
+                serde_json::json!({"action":"dispatch","id":"7"}),
+                true,
+                format!("cat >> {log_q}\necho >> {log_q}\n{answer}"),
+            );
+            let read = |set_aside: bool, rev: &str| ToRunner::Feed {
+                machine: 0,
+                intakes: std::collections::HashMap::from([("7".to_string(), None)]),
+                footings: std::collections::HashMap::from([(
+                    "7".to_string(),
+                    (
+                        crate::resolve::Footing {
+                            set_aside,
+                            ..Default::default()
+                        },
+                        Some(rev.to_string()),
+                    ),
+                )]),
+            };
+            runner.tx.send(read(false, "r9")).unwrap();
+            runner.tx.send(read(later_set_aside, "r10")).unwrap();
+            let mut heard: Vec<String> = next_heard(&rx, 500).into_iter().collect();
+            std::fs::write(&gate, "").unwrap();
+            while let Some(h) = next_heard(&rx, 1_000) {
+                heard.push(h);
+            }
+            let sent: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            (heard, sent)
+        };
+        let (heard, sent) = run(true);
+        assert_eq!(heard, ["changed 2", "done 1 ok"]);
+        assert!(sent.is_empty(), "{sent:?}");
+        let (heard, sent) = run(false);
+        assert_eq!(heard, ["done 1 ok", "started 2", "done 2 ok"]);
+        assert_eq!(sent.len(), 1);
         assert_eq!(sent[0]["rev"], "r9");
     }
 }

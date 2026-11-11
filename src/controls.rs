@@ -1927,6 +1927,8 @@ impl App {
             self.draft = draft.words;
             self.draft_images = draft.images;
             self.draft_came_back = draft.came_back;
+            // Kept as you left them, emptied included.
+            self.keep_words_now();
             // A read for words already sent carries on for them.
             if self.box_loading().is_some() {
                 self.image_load = None;
@@ -2843,6 +2845,8 @@ impl App {
         });
         self.resolver
             .add(machine, request, None, Some(key.clone()), effect);
+        // Into the words file as the send it is before it goes (Codex's review 62, 2).
+        self.keep_words_now();
         if self.closed_on_send && matches!(self.mode, Mode::Backlog { .. }) {
             self.backlog_focus = Some(key.clone());
         }
@@ -3115,6 +3119,7 @@ impl App {
         // Sent from the hold file, through another machine, or held by its backend (intent 0591,
         // release 4).
         if self.held_answer(n, &result) {
+            self.keep_words_now();
             return;
         }
         if let Ok(response) = &result
@@ -3122,6 +3127,7 @@ impl App {
         {
             self.resolver.take(n);
             self.redirected();
+            self.keep_words_now();
             return;
         }
         let to = request["forward_to"].as_str().map(str::to_string);
@@ -3133,6 +3139,8 @@ impl App {
         self.note_via(to, via);
         // A start or a save answered: what waited behind it is decided again.
         self.release_behind();
+        // A new intent saved, or its words given back: the words file says so now.
+        self.keep_words_now();
     }
 
     fn finish_job_answered(&mut self, n: u64, request: Value, result: Result<Response, String>) {
