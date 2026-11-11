@@ -3877,6 +3877,12 @@ impl App {
                 // Answered at last: no longer being sent again (intent 0591).
                 self.account_retrying = None;
             }
+            // A drop of an account request its backend held: said as any drop (r4-b's shape).
+            if let Ok(response) = &result
+                && self.drop_answered(&request, response)
+            {
+                return;
+            }
             // A move for later, or one queued behind another: its card says so (intent 0591,
             // release 4, K2-30 and K2-31).
             self.account_pending(machine, &request, &result);

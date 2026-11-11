@@ -413,6 +413,10 @@ pub struct Held {
     /// The new intent a save held at the feed's top level is for, by its submission id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub submission: Option<String>,
+    /// With `submission`: the title its card shows meanwhile, from his words ("Your new intent"
+    /// when there's none), so a Kerdr opened after it was sent can show it too (r4-a's shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
 }
 
 /// A `held` list, its entries Kerdr can't read left out: one with no `op` or no words for the

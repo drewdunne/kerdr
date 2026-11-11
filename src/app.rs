@@ -1358,8 +1358,14 @@ impl App {
         let current = self.scope().clone();
         // Which cards' keys can't tell a record's copies apart: noted as the feeds are read.
         self.resolver.note_unnamed(&self.machines);
-        // Changes still on their way show as done (intent 0416).
-        self.board = if self.resolver.shows() {
+        // Changes still on their way show as done (intent 0416), and saves a backend finishes in
+        // the background have their cards (intent 0591, release 4).
+        let saving_elsewhere = self
+            .machines
+            .iter()
+            .filter_map(|m| m.feed.as_ref())
+            .any(|f| f.held.iter().any(|h| h.submission.is_some()));
+        self.board = if self.resolver.shows() || saving_elsewhere {
             board::build(&self.resolver.overlay(&self.machines), &self.cfg)
         } else {
             board::build(&self.machines, &self.cfg)

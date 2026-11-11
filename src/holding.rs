@@ -42,6 +42,10 @@ pub enum DropOf {
     Kerdr(String),
     /// One its backend holds, by its op: dropping it asks that backend.
     Backend(String),
+    /// An account request its backend holds (a move for later, or one queued behind another), by
+    /// its op: dropping it asks with `account-drop`, on the machine the agent runs on (r4-b's
+    /// shape).
+    AccountBackend(String),
     /// An account request waiting in Kerdr for its machine to answer, by the request: dropping it
     /// only takes it out.
     Account(Value),
@@ -59,6 +63,8 @@ pub struct Pending {
     pub op: String,
     pub words: String,
     pub reads: u8,
+    /// An account request's (dropped with `account-drop`), not a card change's.
+    pub account: bool,
 }
 
 /// How a held change names the key that asked for it: "d", or the change in words.
@@ -461,6 +467,7 @@ impl App {
                 op,
                 words,
                 reads: 0,
+                account: false,
             });
         }
         false
@@ -509,6 +516,7 @@ impl App {
             op,
             words,
             reads: 0,
+            account: true,
         });
         self.rebuild();
     }
@@ -616,20 +624,40 @@ impl App {
             });
         }
         let mut ops: Vec<String> = vec![];
-        let feed_held = c.detail.iter().flat_map(|d| d.held.iter());
+        // An account request's is dropped with `account-drop`: one the card's own `held` lists as
+        // one, and every one the accounts feed lists for its agent (r4-b's shape).
+        let feed_held = c
+            .detail
+            .iter()
+            .flat_map(|d| d.held.iter())
+            .map(|h| (h, h.action.starts_with("account-")));
         let agent_held = self
             .account_agent(c)
             .into_iter()
-            .flat_map(|a| a.held.iter());
-        for h in feed_held.chain(agent_held) {
+            .flat_map(|a| a.held.iter())
+            .map(|h| (h, true));
+        // A new intent's save its backend finishes, shown again after a restart from the feed's
+        // own list: this Kerdr doesn't have its words, so it isn't dropped from here, which would
+        // lose them.
+        let saved_elsewhere = c.intake() == Some(crate::resolve::SAVING)
+            && crate::app::behind::saving_submission(&c.key)
+                .is_some_and(|s| self.resolver.saving(s).is_none());
+        for (h, account) in feed_held.chain(agent_held) {
             if ops.contains(&h.op) {
                 continue;
             }
             ops.push(h.op.clone());
+            let drop = if saved_elsewhere {
+                None
+            } else if account {
+                Some(DropOf::AccountBackend(h.op.clone()))
+            } else {
+                Some(DropOf::Backend(h.op.clone()))
+            };
             lines.push(HeldLine {
                 words: h.pending.clone(),
                 since: h.since,
-                drop: Some(DropOf::Backend(h.op.clone())),
+                drop,
             });
         }
         for p in self.pendings.iter().filter(|p| p.key == c.key) {
@@ -640,7 +668,13 @@ impl App {
             lines.push(HeldLine {
                 words: p.words.clone(),
                 since: None,
-                drop: (!p.op.is_empty()).then(|| DropOf::Backend(p.op.clone())),
+                drop: (!p.op.is_empty()).then(|| {
+                    if p.account {
+                        DropOf::AccountBackend(p.op.clone())
+                    } else {
+                        DropOf::Backend(p.op.clone())
+                    }
+                }),
             });
         }
         for d in self
@@ -698,6 +732,17 @@ impl App {
             return super::Action::None;
         }
         let Some(line) = droppable.get(index.unwrap_or(0)) else {
+            // A save an earlier Kerdr sent: dropping it here would lose words this one doesn't
+            // have.
+            if droppable.is_empty()
+                && card.intake() == Some(crate::resolve::SAVING)
+                && !self.held_lines(&card).is_empty()
+            {
+                self.say(
+                    "This new intent was sent before Kerdr last opened, so its words aren't here to give back: it isn't dropped from here. It gets its number once it's saved, or its backend keeps its words if it gives up.",
+                    Tone::Info,
+                );
+            }
             return super::Action::None;
         };
         match line.drop.clone() {
@@ -712,6 +757,7 @@ impl App {
                 super::Action::None
             }
             Some(DropOf::Backend(op)) => self.drop_backend(&card, &op, &line.words),
+            Some(DropOf::AccountBackend(op)) => self.drop_account_backend(&card, &op, &line.words),
             Some(DropOf::Account(request)) => {
                 self.drop_account_wait(&request);
                 super::Action::None
@@ -761,18 +807,57 @@ impl App {
         super::Action::Mutate { machine, request }
     }
 
-    /// What a drop's answer says, and the card stops showing what it dropped.
+    /// Asks the machine an agent runs on to drop an account request its backend holds for it:
+    /// `{"action": "account-drop", "held": op}`, which goes through its actions command as every
+    /// account request does (r4-b's shape).
+    fn drop_account_backend(&mut self, card: &Card, op: &str, words: &str) -> super::Action {
+        let machine = card.machine_index;
+        if !self.holds_on(machine) {
+            self.say(
+                format!(
+                    "{}'s backend can't drop what it holds, so \"{words}\" stays.",
+                    self.machines[machine].name()
+                ),
+                Tone::Info,
+            );
+            return super::Action::None;
+        }
+        if !self.can_write(machine) {
+            return super::Action::None;
+        }
+        self.action_key = Some(card.key.clone());
+        super::Action::Mutate {
+            machine,
+            request: json!({"action": "account-drop", "held": op}),
+        }
+    }
+
+    /// What a drop's answer says, and the card stops showing what it dropped. A backend says
+    /// whether it was dropped with `dropped`, or with `state`: `dropped`, or `running`, `ran`,
+    /// `ended`, `replaced` or `unknown` when it wasn't (r4-a's shape).
     pub(crate) fn drop_answered(&mut self, request: &Value, response: &Response) -> bool {
-        if request["action"] != "drop" {
+        if !matches!(request["action"].as_str(), Some("drop" | "account-drop")) {
             return false;
         }
         let op = request["held"].as_str().unwrap_or_default();
         if response.ok {
             self.pendings.retain(|p| p.op != op);
+            let dropped = match (response.dropped, response.state.as_deref()) {
+                (Some(dropped), _) => dropped,
+                (None, Some(state)) => state == "dropped",
+                (None, None) => true,
+            };
+            // A save its feed still lists until the next read doesn't come back as a card.
+            if dropped {
+                for feed in self.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+                    feed.held.retain(|h| h.op != op);
+                }
+            }
             // A new intent's save dropped before it got its number: its card goes, and his words
             // come back as a failed save's do.
             let mut back = None;
-            if response.dropped != Some(false)
+            if dropped
+                && request["action"] == "drop"
                 && let Some(create) = self.resolver.drop_saving(op)
             {
                 let words = create["words"].as_str().unwrap_or_default().to_string();
@@ -795,9 +880,10 @@ impl App {
                 });
             }
             let mut said = if response.message.is_empty() {
-                match response.dropped {
-                    Some(false) => "It had already gone ahead, so there was nothing to drop.",
-                    _ => "Dropped: it won't happen.",
+                if dropped {
+                    "Dropped: it won't happen."
+                } else {
+                    "It had already gone ahead, so there was nothing to drop."
                 }
                 .to_string()
             } else {
@@ -1398,6 +1484,7 @@ mod tests {
                     since: Some(since),
                     until: None,
                     submission: None,
+                    title: None,
                 }];
             }
         }
@@ -1835,6 +1922,7 @@ mod tests {
                 since: Some(app.now().timestamp()),
                 until: None,
                 submission: Some("s-1".into()),
+                title: Some("Fix the feed".into()),
             })
             .into_iter()
             .collect();
@@ -1921,6 +2009,151 @@ mod tests {
                 "Your new intent \"Fix the feed\" stopped saving on {name} without getting its number; {name} keeps its words."
             )
         );
+    }
+
+    #[test]
+    fn a_save_an_earlier_kerdr_sent_shows_from_its_feed_with_its_title_until_it_lands() {
+        // r4-a's shape: the feed's own list names the save, with a title from his words.
+        let mut app = app();
+        supports(&mut app, 0, HOLD);
+        app.machines[0].feed.as_mut().unwrap().held = vec![crate::feed::Held {
+            op: "k-0000000000000009".into(),
+            action: "create".into(),
+            pending: SAVING_WORDS.into(),
+            since: Some(app.now().timestamp()),
+            until: None,
+            submission: Some("s-9".into()),
+            title: Some("Fix the feed".into()),
+        }];
+        app.rebuild();
+        let key = app.placeholder_key(0, "s-9");
+        let card = app.card(&key).expect("its card shows").clone();
+        assert_eq!(card.title, "Fix the feed");
+        assert_eq!(card.intake(), Some(crate::resolve::SAVING));
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some(format!("✎ {SAVING_WORDS}").as_str())
+        );
+        // Its words aren't here, so m lists it but D doesn't drop it, and says why.
+        select(&mut app, &key);
+        press(&mut app, 'm');
+        assert_eq!(press(&mut app, 'D'), Action::None);
+        assert!(
+            said(&app).contains("isn't dropped from here"),
+            "{}",
+            said(&app)
+        );
+        // One card only, however many feeds list it.
+        app.machines[1].feed.as_mut().unwrap().held =
+            app.machines[0].feed.as_ref().unwrap().held.clone();
+        app.rebuild();
+        let saving: Vec<_> = app
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.key.ends_with(":saving-s-9"))
+            .collect();
+        assert_eq!(saving.len(), 1);
+        // It lands: the record's own card takes its place.
+        let mut landed = app.machines[0].feed.as_ref().unwrap().cards[0].clone();
+        landed.id = "0701".into();
+        landed.submission = Some("s-9".into());
+        landed.held.clear();
+        app.machines[0].feed.as_mut().unwrap().cards.push(landed);
+        app.rebuild();
+        assert!(app.card(&key).is_none());
+    }
+
+    #[test]
+    fn a_drop_its_backend_says_came_too_late_leaves_the_save_and_its_card() {
+        // r4-a's shape: `state` says whether it was dropped.
+        let mut app = app();
+        let (key, op) = saved_in_the_background(&mut app);
+        feed_saving(&mut app, Some(&op));
+        let drop = json!({"action":"drop","held":op,"op":"k-2"});
+        app.queue_action(0, drop);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request, ok(json!({"state": "running"})));
+        assert!(app.card(&key).is_some(), "still saving");
+        assert!(app.draft.is_empty(), "no words given back");
+        assert_eq!(
+            said(&app),
+            "It had already gone ahead, so there was nothing to drop."
+        );
+        // `state: dropped` alone is a drop: the card goes, its words come back.
+        let drop = json!({"action":"drop","held":op,"op":"k-3"});
+        app.queue_action(0, drop);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request, ok(json!({"state": "dropped"})));
+        assert!(app.card(&key).is_none());
+        assert_eq!(app.draft, "Fix the feed");
+    }
+
+    #[test]
+    fn an_account_move_its_backend_holds_is_dropped_with_account_drop_on_its_agents_machine() {
+        // r4-b's shape.
+        let mut app = app();
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| !c.agents.is_empty() && c.session.is_some())
+            .expect("a card with an agent in the demo")
+            .clone();
+        let m = card.machine_index;
+        supports(&mut app, m, HOLD);
+        let pane = card.agents[0].pane_id.clone();
+        let request = json!({"action":"account-move","pane":pane,"session":card.session,"to":"ARK_C","op":"k-1"});
+        app.busy = true;
+        app.finish_action(
+            m,
+            request,
+            ok(json!({"state": "queued", "held": "k-1", "pending": "moves to ARK_C at 02:00"})),
+        );
+        select(&mut app, &card.key);
+        press(&mut app, 'm');
+        let Action::Mutate { machine, request } = press(&mut app, 'D') else {
+            panic!("no drop: {}", said(&app))
+        };
+        assert_eq!(machine, m);
+        assert_eq!(request, json!({"action":"account-drop","held":"k-1"}));
+        app.busy = true;
+        app.finish_action(
+            m,
+            json!({"action":"account-drop","held":"k-1","op":"k-2"}),
+            ok(json!({"message": "Dropped the move to ARK_C.", "state": "dropped", "dropped": true})),
+        );
+        assert_eq!(said(&app), "Dropped the move to ARK_C.");
+        let now = app.card(&card.key).unwrap().clone();
+        assert_eq!(app.held_line_for(&now), None);
+        assert!(!app.busy);
+        // One a card's own `held` lists as an account request goes the same way; any other is
+        // a card change's, dropped with `drop`.
+        let (key, id, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        for (action, op, dropped_with) in [
+            ("account-move", "k-0000000000000007", "account-drop"),
+            ("dispatch", "k-0000000000000008", "drop"),
+        ] {
+            for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+                if c.id == id {
+                    c.held = vec![crate::feed::Held {
+                        op: op.into(),
+                        action: action.into(),
+                        pending: "moves to ARK_C at 02:00".into(),
+                        ..Default::default()
+                    }];
+                }
+            }
+            app.rebuild();
+            select(&mut app, &key);
+            press(&mut app, 'm');
+            let Action::Mutate { request, .. } = press(&mut app, 'D') else {
+                panic!("no drop: {}", said(&app))
+            };
+            assert_eq!(request["action"], dropped_with);
+            assert_eq!(request["held"], op);
+        }
     }
 
     #[test]

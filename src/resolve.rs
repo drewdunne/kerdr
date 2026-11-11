@@ -1325,6 +1325,59 @@ impl Resolver {
                 }
             }
         }
+        // A new intent's save its backend finishes in the background, sent by an earlier Kerdr
+        // (r4-a's shape): its card shows from the feed's own list, with the title it gives, until
+        // its record is read or the list no longer has it. Never two cards for one save.
+        let mut shown: HashSet<String> = self
+            .jobs
+            .iter()
+            .filter_map(|j| match &j.effect {
+                Some(Effect::Saving(p)) => Some(p.submission().to_string()),
+                _ => None,
+            })
+            .collect();
+        for (i, m) in machines.iter().enumerate() {
+            let Some(feed) = m.feed.as_ref() else {
+                continue;
+            };
+            for held in &feed.held {
+                let Some(submission) = held.submission.as_deref().filter(|s| !s.is_empty()) else {
+                    continue;
+                };
+                let landed = machines.iter().filter_map(|m| m.feed.as_ref()).any(|f| {
+                    f.cards
+                        .iter()
+                        .any(|c| c.submission.as_deref() == Some(submission))
+                });
+                if landed || !shown.insert(submission.to_string()) {
+                    continue;
+                }
+                let title = held
+                    .title
+                    .clone()
+                    .filter(|t| !t.trim().is_empty())
+                    .unwrap_or_else(|| "Your new intent".into());
+                if let Some(feed) = out.get_mut(i).and_then(|m| m.feed.as_mut()) {
+                    feed.cards.push(FeedCard {
+                        id: Placeholder::id_for(submission),
+                        reference: Some("new".into()),
+                        title,
+                        stage: Some("backlog".into()),
+                        state: Some("queued".into()),
+                        intake: Some(SAVING.into()),
+                        status: Some("Saving…".into()),
+                        home: Some(Home {
+                            machine: Some(m.name()),
+                            session: None,
+                        }),
+                        submission: None,
+                        held: vec![held.clone()],
+                        stale_days: Some(0),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
         out
     }
 
