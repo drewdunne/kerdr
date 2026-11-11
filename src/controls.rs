@@ -2859,10 +2859,27 @@ impl App {
                 team: request["team"].as_str().map(str::to_string),
             })
         });
-        self.resolver
+        let n = self
+            .resolver
             .add(machine, request, None, Some(key.clone()), effect);
-        // Into the words file as the send it is before it goes (Codex's review 62, 2).
-        self.keep_words_now();
+        // Into the words file as the send it is before it goes (Codex's review 62, 2), and not
+        // sent until it's there: sent first, a crash could bring its words back as new ones, to be
+        // saved twice (Codex's review 63, 2).
+        if self.kept.on_disk() {
+            self.resolver.wait_for_words(n);
+        }
+        if !self.keep_words_now() {
+            let why = self
+                .kept
+                .words_trouble()
+                .unwrap_or_else(|| "Kerdr couldn't write its words file".into());
+            self.say(
+                format!(
+                    "Your new intent waits: {why}. It's sent once its words are kept there, so a crash can never save it twice."
+                ),
+                Tone::Warn,
+            );
+        }
         if self.closed_on_send && matches!(self.mode, Mode::Backlog { .. }) {
             self.backlog_focus = Some(key.clone());
         }

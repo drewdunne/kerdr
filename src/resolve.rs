@@ -398,6 +398,9 @@ pub struct Job {
     /// Held in Kerdr until what it waits for is done (Behind): not handed to the runner, and
     /// shown only as what's held for its card.
     pub behind: Option<Behind>,
+    /// A new intent that waits in Kerdr until it's in the words file as the send it is, so a
+    /// crash after it went can never bring its words back as new ones (Codex's review 63, 2).
+    pub unkept: bool,
 }
 
 impl Job {
@@ -854,6 +857,7 @@ impl Resolver {
             retrying: false,
             rev: None,
             behind: None,
+            unkept: false,
         });
         self.next
     }
@@ -949,6 +953,33 @@ impl Resolver {
 
     /// Keeps the op a held change had when its key was pressed, in place of the new one `add`
     /// gave it: it's the same request, sent at last, and its backend may have it already.
+    /// A new intent waits in Kerdr until it's in the words file (Job::unkept).
+    pub fn wait_for_words(&mut self, n: u64) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.unkept = true;
+        }
+    }
+
+    /// The words file has every new intent on its way: each that waited for that goes now.
+    pub fn words_kept(&mut self) {
+        for j in self.jobs.iter_mut() {
+            j.unkept = false;
+        }
+    }
+
+    /// Whether a new intent waits for the words file.
+    pub fn waits_for_words(&self) -> bool {
+        self.jobs.iter().any(|j| j.unkept)
+    }
+
+    /// A change's request set again before it's sent: a hold-file record sent on to the machine a
+    /// refusal named goes as that machine's backend checks it (Codex's review 63, 1).
+    pub fn reshape(&mut self, n: u64, request: Value) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n && !j.sent) {
+            j.request = request;
+        }
+    }
+
     pub fn keep_op(&mut self, n: u64, op: &str) {
         if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n)
             && !op.is_empty()
@@ -1026,7 +1057,7 @@ impl Resolver {
     pub fn ready(&mut self) -> Vec<(u64, usize, Value, bool)> {
         self.jobs
             .iter_mut()
-            .filter(|j| !j.sent && j.settled.is_none() && j.behind.is_none())
+            .filter(|j| !j.sent && j.settled.is_none() && j.behind.is_none() && !j.unkept)
             .map(|j| {
                 j.sent = true;
                 (j.n, j.machine, j.request.clone(), j.gated)

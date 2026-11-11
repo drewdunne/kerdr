@@ -417,6 +417,49 @@ pub struct Held {
     /// when there's none), so a Kerdr opened after it was sent can show it too (r4-a's shape).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// A question it waits on, his to answer: its card shows it as asking him (r4-b's shape). One
+    /// Kerdr can't use is passed over, and the entry shows its `pending` as any other does.
+    #[serde(
+        default,
+        deserialize_with = "held_asks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub asks: Option<HeldAsks>,
+}
+
+/// A question a request its backend holds waits on (intent 0591, release 4, r4-b's shape): a
+/// move for later that, when due, found a background job started since his yes, and won't end it
+/// without asking. His yes, or a choice, sends `request` with `confirm` (and `choice`); his no
+/// drops what's held.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HeldAsks {
+    pub message: String,
+    pub confirm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::actions::choices",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub choices: Vec<crate::actions::Choice>,
+    /// The account request his answer sends.
+    pub request: serde_json::Value,
+}
+
+/// `asks` as a backend gives it: only one with the whole question, its token, and an account
+/// request to answer it with; anything else reads as none.
+fn held_asks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<HeldAsks>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<HeldAsks>(value).ok().filter(|a| {
+        !a.message.trim().is_empty()
+            && !a.confirm.trim().is_empty()
+            && a.request["action"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("account-"))
+    }))
 }
 
 /// A `held` list, its entries Kerdr can't read left out: one with no `op` or no words for the
@@ -699,6 +742,45 @@ mod tests {
         let old = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"a"}]}"#).unwrap();
         assert!(!old.supports("hold") && old.cards[0].held.is_empty());
         assert!(old.held.is_empty());
+    }
+
+    #[test]
+    fn a_held_request_that_asks_carries_its_question_and_one_kerdr_cant_use_reads_as_none() {
+        // r4-b's shape: the question, its token, and the account request that answers it.
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[],
+              "agents":[{"pane":"w1:p1","session":"web","conversation":"c1","account":"KBZ_C",
+                 "held":[
+                  {"op":"k-0000000000000001","action":"account-move","pending":"waits for your answer",
+                   "asks":{"message":"Move it now?","confirm":"t-1","yes":"move it now",
+                           "choices":[{"id":"after-job","key":"j","label":"move it when the job ends"},"oops"],
+                           "request":{"action":"account-move","pane":"w1:p1","to":"ARK_C"}}},
+                  {"op":"k-0000000000000002","action":"account-move","pending":"no request",
+                   "asks":{"message":"Move it now?","confirm":"t-2"}},
+                  {"op":"k-0000000000000003","action":"account-move","pending":"not an account one",
+                   "asks":{"message":"Move it now?","confirm":"t-3","request":{"action":"cancel"}}},
+                  {"op":"k-0000000000000004","action":"account-move","pending":"no token",
+                   "asks":{"message":"Move it now?","request":{"action":"account-move"}}},
+                  {"op":"k-0000000000000005","action":"account-move","pending":"not a question",
+                   "asks":"oops"}]}]}"#,
+        )
+        .unwrap();
+        let held = &feed.agents[0].held;
+        assert_eq!(
+            held.len(),
+            5,
+            "an entry whose question can't be used still shows"
+        );
+        let asks = held[0].asks.as_ref().expect("its question");
+        assert_eq!(
+            (asks.message.as_str(), asks.confirm.as_str()),
+            ("Move it now?", "t-1")
+        );
+        assert_eq!(asks.yes.as_deref(), Some("move it now"));
+        assert_eq!(asks.no, None);
+        assert_eq!(asks.choices.len(), 1);
+        assert_eq!(asks.request["to"], "ARK_C");
+        assert!(held[1..].iter().all(|h| h.asks.is_none()), "{held:?}");
     }
 
     #[test]

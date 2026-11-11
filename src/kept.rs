@@ -63,8 +63,8 @@ pub struct HeldRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
     /// Why it stays in the file though its machine answers, while that's so: "build-box's backend
-    /// doesn't check a held change again". What its card says if its day runs out. Its key pressed
-    /// again sends it as itself, with its op.
+    /// doesn't check a held change again". What its card says if its day runs out (Codex's review
+    /// 63, 3). Its key pressed again sends it as itself, with its op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stays: Option<String>,
 }
@@ -344,7 +344,9 @@ impl Kept {
                 key: h.key.clone(),
                 reference: h.reference.clone(),
                 said: match &h.stays {
-                    Some(why) => format!("{} dropped after a day: {why}", h.what),
+                    Some(why) => {
+                        format!("{} dropped after a day: {why}, so it wasn't sent", h.what)
+                    }
                     None => format!("{} dropped: {} didn't answer for a day", h.what, h.machine),
                 },
             })
@@ -634,6 +636,11 @@ impl Kept {
     /// does once this one has gone, however it ended (Codex's review 62, 2).
     pub fn hold_words(&mut self, words: &Words) -> Result<(), String> {
         self.put_words(words, false)
+    }
+
+    /// Why the words file couldn't be written the last time Kerdr tried, while that's so.
+    pub fn words_trouble(&self) -> Option<String> {
+        self.words_failed.clone()
     }
 
     /// Whether what Kerdr keeps goes to files at all (not in the demo, or a test's memory).
@@ -1197,7 +1204,7 @@ mod tests {
         assert_eq!(
             said,
             [
-                format!("d dropped after a day: {why}").as_str(),
+                format!("d dropped after a day: {why}, so it wasn't sent").as_str(),
                 "d dropped: LAB-Server didn't answer for a day",
             ]
         );

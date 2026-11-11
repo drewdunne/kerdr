@@ -25,6 +25,9 @@ pub const FORWARD: &str = "forward";
 /// forwards.
 const FORWARD_AGAIN: std::time::Duration = std::time::Duration::from_secs(120);
 
+/// How often the words file is tried again while a new intent waits for it.
+const WORDS_AGAIN: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// One thing held for a card, as its card and its peek say it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeldLine {
@@ -523,27 +526,8 @@ impl App {
         }
         self.held_unsure.remove(&op);
         let Some(request) = self.held_marked(machine, &entry) else {
-            self.kept.unclaim(&op);
             let name = self.machines[machine].name();
-            // Kept with it, for its card to say if its day runs out.
-            let why = match entry.after {
-                Some(_) => format!("{name}'s backend wouldn't ask again before stopping it"),
-                None => format!("{name}'s backend doesn't check a held change again"),
-            };
-            self.kept.stays(&op, Some(why));
-            if self.held_unchecked.insert(op) {
-                let (what, reference) = (&entry.what, &entry.reference);
-                let said = if entry.after.is_some() {
-                    format!(
-                        "{what} on {reference} stays held: {name}'s backend wouldn't ask again before stopping it, so Kerdr won't send the yes you gave before it last closed. Press {what} again to be asked now, or m then D drops it."
-                    )
-                } else {
-                    format!(
-                        "{what} on {reference} stays held: {name}'s backend no longer checks a held change again, so Kerdr won't send it unchecked. Press {what} again to send it now, or m then D drops it."
-                    )
-                };
-                self.say(said, Tone::Warn);
-            }
+            self.stays_held(op, &entry, &name, false);
             return;
         };
         if entry.stays.is_some() {
@@ -627,6 +611,40 @@ impl App {
         self.carry_on(before, op, rev);
     }
 
+    /// A held change its machine's backend wouldn't check again, or, for a stop, wouldn't ask
+    /// again about, stays in the file, waiting there with why (`stays`), for its card to say if
+    /// its day runs out; said once. `lives`: its machine is the one a refusal said its card lives
+    /// on now.
+    fn stays_held(&mut self, op: String, entry: &HeldRequest, name: &str, lives: bool) {
+        self.kept.unclaim(&op);
+        // Only a stop that waited behind a start isn't decided again by Kerdr (held_marked).
+        let stop = entry.after.is_some();
+        let why = match stop {
+            true => format!("{name}'s backend wouldn't ask again before stopping it"),
+            false => format!("{name}'s backend doesn't check a held change again"),
+        };
+        self.kept.stays(&op, Some(why));
+        if !self.held_unchecked.insert(op) {
+            return;
+        }
+        let (what, reference) = (&entry.what, &entry.reference);
+        let said = match (stop, lives) {
+            (true, false) => format!(
+                "{what} on {reference} stays held: {name}'s backend wouldn't ask again before stopping it, so Kerdr won't send the yes you gave before it last closed. Press {what} again to be asked now, or m then D drops it."
+            ),
+            (true, true) => format!(
+                "{what} on {reference} stays held: it lives on {name} now, whose backend wouldn't ask again before stopping it, so Kerdr won't send the yes you gave before it last closed. Press {what} again to be asked now, or m then D drops it."
+            ),
+            (false, false) => format!(
+                "{what} on {reference} stays held: {name}'s backend no longer checks a held change again, so Kerdr won't send it unchecked. Press {what} again to send it now, or m then D drops it."
+            ),
+            (false, true) => format!(
+                "{what} on {reference} stays held: it lives on {name} now, whose backend doesn't check a held change again, so Kerdr won't send it unchecked. Press {what} again to send it now, or m then D drops it."
+            ),
+        };
+        self.say(said, Tone::Warn);
+    }
+
     /// The request a held change goes as (Codex's review 60): with `held: true`, and the card's
     /// `rev` when its key was pressed, wherever it ends up checked. That's the machine it's for,
     /// when that one's backend holds; and, through a forwarder, a machine Kerdr doesn't have,
@@ -636,13 +654,23 @@ impl App {
     /// write-up too is decided again by Kerdr, so it goes all the same, and with no `rev` from
     /// before, since what it waited for changed the card. Except a stop: Kerdr deciding it still
     /// makes sense isn't the question its backend asks again, so one goes only to a backend that
-    /// asks its own first (`"steps"`), and otherwise stays held (Codex's review 62, 1).
+    /// asks its own first (`"steps"`), naming no workspace so that it does, and otherwise stays
+    /// held (Codex's review 62, 1). The same goes for the machine a refusal sends it on to (Codex's
+    /// review 63, 1).
     fn held_marked(&self, machine: usize, entry: &HeldRequest) -> Option<Value> {
         let mut request = entry.request.clone();
         let through = request.get("forward_to").is_some();
         if !through && !self.holds_on(machine) {
             let stops = request["action"] == "cancel";
             let decided = entry.after.is_some() && (!stops || self.steps_on(machine));
+            if decided
+                && stops
+                && let Some(fields) = request.as_object_mut()
+            {
+                for field in ["session", "workspace", "tab"] {
+                    fields.remove(field);
+                }
+            }
             return decided.then_some(request);
         }
         request["held"] = Value::Bool(true);
@@ -777,31 +805,29 @@ impl App {
                 .unwrap_or_default();
             let request = self.record_request(&op, &sent);
             self.kept.retarget(&op, &name, request);
-            let decided = self.kept.find(&op).is_some_and(|h| h.after.is_some());
-            // That machine's backend doesn't check a held change again: it isn't sent there
-            // unchecked, as from the file (Codex's review 60, 11).
-            if !through && !decided && !self.holds_on(to) {
-                let key = job.key.clone();
-                self.resolver.take(n);
-                self.resent
-                    .retain(|(m, k)| !(*m == to && Some(k) == key.as_ref()));
-                self.kept.unclaim(&op);
-                let why = format!("{name}'s backend doesn't check a held change again");
-                self.kept.stays(&op, Some(why));
-                self.held_unchecked.insert(op.clone());
-                if let Some(h) = self.kept.find(&op).cloned() {
-                    self.say(
-                        format!(
-                            "{} on {} stays held: it lives on {name} now, whose backend doesn't check a held change again, so Kerdr won't send it unchecked. Press {} again to send it now, or m then D drops it.",
-                            h.what, h.reference, h.what
-                        ),
-                        Tone::Warn,
-                    );
-                }
-                self.rebuild();
+            let Some(mut entry) = self.kept.find(&op).cloned() else {
                 return;
+            };
+            if through {
+                entry.request["forward_to"] = Value::String(name.clone());
             }
-            self.held_sending.insert(n, op);
+            // Checked and marked as that machine's backend takes it, as from the file: one it
+            // wouldn't check again, or a stop it wouldn't ask again about, isn't sent there
+            // (Codex's review 60, 11, and review 63, 1).
+            match self.held_marked(to, &entry) {
+                Some(request) => {
+                    self.resolver.reshape(n, request);
+                    self.held_sending.insert(n, op);
+                }
+                None => {
+                    let key = job.key.clone();
+                    self.resolver.take(n);
+                    self.resent
+                        .retain(|(m, k)| !(*m == to && Some(k) == key.as_ref()));
+                    self.stays_held(op, &entry, &name, true);
+                    self.rebuild();
+                }
+            }
             return;
         }
         let named = self
@@ -1217,7 +1243,12 @@ impl App {
     /// Asks the machine an agent runs on to drop an account request its backend holds for it:
     /// `{"action": "account-drop", "held": op}`, which goes through its actions command as every
     /// account request does (r4-b's shape).
-    fn drop_account_backend(&mut self, card: &Card, op: &str, words: &str) -> super::Action {
+    pub(crate) fn drop_account_backend(
+        &mut self,
+        card: &Card,
+        op: &str,
+        words: &str,
+    ) -> super::Action {
         let machine = card.machine_index;
         if !self.holds_on(machine) {
             self.say(
@@ -1777,17 +1808,38 @@ impl App {
     /// dropped goes from it, and the words this Kerdr took when it opened are replaced. So a crash
     /// never gives back words already saved as new words, which would make a second intent
     /// (Codex's review 62, 2).
-    pub(crate) fn keep_words_now(&mut self) {
+    pub(crate) fn keep_words_now(&mut self) -> bool {
         if !self.kept.on_disk() {
-            return;
+            self.resolver.words_kept();
+            return true;
         }
         let words = self.words();
-        if self.words_kept.as_ref() == Some(&words) {
+        let kept = self.words_kept.as_ref() == Some(&words)
+            || match self.kept.hold_words(&words) {
+                Ok(()) => {
+                    self.words_kept = Some(words);
+                    true
+                }
+                Err(_) => false,
+            };
+        // A new intent that waited for its send to be kept goes now (Codex's review 63, 2).
+        if kept {
+            self.resolver.words_kept();
+        }
+        kept
+    }
+
+    /// A new intent waiting for the words file to be written: tried again every two seconds.
+    pub(crate) fn keep_waiting_words(&mut self) {
+        if !self.resolver.waits_for_words()
+            || self
+                .words_tried
+                .is_some_and(|at| at.elapsed() < WORDS_AGAIN)
+        {
             return;
         }
-        if self.kept.hold_words(&words).is_ok() {
-            self.words_kept = Some(words);
-        }
+        self.words_tried = Some(Instant::now());
+        self.keep_words_now();
     }
 
     /// Words the last Kerdr kept: the box's draft back in the box (c), words given back after it,
@@ -2188,6 +2240,7 @@ mod tests {
                     until: None,
                     submission: None,
                     title: None,
+                    asks: None,
                 }];
             }
         }
@@ -2686,6 +2739,7 @@ mod tests {
                 until: None,
                 submission: Some("s-1".into()),
                 title: Some("Fix the feed".into()),
+                asks: None,
             })
             .into_iter()
             .collect();
@@ -2969,6 +3023,7 @@ mod tests {
             until: None,
             submission: Some("s-9".into()),
             title: Some("Fix the feed".into()),
+            asks: None,
         }];
         app.rebuild();
         let key = app.placeholder_key(0, "s-9");
@@ -3443,7 +3498,7 @@ mod tests {
         assert_eq!(
             said(&app),
             format!(
-                "{reference}: d dropped after a day: {name}'s backend doesn't check a held change again."
+                "{reference}: d dropped after a day: {name}'s backend doesn't check a held change again, so it wasn't sent."
             )
         );
     }
@@ -3476,6 +3531,85 @@ mod tests {
         let name = app.machines[other].name();
         app.finish_job(n, request.clone(), refused_for(&format!("{name}/ARK")));
         (n, request, other, op)
+    }
+
+    #[test]
+    fn a_stop_kept_from_before_a_restart_and_sent_on_to_a_backend_that_wouldnt_ask_again_stays_held()
+     {
+        // Codex's review 63, 1: "Cancel #N once it opens?" answered yes before Kerdr closed, sent
+        // from the file with `held: true` and its workspace named to a backend that holds, and
+        // refused there because its card lives on a machine whose backend lists neither "hold"
+        // nor "steps". It isn't sent there: it stays held, and that's said. A backend there that
+        // asks its own question first ("steps") is sent it, naming no workspace, for it to ask.
+        let sent_on = |steps: bool| {
+            let mut app = app();
+            let card = app
+                .board
+                .cards
+                .iter()
+                .find(|c| {
+                    c.is_open_workspace() && c.detail.is_some() && !c.done() && !c.dismissed()
+                })
+                .cloned()
+                .expect("a card with its workspace open in the demo");
+            let (m, id) = (card.machine_index, card.detail.as_ref().unwrap().id.clone());
+            let other = (0..app.machines.len())
+                .find(|&i| i != m && app.machines[i].feed.is_some())
+                .unwrap();
+            supports(&mut app, m, HOLD);
+            let feed = app.machines[other].feed.as_mut().unwrap();
+            feed.supports.retain(|s| s != HOLD && s != "steps");
+            if steps {
+                feed.supports.push("steps".into());
+            }
+            app.kept.hold(HeldRequest {
+                machine: app.machines[m].name(),
+                request: crate::actions::with_op(json!({"action":"cancel","id":id})),
+                rev: None,
+                key: Some(card.key.clone()),
+                reference: card.reference.clone(),
+                what: "X".into(),
+                pressed: app.now().timestamp(),
+                after: Some("start".into()),
+                by: None,
+                stays: None,
+            });
+            let op = app.kept.held[0].op().to_string();
+            app.feed_read(m);
+            let ready = app.resolver.ready();
+            assert_eq!(ready.len(), 1, "{}", said(&app));
+            let (n, _, request, _) = ready[0].clone();
+            assert_eq!(request["held"], true);
+            assert!(request.get("workspace").is_some(), "{request}");
+            let name = app.machines[other].name();
+            app.finish_job(n, request, refused_for(&format!("{name}/ARK")));
+            (app, card.reference, other, op)
+        };
+        let (mut app, reference, other, op) = sent_on(false);
+        let ready = app.resolver.ready();
+        assert!(
+            ready.is_empty(),
+            "sent there without being asked again: {ready:?}"
+        );
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].op(), op);
+        let name = app.machines[other].name();
+        assert_eq!(app.kept.held[0].machine, name);
+        assert_eq!(
+            said(&app),
+            format!(
+                "X on {reference} stays held: it lives on {name} now, whose backend wouldn't ask again before stopping it, so Kerdr won't send the yes you gave before it last closed. Press X again to be asked now, or m then D drops it."
+            )
+        );
+        let (mut app, _, other, op) = sent_on(true);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        assert_eq!(
+            (ready[0].1, ready[0].2["op"].as_str()),
+            (other, Some(op.as_str()))
+        );
+        assert!(ready[0].2.get("workspace").is_none(), "{}", ready[0].2);
+        assert!(ready[0].2.get("held").is_none(), "{}", ready[0].2);
     }
 
     #[test]
@@ -3790,5 +3924,75 @@ mod tests {
         drop(app);
         let back = Kept::at(dir.path(), 0).take_words();
         assert!(back.is_empty(), "{back:?}");
+    }
+
+    #[test]
+    fn a_new_intent_isnt_sent_until_its_send_is_in_the_words_file() {
+        // Codex's review 63, 2: a draft the last Kerdr kept, with no send of its own, restored and
+        // sent while the words file can't be written. It isn't sent: it waits, said why, and the
+        // file keeps the draft as it was, so a crash then sends nothing twice. Once the file can
+        // be written, the send goes into it, and then goes.
+        let dir = tempfile::tempdir().unwrap();
+        let draft = Words {
+            draft: Some(KeptWords {
+                words: "Fix the banner".into(),
+                ..KeptWords::default()
+            }),
+            ..Words::default()
+        };
+        Kept::at(dir.path(), 0).keep_words(&draft).unwrap();
+        let mut app = app();
+        app.kept = Kept::at(dir.path(), app.now().timestamp());
+        let words = app.kept.take_words();
+        app.restore_words(words);
+        let words_file = dir.path().join("words.json");
+        let before = std::fs::read_to_string(&words_file).unwrap();
+        // Every write fails, its lock not to be had; the file itself stays as it is.
+        let lock = dir.path().join("kept.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        press(&mut app, 'c');
+        let Action::Mutate { machine, request } = press_code(&mut app, KeyCode::Enter) else {
+            panic!("not sent: {}", said(&app))
+        };
+        app.queue_action(machine, request);
+        assert!(
+            app.resolver.ready().is_empty(),
+            "sent before its words were kept"
+        );
+        let words_path = words_file.display().to_string();
+        assert!(
+            said(&app).starts_with(&format!(
+                "Your new intent waits: Kerdr couldn't write {words_path} ("
+            )),
+            "{}",
+            said(&app)
+        );
+        assert!(
+            said(&app).ends_with(
+                "It's sent once its words are kept there, so a crash can never save it twice."
+            ),
+            "{}",
+            said(&app)
+        );
+        assert_eq!(std::fs::read_to_string(&words_file).unwrap(), before);
+        app.keep_waiting_words();
+        assert!(app.resolver.ready().is_empty(), "sent though still unkept");
+        // The file can be written again: the send goes into it, then goes. A crash after that
+        // gives the words back as that send.
+        std::fs::remove_dir(&lock).unwrap();
+        app.words_tried = None;
+        app.keep_waiting_words();
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        let submission = ready[0].2["submission"].as_str().unwrap().to_string();
+        drop(app);
+        let back = Kept::at(dir.path(), 0).take_words();
+        assert!(back.draft.is_none(), "{back:?}");
+        assert_eq!(back.returned.len(), 1, "{back:?}");
+        assert_eq!(
+            back.returned[0].from.as_ref().map(|f| f.id.as_str()),
+            Some(submission.as_str())
+        );
     }
 }

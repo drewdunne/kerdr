@@ -1137,6 +1137,8 @@ fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
 
 /// Hands every new change to a card to the runner, which starts each in its turn.
 fn run_ready(app: &mut App, runner: &Runner) {
+    // A new intent waiting for the words file goes once it's written there (Codex's review 63, 2).
+    app.keep_waiting_words();
     for n in app.resolver.take_dropped() {
         let _ = runner.tx.send(ToRunner::Drop(n));
     }

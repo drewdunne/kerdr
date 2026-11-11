@@ -517,8 +517,11 @@ impl App {
         };
         let key = order[next].clone();
         self.go_to(&key);
-        // A question that waited on it opens as you land (intent 0591).
-        self.open_waiting(&key);
+        // A question that waited on it opens as you land (intent 0591), or one a request its
+        // backend holds waits on (release 4).
+        if !self.open_waiting(&key) {
+            self.open_held_asks(&key);
+        }
         Some(key)
     }
 

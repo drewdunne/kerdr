@@ -848,6 +848,10 @@ pub struct App {
     pub(crate) confirm_by_enter: Option<String>,
     /// Questions that came while you were elsewhere, each waiting on its card (intent 0591).
     pub(crate) waiting: Vec<asking::Waiting>,
+    /// Questions a held request waits on (`asks`, intent 0591, release 4) answered here, by their
+    /// token, so a card doesn't ask again before the feed says what came of it; and those said.
+    pub(crate) asks_answered: std::collections::HashSet<String>,
+    pub(crate) asks_said: std::collections::HashSet<String>,
     /// When a peek was opened from the backlog, whose ⏎ peeks: a second ⏎ held or doubled with
     /// it never starts the work it shows (intent 0591, K1-07).
     pub(crate) peek_opened: Option<Instant>,
@@ -893,6 +897,8 @@ pub struct App {
     /// Your words as this Kerdr last wrote them to the words file while open (holding::
     /// keep_words_now), so an unchanged set isn't written again.
     pub(crate) words_kept: Option<crate::kept::Words>,
+    /// When the words file was last tried again for a new intent waiting for it.
+    pub(crate) words_tried: Option<Instant>,
     /// e pressed on a card being written up or saved: its text opens once that's done (intent
     /// 0591, K1-78).
     pub(crate) edit_after: Option<behind::EditAfter>,
@@ -1011,6 +1017,8 @@ impl App {
             answer_by_enter: false,
             confirm_by_enter: None,
             waiting: vec![],
+            asks_answered: Default::default(),
+            asks_said: Default::default(),
             peek_opened: None,
             catch_up: Default::default(),
             kept: crate::kept::Kept::in_memory(),
@@ -1027,6 +1035,7 @@ impl App {
             quit_unsaved: false,
             words_dir: None,
             words_kept: None,
+            words_tried: None,
             edit_after: None,
             edit_paused: Default::default(),
         };
@@ -1412,8 +1421,10 @@ impl App {
         } else {
             board::build(&self.machines, &self.cfg)
         };
-        // A question that came while you were elsewhere shows its card as asking you (intent 0591).
+        // A question that came while you were elsewhere shows its card as asking you (intent 0591),
+        // and so does one a request its backend holds waits on (release 4).
         self.show_waiting();
+        self.show_held_asks();
         let tabs = self.view_tabs();
         self.tab = tabs
             .iter()

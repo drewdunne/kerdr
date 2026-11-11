@@ -331,6 +331,10 @@ impl App {
 
     /// `s` on a card: the picker its state calls for, or why there's none.
     pub(super) fn s_on_card(&mut self, card: Card) {
+        // What its backend holds for it waits on his answer: s asks it (intent 0591, release 4).
+        if self.open_held_asks(&card.key) {
+            return;
+        }
         // Work Kerdr follows (a start, a move into herdr) is left alone until it ends: its worker may
         // still be bringing the agent back (Codex's review).
         if self.follow_holds(&card, "s").is_some() {

@@ -289,7 +289,7 @@ impl Choice {
 /// `choices` as a backend gives them: each usable one, in its order, at most MOST_CHOICES, and no
 /// id twice; anything else (not a list, an entry of another shape) is passed over, never a failed
 /// answer, so a question still asks yes or no.
-fn choices<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Choice>, D::Error> {
+pub(crate) fn choices<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Choice>, D::Error> {
     let value = Value::deserialize(d)?;
     let mut out: Vec<Choice> = vec![];
     for item in value.as_array().into_iter().flatten() {
