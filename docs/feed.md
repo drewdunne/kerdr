@@ -650,7 +650,10 @@ backend's after.
 
 - **`pending`, on an `ok` answer** for a request it accepted but holds (a start queued until a place
   frees, a move for later, a save finishing in the background): words for the card, "queued in ARK:
-  starts when a place frees". Kerdr shows them on the card, cyan, after ⧗, until the card's `held`
+  starts when a place frees". A `dispatch` or `reopen` already queued for him may answer `ok: false`
+  with `pending` instead, so an older Kerdr says it didn't start: with no question, `home`,
+  `unreachable` or `retry`, Kerdr shows it as held, its `message` on the message line, not as a
+  failure. Kerdr shows them on the card, cyan, after ⧗, until the card's `held`
   lists that request, or two reads of the feed after the answer don't (it ran). An account request's
   `pending` shows on the card of the agent it moves, and the accounts feed's `agents[].held` (as
   cards' `held`) keeps it there. `D` drops one with `{"action": "account-drop", "held": "<its op>",
@@ -1331,9 +1334,12 @@ feed hasn't come, it opens on a machine that has accounts instead and says why t
 ```
 
 `catalog`, optional, names the shared account catalog this backend writes: model lists, the current
-account, and the accounts themselves. Two machines whose feeds give the same `catalog` write the
-same one. Without it, Kerdr counts two feeds as sharing one only when both give the same `source`
-and the same `owners_source`, and that isn't `mock`. Kerdr uses it to send a change to the shared
+account, and the accounts themselves (ark-sdlc's backend sends `"ark-sdlc"` for the catalog every
+machine's copy shares). Two machines whose feeds give the same `catalog` write the same one. A
+backend that lists `"hold"` but sends no `catalog` writes a catalog of its own (a test's, or a
+scratch copy's), shared with no other. Without it from an older backend, Kerdr counts two feeds as
+sharing one only when both give the same `source` and the same `owners_source`, and that isn't
+`mock`. Kerdr uses it to send a change to the shared
 catalog to another machine when the one it's meant for can't take it (see
 [Account actions](#account-actions)). An older Kerdr ignores it.
 

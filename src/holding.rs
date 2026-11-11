@@ -452,6 +452,46 @@ impl App {
             }
             return true;
         }
+        // A start or reopen its backend already holds, queued for him, answered as not done so an
+        // older Kerdr says it didn't start (r4-b's shape): held, with its words on the card, not
+        // a failure.
+        if let Some(r) = response
+            && !r.ok
+            && !r.confirmation
+            && r.home.is_none()
+            && r.unreachable.is_none()
+            && r.retry.is_none()
+            && let Some(words) = r.pending.clone().filter(|w| !w.is_empty())
+            && let Some(job) = self.resolver.job(n)
+            && matches!(job.request["action"].as_str(), Some("dispatch" | "reopen"))
+            && let Some(key) = job.key.clone()
+        {
+            let op = job.request["op"].as_str().unwrap_or_default().to_string();
+            let machine = job.machine;
+            let message = r.message.clone();
+            self.resolver.take(n);
+            self.pendings.retain(|p| !(p.key == key && p.op == op));
+            self.pendings.push(Pending {
+                key: key.clone(),
+                machine,
+                op,
+                words: words.clone(),
+                reads: 0,
+                account: false,
+            });
+            let said = if message.trim().is_empty() {
+                let reference = self
+                    .card(&key)
+                    .map(|c| c.reference.clone())
+                    .unwrap_or_default();
+                format!("{reference}: {words}.")
+            } else {
+                message
+            };
+            self.say(said, Tone::Info);
+            self.rebuild();
+            return true;
+        }
         if let Some(r) = response
             && r.ok
             && let Some(words) = r.pending.clone().filter(|w| !w.is_empty())
@@ -2015,6 +2055,40 @@ mod tests {
                 "Your new intent \"Fix the feed\" stopped saving on {name} without getting its number; {name} keeps its words."
             )
         );
+    }
+
+    #[test]
+    fn a_start_its_backend_already_queued_answered_as_not_done_is_held_not_failed() {
+        // r4-b's shape: d at the most on a reopen queued for him answers ok:false with `pending`,
+        // so an older Kerdr says it didn't reopen. This one shows it waiting.
+        let mut app = app();
+        let (key, _, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        let (n, request) = (ready[0].0, ready[0].2.clone());
+        let words = "queued in web: reopens when a workspace there frees up";
+        let answer = json!({"ok": false, "confirmation": false, "pending": words,
+            "message": format!("{reference} is queued in web already: it reopens when a workspace there frees up.")});
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::parse_response(&answer.to_string()).unwrap()),
+        );
+        assert!(!app.failing(), "not a failure: {}", said(&app));
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference} is queued in web already: it reopens when a workspace there frees up."
+            )
+        );
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some(format!("⧗ {words}").as_str())
+        );
+        assert!(app.resolver.job(n).is_none());
     }
 
     #[test]

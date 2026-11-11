@@ -2680,11 +2680,17 @@ impl App {
 
     /// Whether two machines' backends write the same shared account catalog: by their feeds'
     /// `catalog` when both say, else by both being the same kind of backend reading the same
-    /// owners (an older backend sends no `catalog`).
+    /// owners (an older backend sends no `catalog`). A backend new enough to name it (one that
+    /// lists `"hold"`) that names none has a catalog of its own, a test's or a scratch copy's,
+    /// shared with no other (r4-b's shape).
     fn same_catalog(&self, a: usize, b: usize) -> bool {
         let (Some(fa), Some(fb)) = (self.account_feed(a), self.account_feed(b)) else {
             return false;
         };
+        let own = |i: usize, catalog: &Option<String>| catalog.is_none() && self.holds_on(i);
+        if own(a, &fa.catalog) || own(b, &fb.catalog) {
+            return false;
+        }
         match (&fa.catalog, &fb.catalog) {
             (Some(x), Some(y)) => x == y,
             _ => {
@@ -8288,6 +8294,20 @@ mod tests {
         assert!(!a.same_catalog(0, 1));
         set(&mut a, 0, None, None, None);
         set(&mut a, 1, None, None, None);
+        assert!(!a.same_catalog(0, 1));
+        // A backend new enough to name its catalog that names none has its own (a test's or a
+        // scratch copy's): shared with none, even with the same source and owners file.
+        set(&mut a, 0, None, Some("/a"), Some("x"));
+        set(&mut a, 1, None, Some("/a"), Some("x"));
+        a.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        assert!(!a.same_catalog(0, 1));
+        assert!(!a.same_catalog(1, 0));
+        set(&mut a, 0, Some("ark-sdlc"), Some("/a"), Some("x"));
         assert!(!a.same_catalog(0, 1));
     }
 
