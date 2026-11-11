@@ -2210,6 +2210,38 @@ mod tests {
     }
 
     #[test]
+    fn a_start_queued_on_another_machine_shows_as_held_not_as_starting_there() {
+        // r4-a's shape for B1-92: a start queued on another machine at his word answers ok, with
+        // `pending`, `machine` and `session`, and no `home`. Its card shows it held, in those
+        // words, never "Starting on far-box…", and it isn't taken as a start just made.
+        let mut app = app();
+        let (key, id, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request,
+            ok(json!({
+                "pending": "queued on far-box: starts in ARK once there's room",
+                "machine": "far-box",
+                "session": "ARK",
+                "message": "Queued on far-box: it starts in ARK once there's room.",
+            })),
+        );
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some("⧗ queued on far-box: starts in ARK once there's room")
+        );
+        assert_ne!(
+            card.detail.as_ref().unwrap().status.as_deref(),
+            Some("Starting on far-box…")
+        );
+        assert!(!app.started_lately(&key, &id));
+    }
+
+    #[test]
     fn what_a_backend_holds_shows_on_the_card_and_m_drops_it_there() {
         let mut app = app();
         let (key, id, _, m) = waiting(&mut app);

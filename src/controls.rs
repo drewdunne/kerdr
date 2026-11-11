@@ -3233,6 +3233,17 @@ impl App {
                         self.rebuild();
                     }
                 }
+                // Accepted but held by its backend (`pending`: queued until there's room, on this
+                // machine or another): it shows as held on its card, in those words, never as
+                // starting (intent 0591, release 4, r4-a's shape for B1-92).
+                Some(Effect::Starting | Effect::Reopening)
+                    if response
+                        .pending
+                        .as_deref()
+                        .is_some_and(|w| !w.trim().is_empty()) =>
+                {
+                    job.effect = None;
+                }
                 // Asked for on another machine, where it starts within minutes: it shows as
                 // starting there until that start reaches this copy (intent 0445).
                 Some(Effect::Starting)
@@ -4203,7 +4214,12 @@ impl App {
                 let mut message = response.message.clone();
                 // What a change that went as shown still says: only what you'd need to find it.
                 let mut note = None;
-                if request["action"] == "dispatch" && response.ok {
+                // Queued rather than started (`pending`): no workspace is coming yet.
+                let queued = response
+                    .pending
+                    .as_deref()
+                    .is_some_and(|w| !w.trim().is_empty());
+                if request["action"] == "dispatch" && response.ok && !queued {
                     self.started = request["id"]
                         .as_str()
                         .zip(held.clone())

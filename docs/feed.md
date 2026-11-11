@@ -662,23 +662,26 @@ backend's after.
   starts when a place frees". A `dispatch` or `reopen` already queued for him may answer `ok: false`
   with `pending` instead, so an older Kerdr says it didn't start: with no question, `home`,
   `unreachable` or `retry`, Kerdr shows it as held, its `message` on the message line, not as a
-  failure. Kerdr shows them on the card, cyan, after ⧗, until the card's `held` lists that request,
-  or two reads of the feed after the answer don't (it ran). An account request's `pending` shows on
-  the card of the agent it moves, and the accounts feed's `agents[].held` (as cards' `held`) keeps
-  it there. `D` drops one with `{"action": "account-drop", "held": "<its op>", "op": "k-…"}`, sent
-  to the machine the agent runs on, through its actions command as every account request is; answer
-  it as `drop` below. A held account request that waits on his answer (a move for later that, when
-  due, found a background job started since his yes) carries `asks`: `{"message": "<the question in
-  full>", "confirm": "<token>", "yes": "<label>", "no": "<label>", "choices": [ … ], "request":
-  {<the account request his answer sends, without op, confirm or choice>}}`. Without `message`,
-  `confirm` and an account `request`, Kerdr passes over `asks` and shows `pending` as before. Its
-  card shows as asking him ("asks you: its move for later"), said once ("#44 asks you first, about
-  its move for later: n goes to it, and s on it asks."). n landing on it, or s on it, asks the
-  question. y sends `request` with `confirm` and an `op` of its own, and a choice adds `choice`; n
-  drops it with `account-drop`, as `D` does; Esc leaves it asking. Answered, its card asks no more
-  until the feed says what came of it. An older Kerdr ignores `asks` and shows `pending`, so
-  `pending` should name the key that asks again ("waits for your answer: it started a background job
-  since you asked; s asks again").
+  failure. A start or reopen answered `ok` with `pending` shows as held in the same way, not as
+  starting: one queued on another machine at his word (`"pending": "queued on Y: starts in S once
+  there's room"`, with `machine` and `session`) never reads "Starting on Y…", and isn't taken as a
+  start just made. Kerdr shows them on the card, cyan, after ⧗, until the card's `held` lists that
+  request, or two reads of the feed after the answer don't (it ran). An account request's `pending`
+  shows on the card of the agent it moves, and the accounts feed's `agents[].held` (as cards'
+  `held`) keeps it there. `D` drops one with `{"action": "account-drop", "held": "<its op>", "op":
+  "k-…"}`, sent to the machine the agent runs on, through its actions command as every account
+  request is; answer it as `drop` below. A held account request that waits on his answer (a move for
+  later that, when due, found a background job started since his yes) carries `asks`: `{"message":
+  "<the question in full>", "confirm": "<token>", "yes": "<label>", "no": "<label>", "choices": [ …
+  ], "request": {<the account request his answer sends, without op, confirm or choice>}}`. Without
+  `message`, `confirm` and an account `request`, Kerdr passes over `asks` and shows `pending` as
+  before. Its card shows as asking him ("asks you: its move for later"), said once ("#44 asks you
+  first, about its move for later: n goes to it, and s on it asks."). n landing on it, or s on it,
+  asks the question. y sends `request` with `confirm` and an `op` of its own, and a choice adds
+  `choice`; n drops it with `account-drop`, as `D` does; Esc leaves it asking. Answered, its card
+  asks no more until the feed says what came of it. An older Kerdr ignores `asks` and shows
+  `pending`, so `pending` should name the key that asks again ("waits for your answer: it started a
+  background job since you asked; s asks again").
 - **A save finishing in the background**: a `create` answered `ok` with `pending` and no `id`
   (`{"ok": true, "pending": "saving: its number comes once the central copy answers", "message": "…",
   "submission": "…"}`). Its card stays in the backlog, saying "✎ saving: its number comes once the
