@@ -1041,6 +1041,47 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 if s.went_wrong() { RED } else { CYAN },
             );
         }
+        // Drawn as Where is: what it's about, then the list to pick from (K2-07).
+        AccountScreen::OwnerFor {
+            machine,
+            session,
+            owners,
+            sel,
+        } => {
+            let name = app
+                .machines
+                .get(*machine)
+                .map(|m| m.name())
+                .unwrap_or_default();
+            let message = format!(
+                "{session} on {name} has no owner, so work started there follows no list. Owners are set in Arknet's owners code, not here: ⏎ makes an intent for an agent to give {session} the owner you pick."
+            );
+            let mut lines = wrapped(&message, 68, fg(FG), None);
+            lines.push(Line::raw(""));
+            let top = lines.len();
+            lines.extend(owners.iter().enumerate().map(|(i, o)| {
+                let label = if o.name.is_empty() {
+                    o.id.clone()
+                } else {
+                    o.name.clone()
+                };
+                let label = if o.kind.is_empty() {
+                    label
+                } else {
+                    format!("{label} · {}", o.kind)
+                };
+                selected(label, i == *sel)
+            }));
+            modal(
+                f,
+                area,
+                &format!("Who owns {session}?"),
+                lines,
+                "j k choose    ⏎ make the intent    esc back",
+                top + sel,
+                YELLOW,
+            );
+        }
         AccountScreen::Where {
             code,
             message,

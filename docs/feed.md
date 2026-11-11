@@ -1122,8 +1122,14 @@ tenant or organization its record names, looked up in its own machine's feed fir
 other machine's that names that owner, since every list lives in the one shared catalog. A session
 belongs to the owner whose `sessions` list it, else to the owner whose `code` is its name or the part
 of its name before a `-` (`P4M-Marketing` is P4M's), as the backend reads it. A viewed session no
-owner has opens no list: Kerdr says it needs an owner in the owners file first, since its backend
-starts nothing there on any list. With no card selected, `S` opens the owner of the machine on the
+owner has opens no list, since its backend starts nothing there on any list. Instead `S` asks "Who
+owns web?", listing the owners its machine's accounts feed names. Owners are Arknet's
+infrastructure code, so neither Kerdr nor its backend writes one: `⏎` makes an intent, through the
+usual `create` on a machine whose backend is ark-sdlc's and filed under Arknet when a feed names
+it, for an agent to give that session the owner picked in Arknet's owners code ("Give herdr session
+web on laptop the owner Pick4me (pick4me) in Arknet's owners code…"). No backend action is needed for
+it. Where no owners are listed, or no ark-sdlc backend answers, Kerdr says the session needs an owner
+in the owners file first, as before. With no card selected, `S` opens the owner of the machine on the
 board's machine tab, else of the machine Kerdr runs on, else of the machine the accounts screen
 opens on (its `machine_owner`, else its first organization), saying "Tab switches owner" when that
 machine has several; on the list, `Tab` and `Shift+Tab` go to the machine's next and previous owner

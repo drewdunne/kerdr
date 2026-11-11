@@ -899,20 +899,26 @@ impl App {
         false
     }
 
+    /// The machine that makes Kerdr's own intents (u's herdr update, S's owner): the first that's
+    /// answering whose backend is ark-sdlc's. None without one, or with no actions backend.
+    pub(crate) fn intent_maker(&self) -> Option<usize> {
+        if !self.actions_on() {
+            return None;
+        }
+        self.machines.iter().position(|m| {
+            m.conn.is_live()
+                && m.feed
+                    .as_ref()
+                    .is_some_and(|f| f.source.as_deref() == Some("ark-sdlc"))
+        })
+    }
+
     /// u on a machine's row: an intent to update herdr there, made by a machine whose backend is
     /// ark-sdlc's, this one first. It's done through that machine's infrastructure code, or
     /// omarchy-config on an Omarchy machine: Kerdr installs nothing itself. None when no such
     /// backend answers.
     pub(crate) fn herdr_intent(&mut self, i: usize) -> Option<super::Action> {
-        if !self.actions_on() {
-            return None;
-        }
-        let at = self.machines.iter().position(|m| {
-            m.conn.is_live()
-                && m.feed
-                    .as_ref()
-                    .is_some_and(|f| f.source.as_deref() == Some("ark-sdlc"))
-        })?;
+        let at = self.intent_maker()?;
         let m = self.machines.get(i)?;
         let name = m.name();
         let why = match &m.conn {

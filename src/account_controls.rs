@@ -442,6 +442,14 @@ pub enum AccountScreen {
         choices: Vec<WhereChoice>,
         sel: usize,
     },
+    /// `S` on a session no owner has: which owner to give it. Owners are Arknet's infrastructure
+    /// code, so the pick makes an intent for an agent to set it there (intent 0591, K2-07).
+    OwnerFor {
+        machine: usize,
+        session: String,
+        owners: Vec<Owner>,
+        sel: usize,
+    },
     Confirm {
         machine: usize,
         request: Value,
@@ -1583,6 +1591,80 @@ impl App {
                         .map(|o| (mi, o.clone()))
                 })
             })
+    }
+
+    /// S on a viewed session no owner has, whose machine's feed lists owners: the screen asking
+    /// which to give it. None when there's nothing to pick from, or no backend that makes an
+    /// intent answers, and S says why instead.
+    fn owner_for_viewed_session(&self) -> Option<AccountScreen> {
+        let Scope::Session(name, session) = self.scope() else {
+            return None;
+        };
+        let machine = self.machine_index(name)?;
+        let owners = self.account_feed(machine)?.owners.clone();
+        if owners.is_empty() || self.intent_maker().is_none() {
+            return None;
+        }
+        Some(AccountScreen::OwnerFor {
+            machine,
+            session: session.clone(),
+            owners,
+            sel: 0,
+        })
+    }
+
+    /// The owner picked for a session: an intent, homed on Arknet, for an agent to give it that
+    /// owner in Arknet's owners code. Neither Kerdr nor its backend writes owners itself, since
+    /// they're infrastructure code (intent 0591, K2-07).
+    fn owner_intent(&mut self, machine: usize, session: &str, owner: &Owner) -> Action {
+        let Some(at) = self.intent_maker() else {
+            self.say(
+                "No machine whose backend makes intents is answering, so nothing was asked for.",
+                Tone::Info,
+            );
+            return Action::None;
+        };
+        let name = self.machines[machine].name();
+        let label = if owner.name.is_empty() {
+            owner.id.clone()
+        } else {
+            owner.name.clone()
+        };
+        let words = format!(
+            "Give herdr session {session} on {name} the owner {label} ({}) in Arknet's owners code, and run that code so it takes effect; nothing set by hand. Andrew picked this owner in Kerdr, since work started in {session} followed no list.",
+            owner.id
+        );
+        // Filed under Arknet when its feeds name it; otherwise its write-up works that out from
+        // the words.
+        let arknet = self
+            .board
+            .owners
+            .iter()
+            .find(|o| o.id.eq_ignore_ascii_case("arknet") || o.name.eq_ignore_ascii_case("arknet"))
+            .map(|o| o.id.clone());
+        let draft = super::Draft {
+            words,
+            machine: at,
+            session: "default".into(),
+            images: vec![],
+            came_back: None,
+            filed: super::Filed {
+                organization: arknet,
+                tenant: None,
+                team: None,
+            },
+            unfiled: None,
+        };
+        let action = self.send_draft(draft);
+        if matches!(action, Action::Mutate { .. }) {
+            self.say(
+                format!(
+                    "Making an intent to give {session} the owner {label} in Arknet's owners code: an agent sets it there, and S opens its list once it has."
+                ),
+                Tone::Info,
+            );
+        }
+        action
     }
 
     /// What S says when there's no list to open: never "choose a session first".
@@ -2944,6 +3026,9 @@ impl App {
                 self.models_wanted = None;
                 if let Some((machine, owner)) = self.models_owner() {
                     self.open_models(machine, owner);
+                } else if let Some(screen) = self.owner_for_viewed_session() {
+                    // A viewed session no owner has: which owner to give it (K2-07).
+                    self.push_account_screen(screen);
                 } else {
                     let said = self.no_models_owner_said();
                     // A feed still to come: the list opens once it does, while he's still where he
@@ -3784,6 +3869,25 @@ impl App {
                     _ => {}
                 }
             }
+            AccountScreen::OwnerFor {
+                machine,
+                session,
+                owners,
+                sel,
+            } => match key.code {
+                KeyCode::Down | KeyCode::Char('j') => {
+                    *sel = (*sel + 1).min(owners.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => *sel = sel.saturating_sub(1),
+                KeyCode::Enter => {
+                    if let Some(owner) = owners.get(*sel).cloned() {
+                        let (machine, session) = (*machine, session.clone());
+                        self.mode = *back;
+                        return self.owner_intent(machine, &session, &owner);
+                    }
+                }
+                _ => {}
+            },
             AccountScreen::Where {
                 code,
                 copy,
@@ -8623,6 +8727,69 @@ mod tests {
             said(&a),
             "web has no owner, so work started there follows no list: it needs an owner in the owners file first."
         );
+    }
+
+    #[test]
+    fn s_on_a_session_no_one_owns_asks_whose_it_is_and_makes_an_intent_for_arknets_owners_code() {
+        // K2-07: owners are Arknet's infrastructure code, so the pick makes an intent for an agent
+        // to set it there; neither Kerdr nor its backend writes it.
+        let mut a = app();
+        pick(&mut a);
+        a.machine = Some("laptop".into());
+        a.rebuild();
+        for o in a.machines[0].feed.as_mut().unwrap().owners.iter_mut() {
+            o.sessions.retain(|s| s != "web");
+        }
+        a.machines[0].feed.as_mut().unwrap().source = Some("ark-sdlc".into());
+        a.tab = a
+            .tabs
+            .iter()
+            .position(|s| matches!(s, Scope::Session(_, s) if s == "web"))
+            .unwrap();
+        let owners = a.account_feed(0).unwrap().owners.clone();
+        assert!(owners.len() > 1, "the demo has owners to pick from");
+        assert_eq!(press(&mut a, 'S'), Action::None);
+        let Mode::Accounts {
+            screen: AccountScreen::OwnerFor { session, .. },
+            ..
+        } = &a.mode
+        else {
+            panic!("not asked whose it is: {:?} {}", a.mode, said(&a))
+        };
+        assert_eq!(session, "web");
+        // The second owner, picked: an intent through the usual create, nothing else sent.
+        press(&mut a, 'j');
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!("no intent: {}", said(&a))
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request["action"], "create");
+        let name = a.machines[0].name();
+        let words = request["words"].as_str().unwrap();
+        assert!(
+            words.starts_with(&format!(
+                "Give herdr session web on {name} the owner {} ({}) in Arknet's owners code",
+                owners[1].name, owners[1].id
+            )),
+            "{words}"
+        );
+        assert!(!matches!(a.mode, Mode::Accounts { .. }));
+        assert!(said(&a).starts_with(&format!(
+            "Making an intent to give web the owner {} in Arknet's owners code",
+            owners[1].name
+        )));
+        // Esc leaves it, asking for nothing.
+        a.mode = Mode::Board;
+        press(&mut a, 'S');
+        assert!(matches!(
+            a.mode,
+            Mode::Accounts {
+                screen: AccountScreen::OwnerFor { .. },
+                ..
+            }
+        ));
+        assert_eq!(key(&mut a, KeyCode::Esc), Action::None);
+        assert!(!matches!(a.mode, Mode::Accounts { .. }));
     }
 
     #[test]
