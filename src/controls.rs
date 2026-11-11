@@ -4298,7 +4298,9 @@ impl App {
     /// step-first d, ⏎, s or C on a card there restores it before anything else, so the question
     /// its backend asks after that is about the card as restored. That isn't a change made while
     /// he decided (the end-to-end check's second failure). Only for a backend's own question, by
-    /// its token, from a backend that does steps.
+    /// its token (a yes-or-no's `confirm`, or Kickoff questions' `asked`: Codex's look at the
+    /// end-to-end fixes), from a backend that does steps. The card's workspace, conversation and
+    /// home are still checked for real changes, by `same_work`.
     pub(super) fn restored_by_its_steps(
         &self,
         machine: usize,
@@ -4308,7 +4310,7 @@ impl App {
     ) -> bool {
         then.dismissed
             && !now.dismissed()
-            && request.get("confirm").is_some()
+            && (request.get("confirm").is_some() || request.get("asked").is_some())
             && matches!(
                 request["action"].as_str(),
                 Some("dispatch" | "reopen" | "close")
@@ -4317,7 +4319,8 @@ impl App {
     }
 
     /// The card a question was asked about, as its request's own first step left it: back from
-    /// Won't do when that step brought it back, else as it was.
+    /// Won't do when that step brought it back, and in the backlog when that's where it came back
+    /// to; else as it was.
     pub(super) fn as_its_steps_left_it(
         &self,
         machine: usize,
@@ -4328,6 +4331,7 @@ impl App {
         if self.restored_by_its_steps(machine, request, then, now) {
             CardSnapshot {
                 dismissed: false,
+                waiting: then.waiting || waiting_work(now),
                 ..then.clone()
             }
         } else {

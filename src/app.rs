@@ -11081,6 +11081,94 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn kickoff_questions_after_its_own_step_brought_the_card_back_still_wait_on_it() {
+        // Codex's look at the end-to-end fixes: d on work in Won't do, whose backend brings it back
+        // and then answers with Kickoff questions (their token is `asked`, not `confirm`), slowly:
+        // a board read shows it back, and he's on another card by then. That restore was its own.
+        let kickoff = || crate::actions::Response {
+            ok: false,
+            message: "Brought it back from Won't do. It has open questions.".into(),
+            asked: Some("fedcba9876543211".into()),
+            questions: vec![crate::actions::Question {
+                num: "1".into(),
+                question: "Whose is it?".into(),
+                pick: "Kibbelz".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = |app: &mut App, key: &str, change: &dyn Fn(&mut Card)| {
+            change(app.board.cards.iter_mut().find(|c| c.key == key).unwrap());
+        };
+        let elsewhere = |app: &mut App, key: &str| {
+            let other = app
+                .board
+                .cards
+                .iter()
+                .find(|c| c.key != key && c.stage == Stage::Backlog && !c.dismissed())
+                .unwrap()
+                .key
+                .clone();
+            select_key(app, &other);
+        };
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, id) = wont_do_card(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        elsewhere(&mut app, &key);
+        set(&mut app, &key, &|c| {
+            c.detail.as_mut().unwrap().disposition = None
+        });
+        reply_to(&mut app, machine, request, Ok(kickoff()));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "{said}");
+        assert!(said.contains("kickoff questions for you"), "{said}");
+        assert!(app.waiting_on(&key).is_some());
+        // n finds it and opens the box; its answers go with the start, by their token.
+        for _ in 0..app.needs_you_order().len() {
+            press(&mut app, 'n');
+            if matches!(app.mode, Mode::Kickoff { .. }) {
+                break;
+            }
+        }
+        let Mode::Kickoff { form, .. } = &mut app.mode else {
+            panic!("n never opened the box: {:?}", app.message())
+        };
+        form.ready_at = Instant::now();
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the box sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["asked"], "fedcba9876543211");
+        // A real change meanwhile still counts: its conversation is another one now.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, _) = wont_do_card(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        elsewhere(&mut app, &key);
+        set(&mut app, &key, &|c| {
+            let d = c.detail.as_mut().unwrap();
+            d.disposition = None;
+            d.resume = Some(crate::feed::Resume {
+                agent: Some("codex".into()),
+                conversation: Some("c-another".into()),
+            });
+        });
+        reply_to(&mut app, machine, request, Ok(kickoff()));
+        assert!(app.waiting_on(&key).is_none());
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("conversation changed meanwhile"), "{said}");
+        assert!(!said.contains("brought back"), "{said}");
+    }
+
+    #[test]
     fn a_question_after_its_own_step_brought_the_card_back_is_still_asked() {
         // d on work in Won't do: its backend brings it back first, then asks (the end-to-end
         // check's second failure). A board read between the key and the slow answer shows it

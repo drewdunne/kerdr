@@ -55,9 +55,20 @@ fn asked_about(request: &Value, response: &Response) -> Option<String> {
 /// token, so it's checked as that backend's question about the card, the way its yes is (a stop of
 /// running work, an edit of done work), and not as the bare request it answered (Codex's review).
 fn asked(w: &Waiting) -> Value {
-    let mut request = w.request.clone();
-    if let Some(token) = &w.response.confirm {
+    with_its_tokens(&w.request, &w.response)
+}
+
+/// A request with the tokens its backend's answer asked with: a question's `confirm`, and Kickoff
+/// questions' `asked`, as their answers go back (Codex's look at the end-to-end fixes).
+fn with_its_tokens(request: &Value, response: &Response) -> Value {
+    let mut request = request.clone();
+    if let Some(token) = &response.confirm {
         request["confirm"] = json!(token);
+    }
+    if !response.questions.is_empty()
+        && let Some(token) = &response.asked
+    {
+        request["asked"] = json!(token);
     }
     request
 }
@@ -178,11 +189,8 @@ impl App {
         };
         let card_key = from.key.clone();
         let then = from.clone();
-        // What it asked, with its token: a change its own first step made isn't one to name.
-        let mut asked_with = request.clone();
-        if let Some(token) = &response.confirm {
-            asked_with["confirm"] = json!(token);
-        }
+        // What it asked, with its tokens: a change its own first step made isn't one to name.
+        let asked_with = with_its_tokens(&request, &response);
         self.waiting.retain(|w| w.from.key != card_key);
         self.waiting.push(Waiting {
             machine,
