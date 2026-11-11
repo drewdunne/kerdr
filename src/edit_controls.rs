@@ -897,11 +897,25 @@ impl App {
         let id = request["id"].as_str().unwrap_or_default().to_string();
         let reference = self.reference_for(&id);
         let reads = request.get("text").is_none();
+        // Its read's own flight: by the card it was sent from, else the only one for its id, never
+        // another source's card's with the same number (Codex's sixth look, swept).
         let flight = if reads {
-            self.edit_flights
-                .iter()
-                .position(|f| f.id == id)
-                .map(|i| self.edit_flights.remove(i))
+            let at = match from.as_ref() {
+                Some(f) => self.edit_flights.iter().position(|x| x.key == f.key),
+                None => {
+                    let mut found = self
+                        .edit_flights
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| x.id == id)
+                        .map(|(i, _)| i);
+                    match (found.next(), found.next()) {
+                        (Some(i), None) => Some(i),
+                        _ => None,
+                    }
+                }
+            };
+            at.map(|i| self.edit_flights.remove(i))
         } else {
             None
         };
@@ -2061,6 +2075,45 @@ mod tests {
                 "B's words taken as saved"
             );
         }
+    }
+
+    #[test]
+    fn reads_of_two_sources_cards_with_the_same_number_open_each_ones_own_text() {
+        // Codex's sixth look, swept: e on source A's #N, then on source B's #N, both reads on
+        // their way. B's answer comes first: B's text opens on B's card, and A's read still waits
+        // for its own answer, which opens on A's.
+        let mut app = app();
+        let (ka, id, _) = waiting(&mut app);
+        let (kb, _) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+        for m in &mut app.machines {
+            for c in m.feed.iter_mut().flat_map(|f| f.cards.iter_mut()) {
+                if c.id == id {
+                    c.intake = None;
+                }
+            }
+        }
+        app.rebuild();
+        select(&mut app, &ka);
+        let ra = read(&mut app, &id);
+        select(&mut app, &kb);
+        let rb = read(&mut app, &id);
+        answer(&mut app, &rb, text_answer("B's text.", "sha256:bb"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(kb.as_str()));
+        assert_eq!(
+            app.edits.get(&kb).map(|h| h.current.as_str()),
+            Some("B's text.")
+        );
+        assert!(
+            app.edit_flights.iter().any(|f| f.key == ka),
+            "A's read lost"
+        );
+        select(&mut app, &ka);
+        answer(&mut app, &ra, text_answer("A's text.", "sha256:aa"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(ka.as_str()));
+        assert_eq!(
+            app.edits.get(&ka).map(|h| h.current.as_str()),
+            Some("A's text.")
+        );
     }
 
     #[test]
