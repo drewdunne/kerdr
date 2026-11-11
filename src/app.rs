@@ -824,6 +824,8 @@ pub struct App {
     pub kept: crate::kept::Kept,
     /// Changes sent from the hold file, by job, with their op: each leaves the file once answered.
     pub(crate) held_sending: std::collections::HashMap<u64, String>,
+    /// When a held change for a machine Kerdr doesn't have was last tried through a forwarder.
+    pub(crate) held_tried: std::collections::HashMap<String, Instant>,
     /// What answers said backends hold for cards, until their feeds say so (holding::Pending).
     pub(crate) pendings: Vec<holding::Pending>,
     /// q is waiting for a hand-over to finish, since when: Kerdr quits by itself once it has.
@@ -939,6 +941,7 @@ impl App {
             peek_opened: None,
             kept: crate::kept::Kept::in_memory(),
             held_sending: Default::default(),
+            held_tried: Default::default(),
             pendings: vec![],
             quitting: None,
             words_dir: None,

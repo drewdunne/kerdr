@@ -21,6 +21,10 @@ pub const HOLD: &str = "hold";
 /// A backend that sends a request on to another machine it can reach (`forward_to`).
 pub const FORWARD: &str = "forward";
 
+/// How often a request held for a machine Kerdr doesn't have is tried again through one that
+/// forwards.
+const FORWARD_AGAIN: std::time::Duration = std::time::Duration::from_secs(120);
+
 /// One thing held for a card, as its card and its peek say it.
 #[derive(Clone, Debug, PartialEq)]
 pub struct HeldLine {
@@ -277,6 +281,35 @@ impl App {
             .cloned()
             .collect();
         for entry in entries {
+            self.send_held(machine, entry);
+        }
+        // Held for a machine that isn't one of Kerdr's, after a forwarder couldn't reach it: tried
+        // through this one, if it forwards, at most every two minutes.
+        let forwards = self.machines[machine]
+            .feed
+            .as_ref()
+            .is_some_and(|f| f.supports(FORWARD));
+        if !forwards {
+            return;
+        }
+        let entries: Vec<HeldRequest> = self
+            .kept
+            .held
+            .iter()
+            .filter(|h| {
+                self.machine_index(&h.machine).is_none()
+                    && !self.held_sending.values().any(|op| op == h.op())
+                    && self
+                        .held_tried
+                        .get(h.op())
+                        .is_none_or(|at| at.elapsed() >= FORWARD_AGAIN)
+            })
+            .cloned()
+            .collect();
+        for mut entry in entries {
+            self.held_tried
+                .insert(entry.op().to_string(), Instant::now());
+            entry.request["forward_to"] = Value::String(entry.machine.clone());
             self.send_held(machine, entry);
         }
     }
@@ -1594,5 +1627,35 @@ mod tests {
             assert!(request.get("held").is_none());
             assert_eq!(app.resolver.rev_of(n).is_some(), holds);
         }
+    }
+
+    #[test]
+    fn a_change_held_for_a_machine_kerdr_doesnt_have_is_tried_through_a_forwarder_every_two_minutes()
+     {
+        let mut app = app();
+        let (key, id, _, m) = waiting(&mut app);
+        home(&mut app, &id, m, "elsewhere");
+        supports(&mut app, m, FORWARD);
+        select(&mut app, &key);
+        d(&mut app);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request.clone(), ok(json!({"unreachable": "elsewhere"})));
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].machine, "elsewhere");
+        // The forwarder's next read: tried again through it, same op.
+        app.feed_read(m);
+        let (n, via, again, _) = app.resolver.ready()[0].clone();
+        assert_eq!(via, m);
+        assert_eq!(again["forward_to"], "elsewhere");
+        assert_eq!(again["op"], request["op"]);
+        // Still unreachable: kept, and not tried again for two minutes.
+        app.finish_job(n, again, ok(json!({"unreachable": "elsewhere"})));
+        assert_eq!(app.kept.held.len(), 1);
+        app.feed_read(m);
+        assert!(app.resolver.ready().is_empty());
+        let op = request["op"].as_str().unwrap().to_string();
+        app.held_tried.insert(op, Instant::now() - FORWARD_AGAIN);
+        app.feed_read(m);
+        assert_eq!(app.resolver.ready().len(), 1);
     }
 }
