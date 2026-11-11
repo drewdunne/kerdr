@@ -88,6 +88,15 @@ pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "read_failures")]
     pub read_failures: Vec<ReadFailure>,
+    /// What its backend holds that has no card yet (intent 0591, release 4): a new intent's save
+    /// finishing in the background, each naming its `submission`. Its card says so while it's
+    /// listed here.
+    #[serde(
+        default,
+        deserialize_with = "held_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub held: Vec<Held>,
 }
 
 /// One thing a feed couldn't read: `part` is "feed" (the whole feed failed), "herdr" (herdr on
@@ -396,6 +405,9 @@ pub struct Held {
     pub since: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<i64>,
+    /// The new intent a save held at the feed's top level is for, by its submission id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
 }
 
 /// A `held` list, its entries Kerdr can't read left out: one with no `op` or no words for the
@@ -677,6 +689,23 @@ mod tests {
         // An older feed says none of it.
         let old = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"a"}]}"#).unwrap();
         assert!(!old.supports("hold") && old.cards[0].held.is_empty());
+        assert!(old.held.is_empty());
+    }
+
+    #[test]
+    fn a_feed_lists_the_saves_it_finishes_in_the_background_at_its_top() {
+        let feed = parse(
+            r#"{"kerdr_feed":1,"supports":["op","hold"],"cards":[],"held":[
+                {"op":"k-0000000000000005","action":"create","pending":"saving: its number comes once the central copy answers","since":1794400000,"submission":"s-1"},
+                {"op":"k-0000000000000006","action":"create"}, "nonsense"]}"#,
+        )
+        .unwrap();
+        assert_eq!(feed.held.len(), 1, "{:?}", feed.held);
+        assert_eq!(feed.held[0].submission.as_deref(), Some("s-1"));
+        assert_eq!(feed.held[0].action, "create");
+        // Anything else there is passed over, never a failed feed.
+        let odd = parse(r#"{"kerdr_feed":1,"cards":[],"held":{"op":"x"}}"#).unwrap();
+        assert!(odd.held.is_empty());
     }
 
     #[test]

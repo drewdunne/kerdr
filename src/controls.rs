@@ -2095,7 +2095,7 @@ impl App {
 
     /// Words a failed save gives back: into the box for the next c when it's free, else kept
     /// for a later c. Whether they went into the box.
-    fn give_back(
+    pub(super) fn give_back(
         &mut self,
         words: String,
         images: Vec<images::Image>,
@@ -2385,9 +2385,13 @@ impl App {
                 enter_queues,
                 ..
             } => {
-                // A yes is a new request: never the question's op (intent 0591).
+                // A yes is a new request: never the question's op (intent 0591). Nor the `held`
+                // and `rev` of a request that waited in the hold file: the yes is pressed now, and
+                // a held stop's yes marked held would only get its question back (release 4).
                 if let Some(fields) = request.as_object_mut() {
-                    fields.remove("op");
+                    for waited in ["op", "held", "rev"] {
+                        fields.remove(waited);
+                    }
                 }
                 // One of the answers its backend offers beyond yes and no, by its key (intent 0591).
                 let keys = crate::actions::choice_keys(&choices);
@@ -3132,9 +3136,13 @@ impl App {
             }
             match job.effect.as_mut() {
                 // Its card stays until the feed has the record it made; nothing made, it goes.
+                // Unless its backend is still saving it (`pending`, and no number yet): then it
+                // stays, saying so, until the feed has a card with its submission (release 4).
                 Some(Effect::Saving(p)) => {
                     p.made = response.id.clone();
-                    if p.made.is_none() {
+                    let saving = response.pending.as_deref().is_some_and(|w| !w.is_empty())
+                        && self.holds_on(machine);
+                    if p.made.is_none() && !saving {
                         job.effect = None;
                         self.rebuild();
                     }

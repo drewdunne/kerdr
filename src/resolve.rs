@@ -938,6 +938,17 @@ impl Resolver {
         Some(self.jobs.remove(i))
     }
 
+    /// Takes away the card of a new intent its backend accepted but no longer saves, by the op
+    /// its request had (intent 0591, release 4): that request, with his words.
+    pub fn drop_saving(&mut self, op: &str) -> Option<Value> {
+        let i = self.jobs.iter().position(|j| {
+            j.settled.is_some()
+                && matches!(&j.effect, Some(Effect::Saving(p)) if p.made.is_none())
+                && j.request["op"].as_str() == Some(op)
+        })?;
+        Some(self.jobs.remove(i).request)
+    }
+
     /// Keeps a succeeded change's effect until the feed shows it.
     pub fn settle(&mut self, mut job: Job) {
         if job.effect.is_none() {

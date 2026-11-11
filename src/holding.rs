@@ -506,14 +506,47 @@ impl App {
                     .collect::<Vec<_>>()
             })
             .collect();
+        // A save still finishing in the background has no card yet: its feed lists it at the top.
+        let saving: Vec<String> = self
+            .machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .map(|f| f.held.iter().map(|h| h.op.clone()).collect())
+            .unwrap_or_default();
         for p in self.pendings.iter_mut().filter(|p| p.machine == machine) {
-            if listed.iter().any(|(k, op)| *k == p.key && *op == p.op) {
+            if listed.iter().any(|(k, op)| *k == p.key && *op == p.op) || saving.contains(&p.op) {
                 p.reads = 0;
             } else {
                 p.reads = p.reads.saturating_add(1);
             }
         }
+        let gone: Vec<Pending> = self
+            .pendings
+            .iter()
+            .filter(|p| p.reads >= 3)
+            .cloned()
+            .collect();
         self.pendings.retain(|p| p.reads < 3);
+        // A background save its feed stopped listing with no card come for it: its backend gave
+        // up on it, so its card goes too, said, rather than saving forever.
+        for p in gone {
+            if !self.holds_on(machine) {
+                continue;
+            }
+            if let Some(request) = self.resolver.drop_saving(&p.op) {
+                let title = crate::resolve::Placeholder::title_for(
+                    request["words"].as_str().unwrap_or_default(),
+                );
+                let name = self.machines[machine].name();
+                self.say(
+                    format!(
+                        "Your new intent \"{title}\" stopped saving on {name} without getting its number; {name} keeps its words."
+                    ),
+                    Tone::Warn,
+                );
+                self.rebuild();
+            }
+        }
     }
 
     /// Everything held for a card, Kerdr's first, then its backend's, then what was dropped.
@@ -569,7 +602,8 @@ impl App {
         lines
     }
 
-    /// The card's line for what's held for it: "⧗ d waits for LAB-Server".
+    /// The card's line for what's held for it: "⧗ d waits for LAB-Server", or for a new intent
+    /// its backend is still saving, "✎ saving: its number comes once the central copy answers".
     pub fn held_line_for(&self, c: &Card) -> Option<String> {
         let lines = self.held_lines(c);
         let first = lines.first()?;
@@ -577,7 +611,12 @@ impl App {
             1 => String::new(),
             n => format!(" (+{})", n - 1),
         };
-        Some(format!("⧗ {}{more}", first.words))
+        let mark = if c.intake() == Some(crate::resolve::SAVING) {
+            "✎"
+        } else {
+            "⧗"
+        };
+        Some(format!("{mark} {}{more}", first.words))
     }
 
     /// The peek's key to drop what's held: D for the only one (None), or with a count the one of
@@ -645,6 +684,8 @@ impl App {
         }
         let mut request = json!({"action": "drop", "held": op});
         match (&card.detail, &card.session, &card.workspace_id) {
+            // A new intent still saving has no number yet: its request's op alone names it.
+            _ if card.intake() == Some(crate::resolve::SAVING) => {}
             (Some(d), _, _) => request["id"] = Value::String(d.id.clone()),
             (None, Some(session), Some(workspace)) => {
                 request["session"] = Value::String(session.clone());
@@ -664,7 +705,32 @@ impl App {
         let op = request["held"].as_str().unwrap_or_default();
         if response.ok {
             self.pendings.retain(|p| p.op != op);
-            let said = if response.message.is_empty() {
+            // A new intent's save dropped before it got its number: its card goes, and his words
+            // come back as a failed save's do.
+            let mut back = None;
+            if response.dropped != Some(false)
+                && let Some(create) = self.resolver.drop_saving(op)
+            {
+                let words = create["words"].as_str().unwrap_or_default().to_string();
+                let images = create["images"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|i| {
+                        crate::kept::KeptImage {
+                            tag: u32::try_from(i["tag"].as_u64()?).ok()?,
+                            data: i["data"].as_str()?.to_string(),
+                        }
+                        .image()
+                    })
+                    .collect();
+                back = Some(if self.give_back(words, images, None) {
+                    "c opens it again with your words."
+                } else {
+                    "Its words are kept, and c brings them back once the box is empty."
+                });
+            }
+            let mut said = if response.message.is_empty() {
                 match response.dropped {
                     Some(false) => "It had already gone ahead, so there was nothing to drop.",
                     _ => "Dropped: it won't happen.",
@@ -673,6 +739,9 @@ impl App {
             } else {
                 response.message.clone()
             };
+            if let Some(back) = back {
+                said = format!("{said} {back}");
+            }
             self.say(said, Tone::Info);
             self.rebuild();
             return true;
@@ -1222,6 +1291,7 @@ mod tests {
                     pending: "queued in ARK: starts when a place frees".into(),
                     since: Some(since),
                     until: None,
+                    submission: None,
                 }];
             }
         }
@@ -1609,6 +1679,142 @@ mod tests {
         );
         assert!(app.waiting_line_for(&key).is_some(), "{}", said(&app));
         assert!(app.kept.held.is_empty());
+        // His yes, pressed now, is a fresh press: neither `held` (which would only get the
+        // question back) nor the old `rev` goes with it (r4-a's shape).
+        select(&mut app, &key);
+        assert!(app.open_waiting(&key), "{}", said(&app));
+        if let super::super::Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("no yes sent: {}", said(&app))
+        };
+        assert_eq!(request["action"], "cancel");
+        assert_eq!(request["confirm"], "tok");
+        assert!(request.get("held").is_none(), "{request}");
+        assert!(request.get("rev").is_none(), "{request}");
+    }
+
+    const SAVING_WORDS: &str = "saving: its number comes once the central copy answers";
+
+    /// A new intent sent to machine 0, whose backend holds, answered as one it goes on saving in
+    /// the background: its card's key and its request's op.
+    fn saved_in_the_background(app: &mut App) -> (String, String) {
+        supports(app, 0, HOLD);
+        app.queue_action(
+            0,
+            json!({"action":"create","words":"Fix the feed","submission":"s-1","session":"ark"}),
+        );
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        let op = request["op"].as_str().unwrap().to_string();
+        app.finish_job(
+            n,
+            request,
+            ok(json!({
+                "pending": SAVING_WORDS,
+                "message": "Saving it in the background.",
+                "submission": "s-1",
+            })),
+        );
+        (app.placeholder_key(0, "s-1"), op)
+    }
+
+    /// Machine 0's feed lists what its backend holds with no card yet: this save, or nothing.
+    fn feed_saving(app: &mut App, op: Option<&str>) {
+        app.machines[0].feed.as_mut().unwrap().held = op
+            .map(|op| crate::feed::Held {
+                op: op.into(),
+                action: "create".into(),
+                pending: SAVING_WORDS.into(),
+                since: Some(app.now().timestamp()),
+                until: None,
+                submission: Some("s-1".into()),
+            })
+            .into_iter()
+            .collect();
+    }
+
+    #[test]
+    fn a_new_intent_its_backend_saves_in_the_background_keeps_its_card_saying_so() {
+        let mut app = app();
+        let (key, op) = saved_in_the_background(&mut app);
+        // No number yet: its card stays, with its backend's words.
+        let card = app
+            .card(&key)
+            .expect("its card stays while it saves")
+            .clone();
+        assert_eq!(card.intake(), Some(crate::resolve::SAVING));
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some(format!("✎ {SAVING_WORDS}").as_str())
+        );
+        // However many reads its feed lists it in.
+        feed_saving(&mut app, Some(&op));
+        for _ in 0..5 {
+            app.feed_read(0);
+        }
+        let card = app.card(&key).expect("still saving").clone();
+        assert!(app.held_line_for(&card).is_some());
+        // It lands: the feed has its card, and the one shown while it saved goes.
+        feed_saving(&mut app, None);
+        let mut landed = app.machines[0].feed.as_ref().unwrap().cards[0].clone();
+        landed.id = "0700".into();
+        landed.title = "Fix the feed".into();
+        landed.submission = Some("s-1".into());
+        landed.held.clear();
+        app.machines[0].feed.as_mut().unwrap().cards.push(landed);
+        app.resolver.read(0, app.machines[0].feed.as_ref());
+        app.rebuild();
+        assert!(app.card(&key).is_none());
+    }
+
+    #[test]
+    fn a_new_intent_saving_in_the_background_dropped_with_m_gives_its_words_back() {
+        let mut app = app();
+        let (key, op) = saved_in_the_background(&mut app);
+        select(&mut app, &key);
+        press(&mut app, 'm');
+        // No number to name: the drop names its op alone.
+        let Action::Mutate { machine, request } = press(&mut app, 'D') else {
+            panic!("no drop: {}", said(&app))
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request, json!({"action":"drop","held":op}));
+        app.queue_action(machine, request);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request,
+            ok(json!({"message": "Dropped the save of \"Fix the feed\".", "dropped": true})),
+        );
+        assert!(app.card(&key).is_none());
+        assert_eq!(app.draft, "Fix the feed");
+        assert_eq!(
+            said(&app),
+            "Dropped the save of \"Fix the feed\". c opens it again with your words."
+        );
+    }
+
+    #[test]
+    fn a_new_intent_its_backend_stops_saving_goes_from_the_board_and_says_so() {
+        let mut app = app();
+        let (key, op) = saved_in_the_background(&mut app);
+        feed_saving(&mut app, Some(&op));
+        app.feed_read(0);
+        // Its feed stops listing it, and no card comes for it: after three reads it goes.
+        feed_saving(&mut app, None);
+        app.feed_read(0);
+        app.feed_read(0);
+        assert!(app.card(&key).is_some());
+        app.feed_read(0);
+        assert!(app.card(&key).is_none());
+        let name = app.machines[0].name();
+        assert_eq!(
+            said(&app),
+            format!(
+                "Your new intent \"Fix the feed\" stopped saving on {name} without getting its number; {name} keeps its words."
+            )
+        );
     }
 
     #[test]

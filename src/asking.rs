@@ -301,6 +301,13 @@ impl App {
         from: Option<CardSnapshot>,
         by_enter: bool,
     ) {
+        // Whatever answers it is pressed now: a request that waited in the hold file loses its
+        // `held` and `rev` here, so no answer to its question carries them (release 4).
+        let mut request = request;
+        if let Some(fields) = request.as_object_mut() {
+            fields.remove("held");
+            fields.remove("rev");
+        }
         let id = request["id"].as_str().unwrap_or("this intent").to_string();
         let card = from.as_ref().and_then(|f| self.card(&f.key)).cloned();
         let reference = card
@@ -336,7 +343,6 @@ impl App {
             };
             return;
         }
-        let mut request = request;
         if let Some(fields) = request.as_object_mut() {
             for answer in ["override", "choice", "queue", "op"] {
                 fields.remove(answer);
