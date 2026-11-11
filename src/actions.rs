@@ -649,10 +649,31 @@ pub fn run_resending(
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
 ) -> Answered {
+    run_resending_rev(
+        machine, command, request, None, handed, resends, tell, pause,
+    )
+}
+
+/// As run_resending, every resend carrying `rev`, the card's as it was when the key was pressed,
+/// for a backend that holds requests to check it against the card as it is now (intent 0591,
+/// release 4): the request waited before it went. The first send goes as it was asked.
+#[allow(clippy::too_many_arguments)]
+pub fn run_resending_rev(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    rev: Option<&str>,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+) -> Answered {
+    let again = with_rev(request, rev);
     run_resending_within(
         machine,
         command,
         request,
+        again.as_ref(),
         handed,
         resends,
         tell,
@@ -662,13 +683,25 @@ pub fn run_resending(
     )
 }
 
+/// The request as it's sent again: with `rev`, when there is one and it carries none yet.
+pub fn with_rev(request: &Value, rev: Option<&str>) -> Option<Value> {
+    let rev = rev.filter(|r| !r.is_empty())?;
+    if request.get("rev").is_some() || !changes(request) {
+        return None;
+    }
+    let mut again = request.clone();
+    again["rev"] = Value::String(rev.to_string());
+    Some(again)
+}
+
 /// As run_resending, the first send given `deadline` to answer, and each resend no more than that;
-/// `clock` tells the time (a test's own, which `pause` moves on).
+/// `clock` tells the time (a test's own, which `pause` moves on). A resend is `again` when given.
 #[allow(clippy::too_many_arguments)]
 fn run_resending_within(
     machine: &Machine,
     command: &str,
     request: &Value,
+    again: Option<&Value>,
     handed: Option<transport::Handed>,
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
@@ -676,6 +709,7 @@ fn run_resending_within(
     clock: &dyn Fn() -> Clocks,
     deadline: Duration,
 ) -> Answered {
+    let mut first = true;
     resending(
         request,
         handed,
@@ -685,10 +719,16 @@ fn run_resending_within(
         clock,
         deadline,
         &mut |handed, deadline| {
-            let ran = run_with_deadline(machine, command, request, deadline, handed);
+            let this = if first {
+                request
+            } else {
+                again.unwrap_or(request)
+            };
+            first = false;
+            let ran = run_with_deadline(machine, command, this, deadline, handed);
             let lost = ran.lost;
             Sent {
-                answered: keep_stderr(ran, request),
+                answered: keep_stderr(ran, this),
                 lost,
             }
         },
@@ -1310,6 +1350,7 @@ printf '%s' "$answer"
             command,
             request,
             None,
+            None,
             resends,
             &mut |r| told.push(r.clone()),
             &|d| {
@@ -1398,6 +1439,47 @@ printf '%s' "$answer"
             matches!(&told[..], [Resend::Lost { attempt: 1, .. }]),
             "{told:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resend_carries_the_rev_its_card_had_when_the_key_was_pressed() {
+        // Intent 0591, release 4: it waited before it went, so its backend checks the card is
+        // still as it was. The first send goes as it was asked.
+        let dir = tempfile::tempdir().unwrap();
+        let command = op_keeping_backend(dir.path());
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let again = with_rev(&request, Some("r-1a2b")).unwrap();
+        let waited = std::cell::Cell::new(Duration::ZERO);
+        let answered = run_resending_within(
+            &machine(),
+            &command,
+            &request,
+            Some(&again),
+            None,
+            true,
+            &mut |_| {},
+            &|d| waited.set(waited.get() + d),
+            &|| later(Clocks::now(), waited.get()),
+            Duration::from_millis(1500),
+        );
+        assert!(answered.result.unwrap().ok);
+        let sent: Vec<Value> = lines(dir.path(), "requests.log")
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].get("rev"), None);
+        assert_eq!(sent[1]["rev"], "r-1a2b");
+        assert_eq!(sent[0]["op"], sent[1]["op"]);
+        // Only a change carries it, and only one that has none.
+        assert_eq!(
+            with_rev(&json!({"action":"edit","id":"0041"}), Some("r")),
+            None
+        );
+        assert_eq!(with_rev(&again, Some("r-other")), None);
+        assert_eq!(with_rev(&request, None), None);
+        assert_eq!(with_rev(&request, Some("")), None);
     }
 
     #[cfg(unix)]
