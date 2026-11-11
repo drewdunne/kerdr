@@ -101,6 +101,9 @@ enum Change {
     Release(String),
     /// Who has it now, by its op.
     By(String, Option<String>),
+    /// The machine it's for now, and the request as it goes there, by its op: its card lives
+    /// there, a refusal said.
+    Moved(String, String, Value),
     Holds(String, bool),
 }
 
@@ -116,6 +119,12 @@ impl Change {
             Change::By(op, by) => {
                 for h in file.held.iter_mut().filter(|h| h.op() == op) {
                     h.by = by.clone();
+                }
+            }
+            Change::Moved(op, machine, request) => {
+                for h in file.held.iter_mut().filter(|h| h.op() == op) {
+                    h.machine = machine.clone();
+                    h.request = request.clone();
                 }
             }
             Change::Holds(name, yes) => {
@@ -400,6 +409,20 @@ impl Kept {
             h.by = None;
         }
         self.write(Change::By(op.to_string(), None));
+    }
+
+    /// A held change whose card, a refusal said, lives on another machine: it's for that one now,
+    /// going as `request`, still the same record with its op.
+    pub fn retarget(&mut self, op: &str, machine: &str, request: Value) {
+        let mut changed = false;
+        for h in self.held.iter_mut().filter(|h| h.op() == op) {
+            changed |= h.machine != machine || h.request != request;
+            h.machine = machine.to_string();
+            h.request = request.clone();
+        }
+        if changed {
+            self.write(Change::Moved(op.to_string(), machine.to_string(), request));
+        }
     }
 
     /// Whether another Kerdr open now has handed this one on.

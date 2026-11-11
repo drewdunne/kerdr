@@ -709,8 +709,12 @@ backend's after.
   answers with a backend that no longer lists `"hold"`, a held change isn't sent unchecked: it stays
   held, and Kerdr says once "d on #41 stays held: LAB-Server's backend no longer checks a held change
   again, so Kerdr won't send it unchecked. Press d again to send it now, or m then D drops it." One
-  that also waited behind a start, a save or a write-up is decided again by Kerdr itself, so it goes
-  all the same.
+  refused because its card lives on another machine (`home`) goes there with its `held` and `rev`,
+  and isn't sent there unchecked either: when that machine's backend doesn't list `"hold"`, Kerdr
+  says once "d on #41 stays held: it lives on build-box now, whose backend doesn't check a held
+  change again, so Kerdr won't send it unchecked. Press d again to send it now, or m then D drops
+  it." One that also waited behind a start, a save or a write-up is decided again by Kerdr itself, so
+  it goes all the same.
 
 **Kerdr's hold file.** A change to a card whose machine isn't answering, to a backend that listed
 `"hold"` when Kerdr last read it, goes into `held.json` in Kerdr's state folder (readable by you
@@ -719,7 +723,13 @@ card says "⧗ d waits for LAB-Server", and the message line "Held: d on #582 go
 answers (it dropped 40 s ago)." Once that machine answers, and its feed has been read since, the next
 read sends it as it was asked, with `held: true` and its `rev`; it leaves the file when it's answered,
 and the card says "⧗ d is on its way to LAB-Server" meanwhile. One sent that got no answer, or that a
-forwarder couldn't get through, waits in the file again, to go once more with the same `op`.
+forwarder couldn't get through, waits in the file again, to go once more with the same `op`. One
+refused because its card lives on another machine (`home`) stays the same entry, with its `op` and
+the time its key was pressed, for that machine now: sent on there, or through a machine that
+forwards, it leaves the file only once that answer comes or it's dropped; held for that machine when
+it isn't answering, it waits for it; and while two copies disagree about where the card lives, it
+waits for them to agree, then goes once more from the file, or leaves it when Kerdr says they still
+disagree. So a Kerdr that ends meanwhile leaves it for the next one, which sends it there once.
 Quitting doesn't lose it: the next Kerdr opened sends it, and nothing sends it while no Kerdr is
 open. One older than a day isn't sent: the card says "⧗ d dropped: LAB-Server didn't answer for a
 day".

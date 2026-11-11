@@ -233,6 +233,22 @@ impl App {
         rev: Option<String>,
         after: Option<String>,
     ) {
+        // A record from the hold file refused because its card lives on this machine, which
+        // isn't answering: it waits for it as itself, with its op, never as a second record.
+        if let Some((_, op)) = self
+            .redirecting
+            .take_if(|(_, op)| request["op"].as_str() == Some(op.as_str()))
+            && self.kept.find(&op).is_some()
+        {
+            let request = self.record_request(&op, &request);
+            self.kept.retarget(&op, &machine, request);
+            self.kept.unclaim(&op);
+            if let Some(entry) = self.kept.find(&op).cloned() {
+                self.say_held(&entry, true);
+            }
+            self.rebuild();
+            return;
+        }
         let reference = key
             .as_deref()
             .and_then(|k| self.card(k))
@@ -447,7 +463,7 @@ impl App {
     /// Sends one held change: only once this Kerdr has it to itself in the file, since another
     /// open now may be sending it, or have dropped it (Codex's review 60). It stays in the file,
     /// marked as this Kerdr's, until it's answered.
-    fn send_held(&mut self, machine: usize, entry: HeldRequest) {
+    pub(crate) fn send_held(&mut self, machine: usize, entry: HeldRequest) {
         let op = entry.op().to_string();
         if self.kept.claim(&op) != crate::kept::Claim::Mine {
             self.rebuild();
@@ -578,12 +594,16 @@ impl App {
         let response = result.as_ref().ok();
         if let Some(op) = &from_file {
             match response {
-                Some(r) if r.unreachable.is_none() => {
+                // Its forwarder couldn't get through, or no answer: it waits in the file again,
+                // for any Kerdr to send with the same op (Codex's review 60).
+                Some(r) if r.unreachable.is_some() => self.kept.unclaim(op),
+                // Refused because its card lives on another machine: it stays in the file while
+                // the answer is taken, which may send it on there (redirected).
+                Some(r) if r.sends_on() => self.redirecting = Some((n, op.clone())),
+                Some(_) => {
                     self.kept.release(op);
                 }
-                // No answer, or its forwarder couldn't get through: it waits in the file again,
-                // for any Kerdr to send with the same op (Codex's review 60).
-                _ => self.kept.unclaim(op),
+                None => self.kept.unclaim(op),
             }
         }
         if let Some(to) = response.and_then(|r| r.unreachable.clone()) {
@@ -661,6 +681,87 @@ impl App {
             });
         }
         false
+    }
+
+    /// Once the answer is taken that refused a hold-file record because its card lives on
+    /// another machine: it stays the same record, with its op, until what became of it is answered
+    /// or dropped, so a crash meanwhile can't lose it. Sent on there, it's for that machine now
+    /// and its change carries it; waiting for its two copies to agree, it's this Kerdr's still,
+    /// for the machine the refusal named; held for that machine, it waits in the file
+    /// (hold_request). Not sent on, said why, it was answered, and it leaves the file.
+    pub(crate) fn redirected(&mut self) {
+        let Some((n, op)) = self.redirecting.take() else {
+            return;
+        };
+        if self.kept.find(&op).is_none() {
+            return;
+        }
+        if let Some(job) = self.resolver.job(n) {
+            let (to, sent) = (job.machine, job.request.clone());
+            let through = sent.get("forward_to").is_some();
+            let name = sent["forward_to"]
+                .as_str()
+                .map(str::to_string)
+                .or_else(|| self.machines.get(to).map(|m| m.name()))
+                .unwrap_or_default();
+            let request = self.record_request(&op, &sent);
+            self.kept.retarget(&op, &name, request);
+            let decided = self.kept.find(&op).is_some_and(|h| h.after.is_some());
+            // That machine's backend doesn't check a held change again: it isn't sent there
+            // unchecked, as from the file (Codex's review 60, 11).
+            if !through && !decided && !self.holds_on(to) {
+                let key = job.key.clone();
+                self.resolver.take(n);
+                self.resent
+                    .retain(|(m, k)| !(*m == to && Some(k) == key.as_ref()));
+                self.kept.unclaim(&op);
+                self.held_unchecked.insert(op.clone());
+                if let Some(h) = self.kept.find(&op).cloned() {
+                    self.say(
+                        format!(
+                            "{} on {} stays held: it lives on {name} now, whose backend doesn't check a held change again, so Kerdr won't send it unchecked. Press {} again to send it now, or m then D drops it.",
+                            h.what, h.reference, h.what
+                        ),
+                        Tone::Warn,
+                    );
+                }
+                self.rebuild();
+                return;
+            }
+            self.held_sending.insert(n, op);
+            return;
+        }
+        let named = self
+            .catch_up
+            .disagreed
+            .iter()
+            .find(|d| d.request["op"].as_str() == Some(op.as_str()))
+            .map(|d| (d.named, d.request.clone()));
+        if let Some((named, sent)) = named {
+            let name = self.machines[named].name();
+            let request = self.record_request(&op, &sent);
+            self.kept.retarget(&op, &name, request);
+            return;
+        }
+        self.kept.release(&op);
+    }
+
+    /// What a hold-file record keeps of the request it went as: without what each send adds,
+    /// `held`, `forward_to`, and a `rev` the record keeps apart.
+    pub(crate) fn record_request(&self, op: &str, sent: &Value) -> Value {
+        let had_rev = self
+            .kept
+            .find(op)
+            .is_some_and(|h| h.request.get("rev").is_some());
+        let mut request = sent.clone();
+        if let Some(fields) = request.as_object_mut() {
+            fields.remove("held");
+            fields.remove("forward_to");
+            if !had_rev {
+                fields.remove("rev");
+            }
+        }
+        request
     }
 
     /// An account request its backend accepted and holds (a move for later, or one queued
@@ -957,6 +1058,10 @@ impl App {
                 let reference = &card.reference;
                 let said = match self.kept.drop_waiting(&op) {
                     crate::kept::Claim::Mine => {
+                        // One waiting for its copies to agree isn't sent once they do.
+                        self.catch_up
+                            .disagreed
+                            .retain(|d| d.request["op"].as_str() != Some(op.as_str()));
                         format!("Dropped: {what} on {reference} won't be sent.")
                     }
                     crate::kept::Claim::Taken => format!(
@@ -1294,6 +1399,14 @@ impl App {
                 continue;
             }
             let machine = self.machines[d.named].name();
+            // One from the hold file waits there again as itself, for that machine.
+            let op = d.request["op"].as_str().unwrap_or_default().to_string();
+            if self.kept.find(&op).is_some() {
+                let request = self.record_request(&op, &d.request);
+                self.kept.retarget(&op, &machine, request);
+                self.kept.unclaim(&op);
+                continue;
+            }
             self.kept.hold(HeldRequest {
                 machine,
                 reference: self.reference_for(&d.id),
@@ -3115,5 +3228,217 @@ mod tests {
         app.say("Something else.", Tone::Info);
         app.feed_read(m);
         assert_eq!(said(&app), "Something else.");
+    }
+
+    fn refused_for(home: &str) -> Result<Response, String> {
+        Ok(Response {
+            ok: false,
+            message: format!("It lives on {home} now; ⏎ again opens it there."),
+            home: Some(home.into()),
+            ..Default::default()
+        })
+    }
+
+    /// d held while its machine was away, sent from the file once it answered, and refused there
+    /// because its card lives on another machine, whose backend holds: that answer's job and
+    /// request, the other machine, and the record's op.
+    fn held_then_refused(app: &mut App) -> (u64, Value, usize, String) {
+        let (_, _, _, m) = waiting(app);
+        let other = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(app, m, HOLD);
+        supports(app, other, HOLD);
+        away(app, m, 5);
+        d(app);
+        let op = app.kept.held[0].op().to_string();
+        back(app, m);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        assert_eq!(request["op"], op.as_str());
+        let name = app.machines[other].name();
+        app.finish_job(n, request.clone(), refused_for(&format!("{name}/ARK")));
+        (n, request, other, op)
+    }
+
+    #[test]
+    fn a_held_change_refused_for_another_home_stays_one_record_until_that_home_answers() {
+        // After Codex's review 60: refused because its card lives on another machine, a held
+        // change goes there as the same record, with its op, and leaves the file only once that
+        // machine answers.
+        let mut app = app();
+        let (n, _, other, op) = held_then_refused(&mut app);
+        let name = app.machines[other].name();
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        let (again_n, to, again, _) = ready[0].clone();
+        assert_eq!((again_n, to), (n, other));
+        assert_eq!(again["op"], op.as_str());
+        assert_eq!(
+            app.kept.held.len(),
+            1,
+            "it left the file before that machine answered"
+        );
+        assert_eq!(app.kept.held[0].op(), op);
+        assert_eq!(app.kept.held[0].machine, name);
+        assert!(app.kept.held[0].request.get("held").is_none());
+        app.finish_job(n, again, ok(json!({})));
+        assert!(app.kept.held.is_empty());
+
+        // A Kerdr that ends before that answer leaves it in the file, for that machine: the next
+        // one sends it there once, still with its op, `held` and the card's rev then.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = self::app();
+        app.kept = Kept::at(dir.path(), app.now().timestamp());
+        let (_, _, other, op) = held_then_refused(&mut app);
+        drop(app);
+        let mut next = self::app();
+        next.kept = Kept::at(dir.path(), next.now().timestamp());
+        waiting(&mut next);
+        supports(&mut next, other, HOLD);
+        assert_eq!(next.kept.held.len(), 1);
+        assert_eq!(next.kept.held[0].machine, next.machines[other].name());
+        back(&mut next, other);
+        let ready = next.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&next));
+        let (n, to, request, _) = ready[0].clone();
+        assert_eq!(to, other);
+        assert_eq!(request["op"], op.as_str());
+        assert_eq!(request["held"], true);
+        assert_eq!(request["rev"], "r1");
+        next.feed_read(other);
+        assert!(next.resolver.ready().is_empty(), "sent twice");
+        next.finish_job(n, request, ok(json!({})));
+        assert!(next.kept.held.is_empty());
+    }
+
+    #[test]
+    fn a_held_change_refused_for_a_home_that_isnt_answering_waits_for_it_as_itself() {
+        let mut app = app();
+        let (key, _, reference, m) = waiting(&mut app);
+        let other = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(&mut app, m, HOLD);
+        supports(&mut app, other, HOLD);
+        away(&mut app, m, 5);
+        d(&mut app);
+        let op = app.kept.held[0].op().to_string();
+        back(&mut app, m);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        away(&mut app, other, 7);
+        let name = app.machines[other].name();
+        app.finish_job(n, request, refused_for(&format!("{name}/ARK")));
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 1, "{:?}", app.kept.held);
+        let h = app.kept.held[0].clone();
+        assert_eq!((h.op(), h.machine.as_str()), (op.as_str(), name.as_str()));
+        assert_eq!(h.by, None, "not waiting for a Kerdr's answer any more");
+        assert!(h.request.get("held").is_none() && h.request.get("rev").is_none());
+        assert_eq!(h.rev.as_deref(), Some("r1"));
+        assert_eq!(
+            said(&app),
+            format!("Held: d on {reference} goes when {name} answers (it dropped 7 s ago).")
+        );
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some(format!("⧗ d waits for {name}").as_str())
+        );
+    }
+
+    #[test]
+    fn a_held_change_refused_for_a_home_whose_backend_doesnt_check_one_stays_held() {
+        // Codex's review 60, 11, for the machine a refusal names: a held change isn't sent there
+        // unchecked.
+        let mut app = app();
+        let (key, _, reference, m) = waiting(&mut app);
+        let other = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(&mut app, m, HOLD);
+        away(&mut app, m, 5);
+        d(&mut app);
+        back(&mut app, m);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        let name = app.machines[other].name();
+        app.finish_job(n, request, refused_for(&format!("{name}/ARK")));
+        assert!(app.resolver.ready().is_empty(), "sent unchecked");
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].machine, name);
+        assert_eq!(
+            said(&app),
+            format!(
+                "d on {reference} stays held: it lives on {name} now, whose backend doesn't check a held change again, so Kerdr won't send it unchecked. Press d again to send it now, or m then D drops it."
+            )
+        );
+        // Its machine read again: still not sent, and not said again.
+        app.say("Something else.", Tone::Info);
+        app.feed_read(other);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(said(&app), "Something else.");
+        assert_eq!(peek_drop(&mut app, &key), Action::None);
+        assert!(app.kept.held.is_empty());
+    }
+
+    #[test]
+    fn a_held_change_whose_copies_disagree_stays_one_record_until_sent_said_or_dropped() {
+        // Sent on to the home a refusal named, and refused there naming the first machine: it
+        // waits for both copies to agree as the same record, this Kerdr's, for the machine named
+        // last. Once they agree it goes from the file, checked as any held change; m's D drops
+        // it; two minutes on it leaves the file once that's said; q leaves it in the file.
+        let disagreeing = || {
+            let dir = tempfile::tempdir().unwrap();
+            let mut app = app();
+            app.kept = Kept::at(dir.path(), app.now().timestamp());
+            let (n, _, other, op) = held_then_refused(&mut app);
+            let (_, _, again, _) = app.resolver.ready()[0].clone();
+            let m = (0..app.machines.len())
+                .find(|&i| i != other && app.machines[i].feed.is_some())
+                .unwrap();
+            let first = app.machines[m].name();
+            app.finish_job(n, again, refused_for(&format!("{first}/ARK")));
+            assert_eq!(app.catch_up.disagreed.len(), 1, "{}", said(&app));
+            assert_eq!(app.kept.held.len(), 1);
+            assert_eq!(app.kept.held[0].op(), op);
+            assert_eq!(app.kept.held[0].machine, first);
+            assert!(app.kept.held[0].by.is_some(), "this Kerdr's while it waits");
+            (app, m, op, dir)
+        };
+        let (mut app, m, op, _dir) = disagreeing();
+        let key = app.kept.held[0].key.clone().unwrap();
+        let first = app.machines[m].name();
+        crate::app::catch_up::tests::homes_say(&mut app, &key, &first);
+        app.catch_up_read(0, true);
+        app.catch_up_read(1, true);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        let (n, to, request, _) = ready[0].clone();
+        assert_eq!(to, m);
+        assert_eq!(request["op"], op.as_str());
+        assert_eq!(request["held"], true);
+        assert_eq!(request["rev"], "r1");
+        assert_eq!(app.kept.held.len(), 1, "until that machine answers");
+        app.finish_job(n, request, ok(json!({})));
+        assert!(app.kept.held.is_empty());
+
+        let (mut app, _, _, _dir) = disagreeing();
+        let key = app.kept.held[0].key.clone().unwrap();
+        peek_drop(&mut app, &key);
+        assert!(app.kept.held.is_empty());
+        assert!(app.catch_up.disagreed.is_empty(), "sent once they agree");
+
+        let (mut app, m, _, _dir) = disagreeing();
+        app.catch_up.disagreed[0].since = Instant::now() - crate::app::catch_up::AGREE_WITHIN;
+        app.catch_up_read(m, false);
+        assert!(app.catch_up.disagreed.is_empty());
+        assert!(app.kept.held.is_empty());
+
+        let (mut app, m, op, _dir) = disagreeing();
+        assert!(!app.quit_key());
+        assert!(app.quit_key(), "{}", said(&app));
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].op(), op);
+        assert_eq!(app.kept.held[0].machine, app.machines[m].name());
+        assert_eq!(app.kept.held[0].by, None);
     }
 }

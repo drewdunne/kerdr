@@ -3121,11 +3121,15 @@ impl App {
             && self.drop_answered(&request, response)
         {
             self.resolver.take(n);
+            self.redirected();
             return;
         }
         let to = request["forward_to"].as_str().map(str::to_string);
         let via = result.as_ref().ok().and_then(|r| r.via.clone());
         self.finish_job_answered(n, request, result);
+        // A hold-file record refused because its card lives elsewhere stays one record until
+        // what became of it is answered (holding::redirected).
+        self.redirected();
         self.note_via(to, via);
         // A start or a save answered: what waited behind it is decided again.
         self.release_behind();

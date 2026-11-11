@@ -158,6 +158,19 @@ impl App {
         {
             request["session"] = json!(session);
         }
+        // A hold-file record: it goes from the file, as itself, for that machine now, and is
+        // checked there as any held change is (holding::send_held).
+        if !op.is_empty() && self.kept.find(&op).is_some() {
+            self.catch_up.agreed_once.push(op.clone());
+            self.resent.push((home, d.key));
+            let name = self.machines[home].name();
+            let request = self.record_request(&op, &request);
+            self.kept.retarget(&op, &name, request);
+            if let Some(entry) = self.kept.find(&op).cloned() {
+                self.send_held(home, entry);
+            }
+            return;
+        }
         self.action_from = d.from.or_else(|| self.card(&d.key).map(CardSnapshot::of));
         self.action_key = Some(d.key.clone());
         let before = self.resolver.last_added();
@@ -187,6 +200,12 @@ impl App {
             }
         };
         let kept = self.edit_kept(&d.request);
+        // A hold-file record it was leaves the file: nothing more is sent.
+        if let Some(op) = d.request["op"].as_str()
+            && self.kept.find(op).is_some()
+        {
+            self.kept.release(op);
+        }
         let (a, b) = (says(self, d.asked), says(self, d.named));
         self.fail(format!(
             "{reference}'s copies still disagree about where it lives after two minutes: {a}, and {b}. One of them is behind, so nothing was changed. Try again once they agree.{kept}"

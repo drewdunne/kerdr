@@ -863,6 +863,10 @@ pub struct App {
     /// The op of the hold-file record a change being queued again is (release_behind, send_held):
     /// held again for its machine, it waits in the file as itself, never as a second record.
     pub(crate) carrying: Option<String>,
+    /// A hold-file record whose change was refused because its card lives on another machine,
+    /// by job and op, while that answer is taken: sent on there, held for it or waiting for its
+    /// copies to agree, it stays the same record; otherwise it leaves the file (holding::redirected).
+    pub(crate) redirecting: Option<(u64, String)>,
     /// Drops m's D asked the runner for, by job, with the change and its card in words: its
     /// answer says whether it was in time (holding::job_drop_answered).
     pub(crate) drops_asked: std::collections::HashMap<u64, (String, String)>,
@@ -1006,6 +1010,7 @@ impl App {
             kept: crate::kept::Kept::in_memory(),
             held_sending: Default::default(),
             carrying: None,
+            redirecting: None,
             drops_asked: Default::default(),
             held_unchecked: Default::default(),
             held_tried: Default::default(),
