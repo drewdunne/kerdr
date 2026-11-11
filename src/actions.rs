@@ -110,6 +110,192 @@ pub struct Response {
     /// On a failed test: the sign-in is what's wrong, so the way to fix it can open (intent 0591).
     #[serde(default)]
     pub sign_in: bool,
+    /// With `sign_in` on a move or the current account: the account to sign in there (intent 0591,
+    /// release 3).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// With a question: the answers it offers beyond yes and no, each sent back as the same request
+    /// with `choice` and the question's `confirm` (intent 0591, release 3).
+    #[serde(default, deserialize_with = "choices")]
+    pub choices: Vec<Choice>,
+    /// With a saved list (`account-models`): the running agents it leaves on accounts that aren't
+    /// on it, each moved to the list by an `account-move` with `"to": "list"` (intent 0591, B3-42).
+    #[serde(default, deserialize_with = "off_list")]
+    pub off_list: Vec<OffList>,
+    /// With a refused move: its agent wasn't running, and `why` says how ("gone": it runs nowhere
+    /// on that machine now) (intent 0591, B3-05).
+    #[serde(default)]
+    pub not_running: bool,
+    #[serde(default, deserialize_with = "plain_word")]
+    pub why: Option<String>,
+    /// With Kickoff answers whose questions changed while he answered: his answers to those, as
+    /// Kerdr sent them, for the box to fill in again on the question with the same number, for him
+    /// to check (intent 0591, B1-108). The rest were saved.
+    #[serde(default, deserialize_with = "prefill")]
+    pub prefill: Vec<Prefill>,
+}
+
+/// One Kickoff answer that couldn't be saved, because its question changed while he answered: the
+/// question's number, and his words, or none when he took its recommendation (intent 0591).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Prefill {
+    pub num: String,
+    pub text: Option<String>,
+}
+
+/// `prefill` as a backend gives it: `[{"num","text"}]` or `[{"num","take":true}]`, in its order;
+/// anything else (not a list, an entry with no number, or with neither) is passed over, never a
+/// failed answer.
+fn prefill<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Prefill>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let num = v["num"]
+                .as_str()
+                .map(str::trim)
+                .filter(|n| !n.is_empty() && n.len() <= 16)?
+                .to_string();
+            let text = match v["text"].as_str().map(str::trim) {
+                Some(text) if !text.is_empty() => Some(text.to_string()),
+                _ if v["take"] == true => None,
+                _ => return None,
+            };
+            Some(Prefill { num, text })
+        })
+        .collect())
+}
+
+/// A short word as a backend gives it; anything else is none, never a failed answer.
+fn plain_word<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_str()
+        .filter(|w| !w.is_empty() && w.len() <= 40)
+        .map(str::to_string))
+}
+
+/// A running agent a saved list leaves on another account (intent 0591, B3-42): what an
+/// `account-move` names it by, the account it's on, and the intent it works when there is one.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OffList {
+    pub pane: String,
+    pub session: String,
+    pub conversation: String,
+    pub account: String,
+    pub intent: Option<String>,
+}
+
+/// `off_list` as a backend gives it: each entry naming its pane, in its order; anything else (not
+/// a list, an entry with no pane, a field of another shape) is passed over, never a failed answer.
+fn off_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<OffList>, D::Error> {
+    let value = Value::deserialize(d)?;
+    let text = |v: &Value, field: &str| {
+        v[field]
+            .as_str()
+            .map(str::trim)
+            .filter(|s| !s.is_empty() && !s.chars().any(char::is_control))
+            .map(str::to_string)
+    };
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            Some(OffList {
+                pane: text(v, "pane")?,
+                session: text(v, "session").unwrap_or_default(),
+                conversation: text(v, "conversation").unwrap_or_default(),
+                account: text(v, "account").unwrap_or_default(),
+                intent: text(v, "intent"),
+            })
+        })
+        .collect())
+}
+
+/// One answer a question offers beyond yes and no (intent 0591): "queue it", "shelve the oldest",
+/// "ask it to wrap up instead". `id` is the backend's own short word, sent back as `choice`; `label`
+/// a few plain words; `key` the one lowercase letter it suggests, which Kerdr uses unless it's taken.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Choice {
+    pub id: String,
+    #[serde(default)]
+    pub key: String,
+    pub label: String,
+}
+
+/// The most choices one question shows: each takes a line of the box.
+const MOST_CHOICES: usize = 6;
+
+impl Choice {
+    /// A choice Kerdr can offer: an id that's a short plain word, sent back as it came, and a label
+    /// with something to say. Its label is kept to one line's worth.
+    fn usable(mut self) -> Option<Choice> {
+        let id_ok = !self.id.is_empty()
+            && self.id.len() <= 40
+            && self
+                .id
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'));
+        self.label = self
+            .label
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect::<String>()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if self.label.chars().count() > 80 {
+            self.label = format!(
+                "{}…",
+                self.label.chars().take(79).collect::<String>().trim_end()
+            );
+        }
+        (id_ok && !self.label.is_empty()).then_some(self)
+    }
+}
+
+/// `choices` as a backend gives them: each usable one, in its order, at most MOST_CHOICES, and no
+/// id twice; anything else (not a list, an entry of another shape) is passed over, never a failed
+/// answer, so a question still asks yes or no.
+fn choices<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Choice>, D::Error> {
+    let value = Value::deserialize(d)?;
+    let mut out: Vec<Choice> = vec![];
+    for item in value.as_array().into_iter().flatten() {
+        let Some(choice) = serde_json::from_value::<Choice>(item.clone())
+            .ok()
+            .and_then(Choice::usable)
+        else {
+            continue;
+        };
+        if out.len() < MOST_CHOICES && !out.iter().any(|c| c.id == choice.id) {
+            out.push(choice);
+        }
+    }
+    Ok(out)
+}
+
+/// The keys a question's choices answer to, in their order (intent 0591): each the letter its
+/// backend suggests, unless that's taken (y, n and q answer the question itself, and an earlier
+/// choice may have it), else the next free digit, 1 to 9. None for one that gets no key.
+pub fn choice_keys(choices: &[Choice]) -> Vec<Option<char>> {
+    let mut taken: Vec<char> = vec!['y', 'n', 'q'];
+    let mut out = vec![];
+    for choice in choices {
+        let mut letters = choice.key.chars();
+        let suggested = match (letters.next(), letters.next()) {
+            (Some(c), None) if c.is_ascii_lowercase() && !taken.contains(&c) => Some(c),
+            _ => None,
+        };
+        let key = suggested.or_else(|| ('1'..='9').find(|d| !taken.contains(d)));
+        if let Some(k) = key {
+            taken.push(k);
+        }
+        out.push(key);
+    }
+    out
 }
 
 impl Response {
@@ -1733,6 +1919,109 @@ printf '%s' '{{"ok":true,"message":"Marked #41 done."}}'
             "the same request, the same op"
         );
         assert_eq!(lines(dir.path(), "done.log").len(), 1);
+    }
+
+    #[test]
+    fn prefill_is_read_leniently_and_a_backend_without_it_gives_none() {
+        let read = |prefill: &str| {
+            parse_response(&format!(
+                r#"{{"ok":false,"message":"changed","prefill":{prefill}}}"#
+            ))
+            .unwrap()
+            .prefill
+        };
+        assert_eq!(
+            read(
+                r#"[{"num":"1","text":" mine "},{"num":"2","take":true},{"num":"3"},{"text":"x"},{"num":"4","text":"  ","take":true},"x"]"#
+            ),
+            [
+                Prefill {
+                    num: "1".into(),
+                    text: Some("mine".into())
+                },
+                Prefill {
+                    num: "2".into(),
+                    text: None
+                },
+                Prefill {
+                    num: "4".into(),
+                    text: None
+                },
+            ]
+        );
+        assert!(read(r#""x""#).is_empty());
+        assert!(read("null").is_empty());
+        assert!(
+            parse_response(r#"{"ok":true,"message":"saved"}"#)
+                .unwrap()
+                .prefill
+                .is_empty()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_account_start_or_resume_answered_retry_is_sent_again_with_its_op_and_done_once() {
+        // Account requests that change something follow `retry` by themselves too (intent 0591):
+        // the same op, quietly, and the backend starts it once.
+        for request in [
+            json!({"action":"account-start","session":"web","workspace":"w7","to":"ARK_C"}),
+            json!({"action":"account-resume","session":"web","conversation":"c-0123","label":"scratch"}),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = quote(dir.path().to_str().unwrap());
+            let command = fixture(
+                dir.path(),
+                &format!(
+                    r##"req=$(cat)
+printf '%s\n' "$req" >> {d}/requests.log
+if [ "$(wc -l < {d}/requests.log)" -lt 2 ]; then
+  printf '%s' '{{"ok":false,"retry":3,"message":"herdr in web is slow to answer; nothing started yet."}}'
+  exit 0
+fi
+echo started >> {d}/done.log
+printf '%s' '{{"ok":true,"session":"web","workspace":"w9","label":"scratch","tab":"t9","message":"Started it in scratch."}}'
+"##
+                ),
+                "",
+            );
+            let request = with_op(request);
+            let (answered, told, waits) = resent(&command, &request, true, Duration::from_secs(20));
+            let r = answered.result.unwrap();
+            assert!(r.ok && r.workspace.as_deref() == Some("w9"), "{r:?}");
+            assert_eq!(waits, [Duration::from_secs(3)]);
+            assert!(
+                matches!(&told[..], [Resend::Retry { message, .. }] if message.contains("slow to answer")),
+                "{told:?}"
+            );
+            let sent = lines(dir.path(), "requests.log");
+            assert_eq!(sent.len(), 2);
+            assert_eq!(sent[0], sent[1], "the same request, the same op");
+            assert!(sent[0].contains(request["op"].as_str().unwrap()));
+            assert_eq!(lines(dir.path(), "done.log").len(), 1, "started twice");
+        }
+        // A lost answer to one is sent again too, with its op, to a backend that keeps ops.
+        let resume = with_op(
+            json!({"action":"account-resume","session":"web","conversation":"c-0123","label":"scratch"}),
+        );
+        let (answered, told, sends) = over_ssh(
+            &resume,
+            true,
+            vec![
+                timed_out(),
+                output(
+                    0,
+                    r#"{"ok":true,"repeat":true,"session":"web","workspace":"w9","label":"scratch","message":"Resumed it in scratch."}"#,
+                    "",
+                ),
+            ],
+        );
+        assert!(answered.result.unwrap().ok);
+        assert_eq!(sends, 2);
+        assert!(
+            matches!(&told[..], [Resend::Lost { attempt: 1, .. }]),
+            "{told:?}"
+        );
     }
 
     #[cfg(unix)]

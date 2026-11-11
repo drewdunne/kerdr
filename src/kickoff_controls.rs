@@ -10,7 +10,7 @@
 //! carry the token of what they answered, so the backend still refuses any it wasn't asking.
 
 use super::*;
-use crate::actions::{Question, Response};
+use crate::actions::{Prefill, Question, Response};
 use crate::model::CardSnapshot;
 use serde_json::{Value, json};
 use std::cell::Cell;
@@ -62,6 +62,39 @@ fn drafts_for(questions: &[Question], kept: &[KeptAnswer]) -> Vec<String> {
         .collect()
 }
 
+/// His answers that couldn't be saved, because their questions changed while he answered, filled
+/// in again on the question with the same number where nothing's typed (intent 0591, B1-108): his
+/// words, for him to check. One he took the recommendation for stays as it is, the recommendation.
+/// The numbers it filled.
+fn fill_in(questions: &[Question], drafts: &mut [String], prefill: &[Prefill]) -> Vec<String> {
+    let mut filled = vec![];
+    for (q, draft) in questions.iter().zip(drafts.iter_mut()) {
+        if !draft.trim().is_empty() {
+            continue;
+        }
+        if let Some(text) = prefill
+            .iter()
+            .find(|p| p.num == q.num)
+            .and_then(|p| p.text.as_deref())
+        {
+            *draft = as_filled(text);
+            filled.push(q.num.clone());
+        }
+    }
+    filled
+}
+
+/// Words given back, as the box shows them.
+fn as_filled(text: &str) -> String {
+    clean(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(ANSWER_MOST)
+        .collect()
+}
+
 /// A note with any words typed against an old wording after it.
 fn with_orphaned(note: Option<String>, orphaned: &[String]) -> Option<String> {
     if orphaned.is_empty() {
@@ -97,6 +130,9 @@ pub struct Kickoff {
     /// Words typed for a question the check found changed: they're no answer to the new one, so
     /// they stay in the note, and go with the rest of what's kept if he leaves (intent 0491).
     pub orphaned: Vec<String>,
+    /// His answers its backend gave back because their questions changed while he answered:
+    /// filled in by number, again after a check finds the questions changed (intent 0591).
+    pub prefill: Vec<Prefill>,
     pub ready_at: Instant,
     /// How far the question's text is scrolled, on a screen too small for it, and how far it can
     /// be, which only drawing it can tell.
@@ -131,7 +167,8 @@ impl Kickoff {
             request["session"] = json!(session);
         }
         let questions = cleaned(&response.questions);
-        let drafts = drafts_for(&questions, kept);
+        let mut drafts = drafts_for(&questions, kept);
+        fill_in(&questions, &mut drafts, &response.prefill);
         let orphaned: Vec<String> = kept
             .iter()
             .filter(|(num, ..)| num.is_empty())
@@ -155,6 +192,7 @@ impl Kickoff {
             note: with_orphaned(response.note.as_deref().map(clean), &orphaned),
             check: 0,
             orphaned,
+            prefill: response.prefill.clone(),
             ready_at: Instant::now() + READY_AFTER,
             scroll: Cell::new(0),
             scroll_most: Cell::new(0),
@@ -180,15 +218,27 @@ impl Kickoff {
         if now != self.questions {
             let kept = self.kept();
             self.drafts = drafts_for(&now, &kept);
+            // Answers given back to fill in go on the question with their number, as reworded now.
+            let filled = fill_in(&now, &mut self.drafts, &self.prefill);
             // Words typed against the old wording can't be answers to the new one, but they were
             // typed while this box was up, so they stay on screen rather than vanish (intent 0491).
-            self.orphaned.extend(
-                kept.iter()
-                    .filter(|(num, question, _)| {
-                        !now.iter().any(|q| q.num == *num && q.question == *question)
+            // Words given back that are filled in again aren't lost, so they aren't said twice.
+            let refilled = |num: &String, words: &String| {
+                filled.contains(num)
+                    && self.prefill.iter().any(|p| {
+                        p.num == *num
+                            && p.text.as_deref().map(as_filled).as_deref() == Some(words.as_str())
                     })
-                    .map(|(.., words)| clean(words)),
-            );
+            };
+            let lost: Vec<String> = kept
+                .iter()
+                .filter(|(num, question, words)| {
+                    !now.iter().any(|q| q.num == *num && q.question == *question)
+                        && !refilled(num, words)
+                })
+                .map(|(.., words)| clean(words))
+                .collect();
+            self.orphaned.extend(lost);
             self.questions = now;
             self.at = 0;
             self.reached = 0;
@@ -270,14 +320,20 @@ impl App {
         if self.kickoff_sent.contains(&preloaded.asked) {
             return None;
         }
+        // His answers given back when their questions changed, filled in again (intent 0591).
         let response = Response {
             asked: Some(preloaded.asked.clone()),
             questions: preloaded.questions.clone(),
+            prefill: self
+                .kickoff_prefill
+                .get(&card.key)
+                .cloned()
+                .unwrap_or_default(),
             ..Default::default()
         };
         let kept = self
             .kickoff_kept
-            .get(&detail.id)
+            .get(&card.key)
             .cloned()
             .unwrap_or_default();
         let mut form = Kickoff::from_answer(
@@ -292,6 +348,10 @@ impl App {
         form.check = self.kickoff_checks;
         let check = form.check;
         let id = detail.id.clone();
+        // In the box now: kept there, and with what's typed if he leaves it.
+        self.kickoff_prefill.remove(&card.key);
+        // Its check is this card's, by key (Codex's seventh look).
+        self.action_key = Some(card.key.clone());
         self.mode = Mode::Kickoff {
             form,
             back: Box::new(self.mode.clone()),
@@ -312,7 +372,7 @@ impl App {
         request: &Value,
         result: Result<Response, String>,
     ) {
-        let Mode::Kickoff { form, back, .. } = &mut self.mode else {
+        let Mode::Kickoff { form, back, target } = &mut self.mode else {
             return;
         };
         if form.request["id"] != request["id"] || request["check"] != json!(form.check) {
@@ -332,9 +392,9 @@ impl App {
             }
             // None left to ask, or it can't be answered now: the box goes, keeping what's typed.
             Ok(response) => {
-                let (form, back) = (form.clone(), back.clone());
+                let (form, back, target) = (form.clone(), back.clone(), target.clone());
                 self.kickoff_sent.insert(form.asked.clone());
-                self.keep_kickoff(&form);
+                self.keep_kickoff(&form, target.as_deref());
                 self.mode = *back;
                 if response.ok {
                     self.say(response.message, Tone::Info);
@@ -358,7 +418,7 @@ impl App {
                 return if form.reached > 0 {
                     self.leave_kickoff(form, target, Leaving::Keep)
                 } else {
-                    self.keep_kickoff(&form);
+                    self.keep_kickoff(&form, target.as_deref());
                     Action::None
                 };
             }
@@ -438,11 +498,13 @@ impl App {
         Action::None
     }
 
-    /// Keeps what's typed in the box until it's saved, for when `d` opens it again.
-    fn keep_kickoff(&mut self, form: &Kickoff) {
+    /// Keeps what's typed in the box until it's saved, for when `d` opens it again: for its own
+    /// card, by key, never another source's with the same number (Codex's fifth look).
+    fn keep_kickoff(&mut self, form: &Kickoff, target: Option<&CardSnapshot>) {
         let Some(id) = form.request["id"].as_str() else {
             return;
         };
+        let held = self.intent_key(form.machine, id, target);
         let mut kept = form.kept();
         // No question of their own: an empty number marks them for the next box's note.
         kept.extend(
@@ -451,19 +513,18 @@ impl App {
                 .map(|words| (String::new(), String::new(), words.clone())),
         );
         if kept.is_empty() {
-            self.kickoff_kept.remove(id);
+            self.kickoff_kept.remove(&held);
         } else {
-            self.kickoff_kept.insert(id.to_string(), kept);
+            self.kickoff_kept.insert(held, kept);
         }
     }
 
-    /// What a failure adds when it has words of yours in hand: where they went.
-    pub(super) fn kickoff_kept_note(&self, request: &Value) -> &'static str {
+    /// What a failure adds when it has words of yours in hand: where they went. `held` is its
+    /// card's key.
+    pub(super) fn kickoff_kept_note(&self, request: &Value, held: Option<&str>) -> &'static str {
         let holds = matches!(request["action"].as_str(), Some("dispatch" | "answer"))
             && request.get("answers").is_some()
-            && request["id"]
-                .as_str()
-                .is_some_and(|id| self.kickoff_kept.contains_key(id));
+            && held.is_some_and(|k| self.kickoff_kept.contains_key(k));
         if holds {
             " Your answers are kept: d opens them again."
         } else {
@@ -509,19 +570,15 @@ impl App {
         target: Option<Box<CardSnapshot>>,
         how: Leaving,
     ) -> Action {
-        self.keep_kickoff(&form);
-        if !self.kickoff_still_applies(&form) {
-            self.say(
-                "That intent changed while you were answering, so nothing was sent. Select it again.",
-                Tone::Warn,
-            );
-            return Action::None;
-        }
+        self.keep_kickoff(&form, target.as_deref());
         let answered = if matches!(how, Leaving::Start) {
             form.questions.len()
         } else {
             form.reached
         };
+        if !self.kickoff_still_applies(&form) {
+            return self.answers_for_changed_work(form, target.map(|t| *t), answered);
+        }
         // The feed still has these until its next read: d goes by the backend's answer till then.
         if answered > 0 {
             self.kickoff_sent.insert(form.asked.clone());
@@ -550,6 +607,65 @@ impl App {
         let action = self.emit_mutation(form.machine, request);
         if matches!(action, Action::Mutate { .. }) {
             self.action_from = target.map(|t| *t);
+        }
+        action
+    }
+
+    /// The card stopped being unstarted work there while he answered (it started, was set aside or
+    /// moved home): what he answered is saved on it anyway, where it lives now, and nothing starts.
+    /// The questions' token goes with them, so its backend saves none for questions that changed
+    /// (intent 0591, K1-76). A backend from before that refuses in its own words, and the box keeps
+    /// his words for the next d either way.
+    fn answers_for_changed_work(
+        &mut self,
+        form: Kickoff,
+        from: Option<CardSnapshot>,
+        answered: usize,
+    ) -> Action {
+        let id = form.request["id"].as_str().unwrap_or_default().to_string();
+        // Its own card, never another source's with the same number (Codex's review).
+        let card = self.intent_card(form.machine, &id, from.as_ref()).cloned();
+        let Some(card) = card else {
+            self.say(
+                format!(
+                    "{} is gone from the board while you answered, so your answers weren't sent; they're kept for its next d.",
+                    form.reference
+                ),
+                Tone::Warn,
+            );
+            return Action::None;
+        };
+        // As it was when the box opened: unstarted work, not set aside, with no workspace.
+        let then = from.unwrap_or_else(|| CardSnapshot {
+            workspace: None,
+            waiting: true,
+            done: false,
+            dismissed: false,
+            ..CardSnapshot::of(&card)
+        });
+        let changed = crate::app::asking::what_changed(&then, &card);
+        if answered == 0 {
+            self.say(format!("{changed}, so nothing was sent."), Tone::Warn);
+            return Action::None;
+        }
+        let Some(machine) = self.home_machine(&card) else {
+            // Its home isn't one of Kerdr's machines: home_machine said so.
+            return Action::None;
+        };
+        self.kickoff_sent.insert(form.asked.clone());
+        let request = json!({
+            "action": "answer",
+            "id": id,
+            "asked": form.asked,
+            "answers": form.answers(answered),
+        });
+        let action = self.emit_mutation(machine, request);
+        if matches!(action, Action::Mutate { .. }) {
+            self.action_from = Some(CardSnapshot::of(&card));
+            self.say(
+                format!("{changed}; saving your answers on it, and nothing starts."),
+                Tone::Info,
+            );
         }
         action
     }
@@ -626,6 +742,11 @@ mod tests {
 
     fn open(response: &Response) -> App {
         open_on(response).0
+    }
+
+    /// The key the demo's card for record `id` has, which what's kept for it goes by.
+    fn held(id: &str) -> String {
+        format!("demo:{id}")
     }
 
     /// Presses a key, past the wait a new question has.
@@ -908,6 +1029,36 @@ mod tests {
     }
 
     #[test]
+    fn answers_given_back_fill_in_a_box_opened_from_the_feed_and_survive_its_check() {
+        // Intent 0591, B1-108: his answers to questions that changed, given back by an earlier
+        // save, fill in the box d opens from the questions the feed read ahead, by number; and
+        // when the check behind it finds them reworded again, they go on the new wording.
+        let (mut app, card) = preloaded(vec![
+            question("1", "Whose is it?", "Kibbelz"),
+            question("3", "Where does it run, now?", "The server"),
+        ]);
+        app.kickoff_prefill.insert(
+            card.key.clone(),
+            vec![Prefill {
+                num: "3".into(),
+                text: Some("on  the laptop".into()),
+            }],
+        );
+        let request = sent(d(&mut app, &card));
+        assert_eq!(showing(&app).drafts, ["", "on the laptop"]);
+        assert!(!app.kickoff_prefill.contains_key(&card.key));
+        let mut now = answer();
+        now.questions = vec![
+            question("1", "Whose is it?", "Kibbelz"),
+            question("3", "Where should it run?", "The server"),
+        ];
+        app.finish_kickoff_check(0, &request, Ok(now));
+        let form = showing(&app);
+        assert_eq!(form.drafts, ["", "on the laptop"]);
+        assert_eq!(form.note.as_deref(), Some(CHANGED), "said twice");
+    }
+
+    #[test]
     fn the_check_says_only_that_they_changed_when_no_words_were_lost() {
         let (mut app, card) = preloaded(vec![question("1", "An old question?", "Yes")]);
         let request = sent(d(&mut app, &card));
@@ -971,7 +1122,7 @@ mod tests {
         assert!(!matches!(app.mode, Mode::Kickoff { .. }));
         // Reopened from the feed, once it has caught up: the words are in the note, no answer.
         let id = card.detail.as_ref().unwrap().id.clone();
-        let kept = app.kickoff_kept[&id].clone();
+        let kept = app.kickoff_kept[&card.key].clone();
         let form =
             Kickoff::from_answer(0, &json!({"id": id}), &now, "#41".into(), "t".into(), &kept)
                 .unwrap();
@@ -993,10 +1144,7 @@ mod tests {
         app.finish_kickoff_check(0, &request, Ok(done));
         assert!(matches!(app.mode, Mode::Board));
         assert!(app.message().unwrap().0.contains("d starts it"));
-        assert_eq!(
-            app.kickoff_kept[&request["id"].as_str().unwrap().to_string()][0].2,
-            "kept"
-        );
+        assert_eq!(app.kickoff_kept[&card.key][0].2, "kept");
         // A refusal, in red: it started elsewhere, say.
         let request = sent(d(&mut app, &card));
         let refused = Response {
@@ -1154,8 +1302,11 @@ mod tests {
         key(&mut app, KeyCode::Enter);
         let request = sent(key(&mut app, KeyCode::Enter));
         assert_eq!(request["answers"][0]["text"], "mine");
-        assert!(app.kickoff_kept_note(&request).contains("kept"));
-        let kept = app.kickoff_kept.get(&id).cloned().unwrap();
+        assert!(
+            app.kickoff_kept_note(&request, Some(&held(&id)))
+                .contains("kept")
+        );
+        let kept = app.kickoff_kept.get(&held(&id)).cloned().unwrap();
         let reopened =
             Kickoff::from_answer(0, &request, &answer(), "#41".into(), "t".into(), &kept).unwrap();
         assert_eq!(reopened.drafts[0], "mine");
@@ -1177,7 +1328,7 @@ mod tests {
         let (mut app, id) = open_on(&answer());
         typed(&mut app, "half a thought");
         assert!(matches!(key(&mut app, KeyCode::Esc), Action::None));
-        assert_eq!(app.kickoff_kept[&id][0].2, "half a thought");
+        assert_eq!(app.kickoff_kept[&held(&id)][0].2, "half a thought");
     }
 
     #[test]
@@ -1229,7 +1380,7 @@ mod tests {
     }
 
     #[test]
-    fn answers_for_work_that_changed_meanwhile_are_not_sent() {
+    fn answers_for_work_gone_from_the_board_are_not_sent() {
         let (mut app, _) = open_on(&answer());
         let Mode::Kickoff { form, .. } = &mut app.mode else {
             panic!()
@@ -1243,12 +1394,42 @@ mod tests {
             app.kickoff_key(press(KeyCode::Tab), form, back, target),
             Action::None
         ));
-        assert!(
-            app.message()
-                .unwrap()
-                .0
-                .contains("changed while you were answering")
+        let said = app.message().unwrap().0;
+        assert!(said.contains("gone from the board"), "{said}");
+        assert!(said.contains("kept for its next d"), "{said}");
+    }
+
+    /// Intent 0591, K1-76: work that started while he answered gets his answers anyway, saved on
+    /// it with their token, and nothing starts; never "select it again".
+    #[test]
+    fn answers_for_work_that_started_meanwhile_are_saved_on_it() {
+        let (mut app, id) = open_on(&answer());
+        key(&mut app, KeyCode::Enter);
+        for card in &mut app.board.cards {
+            if card.detail.as_ref().is_some_and(|d| d.id == id) {
+                card.stage = Stage::Build;
+                card.state = Some("active".into());
+            }
+        }
+        let request = sent(key(&mut app, KeyCode::Esc));
+        assert_eq!(
+            request,
+            json!({"action": "answer", "id": id, "asked": "fedcba9876543210", "answers": [{"num": "1", "take": true}]})
         );
+        let said = app.message().unwrap().0;
+        assert!(said.contains("saving your answers on it"), "{said}");
+        // A start from the box sends the same, never a start.
+        let (mut app, id) = open_on(&answer());
+        key(&mut app, KeyCode::Enter);
+        for card in &mut app.board.cards {
+            if card.detail.as_ref().is_some_and(|d| d.id == id) {
+                card.detail.as_mut().unwrap().disposition = Some("wont_do".into());
+            }
+        }
+        let request = sent(key(&mut app, KeyCode::Enter));
+        assert_eq!(request["action"], "answer");
+        assert_eq!(request["answers"].as_array().map(Vec::len), Some(2));
+        assert!(app.message().unwrap().0.contains("set aside meanwhile"));
     }
 
     #[test]

@@ -901,7 +901,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
         },
         back: Box::new(Mode::Board),
     };
-    let mut result=vec![list.clone(),copies.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK_C","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now()},back:Box::new(move_screen)}];
+    let mut result=vec![list.clone(),copies.clone(),move_screen.clone(),Mode::Accounts{screen:S::Confirm{machine:0,request:serde_json::json!({"action":"account-move","pane":target.agent.pane,"to":"ARK_C","confirm":"demo-confirm"}),message:"This agent is mid-step. Move it when it next stops? Restarting also ends its background job.".into(),yes:"move when it stops".into(),no:"leave it".into(),target:Some(target),ready_at:std::time::Instant::now(),choices:vec![]},back:Box::new(move_screen)}];
     // s to an account another program runs: the engine's question, a hand-over.
     if let Some(card) = app.board.cards.iter().find(|c| {
         app.account_agent(c)
@@ -937,6 +937,7 @@ pub fn account_screens(app: &crate::app::App) -> Vec<crate::app::Mode> {
                 no: "leave it".into(),
                 target: Some(handing),
                 ready_at: std::time::Instant::now(),
+                choices: vec![],
             },
             back: Box::new(picker),
         });

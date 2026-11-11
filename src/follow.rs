@@ -217,17 +217,15 @@ impl App {
         }
     }
 
-    /// The followed work for this record, if Kerdr is following any.
-    pub fn following(&self, id: &str) -> Option<&Following> {
-        self.follows.iter().find(|f| f.id == id)
-    }
-
-    /// The followed work shown on this card, if any.
+    /// The followed work shown on this card, if any: by its card's key, and by its record's number
+    /// only where a key can't tell (`Resolver::for_card`). Another source's card with the same
+    /// number never shows it or waits on it (Codex's sixth and seventh looks).
     pub fn following_card(&self, card: &Card) -> Option<&Following> {
         let id = card.detail.as_ref()?.id.as_str();
-        self.follows
-            .iter()
-            .find(|f| f.key.as_deref() == Some(card.key.as_str()) || f.id == id)
+        self.follows.iter().find(|f| {
+            self.resolver
+                .for_card(f.key.as_deref(), &f.id, &card.key, id)
+        })
     }
 
     /// The progress requests due now, each with its token and machine, marked as on their way.
@@ -361,7 +359,11 @@ impl App {
             if done && (response.workspace.is_none() || response.session.is_none()) {
                 // Done, with no workspace named yet: the ⏎ goes in when the feed shows one, as after
                 // any start answered yes.
-                self.started = Some((f.id.clone(), Instant::now()));
+                let key = f
+                    .key
+                    .clone()
+                    .unwrap_or_else(|| self.intent_key(f.machine, &f.id, None));
+                self.started = Some((key, f.id.clone(), Instant::now()));
             } else {
                 self.forget_enter();
             }
@@ -371,7 +373,12 @@ impl App {
         self.follow_end = Some(FollowEnd { enter: f.enter });
         self.answer_stderr = String::new();
         self.answer_by_enter = f.enter;
+        // Its end is the answer of the change it followed (intent 0591, Codex's fifth look).
+        self.answer_job = Some(f.job);
+        self.answer_key = f.key.clone();
         self.finish_action(f.machine, f.request.clone(), Ok(response));
+        self.answer_job = None;
+        self.answer_key = None;
         self.answer_by_enter = false;
         self.follow_end = None;
         self.action_from = None;
@@ -404,6 +411,8 @@ impl App {
             ),
             Tone::Warn,
         );
+        // A stop he asked for once it started can't tell whether it did (intent 0591, K1-44).
+        self.start_lost(f.job);
     }
 
     /// The machine has no record of the followed work (expired, or never its): Kerdr says so
@@ -430,6 +439,7 @@ impl App {
             ),
             Tone::Warn,
         );
+        self.start_lost(f.job);
     }
 
     /// Esc: followed work still finishes, but takes you nowhere and asks nothing where you are.
@@ -1520,5 +1530,31 @@ mod tests {
         );
         assert!(app.follows.is_empty());
         assert!(app.open_after.is_some());
+    }
+
+    #[test]
+    fn another_sources_card_with_the_same_number_never_shows_or_waits_on_this_follow() {
+        // Codex's sixth look, swept: #39's reopen is followed. Another source's #39, other work,
+        // shows no progress of it, and its keys don't wait for it.
+        let mut app = demo_app();
+        let (k, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(&id, "recover", "Bringing web back on its machine…"),
+        );
+        let (other, _) = crate::app::tests::same_number_elsewhere(&mut app, &k);
+        let a = app.card(&k).cloned().unwrap();
+        let b = app.card(&other).cloned().unwrap();
+        assert!(app.following_card(&a).is_some());
+        assert!(app.following_card(&b).is_none(), "A's follow shown on B");
+        assert_eq!(
+            app.follow_holds(&b, "close"),
+            None,
+            "B's keys wait on A's follow"
+        );
     }
 }

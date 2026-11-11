@@ -474,6 +474,8 @@ impl App {
         };
         let key = order[next].clone();
         self.go_to(&key);
+        // A question that waited on it opens as you land (intent 0591).
+        self.open_waiting(&key);
         Some(key)
     }
 
@@ -519,7 +521,7 @@ impl App {
     }
 
     /// Goes to a card or piece from n: a piece on its card's screen, a card on the board.
-    fn go_to(&mut self, key: &str) {
+    pub(super) fn go_to(&mut self, key: &str) {
         let Some(i) = self.card_index(key) else {
             return;
         };
@@ -645,13 +647,102 @@ impl App {
         if let Some(tab) = &card.tab_id {
             (Some(tab.clone()), true)
         } else if let Some(tab) = &card.own_tab {
-            // A recorded own tab is never guessed past: when it's gone, Enter offers a reopen.
+            // A recorded own tab is never guessed past: when it's gone, Enter reopens it.
             (Some(tab.clone()), true)
+        } else if let Some(tab) = self.conversation_tab(card) {
+            // The tab whose agent herdr sees running its conversation (intent 0591, K3-07).
+            (Some(tab), true)
         } else if let Some(tab) = self.live_own_tab(card) {
             (Some(tab), true)
+        } else if !self.tabs_inside(card).is_empty() {
+            // Which tab is its own can't be told: the workspace's first tab that isn't known to
+            // be another card's or a helper's, never a child's (intent 0591, K3-07). Only that tab
+            // will do: if it closes on the way, herdr mustn't land on whichever tab it shows,
+            // which may be a child's (Codex's review), so tab_gone takes it from there.
+            let tab = self.first_unclaimed_tab(card);
+            let strict = tab.is_some();
+            (tab, strict)
         } else {
             (None, false)
         }
+    }
+
+    /// The tab in the card's workspace whose agent herdr sees running the card's own
+    /// conversation, by its id (intent 0591, K3-07).
+    fn conversation_tab(&self, card: &Card) -> Option<String> {
+        let conversation = card
+            .detail
+            .as_ref()?
+            .resume
+            .as_ref()?
+            .conversation
+            .as_deref()?;
+        let ws = card.workspace_id.as_deref()?;
+        let snap = self
+            .machines
+            .get(card.machine_index)?
+            .snapshot(card.session.as_deref()?)?;
+        snap.agents
+            .iter()
+            .filter(|a| a.workspace_id == ws && !a.helper)
+            .find(|a| {
+                a.agent_session.as_ref().and_then(|s| s.value.as_deref()) == Some(conversation)
+            })
+            .and_then(|a| a.tab_id.clone())
+    }
+
+    /// Whether herdr knows the conversation of every agent in the card's workspace and none is
+    /// the card's own: then its conversation isn't running in herdr there (intent 0591, K3-07).
+    fn conversation_not_there(&self, card: &Card) -> bool {
+        let Some(conversation) = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.resume.as_ref())
+            .and_then(|r| r.conversation.as_deref())
+        else {
+            return false;
+        };
+        let (Some(ws), Some(session)) = (card.workspace_id.as_deref(), card.session.as_deref())
+        else {
+            return false;
+        };
+        let Some(snap) = self
+            .machines
+            .get(card.machine_index)
+            .and_then(|m| m.snapshot(session))
+        else {
+            return false;
+        };
+        let known: Option<Vec<&str>> = snap
+            .agents
+            .iter()
+            .filter(|a| a.workspace_id == ws && !a.helper)
+            .map(|a| a.agent_session.as_ref().and_then(|s| s.value.as_deref()))
+            .collect();
+        known.is_some_and(|all| !all.contains(&conversation))
+    }
+
+    /// The workspace's first tab with an agent, a helper's aside, when it isn't another card's
+    /// inside it: where ⏎ lands when which tab is the card's own can't be told.
+    fn first_unclaimed_tab(&self, card: &Card) -> Option<String> {
+        let ws = card.workspace_id.as_deref()?;
+        let snap = self
+            .machines
+            .get(card.machine_index)?
+            .snapshot(card.session.as_deref()?)?;
+        let inside: Vec<String> = self
+            .tabs_inside(card)
+            .iter()
+            .filter_map(|c| c.tab_id.clone())
+            .collect();
+        let number = |t: &str| t.rsplit_once(":t").and_then(|(_, n)| n.parse::<u32>().ok());
+        let first = snap
+            .agents
+            .iter()
+            .filter(|a| a.workspace_id == ws && !a.helper)
+            .filter_map(|a| a.tab_id.as_deref())
+            .min_by_key(|t| number(t).unwrap_or(u32::MAX))?;
+        (!inside.iter().any(|i| i == first)).then(|| first.to_string())
     }
 
     /// With no own tab on record (herdr doesn't know its agent's conversation), the one tab in the
@@ -699,8 +790,21 @@ impl App {
         if card.tab_id.is_some()
             || card.own_tab.is_some()
             || self.tabs_inside(card).is_empty()
+            || self.conversation_tab(card).is_some()
             || self.live_own_tab(card).is_some()
         {
+            return None;
+        }
+        // herdr knows every agent's conversation there, and none is its own: it isn't running in
+        // herdr, so ⏎ reopens it without asking, as for a workspace that closed (intent 0591,
+        // K3-07). Its backend refuses one still running anywhere.
+        if self.conversation_not_there(card) && self.actions_on() {
+            let action = self.reopen_action(card);
+            return Some(self.by_enter(action));
+        }
+        // It can't be told: herdr opens on the workspace's first tab (jump_tab), unless that's
+        // known to be another card's, when it asks rather than land on a child's tab.
+        if self.first_unclaimed_tab(card).is_some() {
             return None;
         }
         Some(self.offer_own_reopen(card, false))
@@ -712,19 +816,48 @@ impl App {
         let Some(card) = self.card(key).cloned() else {
             return;
         };
-        if card.tab_id.is_some() {
-            if self.actions_on() && (card.under_way() || card.done()) {
-                self.owe_reopen(key, "tab");
+        let conversation = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.resume.as_ref())
+            .is_some_and(|r| r.conversation.is_some());
+        let reference = &card.reference;
+        if !self.actions_on() {
+            let whose = if card.tab_id.is_some() {
+                format!("{reference}'s tab has closed")
             } else {
-                self.say(format!("{}'s tab has closed.", card.reference), Tone::Warn);
-            }
-        } else {
-            self.offer_own_reopen(&card, true);
+                format!("{reference}'s own agent has closed its tab")
+            };
+            self.say(
+                format!(
+                    "{whose}; with no actions backend Kerdr can't reopen it. o shows what's inside."
+                ),
+                Tone::Warn,
+            );
+            return;
         }
+        // Its own tab is gone, so its conversation isn't running there: reopened without asking,
+        // as for a workspace that closed, and its backend refuses one running anywhere else
+        // (intent 0591, K3-05, K3-06). Never onto another card's tab.
+        if card.under_way() || card.done() || (conversation && !card.dismissed()) {
+            self.owe_reopen(key, "tab");
+            return;
+        }
+        let whose = if card.tab_id.is_some() {
+            format!("{reference}'s tab has closed")
+        } else {
+            format!("{reference}'s own agent has closed its tab")
+        };
+        self.say(
+            format!(
+                "{whose}, and nothing recorded its conversation, so there's nothing to reopen."
+            ),
+            Tone::Warn,
+        );
     }
 
-    /// Offers to reopen a card's own agent: its tab has `closed`, or Kerdr can't tell which tab
-    /// is its own (herdr doesn't know that agent's conversation).
+    /// Offers to reopen a card's own agent when Kerdr can't tell which tab is its own and the
+    /// workspace's first tab is another card's: never landing there (intent 0591, K3-07).
     fn offer_own_reopen(&mut self, card: &Card, closed: bool) -> Action {
         let others: Vec<String> = self
             .tabs_inside(card)
@@ -768,6 +901,8 @@ impl App {
                     queue: false,
                     ready_at: None,
                     plain: true,
+                    choices: vec![],
+                    enter_queues: false,
                 };
             }
             other => return other,
@@ -1556,50 +1691,102 @@ mod tests {
         // A child lands on its own tab.
         let child = app.card(&key(&app, "0262")).unwrap().clone();
         assert_eq!(app.jump_tab(&child), (Some("w2K:t2".into()), true));
-        // herdr finds the card's own tab gone: it asks to reopen the card, landing nowhere.
+        // herdr finds the card's own tab gone: its conversation isn't running there, so it's
+        // reopened without asking, as for a workspace that closed, landing on no other tab
+        // (intent 0591, K3-06). The reopen goes as it is, never past the backend's questions.
         app.tab_gone(&k);
-        let Mode::Confirm { request, plain, .. } = &app.mode else {
-            panic!("asks: {:?}", app.mode)
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        assert_eq!(app.pending_reopen.as_deref(), Some(k.as_str()));
+        let Action::Mutate { request, .. } = app.next_owed() else {
+            panic!("no reopen: {:?}", app.message())
         };
         assert_eq!(request["action"], "reopen");
         assert_eq!(request["id"], "0256");
-        assert!(plain);
-        // The yes sends the reopen as it is, never as an override past the backend's questions.
-        let action = press(&mut app, KeyCode::Char('y'));
-        let Action::Mutate { request, .. } = action else {
-            panic!("{action:?}")
-        };
-        assert_eq!(request["action"], "reopen");
         assert!(request.get("override").is_none());
     }
 
     #[test]
-    fn with_no_tab_of_its_own_on_record_enter_offers_a_reopen_instead_of_guessing() {
+    fn with_no_tab_of_its_own_on_record_enter_goes_to_its_workspaces_first_tab() {
+        // Which tab is its own can't be told: herdr opens on the workspace's first tab rather
+        // than stop at a question, since that one isn't a child's (intent 0591, K3-07).
         let mut app = two_unknown_tabs();
         select(&mut app, "0256");
-        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
-        let Mode::Confirm { title, message, .. } = &app.mode else {
-            panic!("{:?}", app.mode)
-        };
-        assert_eq!(title, "Reopen #256's own agent?");
-        assert!(message.contains("#262's tab"), "{message}");
-        assert!(message.contains("can't tell which tab"), "{message}");
-        press(&mut app, KeyCode::Esc);
-        assert!(matches!(app.mode, Mode::Board));
+        let k = key(&app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k.clone()));
+        let card = app.card(&k).cloned().unwrap();
+        // Only that tab: if it closes on the way, Enter stops rather than land on a child's.
+        assert_eq!(app.jump_tab(&card), (Some("w2K:t1".to_string()), true));
     }
 
     #[test]
-    fn with_no_tab_of_its_own_on_record_enter_asks_at_once_while_an_account_action_runs() {
+    fn enter_finds_its_own_tab_by_the_conversation_herdr_sees_there() {
+        // herdr knows each agent's conversation: the one running the card's own is its tab, and
+        // with none running it there, ⏎ reopens it without asking (intent 0591, K3-07).
+        let mut app = two_unknown_tabs();
+        let conversation = "4f2b8c1e-5d3a-4b6f-9c2e-1a7d3e9b0c41";
+        let f = app.machines[0].feed.as_mut().unwrap();
+        let card = f.cards.iter_mut().find(|c| c.id == "0256").unwrap();
+        card.resume = Some(crate::feed::Resume {
+            agent: Some("claude".into()),
+            conversation: Some(conversation.into()),
+        });
+        let snap = app.machines[0]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .values_mut()
+            .next()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        for a in &mut snap.agents {
+            let value = if a.tab_id.as_deref() == Some("w2K:t3") {
+                conversation.to_string()
+            } else {
+                format!("other-{}", a.pane_id)
+            };
+            a.agent_session = Some(crate::herdr::AgentSession { value: Some(value) });
+        }
+        app.rebuild();
+        select(&mut app, "0256");
+        let k = key(&app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k.clone()));
+        let card = app.card(&k).cloned().unwrap();
+        assert_eq!(app.jump_tab(&card), (Some("w2K:t3".to_string()), true));
+        // Running in none of them: reopened, never landing on another tab.
+        let snap = app.machines[0]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .values_mut()
+            .next()
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        for a in &mut snap.agents {
+            a.agent_session = Some(crate::herdr::AgentSession {
+                value: Some(format!("other-{}", a.pane_id)),
+            });
+        }
+        app.rebuild();
+        select(&mut app, "0256");
+        let Action::Mutate { request, .. } = press(&mut app, KeyCode::Enter) else {
+            panic!("⏎ didn't reopen it: {:?}", app.mode)
+        };
+        assert_eq!(request["action"], "reopen");
+    }
+
+    #[test]
+    fn with_no_tab_of_its_own_on_record_enter_goes_at_once_while_an_account_action_runs() {
         // An account action running is no reason for ⏎ on a card to wait (intent 0445).
         let mut app = two_unknown_tabs();
         app.busy = true;
         app.busy_id = Some("0999".into());
         select(&mut app, "0256");
-        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
-        let Mode::Confirm { title, .. } = &app.mode else {
-            panic!("{:?}", app.mode)
-        };
-        assert_eq!(title, "Reopen #256's own agent?");
+        let k = key(&app, "0256");
+        assert_eq!(press(&mut app, KeyCode::Enter), Action::Jump(k));
     }
 
     #[test]
@@ -1652,7 +1839,7 @@ mod tests {
     }
 
     #[test]
-    fn search_enter_on_a_parent_with_no_own_tab_asks_as_the_board_does() {
+    fn search_enter_on_a_parent_with_no_own_tab_does_as_the_board_does() {
         let mut app = two_unknown_tabs();
         let i = app
             .board
@@ -1665,11 +1852,8 @@ mod tests {
             filter: SearchFilter::Everything,
             sel: 0,
         };
-        assert_eq!(app.open_hit(Hit::Card(i), search), Action::None);
-        let Mode::Confirm { title, .. } = &app.mode else {
-            panic!("{:?}", app.mode)
-        };
-        assert_eq!(title, "Reopen #256's own agent?");
+        let k = key(&app, "0256");
+        assert_eq!(app.open_hit(Hit::Card(i), search), Action::Jump(k));
         // With its own tab on record, search goes in as the board does.
         let mut app = families(Some("w2K:t1"));
         let search = Search {
@@ -1972,13 +2156,10 @@ mod tests {
         let card = app.card(&key(&app, "0256")).unwrap().clone();
         assert!(app.tabs_inside(&card).is_empty());
         assert_eq!(app.jump_tab(&card), (Some("w2K:t1".into()), true));
-        // Gone, it offers a reopen, never another tab.
+        // Gone, it reopens without asking, never going to another tab (intent 0591, K3-06).
         app.tab_gone(&card.key);
-        assert!(
-            matches!(app.mode, Mode::Confirm { plain: true, .. }),
-            "{:?}",
-            app.mode
-        );
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        assert_eq!(app.pending_reopen.as_deref(), Some(card.key.as_str()));
     }
 
     #[test]

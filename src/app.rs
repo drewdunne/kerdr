@@ -13,6 +13,10 @@ use crate::poll::{Conn, Event};
 
 #[path = "account_controls.rs"]
 pub mod account_controls;
+#[path = "asking.rs"]
+pub mod asking;
+#[path = "cancels.rs"]
+pub mod cancels;
 #[path = "controls.rs"]
 mod controls;
 #[path = "edit_controls.rs"]
@@ -25,6 +29,8 @@ pub mod follow;
 pub mod inside;
 #[path = "kickoff_controls.rs"]
 pub mod kickoff_controls;
+#[path = "resume.rs"]
+pub mod resume;
 #[path = "run_state.rs"]
 pub mod run_state;
 #[path = "view_controls.rs"]
@@ -288,6 +294,11 @@ pub enum Mode {
         /// A question Kerdr asks for itself (reopening a card's own agent when its tab is gone):
         /// the yes sends the request as it is, so the backend still asks its own questions.
         plain: bool,
+        /// The answers its backend offers beyond yes and no (intent 0591): each sends the request
+        /// again with `choice` and the question's token. Empty for a backend that offers none.
+        choices: Vec<crate::actions::Choice>,
+        /// At the most its session holds, a yes can't open it there: ⏎ queues it (intent 0591).
+        enter_queues: bool,
     },
     Board,
     /// A card's own screen: the card itself, then what's inside it (`o`). `focus` is the row
@@ -423,6 +434,23 @@ fn holds_peek(mode: &Mode) -> bool {
     }
 }
 
+/// The action of Kerdr's own question whether a new intent's words go without the image that
+/// didn't go in: never sent to a backend.
+pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
+
+/// Words whose image didn't go in, and the question about them: its number goes in the question's
+/// request, so its answer finds these words and no others (Codex's review).
+#[derive(Clone, Debug)]
+pub(crate) struct SendWithout {
+    pub n: u64,
+    pub machine: usize,
+    pub draft: Draft,
+    pub message: String,
+}
+/// Kerdr's own question after a saved list leaves running agents on other accounts: its yes
+/// moves them to the list, one at a time (intent 0591, B3-42).
+pub(crate) const MOVE_OFF_LIST: &str = "kerdr:move-off-list";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Action {
     Mutate {
@@ -467,6 +495,50 @@ pub struct Selection {
     pub key: Option<String>,
 }
 
+/// How far a question's box is scrolled when the screen can't hold all of it (Codex's review): set
+/// as it's drawn, as the Kickoff box's is, and a new question starts at its top.
+#[derive(Clone, Debug, Default)]
+pub struct QuestionView {
+    /// Which question it's for: its title and words, hashed.
+    of: std::cell::Cell<u64>,
+    scroll: std::cell::Cell<u16>,
+    /// Its lines below what the box shows when scrolled to its top: 0 when all of it shows.
+    most: std::cell::Cell<u16>,
+}
+
+impl QuestionView {
+    /// Whether some of the question is still below the box.
+    pub fn unseen(&self) -> bool {
+        self.scroll.get() < self.most.get()
+    }
+    pub fn down(&self, by: u16) {
+        self.scroll
+            .set(self.scroll.get().saturating_add(by).min(self.most.get()));
+    }
+    pub fn up(&self, by: u16) {
+        self.scroll.set(self.scroll.get().saturating_sub(by));
+    }
+    pub fn to_end(&self) {
+        self.scroll.set(self.most.get());
+    }
+    /// As it's drawn: this question, its lines and the rows the box gives them. Where its text
+    /// starts.
+    pub fn fit(&self, title: &str, message: &str, lines: u16, rows: u16) -> u16 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        (title, message).hash(&mut h);
+        let of = h.finish();
+        if self.of.get() != of {
+            self.of.set(of);
+            self.scroll.set(0);
+        }
+        let most = lines.saturating_sub(rows);
+        self.most.set(most);
+        self.scroll.set(self.scroll.get().min(most));
+        self.scroll.get()
+    }
+}
+
 /// A workspace a reopen just made, to go into as soon as its answer arrives: on the machine the
 /// action ran on, before any card claims it.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -496,6 +568,9 @@ pub struct PendingJump {
     /// A workspace no card claims, or one a reopen's answer named, by machine, session and id, in
     /// place of a card, with the tab to land on when one was named (a child's new tab).
     pub bare: Option<(usize, String, String, Option<String>)>,
+    /// A bare workspace's conversation, as the board saw it when ⏎ began to wait: offered to
+    /// resume if the workspace has closed by the time its machine answers (intent 0591, K1-03).
+    pub resume: Option<resume::BareResume>,
 }
 
 /// How long ⏎ waits for a herdr session that didn't answer its last read before saying it's still
@@ -557,6 +632,16 @@ pub struct App {
     /// A new intent Enter sent while its image was still being read: the read's number and its
     /// words, sent once the image is in (intent 0445).
     pub send_after_load: Option<(u64, Draft)>,
+    /// New intents whose image didn't go in, while Kerdr asks whether their words go without it
+    /// (intent 0591, K1-37), oldest first. Their words are kept meanwhile where give_back put
+    /// them. Each question is bound to its own words, so answering one never sends another's;
+    /// one that came while he typed or answered something else is asked once he's back on the
+    /// board (Codex's review).
+    pub(crate) send_without: Vec<SendWithout>,
+    /// The number the last of those got.
+    pub(crate) send_without_count: u64,
+    /// How far the question box on screen is scrolled (Codex's review).
+    pub question_view: QuestionView,
     /// The answer being handled is for a start or reopen whose workspace Andrew already went
     /// into himself (intent 0445).
     answer_went_in: bool,
@@ -579,9 +664,10 @@ pub struct App {
     pub pending_jump: Option<PendingJump>,
     /// The workspace a reopen just made, to go into now.
     pub open_after: Option<OpenAfter>,
-    /// The record a start just went out for, and when, so a second ⏎ before the feed shows it
-    /// under way doesn't start it again (intent 0404).
-    pub started: Option<(String, Instant)>,
+    /// The card a start just went out for, by key, its record's number, and when, so a second ⏎
+    /// before the feed shows it under way doesn't start it again (intent 0404). Its own card's:
+    /// another source's card with the same number goes ahead (Codex's seventh look).
+    pub started: Option<(String, String, Instant)>,
     /// The card the running action was asked from, as it was then: its answer asks or takes you
     /// in only while you're still on that work. Esc lets it go.
     pub action_from: Option<CardSnapshot>,
@@ -591,18 +677,44 @@ pub struct App {
     /// Actions refused because their intent lives on another machine than the one asked: each
     /// request, to send there next, and the card it was asked from (intent 0411). Several can
     /// answer at once now that changes run side by side (intent 0416), so they wait in order.
-    pub resend: std::collections::VecDeque<(usize, serde_json::Value, Option<CardSnapshot>)>,
-    /// The machine and record of each such resend still unanswered: its answer is shown as it
-    /// is, never sent on again, so one ⏎ asks two machines at most.
+    /// Each with the card it's for, by key, kept when that card has gone (Codex's seventh look).
+    pub resend: std::collections::VecDeque<(
+        usize,
+        serde_json::Value,
+        Option<CardSnapshot>,
+        Option<String>,
+    )>,
+    /// The machine and card, by key, of each such resend still unanswered: its answer is shown as
+    /// it is, never sent on again, so one ⏎ asks two machines at most. By key, never by number,
+    /// which another source's card can share (Codex's sixth look, swept).
     pub resent: Vec<(usize, String)>,
-    /// Each record a refusal said lives on another machine, that machine, and the home the
-    /// board's feed still showed for it when the refusal came: its actions go there, and a
-    /// question that machine asks can be answered yes, even before the board catches up. Each
-    /// holds only while the feed still shows that old home; fresh news of its home ends it. One
-    /// for each record, since several can be refused at once (intent 0416).
+    /// Each card, by key, whose record a refusal said lives on another machine, that machine, and
+    /// the home the board's feed still showed for it when the refusal came: its actions go there,
+    /// and a question that machine asks can be answered yes, even before the board catches up.
+    /// Each holds only while the feed still shows that old home; fresh news of its home ends it.
+    /// One for each card, since several can be refused at once (intent 0416). By key: another
+    /// source's card with the same number and home never follows it (Codex's sixth look, swept).
     pub moved_home: Vec<(String, usize, Option<String>)>,
-    /// What's typed in a Kickoff Questions box and not saved yet, by its record's number.
+    /// What's typed in a Kickoff Questions box and not saved yet, by its card's key: never another
+    /// source's card with the same number (Codex's fifth look).
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
+    /// Kickoff answers its backend gave back because their questions changed while he answered,
+    /// by its card's key: filled in on the next box d opens (intent 0591, B1-108).
+    pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
+    /// Starts Esc came too late for, each with Kerdr's question whether to stop it and put it
+    /// back in the backlog, bound to its own change (intent 0591, K1-44; Codex's fifth look).
+    pub stop_starts: Vec<cancels::StopStart>,
+    /// The change whose answer is being taken, by Kerdr's number for it: what's bound to that
+    /// change finds it by this, never by its record's number.
+    pub(crate) answer_job: Option<u64>,
+    /// The card the change whose answer is being taken was for, by key, kept when its card has
+    /// gone from the board or its answer takes you nowhere: that answer is that card's or no
+    /// card's, never another source's with the same number (Codex's seventh look).
+    pub(crate) answer_key: Option<String>,
+    /// The card a change about to be sent is for, by key, when it goes without the card it was
+    /// asked from (`action_from`): its card has gone, or its answer is to take you nowhere. It's
+    /// still that card's change (Codex's seventh look).
+    pub(crate) action_key: Option<String>,
     /// The tokens of questions answered from the box, whose copy in the feed is out of date until
     /// its next read: d doesn't open them again from there (intent 0491).
     pub kickoff_sent: std::collections::HashSet<String>,
@@ -630,7 +742,13 @@ pub struct App {
     pub account_batch_failed: bool,
     /// Machines `R` couldn't bring up to date, still being tried, and when (intent 0591).
     pub refresh_behind: Option<(Instant, Vec<usize>)>,
+    /// The account request on its way, with what it was asked from: one at a time. A reply is
+    /// matched to it before anything about it is touched (intent 0591, Codex's fourth look).
     pub account_pending: Option<account_controls::Pending>,
+    /// Account requests made while another was on its way, each with what it was asked from, sent
+    /// in turn once that one has its answer: never sent over it, never dropped (Codex's fourth
+    /// look).
+    pub account_later: std::collections::VecDeque<(account_controls::Pending, serde_json::Value)>,
     /// Backlog items' texts held for editing, by card (intent 0414): what each was read as, and
     /// your version until a save of it succeeds.
     pub edits: std::collections::HashMap<String, edit_controls::Held>,
@@ -666,17 +784,39 @@ pub struct App {
     pub pending_go: Option<(String, Option<String>)>,
     /// Accounts picked with s that their cards are still owed, one for each card (intent 0591).
     pub owed_accounts: Vec<run_state::OwedAccount>,
+    /// A move waiting on its account's sign-in on that machine: sent again by itself, as a new
+    /// request, once that sign-in is done; dropped if he leaves it (intent 0591, B3-10).
+    pub after_signin: Option<account_controls::AfterSignin>,
+    /// The agents a saved list left on other accounts, moved to the list one at a time once he
+    /// said yes (intent 0591, B3-42).
+    pub off_list_moves: Option<account_controls::OffListMoves>,
+    /// What each account question needs beyond its words: the agent or card it came from, and
+    /// what follows once it's settled (Codex's review).
+    pub asked_about: Vec<account_controls::AskedAbout>,
+    /// The account questions the answer being read keeps going (asked again, held, or waiting on
+    /// a sign-in): any other it answers is settled once it's read (Codex's third look).
+    pub asked_now: Vec<(usize, serde_json::Value)>,
+    /// The card whose account request is being sent again by itself, with the same op: it says
+    /// "Trying again…" until the answer comes (intent 0591).
+    pub account_retrying: Option<String>,
     /// The number of the last request asking an old backend to update, so each answer finds the
     /// waits it was asked for.
     pub update_asks: u64,
     /// The end of followed work being taken as its request's answer.
     pub(crate) follow_end: Option<follow::FollowEnd>,
-    /// The record a start or reopen ⏎ just asked for, for its change to note it was ⏎'s.
+    /// The card, by key, whose start or reopen ⏎ just asked for, for its change to note it was
+    /// ⏎'s: taken by the very next change Kerdr takes in, sent or not, and matched by its card,
+    /// never by its record's number, which another source's card can share (Codex's sixth look).
     pub(crate) enter_sent: Option<String>,
-    /// The answer being taken is to a start ⏎ asked for; and the record whose question, up now,
-    /// such a start asked (Codex's review).
+    /// The answer being taken is to a start ⏎ asked for; and the card, by key, whose question, up
+    /// now, such a start asked (Codex's review; by key since Codex's fifth look).
     pub(crate) answer_by_enter: bool,
     pub(crate) confirm_by_enter: Option<String>,
+    /// Questions that came while you were elsewhere, each waiting on its card (intent 0591).
+    pub(crate) waiting: Vec<asking::Waiting>,
+    /// When a peek was opened from the backlog, whose ⏎ peeks: a second ⏎ held or doubled with
+    /// it never starts the work it shows (intent 0591, K1-07).
+    pub(crate) peek_opened: Option<Instant>,
 }
 
 impl App {
@@ -714,6 +854,9 @@ impl App {
             submissions: vec![],
             returned: Default::default(),
             send_after_load: None,
+            send_without: Vec::new(),
+            send_without_count: 0,
+            question_view: QuestionView::default(),
             answer_went_in: false,
             backlog_focus: None,
             view_search: None,
@@ -730,6 +873,11 @@ impl App {
             resent: vec![],
             moved_home: vec![],
             kickoff_kept: Default::default(),
+            kickoff_prefill: Default::default(),
+            stop_starts: Vec::new(),
+            answer_job: None,
+            answer_key: None,
+            action_key: None,
             kickoff_sent: Default::default(),
             kickoff_checks: 0,
             answered_at: None,
@@ -746,6 +894,7 @@ impl App {
             account_batch_failed: false,
             refresh_behind: None,
             account_pending: None,
+            account_later: Default::default(),
             edits: Default::default(),
             edit_flights: vec![],
             edit_open: None,
@@ -763,11 +912,18 @@ impl App {
             accounts_wait: None,
             pending_go: None,
             owed_accounts: Vec::new(),
+            after_signin: None,
+            off_list_moves: None,
+            asked_about: Vec::new(),
+            asked_now: Vec::new(),
+            account_retrying: None,
             update_asks: 0,
             follow_end: None,
             enter_sent: None,
             answer_by_enter: false,
             confirm_by_enter: None,
+            waiting: vec![],
+            peek_opened: None,
         };
         app.rebuild();
         app
@@ -1120,12 +1276,16 @@ impl App {
     pub fn rebuild(&mut self) {
         self.refresh_accounts();
         let current = self.scope().clone();
+        // Which cards' keys can't tell a record's copies apart: noted as the feeds are read.
+        self.resolver.note_unnamed(&self.machines);
         // Changes still on their way show as done (intent 0416).
         self.board = if self.resolver.shows() {
             board::build(&self.resolver.overlay(&self.machines), &self.cfg)
         } else {
             board::build(&self.machines, &self.cfg)
         };
+        // A question that came while you were elsewhere shows its card as asking you (intent 0591).
+        self.show_waiting();
         let tabs = self.view_tabs();
         self.tab = tabs
             .iter()
@@ -1429,13 +1589,27 @@ impl App {
                 card.state.as_deref(),
                 Some("closed" | "active" | "background")
             );
+        // As herdr says it is now, which the board will say at its next read.
+        let mut gone = card.clone();
+        gone.workspace_id = None;
+        gone.session = None;
+        gone.tab_id = None;
+        gone.agents.clear();
+        // A conversation on record: reopened, as for work under way, and its backend refuses
+        // one still running elsewhere (intent 0591, K3-02).
+        let conversation = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.resume.as_ref())
+            .is_some_and(|r| r.conversation.is_some());
+        if conversation && !card.dismissed() && self.actions_on() {
+            let action = self.reopen_action(&gone);
+            if matches!(action, Action::Mutate { .. }) {
+                self.action_from = Some(CardSnapshot::of(&card));
+            }
+            return self.by_enter(action);
+        }
         if never_started && self.actions_on() {
-            // As herdr says it is now, which the board will say at its next read.
-            let mut gone = card.clone();
-            gone.workspace_id = None;
-            gone.session = None;
-            gone.tab_id = None;
-            gone.agents.clear();
             let action = self.intent_action_on(gone, "dispatch", serde_json::json!({}));
             if matches!(action, Action::Mutate { .. }) {
                 // Its answer asks or takes you in on the card as the board still shows it.
@@ -1461,7 +1635,7 @@ impl App {
         let starting = card
             .detail
             .as_ref()
-            .is_some_and(|d| self.started_lately(&d.id));
+            .is_some_and(|d| self.started_lately(&card.key, &d.id));
         if starting {
             self.say(
                 format!(
@@ -1480,9 +1654,26 @@ impl App {
     /// the board, a peek, a list or a card's own screen.
     pub fn next_owed(&mut self) -> Action {
         // A refusal that named the intent's home elsewhere: ask there, straight away.
-        if let Some((machine, request, from)) = self.resend.pop_front() {
+        if let Some((machine, request, from, key)) = self.resend.pop_front() {
             self.action_from = from;
+            self.action_key = key;
             return Action::Mutate { machine, request };
+        }
+        // Words whose image didn't go in, asked about once he's back where no typing is taken:
+        // the oldest first, each on its own. Only while they're still kept unsent: sent or thrown
+        // away meanwhile, there's no question left.
+        if self.enter_can_land_here() && !self.send_without.is_empty() {
+            let (draft, draft_images, returned) = (&self.draft, &self.draft_images, &self.returned);
+            self.send_without.retain(|w| {
+                (*draft == w.draft.words && *draft_images == w.draft.images)
+                    || returned
+                        .iter()
+                        .any(|r| r.words == w.draft.words && r.images == w.draft.images)
+            });
+            if let Some(n) = self.send_without.first().map(|w| w.n) {
+                self.ask_send_without_now(n);
+            }
+            return Action::None;
         }
         // An account action running holds none of this: card changes go their own way (intent
         // 0445).
@@ -1527,6 +1718,7 @@ impl App {
             machine: card.machine.clone(),
             stuck: None,
             bare: None,
+            resume: self.bare_resume_of(card),
         });
     }
 
@@ -1543,12 +1735,16 @@ impl App {
         bare: Option<(String, String, Option<String>)>,
     ) {
         let name = self.machines[machine].name();
+        let resume = key
+            .and_then(|k| self.card(k))
+            .and_then(|c| self.bare_resume_of(c));
         self.pending_jump = Some(PendingJump {
             key: key.unwrap_or_default().to_string(),
             workspace: what.to_string(),
             machine: name.clone(),
             stuck: Some((session.to_string(), Instant::now())),
             bare: bare.map(|(s, id, tab)| (machine, s, id, tab)),
+            resume,
         });
         self.say(
             format!(
@@ -1613,12 +1809,38 @@ impl App {
                 id,
             });
         }
+        // An intent's card, wherever its record lives now and whichever machine's copy shows it:
+        // its key is its feed's source and its number, which a move home doesn't change, and ⏎
+        // does for it what it does now: goes in, reopens it, or asks the done-work question
+        // (intent 0591, K1-04). Never another source's card with the same number: that's other
+        // work (Codex's review).
         if self.card(&pending.key).is_some() {
             return Some(Action::Jump(pending.key));
         }
+        if !pending.key.starts_with("ws:") {
+            self.say(
+                format!(
+                    "{} closed while {} was away, and its card is no longer on this board, so Kerdr didn't go in.",
+                    pending.workspace, pending.machine
+                ),
+                Tone::Warn,
+            );
+            return None;
+        }
+        // A bare workspace whose conversation the board knew: offered to resume, never resumed on
+        // its own, since it may have closed because its agent wrapped (intent 0591, K1-03).
+        let said = format!(
+            "{} closed while {} was away.",
+            pending.workspace, pending.machine
+        );
+        if let Some(resume) = &pending.resume
+            && self.offer_resume(resume, None, &said)
+        {
+            return None;
+        }
         self.say(
             format!(
-                "{} closed while {} was away; it's off the board now.",
+                "{} closed while {} was away, and nothing of it is left to open.",
                 pending.workspace, pending.machine
             ),
             Tone::Warn,
@@ -1744,6 +1966,10 @@ impl App {
         if self.still_saving(&card) {
             return Action::None;
         }
+        // The question its start asked while you were elsewhere, waiting on it (intent 0591).
+        if self.key_opens_waiting(&key, "enter") {
+            return Action::None;
+        }
         // A start or reopen on its way: into the workspace it opened, once one shows (intent 0445).
         if let Some(action) = self.enter_starting(&card) {
             return action;
@@ -1774,6 +2000,12 @@ impl App {
             return self.by_enter(action);
         }
         if card.dismissed() {
+            // ⏎ means starting that card: to a backend that does the step first, asked once,
+            // since Won't do was his own decision, and its yes brings it back and starts or
+            // reopens it in one request, every usual check still asked (intent 0591, K1-06).
+            if self.actions_on() && self.does_steps(&card) {
+                return self.ask_to_bring_back(&card);
+            }
             self.say(
                 format!("{} is in won't do; u brings it back.", card.reference),
                 Tone::Info,
@@ -1781,14 +2013,14 @@ impl App {
             return Action::None;
         }
         // Work nobody has started: ⏎ starts it, as d does, asking past the usual limit (intent
-        // 0404). A peek opened from the backlog screen, whose ⏎ peeks, leaves that to d.
+        // 0404), from a peek opened from the backlog screen too (intent 0591, K1-07): the
+        // question's own wait keeps a doubled ⏎ from starting it by accident.
         if waiting_work(&card) && self.actions_on() {
             if matches!(&self.mode, Mode::Peek { back, .. } if matches!(**back, Mode::Backlog { .. }))
+                && self
+                    .peek_opened
+                    .is_some_and(|at| at.elapsed() < std::time::Duration::from_millis(500))
             {
-                self.say(
-                    format!("{} hasn't started: d starts it.", card.reference),
-                    Tone::Info,
-                );
                 return Action::None;
             }
             if self.just_started(&card) {
@@ -1808,6 +2040,10 @@ impl App {
             return self.by_enter(action);
         }
         // What's left can't be started or reopened from here: say why, plainly (intent 0591).
+        // A bare workspace gone, its conversation known: offered to resume (intent 0591, K1-08).
+        if card.detail.is_none() && self.offer_resume_closed(&card) {
+            return Action::None;
+        }
         let reference = &card.reference;
         let msg = if card.detail.is_none() {
             format!(
@@ -1831,6 +2067,73 @@ impl App {
             )
         };
         self.say(msg, Tone::Info);
+        Action::None
+    }
+
+    /// ⏎ on a card in Won't do, to a backend that brings it back first: "Bring #41 back and start
+    /// it?", whose yes sends the start (or the reopen, for work that ran) as it is, so its backend
+    /// still asks its own questions (intent 0591, K1-06).
+    fn ask_to_bring_back(&mut self, card: &Card) -> Action {
+        let Some(detail) = card.detail.clone() else {
+            return Action::None;
+        };
+        let ran = card
+            .detail
+            .as_ref()
+            .and_then(|d| d.resume.as_ref())
+            .is_some_and(|r| r.conversation.is_some())
+            || card.stage != Stage::Backlog
+            || matches!(
+                card.state.as_deref(),
+                Some("active" | "background" | "closed")
+            );
+        let (machine, request) = if ran {
+            match self.reopen_action(card) {
+                Action::Mutate { machine, request } => (machine, request),
+                other => return other,
+            }
+        } else {
+            let Some(machine) = self.home_machine(card) else {
+                return Action::None;
+            };
+            if !self.can_write(machine) {
+                return Action::None;
+            }
+            (
+                machine,
+                serde_json::json!({"action": "dispatch", "id": detail.id}),
+            )
+        };
+        // Nothing goes until the yes.
+        self.action_from = None;
+        let reference = &card.reference;
+        let (title, does) = if ran {
+            (
+                format!("Bring {reference} back and reopen it?"),
+                "brings it back from Won't do and reopens it, resuming its conversation",
+            )
+        } else {
+            (
+                format!("Bring {reference} back and start it?"),
+                "brings it back from Won't do and starts it",
+            )
+        };
+        self.mode = Mode::Confirm {
+            machine,
+            request,
+            title,
+            message: format!(
+                "{reference} is in Won't do. Yes {does}, with every usual check: a full session or its own questions still ask first. u only brings it back."
+            ),
+            back: Box::new(self.mode.clone()),
+            target: Some(Box::new(CardSnapshot::of(card))),
+            queue: false,
+            ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+        self.confirm_by_enter = Some(card.key.clone());
         Action::None
     }
 
@@ -1858,8 +2161,9 @@ impl App {
 
     /// Notes that a start or reopen was ⏎'s: when it's followed, its end takes you in (intent 0591).
     pub(crate) fn by_enter(&mut self, action: Action) -> Action {
-        if let Action::Mutate { request, .. } = &action {
-            self.enter_sent = request["id"].as_str().map(str::to_string);
+        if let Action::Mutate { machine, request } = &action {
+            let id = request["id"].as_str().unwrap_or_default();
+            self.enter_sent = Some(self.intent_key(*machine, id, self.action_from.as_ref()));
         }
         action
     }
@@ -2068,7 +2372,7 @@ impl App {
             }
             KeyCode::Char('b') => self.enter_backlog(false),
             KeyCode::Char('D') => self.enter_done(),
-            KeyCode::Char('M') => self.mode = Mode::Machines { sel: 0 },
+            KeyCode::Char('M') => self.open_machines(),
             KeyCode::Char('r') => {
                 let target = self
                     .selected()
@@ -2518,6 +2822,36 @@ impl App {
         (0..self.machines.len()).collect()
     }
 
+    /// The machines the banner speaks of, the one in the most trouble first: one that needs you
+    /// (SSH asks something), then one dropping or away, then one whose herdr needs setting up. A
+    /// drop counts only once it lasts; its tab is marked meanwhile (intent 0591).
+    pub fn troubled_machines(&self) -> Vec<usize> {
+        let now = self.now();
+        let rank = |c: &Conn| match c {
+            Conn::HostKey { .. } | Conn::Auth { .. } => 0,
+            Conn::Reconnecting { .. } => 1,
+            Conn::Unreachable { .. } => 2,
+            Conn::HerdrTooOld { .. } | Conn::HerdrMissing => 3,
+            _ => 9,
+        };
+        let mut troubled: Vec<usize> = (0..self.machines.len())
+            .filter(|&i| rank(&self.machines[i].conn) < 9 && self.machines[i].conn.lasting(now))
+            .collect();
+        troubled.sort_by_key(|&i| rank(&self.machines[i].conn));
+        troubled
+    }
+
+    /// M: the machines screen, on the machine the banner names, so its ⏎ or u is the next key
+    /// (intent 0591, K3-38 to K3-41).
+    pub(crate) fn open_machines(&mut self) {
+        let sel = self
+            .troubled_machines()
+            .first()
+            .and_then(|&i| self.machine_rows().iter().position(|&r| r == i))
+            .unwrap_or(0);
+        self.mode = Mode::Machines { sel };
+    }
+
     fn machines_key(&mut self, key: KeyEvent, sel: usize) -> Action {
         let rows = self.machine_rows();
         let n = rows.len().max(1);
@@ -2536,13 +2870,9 @@ impl App {
             }
             KeyCode::Char('r') => return Action::Retry(Some(i)),
             KeyCode::Char('R') => return Action::Retry(None),
-            KeyCode::Char('x') => {
-                if self.machines[i].machine.is_local() {
-                    self.say("This machine can't be hidden.", Tone::Info);
-                } else {
-                    return Action::ToggleHidden(i);
-                }
-            }
+            // This machine too: only its cards leave the board, and it's still read for its
+            // accounts and the actions it runs (intent 0591, K1-10).
+            KeyCode::Char('x') => return Action::ToggleHidden(i),
             KeyCode::Char('u') => {
                 if self.machines[i].machine.is_local() {
                     self.say("Update herdr here with: herdr update", Tone::Info);
@@ -2558,6 +2888,7 @@ impl App {
                         return Action::Setup(i);
                     }
                     Conn::Hidden => return Action::ToggleHidden(i),
+                    _ if m.machine.hidden => return Action::ToggleHidden(i),
                     _ => {
                         let scope = Scope::Machine(m.name());
                         self.choose_scope(scope);
@@ -2783,6 +3114,7 @@ impl App {
                         scroll: 0,
                         back: Box::new(Mode::Backlog { sel }),
                     };
+                    self.peek_opened = Some(Instant::now());
                 }
             }
             _ => {}
@@ -3036,6 +3368,10 @@ pub(crate) mod tests {
 
     pub(crate) fn press(app: &mut App, c: char) -> Action {
         app.on_key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE))
+    }
+
+    pub(crate) fn press_code(app: &mut App, code: KeyCode) -> Action {
+        app.on_key(KeyEvent::new(code, KeyModifiers::NONE))
     }
 
     /// A change's answer arriving, as the event loop takes it: through the action resolution tool
@@ -3321,6 +3657,8 @@ pub(crate) mod tests {
             queue: false,
             ready_at: Some(Instant::now() + Duration::from_secs(60)),
             plain: false,
+            choices: vec![],
+            enter_queues: false,
         };
         assert_eq!(app.key_wait(), KEY_WAIT_COMING);
         settle(&mut app);
@@ -3644,6 +3982,229 @@ pub(crate) mod tests {
         );
     }
 
+    /// Intent 0591, B1-106 and B1-108 (r3-a's `prefill`): his Kickoff answers whose questions
+    /// changed while he answered come back, and the box fills them in again by number for him to
+    /// check, rather than have him type them again.
+    fn kickoff_reply(
+        app: &mut App,
+        home: usize,
+        request: serde_json::Value,
+        reply: serde_json::Value,
+    ) {
+        reply_to(
+            app,
+            home,
+            request,
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+
+    fn kickoff_now() -> serde_json::Value {
+        serde_json::json!({"ok":false,"message":"for an older Kerdr","asked":"newtoken00000000",
+            "note":"Some of these changed while you were answering: your answers to question 3 were saved, and yours to the rest are filled in for you to check.",
+            "questions":[
+                {"num":"1","question":"Whose is it, now that it's two sites?","pick":"Kibbelz"},
+                {"num":"2","question":"Where does it run?","pick":"The server"}]})
+    }
+
+    #[test]
+    fn a_start_whose_questions_changed_while_he_answered_fills_his_answers_in_again() {
+        for with_prefill in [true, false] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = waiting_backlog_card(&app);
+            let home = app.card(&key).unwrap().machine_index;
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            let request = serde_json::json!({"action":"dispatch","id":id,"asked":"oldtoken00000000",
+                "answers":[{"num":"1","text":"Kibbelz, the personal one"},{"num":"2","take":true},{"num":"3","text":"Soon"}]});
+            let mut reply = kickoff_now();
+            if with_prefill {
+                reply["prefill"] = serde_json::json!([
+                    {"num":"1","text":"Kibbelz, the personal one"},
+                    {"num":"2","take":true}
+                ]);
+            }
+            app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+            kickoff_reply(&mut app, home, request, reply);
+            let Mode::Kickoff { form, .. } = &mut app.mode else {
+                panic!("expected the box: {:?}", app.mode)
+            };
+            assert!(
+                form.note
+                    .as_deref()
+                    .unwrap()
+                    .contains("filled in for you to check")
+            );
+            if !with_prefill {
+                // A backend without it: as before, nothing filled in on a reworded question.
+                assert_eq!(form.drafts, ["", ""]);
+                continue;
+            }
+            assert_eq!(form.drafts, ["Kibbelz, the personal one", ""]);
+            // His to check: ⏎ takes each, his words and the recommendation he took.
+            form.ready_at = Instant::now();
+            press_code(&mut app, KeyCode::Enter);
+            let Mode::Kickoff { form, .. } = &mut app.mode else {
+                panic!("the box shut")
+            };
+            form.ready_at = Instant::now();
+            let Action::Mutate { request: sent, .. } = press_code(&mut app, KeyCode::Enter) else {
+                panic!("expected the start")
+            };
+            assert_eq!(sent["asked"], "newtoken00000000");
+            assert_eq!(
+                sent["answers"],
+                serde_json::json!([{"num":"1","text":"Kibbelz, the personal one"},{"num":"2","take":true}])
+            );
+        }
+    }
+
+    #[test]
+    fn answers_given_back_after_esc_are_filled_in_on_the_next_box() {
+        // Esc's save found some questions changed: those answers come back with no box to fill,
+        // and the next d's box fills them in, once. Refused whole or saved in part alike.
+        for saved in [
+            serde_json::json!({"ok":false,"message":"#41's questions changed while you were answering, so your answers weren't saved. d shows them as they are now, with yours filled in.","prefill":[{"num":"2","text":"on the laptop"}]}),
+            serde_json::json!({"ok":true,"partial":true,"message":"Saved your answers to question 1 of #41; the rest changed while you were answering, so d shows them as they are now, with yours filled in.","prefill":[{"num":"2","text":"on the laptop"}]}),
+        ] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            let (key, id) = waiting_backlog_card(&app);
+            let home = app.card(&key).unwrap().machine_index;
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            let mut saved = saved;
+            saved["id"] = serde_json::json!(id);
+            kickoff_reply(
+                &mut app,
+                home,
+                serde_json::json!({"action":"answer","id":id,"asked":"oldtoken00000000",
+                    "answers":[{"num":"1","take":true},{"num":"2","text":"on the laptop"}]}),
+                saved,
+            );
+            assert!(app.kickoff_prefill.contains_key(&key));
+            // The next d's answer: the questions as they are now, with nothing given back.
+            app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+            let mut now = kickoff_now();
+            now["note"] = serde_json::Value::Null;
+            kickoff_reply(
+                &mut app,
+                home,
+                serde_json::json!({"action":"dispatch","id":id}),
+                now,
+            );
+            let Mode::Kickoff { form, .. } = &app.mode else {
+                panic!("expected the box: {:?}", app.mode)
+            };
+            assert_eq!(form.drafts, ["", "on the laptop"]);
+            assert!(!app.kickoff_prefill.contains_key(&key), "filled in twice");
+        }
+    }
+
+    /// Two sources sharing a record number (Codex's fifth look): beside the card `key`, a copy of
+    /// its record on the other demo machine, whose feed is another source's, homed there. That
+    /// copy's key and machine.
+    pub(crate) fn same_number_elsewhere(app: &mut App, key: &str) -> (String, usize) {
+        let card = app.card(key).unwrap().clone();
+        let id = card.detail.as_ref().unwrap().id.clone();
+        let here = card.machine_index;
+        let there = if here == 0 { 1 } else { 0 };
+        let name = app.machines[there].name();
+        let mut copy = app.machines[here]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .clone();
+        copy.home = Some(crate::feed::Home {
+            machine: Some(name),
+            session: copy.home.as_ref().and_then(|h| h.session.clone()),
+        });
+        let feed = app.machines[there].feed.as_mut().unwrap();
+        feed.source = Some("other".into());
+        feed.cards.retain(|c| c.id != id);
+        feed.cards.push(copy);
+        app.rebuild();
+        let other = format!("other:{id}");
+        assert!(app.card(&other).is_some(), "no copy on the board");
+        assert!(app.card(key).is_some(), "the first one went");
+        (other, there)
+    }
+
+    /// This card goes from the board: its record leaves every feed whose source keys it so, and
+    /// another source's card with the same number stays.
+    pub(crate) fn gone_from_board(app: &mut App, key: &str) {
+        let id = app.card(key).unwrap().detail.as_ref().unwrap().id.clone();
+        for m in &mut app.machines {
+            if let Some(feed) = m.feed.as_mut() {
+                let source = feed.source.clone().unwrap_or_else(|| "feed".into());
+                if format!("{source}:{id}") == key {
+                    feed.cards.retain(|c| c.id != id);
+                }
+            }
+        }
+        app.rebuild();
+        assert!(app.card(key).is_none(), "still on the board");
+    }
+
+    #[test]
+    fn answers_given_back_fill_in_their_own_cards_box_when_two_sources_share_its_number() {
+        // Codex's fifth look: Esc's saves for source A's #N and source B's #N both come back with
+        // answers to fill in, B's first. Each card's next box fills in its own words, never the
+        // other's.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id) = waiting_backlog_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &a);
+        let here = app.card(&a).unwrap().machine_index;
+        let save = serde_json::json!({"action":"answer","id":id,"asked":"oldtoken00000000",
+            "answers":[{"num":"1","take":true},{"num":"2","text":"mine"}]});
+        let mut sent = vec![];
+        for (key, machine) in [(&a, here), (&b, there)] {
+            app.action_from = Some(CardSnapshot::of(app.card(key).unwrap()));
+            app.queue_action(machine, save.clone());
+            sent.push(app.resolver.last_added());
+        }
+        let given = |words: &str| {
+            Ok(crate::actions::parse_response(
+                &serde_json::json!({"ok":false,"message":"Its questions changed while you were answering.",
+                    "prefill":[{"num":"2","text":words}]})
+                .to_string(),
+            )
+            .unwrap())
+        };
+        app.finish_job(sent[1], save.clone(), given("words for B"));
+        app.finish_job(sent[0], save.clone(), given("words for A"));
+        for (key, machine, words) in [(&b, there, "words for B"), (&a, here, "words for A")] {
+            app.mode = Mode::Board;
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            app.action_from = Some(CardSnapshot::of(app.card(key).unwrap()));
+            let mut now = kickoff_now();
+            now["note"] = serde_json::Value::Null;
+            app.finish_action(
+                machine,
+                serde_json::json!({"action":"dispatch","id":id}),
+                Ok(crate::actions::parse_response(&now.to_string()).unwrap()),
+            );
+            let Mode::Kickoff { form, .. } = &app.mode else {
+                panic!("expected {key}'s box: {:?} {:?}", app.mode, app.message())
+            };
+            assert_eq!(form.drafts, ["", words], "{key}");
+        }
+        assert!(app.kickoff_prefill.is_empty());
+    }
+
     /// Intent 0404: ⏎ on work nobody started starts it, sending what d sends, and past the usual
     /// limit asks the same question, whose yes overrides it.
     #[test]
@@ -3727,9 +4288,17 @@ pub(crate) mod tests {
         assert_eq!(enter(&mut app), Action::None);
         assert!(matches!(app.mode, Mode::Peek { .. }));
         assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        // ⏎ again at once, doubled or held: it starts nothing (intent 0591, K1-07).
         assert_eq!(enter(&mut app), Action::None);
-        assert!(app.message().unwrap().0.contains("d starts it"));
         assert!(matches!(app.mode, Mode::Peek { .. }));
+        // Once the peek has been up a moment, ⏎ starts it, as it does everywhere else.
+        app.peek_opened = Some(Instant::now() - std::time::Duration::from_secs(1));
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("⏎ in the peek started nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert!(matches!(app.mode, Mode::Peek { .. }));
+        app.resolver = Default::default();
         app.mode = Mode::Peek {
             scroll: 0,
             back: Box::new(Mode::Board),
@@ -4184,7 +4753,7 @@ pub(crate) mod tests {
             app.message(),
             Some((
                 format!(
-                    "Workspace {} closed while build-box was away; it's off the board now.",
+                    "Workspace {} closed while build-box was away, and nothing of it is left to open.",
                     card.reference
                 )
                 .as_str(),
@@ -4218,6 +4787,146 @@ pub(crate) mod tests {
             "dispatch"
         };
         assert_eq!(request["action"], expected);
+    }
+
+    #[test]
+    fn a_waiting_jump_does_for_its_intent_what_enter_does_now_and_never_takes_another_sources() {
+        // Intent 0591, K1-04: its card under its own key, its workspace closed meanwhile: ⏎ does
+        // what it does now, never "it's off the board".
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let pending = |key: String| PendingJump {
+            key,
+            workspace: "07-build".into(),
+            machine: "gone-box".into(),
+            stuck: None,
+            bare: None,
+            resume: None,
+        };
+        app.pending_jump = Some(pending(key.clone()));
+        app.mode = Mode::Board;
+        assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
+        // Codex's review: another source's card with the same number is other work. Nothing is
+        // started or entered for it, and it's said.
+        app.pending_jump = Some(pending(format!("another-source:{id}")));
+        app.sel.key = None;
+        assert_eq!(app.pending_jump_ready(), None);
+        assert_eq!(app.sel.key, None);
+        let (said, tone) = app.message().unwrap();
+        assert!(said.contains("no longer on this board"), "{said}");
+        assert_eq!(tone, Tone::Warn);
+    }
+
+    #[test]
+    fn a_yes_to_a_question_whose_card_left_the_board_never_acts_on_another_sources_card() {
+        // Codex's review: the question was about source-a's #N; it left the board while he
+        // decided, and another source's card has the same number. Nothing is started, moved or
+        // selected for it.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let card = app.card(&key).unwrap().clone();
+        let mut asked_about = crate::model::CardSnapshot::of(&card);
+        asked_about.key = format!("source-a:{id}");
+        app.sel.key = None;
+        for request in [
+            serde_json::json!({"action":"dispatch","id":id,"account":"ARK_C","confirm":"t-1"}),
+            serde_json::json!({"action":"reopen","id":id,"confirm":"t-1"}),
+            serde_json::json!({"action":"close","id":id,"confirm":"t-1"}),
+        ] {
+            let action = app.ask_again(
+                card.machine_index,
+                request.clone(),
+                Some(asked_about.clone()),
+            );
+            assert_eq!(action, Action::None, "{request}");
+            assert!(matches!(app.mode, Mode::Board), "{request}: {:?}", app.mode);
+            assert_eq!(app.sel.key, None, "{request}");
+            let (said, tone) = app.message().unwrap();
+            assert!(said.contains("is gone from the board"), "{said}");
+            assert_eq!(tone, Tone::Warn);
+        }
+    }
+
+    #[test]
+    fn each_image_question_sends_its_own_words_never_a_later_one_s() {
+        // Codex's review: A's question is held while he types B; B goes with its image still
+        // being read, and A's question opens. B's image fails then: its question waits, the yes
+        // to A sends A's words, and B is asked next, its yes sending B's.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        use crate::images::Source;
+        let none = || crate::images::Loading {
+            images: vec![],
+            why: Some("The clipboard holds no image.".into()),
+        };
+        let type_in = |app: &mut App, words: &str| {
+            press(app, 'c');
+            for c in words.chars() {
+                press(app, c);
+            }
+        };
+        type_in(&mut app, "Words A");
+        let (a, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        type_in(&mut app, "Words B");
+        assert_eq!(app.images_loaded(a, none()), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Compose { .. }),
+            "asked over typing"
+        );
+        let (b, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(app.next_owed(), Action::None);
+        let Mode::Confirm {
+            request: asked_a, ..
+        } = app.mode.clone()
+        else {
+            panic!("A not asked: {:?}", app.mode)
+        };
+        assert_eq!(app.images_loaded(b, none()), Action::None);
+        assert!(
+            matches!(&app.mode, Mode::Confirm { request, .. } if *request == asked_a),
+            "B's question took A's place: {:?}",
+            app.mode
+        );
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("A's yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["words"], "Words A");
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "B not asked");
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("B's yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["words"], "Words B");
+    }
+
+    #[test]
+    fn a_closed_workspace_on_work_with_a_conversation_on_record_reopens_it() {
+        // Intent 0591, K3-02: neither under way nor done (shelved), but its conversation is on
+        // record: reopened as for work under way, never "has closed since the board last read it".
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = closed_workspace_card(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.stage = Stage::Backlog;
+        card.state = Some("shelved".into());
+        card.workspace_id = Some("w5".into());
+        card.session = Some("web".into());
+        assert!(!app.closed_under_you(&key, Some("w5")));
+        let Action::Mutate { request, .. } = app.after_closed(&key, Some("w5"), false) else {
+            panic!("nothing done: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
     }
 
     #[test]
@@ -4327,12 +5036,17 @@ pub(crate) mod tests {
             key: Some(card.key.clone()),
         };
         assert!(app.backlog_card_for_keys().is_none());
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        let (text, _) = app.message().unwrap();
-        assert!(
-            text.contains(&card.reference) && text.contains("backlog work"),
-            "{text}"
-        );
+        // d does what ⏎ does: it goes in (intent 0591, K1-24).
+        assert_eq!(press(&mut app, 'd'), Action::Jump(card.key.clone()));
+        // The ordering keys say it has no place in the backlog order.
+        for c in ['y', 't', 'B', 'J', 'K'] {
+            assert_eq!(press(&mut app, c), Action::None, "{c}");
+            let (text, _) = app.message().unwrap();
+            assert!(
+                text.contains(&card.reference) && text.contains("no place in the backlog order"),
+                "{c}: {text}"
+            );
+        }
     }
 
     #[test]
@@ -4658,10 +5372,117 @@ pub(crate) mod tests {
             why: Some("The clipboard holds no image.".into()),
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
-        let (said, tone) = app.message().unwrap();
-        assert_eq!(tone, Tone::Fail);
-        assert!(said.contains("c opens it again with your words"), "{said}");
+        // Whether they go without it is his call (intent 0591, K1-37); they're kept meanwhile.
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert_eq!(title, "Send without the image?");
+        assert!(
+            message.contains("The clipboard holds no image."),
+            "{message}"
+        );
+        assert!(message.contains("c opens them again"), "{message}");
         assert_eq!(app.draft, "Again");
+        answer_now(&mut app);
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Backlog { .. }), "{:?}", app.mode);
+        assert!(app.message().unwrap().0.contains("kept, unsent"));
+        assert_eq!(app.draft, "Again");
+        assert!(app.send_without.is_empty());
+    }
+
+    /// Lets the question on screen take an answer now, as it does half a second after it appears.
+    fn answer_now(app: &mut App) {
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+    }
+
+    #[test]
+    fn words_whose_image_didn_t_go_in_go_without_it_on_a_yes() {
+        // Intent 0591, K1-37: the image couldn't be read; a yes sends the words as they are,
+        // taken back from the box they were kept in, and not too soon.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        use crate::images::Source;
+        app.draft = "The dock".into();
+        press(&mut app, 'c');
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let none = crate::images::Loading {
+            images: vec![],
+            why: Some("The clipboard holds no image.".into()),
+        };
+        assert_eq!(app.images_loaded(id, none), Action::None);
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE)),
+            Action::None,
+            "a y typed before the question was seen answered it"
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("the yes didn't send the words: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "create");
+        assert_eq!(request["words"], "The dock");
+        assert!(app.draft.is_empty(), "the words sent stayed in the box too");
+        assert!(app.send_without.is_empty());
+        // Kept in the queue behind words typed meanwhile, they're taken from there.
+        app.mode = Mode::Board;
+        press(&mut app, 'c');
+        for c in "Fix the NAS".chars() {
+            press(&mut app, c);
+        }
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        press(&mut app, 'c');
+        for c in "Other".chars() {
+            press(&mut app, c);
+        }
+        let none = crate::images::Loading {
+            images: vec![],
+            why: Some("The clipboard holds no image.".into()),
+        };
+        assert_eq!(app.images_loaded(id, none), Action::None);
+        // Never asked over the words he's typing, where a y or ⏎ meant for them would send these
+        // (Codex's review): held, and those keys go into his box.
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Other"),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Compose { .. }),
+            "asked over typing"
+        );
+        press(&mut app, 'y');
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. } if draft.words == "Othery"),
+            "{:?}",
+            app.mode
+        );
+        assert_eq!(app.returned.len(), 1);
+        // Back on the board or a list, it's asked, and its yes sends those words, not the box's.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.enter_can_land_here(), "{:?}", app.mode);
+        assert_eq!(app.next_owed(), Action::None);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert!(message.contains("once the box is empty"), "{message}");
+        answer_now(&mut app);
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("Enter didn't send the words")
+        };
+        assert_eq!(request["words"], "Fix the NAS");
+        assert!(app.returned.is_empty());
+        assert_eq!(app.draft, "Othery", "the words typed meanwhile stay");
     }
 
     fn a_png() -> crate::images::Loaded {
@@ -4773,9 +5594,12 @@ pub(crate) mod tests {
             why: None,
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
-        let (said, tone) = app.message().unwrap();
-        assert_eq!(tone, Tone::Fail);
-        assert!(said.contains("The box is full"), "{said}");
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert!(message.contains("The box is full"), "{message}");
+        assert_eq!(app.draft, full);
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.draft, full);
         // One image in and one that couldn't be read: not sent either.
         app.draft = "The dock".into();
@@ -4788,7 +5612,10 @@ pub(crate) mod tests {
             why: Some("photo.heic isn't an image Kerdr can send.".into()),
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
-        assert!(app.message().unwrap().0.contains("photo.heic"));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?}", app.mode)
+        };
+        assert!(message.contains("photo.heic"), "{message}");
         assert_eq!(app.draft, "The dock [Image #1] ");
         assert_eq!(app.draft_images.len(), 1);
     }
@@ -5362,13 +6189,20 @@ pub(crate) mod tests {
             key: Some(key),
         };
         assert!(app.backlog_card_for_keys().is_none());
-        for c in ['d', 'y', 'x', 't', 'B', 'J', 'u'] {
+        for c in ['y', 'x', 't', 'B', 'J', 'u'] {
             assert_eq!(
                 press(&mut app, c),
                 Action::None,
                 "{c} acted on finished work"
             );
         }
+        // d does what ⏎ does: a reopen, whose backend always asks first for done work (intent
+        // 0591, K1-25).
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert!(request.get("override").is_none());
     }
 
     #[test]
@@ -5459,11 +6293,17 @@ pub(crate) mod tests {
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         app.board.cards[i].stage = Stage::Build;
         app.board.cards[i].state = Some("active".into());
+        // The yes isn't sent: x on the card as it is now asks again at once, saying what changed
+        // (intent 0591, K1-38).
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::None
         );
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("started meanwhile"), "{message}");
+        press_code(&mut app, KeyCode::Esc);
         // Still waiting: yes sends it.
         app.board.cards[i].stage = Stage::Backlog;
         app.board.cards[i].state = Some("queued".into());
@@ -5757,16 +6597,16 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn d_on_started_work_with_no_workspace_names_c_and_x() {
+    fn d_on_started_work_with_no_workspace_reopens_it_as_enter_does() {
+        // Intent 0591, K1-24: d on work under way does what ⏎ does, never "already under way".
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        closed_workspace_card(&mut app);
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        let said = app.message().unwrap().0;
-        assert!(
-            said.contains("C marks it done and x sets it aside"),
-            "{said}"
-        );
+        let (_, id) = closed_workspace_card(&mut app);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
     }
 
     #[test]
@@ -5799,8 +6639,14 @@ pub(crate) mod tests {
             machine: Some(app.machines[0].name()),
             session: Some("elsewhere".into()),
         });
+        // Its yes isn't sent: the question is asked again at once, for the card as it is now, led
+        // by what changed (intent 0591, K1-38).
         assert_eq!(enter(&mut app), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("moved to"), "{message}");
+        press_code(&mut app, KeyCode::Esc);
         app.sel = Selection {
             col: Stage::Build.index(),
             key: Some(key),
@@ -5811,7 +6657,10 @@ pub(crate) mod tests {
         app.board.cards[i].stage = Stage::Backlog;
         app.board.cards[i].state = Some("queued".into());
         assert_eq!(enter(&mut app), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("went back to the backlog"), "{message}");
     }
 
     #[test]
@@ -5962,26 +6811,38 @@ pub(crate) mod tests {
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         press(&mut app, 'X');
         settle(&mut app);
-        // Its workspace closed and another opened on it while the question was up.
+        // Its workspace closed and another opened on it while the question was up: the yes stops
+        // nothing, and the question comes back at once about where it runs now (intent 0591).
         app.board.cards[i].workspace_id = Some("w9".into());
         assert_eq!(enter(&mut app), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("now runs in"), "{message}");
+        // Its yes is for the card as it is now.
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the new yes sent nothing")
+        };
+        assert_eq!(request["action"], "cancel");
     }
 
     #[test]
     fn x_upper_refuses_work_no_agent_is_at_and_done_work() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
-        let (key, _) = closed_workspace_card(&mut app);
+        let (key, id) = closed_workspace_card(&mut app);
+        // Nothing to stop: X's end is Won't do, so it asks to set it aside (intent 0591, K1-30).
         assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("X asked nothing: {:?}", app.message())
+        };
+        assert!(message.contains("Nothing is running for"), "{message}");
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "dismiss", "id": id}));
+        app.resolver = Default::default();
         assert!(matches!(app.mode, Mode::Board));
-        assert!(
-            app.message().unwrap().0.contains(
-                "has no workspace open, so no agent to stop: x sets it aside, C marks it done."
-            ),
-            "{:?}",
-            app.message()
-        );
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         app.board.cards[i].workspace_id = Some("w7".into());
         app.board.cards[i].session = Some("web".into());
@@ -6366,7 +7227,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_yes_to_reopen_a_done_card_is_refused_once_it_has_a_workspace_again() {
+    fn a_yes_to_reopen_a_done_card_goes_in_once_it_has_a_workspace_again() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _) = done_card(&mut app);
@@ -6379,16 +7240,16 @@ pub(crate) mod tests {
             done_question(&reference, "0123456789ab0008"),
         );
         settle(&mut app);
-        // Opened meanwhile, from somewhere else: the yes no longer fits it.
+        // Opened meanwhile, from somewhere else: the yes reopens nothing, and Enter on the card
+        // as it is now goes in, saying why (intent 0591).
         let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
         card.workspace_id = Some("w9".into());
         card.session = Some("web".into());
-        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(press(&mut app, 'y'), Action::Jump(k) if k == key));
+        let said = app.message().unwrap().0;
         assert!(
-            app.message()
-                .unwrap()
-                .0
-                .contains("changed while you were deciding")
+            said.contains("now runs in") && said.contains("going in"),
+            "{said}"
         );
     }
 
@@ -6502,7 +7363,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn a_yes_is_refused_when_the_work_changed_since_it_was_asked_for() {
+    fn a_yes_asks_again_when_the_work_changed_since_it_was_asked_for() {
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
         let (key, _) = closed_workspace_card(&mut app);
@@ -6525,9 +7386,13 @@ pub(crate) mod tests {
         );
         settle(&mut app);
         assert!(!matches!(app.mode, Mode::Confirm { .. }));
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Fail));
+        assert!(app.waiting_on(&key).is_none());
+        let said = app.message().unwrap();
+        assert_eq!(said.1, Tone::Warn);
+        assert!(said.0.contains("conversation changed"), "{said:?}");
         seen(&mut app);
-        // Its agent changes while the question is up: the yes sends nothing.
+        // Its agent changes while the question is up: the yes overrides nothing, and Enter on
+        // the card as it is now sends its reopen afresh, for the backend to ask again (0591).
         let request = reopen_by_enter(&mut app);
         reply_to(
             &mut app,
@@ -6545,14 +7410,18 @@ pub(crate) mod tests {
             .as_mut()
             .unwrap()
             .agent = Some("claude".into());
-        assert_eq!(press(&mut app, 'y'), Action::None);
-        assert_eq!(
-            app.message().map(|(_, tone)| tone),
-            Some(Tone::Warn),
-            "{:?}",
-            app.message()
+        let Action::Mutate { request: again, .. } = press(&mut app, 'y') else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert_eq!(again["action"], "reopen");
+        assert!(again.get("override").is_none() && again.get("confirm").is_none());
+        let said = app.message().unwrap().0;
+        assert!(
+            said.contains("conversation changed") && said.contains("asking again"),
+            "{said}"
         );
-        // It gets a workspace of its own while the question is up: the yes sends nothing either.
+        // It gets a workspace of its own while the question is up: the yes reopens nothing, and
+        // goes in instead, as Enter on it would now.
         let (key, _) = closed_workspace_card(&mut app);
         let request = reopen_by_enter(&mut app);
         reply_to(
@@ -6565,7 +7434,7 @@ pub(crate) mod tests {
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
         app.board.cards[i].workspace_id = Some("w9".into());
         app.board.cards[i].session = Some("web".into());
-        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(press(&mut app, 'y'), Action::Jump(k) if k == key));
     }
 
     #[test]
@@ -6588,9 +7457,18 @@ pub(crate) mod tests {
         );
         settle(&mut app);
         assert!(matches!(app.mode, Mode::Search(_)));
-        assert!(app.message().unwrap().0.contains("needs a yes first"));
+        // It waits on its card, asking, not failed (intent 0591).
+        assert!(app.message().unwrap().0.contains("n goes to it"));
+        assert_eq!(app.message().unwrap().1, Tone::Info);
         press(&mut app, 'y');
         assert!(matches!(&app.mode, Mode::Search(s) if s.query == "checy"));
+        // Enter on its card asks that question now; Esc leaves it, and it stops waiting.
+        app.mode = Mode::Board;
+        app.sel.key = Some(key.clone());
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        esc(&mut app);
+        assert!(app.waiting_on(&key).is_none());
         // Reopened from the board, then into the backlog: the board's selection still names it,
         // but you're looking at the backlog, so it doesn't pull you out.
         app.mode = Mode::Board;
@@ -6738,6 +7616,7 @@ pub(crate) mod tests {
             machine: app.card(&key).unwrap().machine.clone(),
             stuck: None,
             bare: None,
+            resume: None,
         };
         app.pending_jump = Some(pending(&app));
         assert_eq!(app.pending_jump_ready(), Some(Action::Jump(key.clone())));
@@ -6817,7 +7696,8 @@ pub(crate) mod tests {
             (sent["override"].as_bool(), sent["session"].as_str()),
             (Some(true), Some("web"))
         );
-        // Its home moves while the question is up: the yes sends nothing.
+        // Its home moves while the question is up: the yes never overrides the limit where it
+        // was asked. It sends d again, as the card is now, for its new home to ask (intent 0591).
         app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
         reply_to(&mut app, machine, request, Ok(asks));
         settle(&mut app);
@@ -6826,8 +7706,13 @@ pub(crate) mod tests {
             machine: Some(app.machines[0].name()),
             session: Some("api".into()),
         });
-        assert_eq!(press(&mut app, 'y'), Action::None);
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Warn));
+        let Action::Mutate { request: again, .. } = press(&mut app, 'y') else {
+            panic!("the yes didn't ask again: {:?}", app.message())
+        };
+        assert_eq!(again["action"], "dispatch");
+        assert!(again.get("override").is_none() && again.get("confirm").is_none());
+        assert_ne!(again["session"].as_str(), Some("web"));
+        assert!(app.message().unwrap().0.contains("asking again"));
     }
 
     fn type_in(app: &mut App, words: &str) {
@@ -7109,7 +7994,9 @@ pub(crate) mod tests {
         assert!(matches!(app.mode, Mode::Backlog { .. }));
         assert_eq!(press(&mut app, 'y'), Action::None);
         assert!(query(&app).is_some_and(|(q, typing)| q.ends_with('y') && typing));
-        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Fail));
+        // It waits on its card instead, asking, never a failure (intent 0591).
+        assert_eq!(app.message().map(|(_, tone)| tone), Some(Tone::Info));
+        assert!(app.waiting_on(&key).is_some());
     }
 
     #[test]
@@ -7407,7 +8294,7 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(i, t, _)| (i.clone(), *t))
                 .collect::<Vec<_>>(),
-            vec![(id.clone(), 1)]
+            vec![(key.clone(), 1)]
         );
         let card = app.card(&key).cloned().unwrap();
         assert_eq!(app.home_machine(&card), Some(1));
@@ -7489,8 +8376,89 @@ pub(crate) mod tests {
                 .iter()
                 .map(|(i, t, _)| (i.clone(), *t))
                 .collect::<Vec<_>>(),
-            vec![(id.clone(), 1)],
+            vec![(key.clone(), 1)],
             "⏎ goes there once it's back"
+        );
+    }
+
+    #[test]
+    fn a_move_one_sources_card_was_refused_with_never_redirects_anothers_with_its_number() {
+        // Codex's sixth look, swept: source A's #N and source B's #N, both homed on the same
+        // machine. A refusal says A's lives on another machine now: A's actions go there, and
+        // B's stay where B's own home says. Its resend is A's alone.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        room_in_every_session(&mut app);
+        let (ka, id) = waiting_backlog_card(&app);
+        let (kb, there) = same_number_elsewhere(&mut app, &ka);
+        let here = app.card(&ka).unwrap().machine_index;
+        let home = app.machines[here].name();
+        for m in [here, there] {
+            for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+                if c.id == id {
+                    c.home = Some(crate::feed::Home {
+                        machine: Some(home.clone()),
+                        session: None,
+                    });
+                }
+            }
+        }
+        app.rebuild();
+        app.sel = Selection {
+            col: app.card(&ka).unwrap().stage.index(),
+            key: Some(ka.clone()),
+        };
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, here);
+        app.queue_action(machine, request);
+        let n = app.resolver.last_added();
+        let request = app.resolver.job_request(n).unwrap().clone();
+        let name = app.machines[there].name();
+        app.finish_job(
+            n,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                message: format!("It lives on {name} now; ⏎ again opens it there."),
+                home: Some(format!("{name}/web")),
+                ..Default::default()
+            }),
+        );
+        let a = app.card(&ka).cloned().unwrap();
+        let b = app.card(&kb).cloned().unwrap();
+        assert_eq!(app.moved_target(&a), Some(there));
+        assert_eq!(app.moved_target(&b), None, "B's actions follow A's move");
+        assert_eq!(app.resent.len(), 1);
+        assert_eq!(app.resent[0].1, ka);
+    }
+
+    #[test]
+    fn a_change_asked_with_no_card_is_its_machines_own_never_another_sources_with_its_number() {
+        // Codex's sixth look, swept: a change sent to a machine with no card it was asked from
+        // is about that machine's own record, by its feed's source: never another source's card
+        // that only shows on that machine, with the same number.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (ka, id) = waiting_backlog_card(&app);
+        let (kb, there) = same_number_elsewhere(&mut app, &ka);
+        let here = app.card(&ka).unwrap().machine_index;
+        // Each shows on the other's machine, where its workspace would run.
+        for (k, m) in [(&ka, there), (&kb, here)] {
+            app.board
+                .cards
+                .iter_mut()
+                .find(|c| &c.key == k)
+                .unwrap()
+                .machine_index = m;
+        }
+        app.queue_action(here, serde_json::json!({"action":"close","id":id}));
+        let n = app.resolver.last_added();
+        assert_eq!(
+            app.resolver.job(n).unwrap().key.as_deref(),
+            Some(ka.as_str()),
+            "taken as another source's card"
         );
     }
 
@@ -7883,10 +8851,13 @@ pub(crate) mod tests {
             panic!("⏎ sent nothing")
         };
         assert_eq!(request, by_enter);
-        // Work with a state of its own is still under way to d.
+        // Work with a state of its own too: d reopens it, as ⏎ does (intent 0591, K1-24).
         app.board.cards[i].state = Some("active".into());
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        assert!(app.message().unwrap().0.contains("already under way"));
+        app.resolver = Default::default();
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "reopen");
     }
 
     #[test]
@@ -8243,10 +9214,12 @@ pub(crate) mod tests {
         };
         app.finish_job(n, request, Ok(asks));
         assert_eq!(app.card(&key).unwrap().stage, Stage::Backlog);
+        // It names the card as the board does, #21, not its bare id (intent 0591, K1-60).
+        let reference = format!("#{}", id.trim_start_matches('0'));
         assert!(
-            matches!(&app.mode, Mode::Confirm { title, .. } if title.contains(&format!("Start {id}"))),
+            matches!(&app.mode, Mode::Confirm { title, .. } if title.contains(&format!("Start {reference}"))),
             "{:?}",
-            app.message()
+            app.mode
         );
     }
 
@@ -8711,7 +9684,7 @@ pub(crate) mod tests {
             .unanswered_where(|r| r["action"] == "dispatch")
             .unwrap();
         app.resolver.take(n);
-        app.started = Some((id, Instant::now()));
+        app.started = Some((key.clone(), id, Instant::now()));
         assert_eq!(app.enter_when_open_due(), None);
         assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()), "lately");
         app.started = None;
@@ -8945,8 +9918,172 @@ pub(crate) mod tests {
         let mut job = app.resolver.take(n).unwrap();
         job.effect = Some(crate::resolve::Effect::StartingOn("far-box".into()));
         app.resolver.settle(job);
-        assert!(app.resolver.starting(&id).is_some());
+        assert!(app.resolver.starting(&card.key, &id).is_some());
         assert!(!app.still_changing(&card, "close"));
+    }
+
+    #[test]
+    fn d_on_another_sources_card_goes_while_one_with_its_number_starts() {
+        // Codex's seventh look: source A's #N is starting. d on A's card again still waits; going
+        // into source B's #N leaves A's start free to take you in; and d on B's card starts B's
+        // at once, sent to where B lives.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id, machine) = waiting_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &a);
+        select_key(&mut app, &a);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        select_key(&mut app, &a);
+        assert_eq!(press(&mut app, 'd'), Action::None, "A's started twice");
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("is starting up"), "{said}");
+        app.went_into(&b);
+        let job = app.resolver.starting(&a, &id).expect("A's start");
+        assert!(
+            !job.entered && job.from.is_some(),
+            "going into B let A's start's answer go"
+        );
+        select_key(&mut app, &b);
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'd')
+        else {
+            panic!("d on B waited for A's start: {:?}", app.message())
+        };
+        assert_eq!(
+            (to, request["action"].as_str(), request["id"].as_str()),
+            (there, Some("dispatch"), Some(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn a_source_named_with_a_feed_prefix_holds_up_only_its_own_cards_start() {
+        // Codex's eighth look: source A is named "feed:alpha", so its #N's key starts the way a
+        // feed naming no source would. It's still a named source: going into source B's #N leaves
+        // A's start free to take you in, d on B starts B's at once, and ⏎ on B isn't held up by
+        // A's start answered lately.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (first, id, machine) = waiting_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &first);
+        app.machines[machine].feed.as_mut().unwrap().source = Some("feed:alpha".into());
+        app.rebuild();
+        let a = format!("feed:alpha:{id}");
+        assert!(app.card(&a).is_some(), "no card keyed {a}");
+        select_key(&mut app, &a);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        app.went_into(&b);
+        let job = app.resolver.starting(&a, &id).expect("A's start");
+        assert!(
+            !job.entered && job.from.is_some(),
+            "going into B marked A's start entered"
+        );
+        select_key(&mut app, &b);
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'd')
+        else {
+            panic!("d on B waited for A's start: {:?}", app.message())
+        };
+        assert_eq!(
+            (to, request["action"].as_str(), request["id"].as_str()),
+            (there, Some("dispatch"), Some(id.as_str()))
+        );
+        app.resolver = Default::default();
+        app.started = Some((a.clone(), id.clone(), Instant::now()));
+        select_key(&mut app, &b);
+        assert!(
+            matches!(enter(&mut app), Action::Mutate { .. }),
+            "⏎ on B waited for A's start: {:?}",
+            app.message()
+        );
+    }
+
+    #[test]
+    fn a_start_answered_lately_holds_only_its_own_card() {
+        // Codex's seventh look: A's start was answered yes a moment ago, gone from the action
+        // resolution tool with no workspace shown yet. ⏎ on A's card waits for it; ⏎ on source
+        // B's card with the same number starts B's.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id, _) = waiting_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &a);
+        app.started = Some((a.clone(), id.clone(), Instant::now()));
+        select_key(&mut app, &a);
+        assert_eq!(enter(&mut app), Action::None, "A's started twice");
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("is starting"), "{said}");
+        select_key(&mut app, &b);
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = enter(&mut app)
+        else {
+            panic!("⏎ on B waited for A's start: {:?}", app.message())
+        };
+        assert_eq!(
+            (to, request["action"].as_str(), request["id"].as_str()),
+            (there, Some("dispatch"), Some(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn the_same_record_shown_from_another_machine_still_waits_for_its_start() {
+        // Codex's seventh look: the same record on two machines shares one key, so a second copy
+        // of it waits for the start on its way, whichever machine's copy the board shows now.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (a, id, machine) = waiting_card(&app);
+        select_key(&mut app, &a);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        // Its copy on the other machine, its home now, is the one the board shows.
+        let there = if machine == 0 { 1 } else { 0 };
+        let name = app.machines[there].name();
+        let mut copy = app.machines[machine]
+            .feed
+            .as_ref()
+            .unwrap()
+            .cards
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap()
+            .clone();
+        copy.home = Some(crate::feed::Home {
+            machine: Some(name),
+            session: copy.home.as_ref().and_then(|h| h.session.clone()),
+        });
+        for m in [machine, there] {
+            let feed = app.machines[m].feed.as_mut().unwrap();
+            feed.cards.retain(|c| c.id != id);
+            feed.cards.push(copy.clone());
+        }
+        app.rebuild();
+        assert_eq!(app.card(&a).map(|c| c.machine_index), Some(there));
+        select_key(&mut app, &a);
+        assert_eq!(
+            press(&mut app, 'd'),
+            Action::None,
+            "the same record started twice"
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(said.contains("is starting up"), "{said}");
+        select_key(&mut app, &a);
+        assert_eq!(enter(&mut app), Action::None, "⏎ started it twice");
     }
 
     #[test]
@@ -8992,7 +10129,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("Being written up")
         );
-        assert!(app.resolver.starting(&id).is_none());
+        assert!(app.resolver.starting(&key, &id).is_none());
         assert_eq!(app.quit_held(), None);
         assert!(
             app.quit_loses()
@@ -9016,7 +10153,7 @@ pub(crate) mod tests {
         assert!(app.resolver.started(n).shows_now);
         app.rebuild();
         assert!(!app.starts_when_written(&key));
-        assert!(app.resolver.starting(&id).is_some());
+        assert!(app.resolver.starting(&key, &id).is_some());
         app.finish_job(n, request, done("Started."));
         // Esc on the board drops one still waiting, and the runner is told.
         let mut app = demo_app();
@@ -9234,5 +10371,1082 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("Marking it done")
         );
+    }
+
+    /// The demo session a backlog card's start asks about, on the machine its d goes to.
+    fn start_question(
+        app: &mut App,
+        key: &str,
+        used: u32,
+        choices: Vec<crate::actions::Choice>,
+    ) -> (usize, serde_json::Value) {
+        select_key(app, key);
+        let Action::Mutate { machine, request } = press(app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        let session = app.machines[machine]
+            .feed
+            .as_ref()
+            .and_then(|f| f.sessions.iter().find(|(_, s)| s.max.is_some()))
+            .map(|(name, _)| name.clone())
+            .expect("a session with a most in the demo");
+        let asks = crate::actions::Response {
+            ok: false,
+            message: format!(
+                "{session} has {used} workspaces, past its usual limit. Start it anyway?"
+            ),
+            confirmation: true,
+            confirm: Some("0123456789ab0011".into()),
+            used: Some(used),
+            limit: Some(3),
+            session: Some(session),
+            choices,
+            ..Default::default()
+        };
+        reply_to(app, machine, request.clone(), Ok(asks));
+        settle(app);
+        (machine, request)
+    }
+
+    fn a_choice(id: &str, key: &str, label: &str) -> crate::actions::Choice {
+        crate::actions::Choice {
+            id: id.into(),
+            key: key.into(),
+            label: label.into(),
+        }
+    }
+
+    #[test]
+    fn a_choice_sends_its_question_again_with_the_same_token_and_no_override() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        start_question(
+            &mut app,
+            &key,
+            3,
+            vec![
+                a_choice("queue", "w", "queue it"),
+                // y is the yes: it takes the first free digit.
+                a_choice("shelve-oldest", "y", "shelve the oldest, then start it"),
+            ],
+        );
+        let Mode::Confirm { choices, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert_eq!(choices.len(), 2);
+        // Shown beside yes and no, each with its key, one to a line.
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        for shown in [
+            "Enter / y start anyway",
+            "w queue it",
+            "1 shelve the oldest, then start it",
+            "Esc / n leave it",
+        ] {
+            assert!(screen.contains(shown), "{shown} isn't on screen");
+        }
+        let Action::Mutate { request, .. } = press(&mut app, '1') else {
+            panic!("the choice sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["choice"], "shelve-oldest");
+        assert_eq!(request["confirm"], "0123456789ab0011");
+        assert!(request.get("override").is_none() && request.get("queue").is_none());
+    }
+
+    #[test]
+    fn at_the_most_a_session_holds_enter_queues_and_there_is_no_yes() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        start_question(&mut app, &key, 5, vec![a_choice("queue", "w", "queue it")]);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert!(title.starts_with("Queue #"), "{title}");
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(!screen.contains("start anyway"), "{screen}");
+        assert!(screen.contains("Enter / w queue it"));
+        // y does nothing here; Enter queues it.
+        assert_eq!(press(&mut app, 'y'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter queued nothing: {:?}", app.message())
+        };
+        assert_eq!(request["choice"], "queue");
+        assert!(request.get("override").is_none());
+    }
+
+    #[test]
+    fn at_the_most_with_no_queue_offered_the_question_is_still_the_queue_and_its_yes_queues() {
+        // The backend's own at-the-most question has no queue choice: its yes queues it (the
+        // end-to-end check's first failure). It still reads as the queue it is.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        start_question(&mut app, &key, 5, vec![]);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert!(title.starts_with("Queue #"), "{title}");
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(!screen.contains("start anyway"), "{screen}");
+        assert!(screen.contains("Enter / y queue it"), "{screen}");
+        assert!(screen.contains("⏎ queues"), "{screen}");
+        // y is that same yes, as Enter is.
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("y queued nothing: {:?}", app.message())
+        };
+        assert_eq!(request["override"], true);
+        assert_eq!(request["confirm"], "0123456789ab0011");
+        assert!(request.get("choice").is_none());
+        // And with only shelve-oldest offered beside it, Enter is the yes that queues.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        start_question(
+            &mut app,
+            &key,
+            5,
+            vec![a_choice(
+                "shelve-oldest",
+                "o",
+                "shelve the oldest, then start it",
+            )],
+        );
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(screen.contains("Queue #"), "{screen}");
+        assert!(screen.contains("Enter / y queue it"), "{screen}");
+        assert!(screen.contains("o shelve the oldest"), "{screen}");
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("Enter queued nothing: {:?}", app.message())
+        };
+        assert_eq!(request["override"], true);
+        assert!(request.get("choice").is_none());
+    }
+
+    #[test]
+    fn a_question_that_arrives_while_you_are_elsewhere_waits_on_its_card() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = waiting_backlog_card(&app);
+        select_key(&mut app, &key);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing")
+        };
+        // On another card when it comes.
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.stage == Stage::Backlog)
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        let asks = crate::actions::Response {
+            ok: false,
+            message: "web has 3 workspaces, its usual limit. Start it anyway?".into(),
+            confirmation: true,
+            confirm: Some("0123456789ab0012".into()),
+            used: Some(3),
+            limit: Some(3),
+            session: Some("web".into()),
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, request, Ok(asks));
+        assert!(matches!(app.mode, Mode::Board));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "{said}");
+        assert!(
+            said.contains("asks you first") && said.contains("n goes to it"),
+            "{said}"
+        );
+        // Its card shows it as asking, never as failed, and a read keeps it so.
+        app.rebuild();
+        let card = app.card(&key).unwrap();
+        assert_eq!(card.attention, Attention::NeedsYou);
+        assert!(card.why.starts_with("asks you:"), "{}", card.why);
+        assert!(app.needs_you_order().contains(&key));
+        // n finds it and asks.
+        for _ in 0..app.needs_you_order().len() {
+            press(&mut app, 'n');
+            if matches!(app.mode, Mode::Confirm { .. }) {
+                break;
+            }
+        }
+        let Mode::Confirm { request, .. } = &app.mode else {
+            panic!("n never asked: {:?}", app.message())
+        };
+        assert_eq!(request["confirm"], "0123456789ab0012");
+        assert_eq!(app.sel.key.as_deref(), Some(key.as_str()));
+        assert!(app.waiting_on(&key).is_none());
+    }
+
+    #[test]
+    fn a_question_is_shown_whole() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = closed_workspace_card(&mut app);
+        let request = reopen_by_enter(&mut app);
+        let long = format!(
+            "{} The end of it shows.",
+            "It was closed by its agent after the work was merged and its tab was shut. ".repeat(6)
+        );
+        let mut asks = reopen_reply("web", false, true, "0123456789ab0004").unwrap();
+        asks.message = long.clone();
+        reply_to(&mut app, 0, request, Ok(asks));
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question")
+        };
+        assert_eq!(message, &long);
+        let screen = crate::ui::tests_render(&app, 120, 50);
+        // Its last words, wrapped, still in the box.
+        assert!(screen.contains("it shows."), "{screen}");
+        assert!(app.card(&key).is_some());
+    }
+
+    /// Every machine's backend does each key's step first (intent 0591): its feed says "steps".
+    fn steps_everywhere(app: &mut App) {
+        for machine in &mut app.machines {
+            if let Some(feed) = machine.feed.as_mut() {
+                feed.supports = vec!["op".into(), "retry".into(), "follow".into(), "steps".into()];
+            }
+        }
+    }
+
+    /// A backlog card set aside in Won't do, selected on the board.
+    fn wont_do_card(app: &mut App) -> (String, String) {
+        let (key, id) = waiting_backlog_card(app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        app.sel = Selection {
+            col: Stage::Backlog.index(),
+            key: Some(key.clone()),
+        };
+        (key, id)
+    }
+
+    #[test]
+    fn c_and_x_on_work_an_agent_may_be_at_go_to_a_backend_that_asks_itself() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        // A backend without it: refused, as 0.33.0 did.
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        assert!(app.message().unwrap().0.contains("a workspace open"));
+        steps_everywhere(&mut app);
+        for (c, action) in [('C', "close"), ('x', "dismiss")] {
+            app.resolver = Default::default();
+            let Action::Mutate { machine, request } = press(&mut app, c) else {
+                panic!("{c} sent nothing: {:?}", app.message())
+            };
+            assert_eq!(request, serde_json::json!({"action": action, "id": id}));
+            // Nothing shows on the card until its yes: the backend asks first.
+            assert!(app.effect_for(&key, &request).is_none());
+            // Its question, with wrap-up beside yes: w asks the agent to wrap up instead.
+            let asks = crate::actions::Response {
+                ok: false,
+                message: format!(
+                    "An agent is at {} (workspace 07-build in web). Stop it?",
+                    app.card(&key).unwrap().reference
+                ),
+                confirmation: true,
+                confirm: Some("00000000000000aa".into()),
+                session: Some("web".into()),
+                choices: vec![a_choice("wrap-up", "w", "ask it to wrap up")],
+                ..Default::default()
+            };
+            reply_to(&mut app, machine, request, Ok(asks));
+            settle(&mut app);
+            let Mode::Confirm { title, .. } = &app.mode else {
+                panic!("no question: {:?}", app.message())
+            };
+            assert!(
+                title.starts_with(if c == 'C' { "Mark" } else { "Won't do" }),
+                "{title}"
+            );
+            let Action::Mutate { request, .. } = press(&mut app, 'w') else {
+                panic!("w sent nothing: {:?}", app.message())
+            };
+            assert_eq!(request["choice"], "wrap-up");
+            assert_eq!(request["confirm"], "00000000000000aa");
+            assert!(request.get("override").is_none());
+        }
+    }
+
+    #[test]
+    fn x_on_work_an_agent_is_at_goes_as_c_and_x_do_so_its_backend_offers_wrap_up() {
+        // The end-to-end check's fourth failure: Kerdr's own X question named the place, which
+        // its backend took as the yes, so the backend's question with wrap-up never came.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        let card = app.card(&key).unwrap().clone();
+        let reference = card.reference.clone();
+        // A backend without it: Kerdr's own question, naming the place, as before.
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { title, request, .. } = &app.mode else {
+            panic!("X asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {reference}?"));
+        assert_eq!(request["workspace"].as_str(), card.workspace_id.as_deref());
+        app.mode = Mode::Board;
+        steps_everywhere(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'X') else {
+            panic!("X sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, card.machine_index);
+        assert_eq!(request, serde_json::json!({"action": "cancel", "id": id}));
+        // Nothing shows on the card until its yes: the backend asks first.
+        assert!(app.effect_for(&key, &request).is_none());
+        // Only a backend that does the step first gets it.
+        assert_eq!(
+            controls::needs(&request, None, false),
+            Some(controls::STEPS)
+        );
+        let asks = crate::actions::Response {
+            ok: false,
+            message: format!(
+                "An agent is at {reference} (workspace 07-build in web). Stop it and set {reference} aside in Won't do?"
+            ),
+            confirmation: true,
+            confirm: Some("00000000000000cc".into()),
+            session: Some("web".into()),
+            choices: vec![a_choice("wrap-up", "w", "ask it to wrap up")],
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, request.clone(), Ok(asks.clone()));
+        settle(&mut app);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("no question: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {reference}?"));
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(screen.contains("w ask it to wrap up"), "{screen}");
+        // w asks its agent to wrap up instead.
+        let Action::Mutate { request: wrap, .. } = press(&mut app, 'w') else {
+            panic!("w sent nothing: {:?}", app.message())
+        };
+        assert_eq!(wrap["choice"], "wrap-up");
+        assert_eq!(wrap["confirm"], "00000000000000cc");
+        assert!(wrap.get("override").is_none() && wrap.get("workspace").is_none());
+        assert!(app.effect_for(&key, &wrap).is_none());
+        // Its yes stops it, by the token, and shows it set aside.
+        app.resolver = Default::default();
+        reply_to(&mut app, machine, request, Ok(asks));
+        settle(&mut app);
+        let Action::Mutate { request: yes, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(yes["action"], "cancel");
+        assert_eq!(yes["id"].as_str(), Some(id.as_str()));
+        assert_eq!(yes["confirm"], "00000000000000cc");
+        assert_eq!(yes["override"], true);
+        assert!(yes.get("workspace").is_none());
+        assert!(matches!(
+            app.effect_for(&key, &yes),
+            Some(crate::resolve::Effect::SetAside)
+        ));
+    }
+
+    #[test]
+    fn a_late_question_about_stopping_running_work_waits_on_its_card_and_stays_answerable() {
+        // Codex's review: C's question about work an agent is at, come after you'd moved on,
+        // waits on its card as the backend's question it is, never dropped because the card has
+        // a workspace open.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = running_card(&mut app);
+        steps_everywhere(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'C') else {
+            panic!("C sent nothing: {:?}", app.message())
+        };
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.detail.is_some())
+            .unwrap()
+            .key
+            .clone();
+        app.sel.key = Some(other);
+        let asks = crate::actions::Response {
+            ok: false,
+            message: "An agent is at it (workspace 07-build in web). Stop it and mark it done?"
+                .into(),
+            confirmation: true,
+            confirm: Some("00000000000000bb".into()),
+            session: Some("web".into()),
+            choices: vec![a_choice("wrap-up", "w", "ask it to wrap up")],
+            ..Default::default()
+        };
+        reply_to(&mut app, machine, request, Ok(asks));
+        assert!(
+            app.waiting_on(&key).is_some(),
+            "dropped: {:?}",
+            app.message()
+        );
+        assert!(app.card(&key).unwrap().why.starts_with("asks you"));
+        // Back on it, C opens it, and its yes goes with its token.
+        app.sel.key = Some(key.clone());
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        settle(&mut app);
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "close");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["confirm"], "00000000000000bb");
+        assert_eq!(request["override"], true);
+    }
+
+    #[test]
+    fn a_step_first_request_is_never_sent_on_to_a_home_whose_backend_doesnt_do_steps() {
+        // Codex's fifth look: d on work in Won't do goes to a backend that brings it back and
+        // starts it in one request. Refused there, its record living on a machine whose backend
+        // doesn't do that, it isn't sent on, which there would be a start of work set aside; it's
+        // said, and d there again does what that backend takes.
+        for newer in [false, true] {
+            let mut app = demo_app();
+            app.cfg.actions.command = Some("test-adapter".into());
+            steps_everywhere(&mut app);
+            let (key, id) = waiting_backlog_card(&app);
+            let here = app.card(&key).unwrap().machine_index;
+            let there = if here == 0 { 1 } else { 0 };
+            for c in app.machines[here].feed.as_mut().unwrap().cards.iter_mut() {
+                if c.id == id {
+                    c.disposition = Some("wont_do".into());
+                }
+            }
+            if !newer {
+                app.machines[there].feed.as_mut().unwrap().supports = vec!["op".into()];
+            }
+            app.rebuild();
+            app.sel = Selection {
+                col: Stage::Backlog.index(),
+                key: Some(key.clone()),
+            };
+            assert!(app.card(&key).unwrap().dismissed());
+            let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+                panic!("d sent nothing: {:?}", app.message())
+            };
+            assert_eq!(machine, here);
+            app.queue_action(machine, request.clone());
+            let n = app.resolver.last_added();
+            app.resolver.ready();
+            let name = app.machines[there].name();
+            app.finish_job(
+                n,
+                request.clone(),
+                Ok(crate::actions::Response {
+                    ok: false,
+                    message: format!("It lives on {name} now; d again starts it there."),
+                    home: Some(format!("{name}/web")),
+                    ..Default::default()
+                }),
+            );
+            let on = app.resolver.ready();
+            if newer {
+                let [(_, to, again, _)] = &on[..] else {
+                    panic!("not sent on: {:?}", app.message())
+                };
+                assert_eq!((*to, again["action"].as_str()), (there, Some("dispatch")));
+                continue;
+            }
+            assert!(on.is_empty(), "sent on to a backend without steps: {on:?}");
+            let (said, tone) = app.message().unwrap();
+            assert!(
+                said.contains(&format!(
+                    "lives on {name} now, whose backend doesn't do that step first, so nothing was sent there"
+                )),
+                "{said}"
+            );
+            assert_eq!(tone, Tone::Warn);
+            // d again goes there, as that backend takes it: u first.
+            app.message = None;
+            app.sel.key = Some(key.clone());
+            assert_eq!(press(&mut app, 'd'), Action::None);
+            assert!(
+                app.message().unwrap().0.contains("u brings it back"),
+                "{:?}",
+                app.message()
+            );
+        }
+    }
+
+    #[test]
+    fn a_start_on_a_chosen_account_goes_only_to_a_backend_that_still_starts_on_one() {
+        // Codex's fifth look, swept: a question's yes, or a held offer, can come after its
+        // backend's feed changed. Each send is checked where it goes.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = waiting_backlog_card(&app);
+        let machine = app.card(&key).unwrap().machine_index;
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .starts_on
+            .clear();
+        app.action_from = Some(CardSnapshot::of(app.card(&key).unwrap()));
+        app.queue_action(
+            machine,
+            serde_json::json!({"action":"dispatch","id":id,"account":"ARK_C","confirm":"t-1","override":true}),
+        );
+        assert!(app.resolver.ready().is_empty(), "sent to an older backend");
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("can't start work on a chosen account"),
+            "{:?}",
+            app.message()
+        );
+        assert_eq!(
+            app.send_account(
+                machine,
+                serde_json::json!({"action":"account-resume","session":"web","conversation":"c-1","to":"ARK_C"}),
+            ),
+            Action::None
+        );
+        assert!(app.account_pending.is_none());
+    }
+
+    #[test]
+    fn a_yes_by_enter_that_isnt_sent_never_marks_another_sources_start_with_its_number() {
+        // Codex's sixth look, swept: ⏎ asked to bring source A's #N back and start it. By the
+        // yes, A's backend no longer does steps, so nothing is sent. Then d on source B's #N:
+        // its start is d's, not ⏎'s, so its answer doesn't take him in as ⏎'s would.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        room_in_every_session(&mut app);
+        steps_everywhere(&mut app);
+        let (ka, id) = waiting_backlog_card(&app);
+        let (kb, _) = same_number_elsewhere(&mut app, &ka);
+        let here = app.card(&ka).unwrap().machine_index;
+        for c in app.machines[here].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.disposition = Some("wont_do".into());
+            }
+        }
+        app.rebuild();
+        app.sel = Selection {
+            col: app.card(&ka).unwrap().stage.index(),
+            key: Some(ka.clone()),
+        };
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        settle(&mut app);
+        app.machines[here]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .retain(|s| s != "steps");
+        // As the board sends it: stopped by its check, so nothing goes.
+        if let Action::Mutate { machine, request } = enter(&mut app) {
+            app.queue_action(machine, request);
+        }
+        assert!(app.resolver.ready().is_empty(), "sent without steps");
+        app.sel = Selection {
+            col: app.card(&kb).unwrap().stage.index(),
+            key: Some(kb.clone()),
+        };
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d on B sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        let n = app.resolver.last_added();
+        let job = app.resolver.job(n).expect("B's start");
+        assert_eq!(job.key.as_deref(), Some(kb.as_str()));
+        assert!(!job.by_enter, "B's start taken as ⏎'s");
+        assert!(app.enter_sent.is_none());
+    }
+
+    #[test]
+    fn a_home_kerdr_cant_reach_never_borrows_the_cards_machine_for_steps() {
+        // Codex's sixth look, swept: the card's record lives on a machine Kerdr isn't set up for.
+        // Whether its backend does each key's step first isn't answered by the machine the card
+        // shows on: d on it in Won't do says what 0.33.0 said, and nothing is sent.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, _) = wont_do_card(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        assert!(app.does_steps(&app.board.cards[i].clone()));
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some("far-away".into()),
+            session: None,
+        });
+        let card = app.board.cards[i].clone();
+        assert!(
+            !app.does_steps(&card),
+            "the card's own machine answered for its home"
+        );
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert!(app.resolver.ready().is_empty());
+        assert!(
+            app.message().unwrap().0.contains("u brings it back"),
+            "{:?}",
+            app.message()
+        );
+    }
+
+    #[test]
+    fn keys_on_work_in_wont_do_start_or_finish_it_where_the_backend_brings_it_back() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = wont_do_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        // A backend without it: each says u brings it back, as before.
+        for c in ['d', 'C'] {
+            assert_eq!(press(&mut app, c), Action::None);
+            assert!(app.message().unwrap().0.contains("u brings it back"), "{c}");
+        }
+        assert_eq!(enter(&mut app), Action::None);
+        assert!(app.message().unwrap().0.contains("u brings it back"));
+        steps_everywhere(&mut app);
+        // d means starting it: sent at once, for its backend to bring it back and start it.
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request, serde_json::json!({"action": "dispatch", "id": id}));
+        app.resolver = Default::default();
+        // ⏎ asks once, since Won't do was his own choice; its yes sends the start as it is.
+        assert_eq!(enter(&mut app), Action::None);
+        let Mode::Confirm { title, .. } = &app.mode else {
+            panic!("⏎ asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Bring {reference} back and start it?"));
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "dispatch", "id": id}));
+        app.resolver = Default::default();
+        // C asks as any C does, and sends the close for its backend to bring it back first.
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("C asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Mark {reference} done?"));
+        assert!(message.contains("brings it back"));
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing")
+        };
+        assert_eq!(request, serde_json::json!({"action": "close", "id": id}));
+        app.resolver = Default::default();
+        // Its yes waits for nothing that changed: brought back meanwhile, it asks again.
+        assert_eq!(press(&mut app, 'C'), Action::None);
+        app.board
+            .cards
+            .iter_mut()
+            .find(|c| c.key == key)
+            .unwrap()
+            .detail
+            .as_mut()
+            .unwrap()
+            .disposition = None;
+        assert_eq!(enter(&mut app), Action::None);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked again: {:?}", app.message())
+        };
+        assert!(message.contains("brought back meanwhile"), "{message}");
+        app.mode = Mode::Board;
+        // The ordering keys have no backlog place to change for it.
+        app.board
+            .cards
+            .iter_mut()
+            .find(|c| c.key == key)
+            .unwrap()
+            .detail
+            .as_mut()
+            .unwrap()
+            .disposition = Some("wont_do".into());
+        app.mode = Mode::Board;
+        assert_eq!(press(&mut app, 't'), Action::None);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("no place in the backlog order")
+        );
+    }
+
+    #[test]
+    fn kickoff_questions_after_its_own_step_brought_the_card_back_still_wait_on_it() {
+        // Codex's look at the end-to-end fixes: d on work in Won't do, whose backend brings it back
+        // and then answers with Kickoff questions (their token is `asked`, not `confirm`), slowly:
+        // a board read shows it back, and he's on another card by then. That restore was its own.
+        let kickoff = || crate::actions::Response {
+            ok: false,
+            message: "Brought it back from Won't do. It has open questions.".into(),
+            asked: Some("fedcba9876543211".into()),
+            questions: vec![crate::actions::Question {
+                num: "1".into(),
+                question: "Whose is it?".into(),
+                pick: "Kibbelz".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let set = |app: &mut App, key: &str, change: &dyn Fn(&mut Card)| {
+            change(app.board.cards.iter_mut().find(|c| c.key == key).unwrap());
+        };
+        let elsewhere = |app: &mut App, key: &str| {
+            let other = app
+                .board
+                .cards
+                .iter()
+                .find(|c| c.key != key && c.stage == Stage::Backlog && !c.dismissed())
+                .unwrap()
+                .key
+                .clone();
+            select_key(app, &other);
+        };
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, id) = wont_do_card(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        elsewhere(&mut app, &key);
+        set(&mut app, &key, &|c| {
+            c.detail.as_mut().unwrap().disposition = None
+        });
+        reply_to(&mut app, machine, request, Ok(kickoff()));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "{said}");
+        assert!(said.contains("kickoff questions for you"), "{said}");
+        assert!(app.waiting_on(&key).is_some());
+        // n finds it and opens the box; its answers go with the start, by their token.
+        for _ in 0..app.needs_you_order().len() {
+            press(&mut app, 'n');
+            if matches!(app.mode, Mode::Kickoff { .. }) {
+                break;
+            }
+        }
+        let Mode::Kickoff { form, .. } = &mut app.mode else {
+            panic!("n never opened the box: {:?}", app.message())
+        };
+        form.ready_at = Instant::now();
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the box sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["asked"], "fedcba9876543211");
+        // A real change meanwhile still counts: its conversation is another one now.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, _) = wont_do_card(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        elsewhere(&mut app, &key);
+        set(&mut app, &key, &|c| {
+            let d = c.detail.as_mut().unwrap();
+            d.disposition = None;
+            d.resume = Some(crate::feed::Resume {
+                agent: Some("codex".into()),
+                conversation: Some("c-another".into()),
+            });
+        });
+        reply_to(&mut app, machine, request, Ok(kickoff()));
+        assert!(app.waiting_on(&key).is_none());
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("conversation changed meanwhile"), "{said}");
+        assert!(!said.contains("brought back"), "{said}");
+    }
+
+    #[test]
+    fn a_question_after_its_own_step_brought_the_card_back_is_still_asked() {
+        // d on work in Won't do: its backend brings it back first, then asks (the end-to-end
+        // check's second failure). A board read between the key and the slow answer shows it
+        // back; that's its own first step, not a change while he decided.
+        let asks = |reference: &str| crate::actions::Response {
+            ok: false,
+            message: format!(
+                "Brought {reference} back from Won't do. {reference} can't start on its own. Say yes to start it with you along."
+            ),
+            confirmation: true,
+            confirm: Some("0123456789ab0031".into()),
+            session: Some("web".into()),
+            ..Default::default()
+        };
+        let restored = |app: &mut App, key: &str| {
+            app.board
+                .cards
+                .iter_mut()
+                .find(|c| c.key == key)
+                .unwrap()
+                .detail
+                .as_mut()
+                .unwrap()
+                .disposition = None;
+        };
+        // Somewhere else when it comes: it waits on its card, and n opens it.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, id) = wont_do_card(&mut app);
+        let reference = app.card(&key).unwrap().reference.clone();
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.stage == Stage::Backlog && !c.dismissed())
+            .unwrap()
+            .key
+            .clone();
+        select_key(&mut app, &other);
+        restored(&mut app, &key);
+        reply_to(&mut app, machine, request, Ok(asks(&reference)));
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Info, "{said}");
+        assert!(said.contains("asks you first"), "{said}");
+        assert!(app.waiting_on(&key).is_some());
+        app.rebuild();
+        assert!(app.waiting_on(&key).is_some());
+        for _ in 0..app.needs_you_order().len() {
+            press(&mut app, 'n');
+            if matches!(app.mode, Mode::Confirm { .. }) {
+                break;
+            }
+        }
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["override"], true);
+        assert_eq!(request["confirm"], "0123456789ab0031");
+        // On it when it comes: asked at once, and its yes isn't asked again.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        steps_everywhere(&mut app);
+        let (key, _) = wont_do_card(&mut app);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        restored(&mut app, &key);
+        reply_to(&mut app, machine, request, Ok(asks(&reference)));
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        settle(&mut app);
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes was asked again: {:?}", app.mode)
+        };
+        assert_eq!(request["override"], true);
+        // Started somewhere meanwhile is a change, though: that yes asks again, saying so.
+        let (key, _) = wont_do_card(&mut app);
+        app.mode = Mode::Board;
+        app.resolver = Default::default();
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        restored(&mut app, &key);
+        reply_to(&mut app, machine, request, Ok(asks(&reference)));
+        settle(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.workspace_id = Some("w9".into());
+        card.workspace_label = Some("21-elsewhere".into());
+        card.session = Some("web".into());
+        assert_eq!(enter(&mut app), Action::None);
+        let said = match &app.mode {
+            Mode::Confirm { message, .. } => message.clone(),
+            _ => app
+                .message()
+                .map(|(t, _)| t)
+                .unwrap_or_default()
+                .to_string(),
+        };
+        assert!(said.contains("now runs in 21-elsewhere"), "{said}");
+        assert!(!said.contains("brought back"), "{said}");
+    }
+
+    #[test]
+    fn x_on_done_work_goes_to_a_backend_that_asks_to_move_it_to_wont_do() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = done_card(&mut app);
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert!(app.message().unwrap().0.contains("is done"));
+        steps_everywhere(&mut app);
+        let Action::Mutate { request, .. } = press(&mut app, 'x') else {
+            panic!("x sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request, serde_json::json!({"action": "dismiss", "id": id}));
+        assert!(app.effect_for(&key, &request).is_none());
+    }
+
+    #[test]
+    fn x_upper_on_done_work_still_open_stops_its_agent_and_leaves_it_done() {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, id) = done_card(&mut app);
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.workspace_id = Some("w9".into());
+        card.session = Some("web".into());
+        let reference = card.reference.clone();
+        // A backend without it: done already, as before.
+        press(&mut app, 'X');
+        assert!(app.message().unwrap().0.contains("done already"));
+        steps_everywhere(&mut app);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        let Mode::Confirm { title, message, .. } = &app.mode else {
+            panic!("X asked nothing: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Stop {reference}'s agent?"));
+        assert!(message.contains("stays done"), "{message}");
+        let Action::Mutate { request, .. } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(
+            request,
+            serde_json::json!({"action": "cancel", "id": id, "session": "web", "workspace": "w9"})
+        );
+        // While it goes, the card stays done: never shown in Won't do (Codex's review).
+        assert!(app.effect_for(&key, &request).is_none());
+        app.queue_action(app.card(&key).unwrap().machine_index, request);
+        app.rebuild();
+        assert!(
+            !app.card(&key).unwrap().dismissed(),
+            "a done card showed in Won't do"
+        );
+    }
+
+    #[test]
+    fn x_upper_on_done_work_asks_the_backend_where_its_workspace_runs_about_steps() {
+        // Codex's review: X's request goes to the machine its workspace runs on, so that
+        // machine's backend, not its home's, decides whether it does the step.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (key, _) = done_card(&mut app);
+        let runs = app.card(&key).unwrap().machine_index;
+        let home = (0..app.machines.len())
+            .find(|&m| m != runs && app.machines[m].feed.is_some())
+            .expect("a second machine with a feed");
+        let home_name = app.machines[home].name();
+        let set = |app: &mut App| {
+            let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+            card.workspace_id = Some("w9".into());
+            card.session = Some("web".into());
+            card.detail.as_mut().unwrap().home = Some(crate::feed::Home {
+                machine: Some(home_name.clone()),
+                session: Some("web".into()),
+            });
+        };
+        set(&mut app);
+        let steps = |app: &mut App, on: usize| {
+            for (m, machine) in app.machines.iter_mut().enumerate() {
+                if let Some(feed) = machine.feed.as_mut() {
+                    feed.supports = vec!["op".into(), "retry".into(), "follow".into()];
+                    if m == on {
+                        feed.supports.push("steps".into());
+                    }
+                }
+            }
+        };
+        // Its home does the step, but the machine its workspace runs on doesn't: as before.
+        steps(&mut app, home);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        assert!(!matches!(app.mode, Mode::Confirm { .. }), "{:?}", app.mode);
+        assert!(app.message().unwrap().0.contains("done already"));
+        // The machine its workspace runs on does: X asks, and its yes goes there.
+        steps(&mut app, runs);
+        set(&mut app);
+        assert_eq!(press(&mut app, 'X'), Action::None);
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(machine, runs);
+        assert_eq!(request["action"], "cancel");
+    }
+
+    #[test]
+    fn m_opens_the_machines_screen_on_the_machine_the_banner_names() {
+        // Intent 0591, K3-38 to K3-41: its ⏎ or u is the next key, with no hunting for it.
+        let mut app = demo_app();
+        let last = app.machines.len() - 1;
+        for m in &mut app.machines {
+            if m.conn.needs_you() {
+                m.conn = crate::poll::Conn::Live {
+                    latency: Duration::from_millis(9),
+                };
+            }
+        }
+        app.machines[last].conn = crate::poll::Conn::HostKey {
+            detail: "the host key changed".into(),
+        };
+        assert_eq!(app.troubled_machines().first(), Some(&last));
+        press(&mut app, 'M');
+        let Mode::Machines { sel } = app.mode else {
+            panic!("not the machines screen: {:?}", app.mode)
+        };
+        assert_eq!(app.machine_rows()[sel], last);
+        assert_eq!(enter(&mut app), Action::Answer(last));
+    }
+
+    #[test]
+    fn this_machine_hidden_leaves_the_board_and_is_still_read() {
+        // Intent 0591, K1-10: x hides this machine's cards too, and Kerdr keeps reading it for
+        // its accounts and the actions it runs.
+        let mut app = demo_app();
+        let local = app
+            .machines
+            .iter()
+            .position(|m| m.machine.is_local())
+            .expect("this machine in the demo");
+        app.mode = Mode::Machines { sel: local };
+        assert_eq!(press(&mut app, 'x'), Action::ToggleHidden(local));
+        let had = app
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.machine_index == local)
+            .count();
+        assert!(had > 0, "the demo shows this machine's cards");
+        app.machines[local].machine.hidden = true;
+        app.rebuild();
+        assert!(app.machines[local].is_shown(), "still read");
+        assert!(!app.machines[local].on_board());
+        assert_eq!(
+            app.board
+                .cards
+                .iter()
+                .filter(|c| c.machine_index == local)
+                .count(),
+            0
+        );
+        // ⏎ on its row shows its cards again.
+        app.mode = Mode::Machines { sel: local };
+        assert_eq!(enter(&mut app), Action::ToggleHidden(local));
     }
 }

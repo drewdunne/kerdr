@@ -50,7 +50,10 @@ fn place(app: &App, c: &Card, holder: &Card, itself: bool) -> (String, Color) {
     // A start or reopen on its way, before its workspace or tab shows: what it is, not what
     // broken work would say (intent 0445).
     if !c.is_open_workspace()
-        && let Some(job) = c.detail.as_ref().and_then(|d| app.resolver.starting(&d.id))
+        && let Some(job) = c
+            .detail
+            .as_ref()
+            .and_then(|d| app.resolver.starting(&c.key, &d.id))
     {
         let secs = job.asked.elapsed().as_secs();
         let what = if job.request["action"] == "reopen" {

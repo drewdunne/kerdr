@@ -153,11 +153,18 @@ impl App {
         self.edit_action_on(card)
     }
 
-    /// Whether a request for this item's text is on its way: its read (`reads`), or a save.
-    fn edit_on_its_way(&self, id: &str, reads: bool) -> bool {
-        self.resolver
-            .on_its_way()
-            .any(|j| j.request["action"] == "edit" && j.request["id"] == id && j.reads() == reads)
+    /// Whether a request for this card's text is on its way: its read (`reads`), or a save. By
+    /// its card, `key`, never another source's card with the same number; by number only for one
+    /// asked with no card (Codex's sixth look, swept).
+    fn edit_on_its_way(&self, key: &str, id: &str, reads: bool) -> bool {
+        self.resolver.on_its_way().any(|j| {
+            j.request["action"] == "edit"
+                && j.reads() == reads
+                && match &j.key {
+                    Some(k) => k == key,
+                    None => j.request["id"] == id,
+                }
+        })
     }
 
     /// `e` on this card: refused plainly unless it's backlog work that's written up; else its
@@ -176,10 +183,14 @@ impl App {
         if self.still_saving(&card) || self.still_changing(&card, "edit") {
             return Action::None;
         }
+        // The question its last save asked while you were elsewhere, waiting on it (intent 0591).
+        if self.key_opens_waiting(&card.key, "edit") {
+            return Action::None;
+        }
         self.backlog_focus = Some(card.key.clone());
         let reference = card.reference.clone();
         // Its new text on its way, then written up again: the card shows ✎ meanwhile.
-        if self.edit_on_its_way(&detail.id, false) {
+        if self.edit_on_its_way(&card.key, &detail.id, false) {
             self.say(
                 format!("{reference} is still being written up; edit it once that's done."),
                 Tone::Info,
@@ -187,7 +198,7 @@ impl App {
             return Action::None;
         }
         // Asked already: it opens when it comes, counted from now.
-        if self.edit_on_its_way(&detail.id, true) {
+        if self.edit_on_its_way(&card.key, &detail.id, true) {
             if let Some(f) = self.edit_flights.iter_mut().find(|f| f.key == card.key) {
                 f.at = Instant::now();
                 f.away = self.away;
@@ -198,15 +209,19 @@ impl App {
             );
             return Action::None;
         }
-        let refusal = if card.dismissed() {
+        // A backend that does each key's step first edits it where it is: in Won't do it stays
+        // there, done work's save asks to become a new intent made from it, and started work's
+        // agent is told (intent 0591, K1-79 to K1-81). An older one refuses those, as Kerdr did.
+        let steps = self.does_steps(&card);
+        let refusal = if card.dismissed() && !steps {
             Some(format!(
                 "{reference} is in won't do; u brings it back before its text can be edited."
             ))
-        } else if card.done() || card.state.as_deref() == Some("closed") {
+        } else if (card.done() || card.state.as_deref() == Some("closed")) && !steps {
             Some(format!(
                 "{reference} is done, so its text can't be edited here."
             ))
-        } else if !waiting_work(&card) {
+        } else if !waiting_work(&card) && !steps {
             Some(format!(
                 "{reference} has started, so its text can't be edited here."
             ))
@@ -601,6 +616,31 @@ impl App {
                     } else {
                         ""
                     };
+                    // Emptied, it most likely isn't wanted: asked whether to set it aside, never
+                    // saved empty (intent 0591, K1-91). Anything else is as it was.
+                    let card = self
+                        .card(key)
+                        .filter(|c| waiting_work(c) && self.actions_on())
+                        .cloned();
+                    if let Some(card) = card {
+                        self.editor_trouble(&run, &reference);
+                        self.mode = Mode::Confirm {
+                            machine: held.machine,
+                            request: json!({"action": "dismiss", "id": held.id}),
+                            title: format!("Won't do {reference}?"),
+                            message: format!(
+                                "You emptied {reference}'s text. An item's text can't be empty, so nothing was saved. Set {reference} aside in Won't do instead? Its record keeps where it was, and u brings it back; no leaves it as it was.{kept}"
+                            ),
+                            back: Box::new(self.mode.clone()),
+                            target: Some(Box::new(CardSnapshot::of(&card))),
+                            queue: false,
+                            ready_at: Some(Instant::now() + Duration::from_millis(500)),
+                            plain: true,
+                            choices: vec![],
+                            enter_queues: false,
+                        };
+                        return Action::None;
+                    }
                     self.fail(format!(
                         "An item's text can't be empty; {reference} is as it was.{kept}{note}"
                     ));
@@ -635,6 +675,14 @@ impl App {
                     return Action::None;
                 }
                 self.editor_trouble(&run, &reference);
+                // The card it's saved from, so a question its backend asks about the save waits on
+                // that card, and its yes holds only for the same work (intent 0591). Gone from the
+                // board meanwhile, the save is still that card's, never another source's with the
+                // same number (Codex's seventh look).
+                self.action_from = self.card(key).map(CardSnapshot::of);
+                if self.action_from.is_none() {
+                    self.action_key = Some(key.to_string());
+                }
                 Action::Mutate { machine, request }
             }
         }
@@ -716,9 +764,9 @@ impl App {
     /// when it holds none.
     pub(super) fn edits_lost(&self) -> Option<String> {
         let (mut saving, mut unsaved): (Vec<String>, Vec<String>) = (vec![], vec![]);
-        for held in self.edits.values().filter(|h| h.mine.is_some()) {
+        for (key, held) in self.edits.iter().filter(|(_, h)| h.mine.is_some()) {
             let reference = self.reference_for(&held.id);
-            if self.edit_on_its_way(&held.id, false) {
+            if self.edit_on_its_way(key, &held.id, false) {
                 saving.push(reference);
             } else {
                 unsaved.push(reference);
@@ -751,18 +799,26 @@ impl App {
     }
 
     /// A save sent on to the machine a refusal named: its text, which came back only counted,
-    /// goes again as you wrote it.
-    pub(super) fn edit_resend(&self, request: &mut Value) {
+    /// goes again as you wrote it. Your words for its own card, `key`, and only those: none held
+    /// for it, the text is asked for instead, never taken from another source's card with the
+    /// same number (Codex's sixth and seventh looks). By number only for a save that never had a
+    /// card, and then only the one held.
+    pub(super) fn edit_resend(&self, request: &mut Value, key: Option<&str>) {
         if request.get("text").is_none() {
             return;
         }
         let id = request["id"].as_str().unwrap_or_default();
-        match self
-            .edits
-            .values()
-            .find(|h| h.id == id)
-            .and_then(|h| h.mine.as_ref())
-        {
+        let held = match key {
+            Some(key) => self.edits.get(key).filter(|h| h.id == id),
+            None => {
+                let mut found = self.edits.values().filter(|h| h.id == id);
+                match (found.next(), found.next()) {
+                    (Some(only), None) => Some(only),
+                    _ => None,
+                }
+            }
+        };
+        match held.and_then(|h| h.mine.as_ref()) {
             Some(mine) => request["text"] = json!(mine.text),
             // Nothing to send again: ask for the text instead.
             None => {
@@ -783,39 +839,59 @@ impl App {
         format!(" Your version of {reference}'s text is kept: e opens it.")
     }
 
-    /// The card whose text Kerdr holds for this item, on this machine: where its save shows.
+    /// The card whose text Kerdr holds for this item, for a save that never had a card: the only
+    /// one held on this machine, else the only one held anywhere. Never a guess between two
+    /// (Codex's seventh look).
     pub(super) fn edit_card(&self, id: &str, machine: usize) -> Option<String> {
-        let mut held: Vec<(&String, &Held)> =
-            self.edits.iter().filter(|(_, h)| h.id == id).collect();
-        held.sort_by_key(|(_, h)| h.machine != machine);
-        held.first().map(|(k, _)| (*k).clone())
+        let only = |here: bool| {
+            let mut found = self
+                .edits
+                .iter()
+                .filter(|(_, h)| h.id == id && (!here || h.machine == machine))
+                .map(|(k, _)| k);
+            match (found.next(), found.next()) {
+                (Some(one), None) => Some(one.clone()),
+                _ => None,
+            }
+        };
+        only(true).or_else(|| only(false))
     }
 
-    /// The card an edit's answer is for: the one it was sent from while that's still the same
-    /// record, else whichever card has its id.
-    fn edit_key(&self, id: &str, flight: Option<&EditFlight>) -> Option<String> {
-        let of = |key: &str| {
-            self.card(key)
+    /// The card an edit's answer is for. Sent for a card (`key`: the one it was asked from, its
+    /// change's, or its read's), that card and no other: once it's gone from the board with
+    /// nothing of it held, none, never another source's card with the same number (Codex's
+    /// seventh look). Only for one that never had a card: the only card holding words for its
+    /// id, else the only card with its id, never a guess between two.
+    fn edit_key(&self, id: &str, key: Option<&str>) -> Option<String> {
+        if let Some(key) = key {
+            let still = self
+                .card(key)
                 .and_then(|c| c.detail.as_ref())
                 .is_some_and(|d| d.id == id)
-                || self.edits.get(key).is_some_and(|h| h.id == id)
+                || self.edits.get(key).is_some_and(|h| h.id == id);
+            return still.then(|| key.to_string());
+        }
+        let only = |mut keys: Vec<String>| match keys.len() {
+            1 => keys.pop(),
+            _ => None,
         };
-        flight
-            .map(|f| f.key.clone())
-            .filter(|k| of(k))
-            .or_else(|| {
-                self.edits
-                    .iter()
-                    .find(|(_, h)| h.id == id)
-                    .map(|(k, _)| k.clone())
-            })
-            .or_else(|| {
+        only(
+            self.edits
+                .iter()
+                .filter(|(_, h)| h.id == id)
+                .map(|(k, _)| k.clone())
+                .collect(),
+        )
+        .or_else(|| {
+            only(
                 self.board
                     .cards
                     .iter()
-                    .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+                    .filter(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
                     .map(|c| c.key.clone())
-            })
+                    .collect(),
+            )
+        })
     }
 
     /// An edit's answer: a read opens the editor while you're still where you pressed `e`, and a
@@ -830,20 +906,42 @@ impl App {
         let id = request["id"].as_str().unwrap_or_default().to_string();
         let reference = self.reference_for(&id);
         let reads = request.get("text").is_none();
+        // The card it was sent for, kept when that card has gone from the board (Codex's seventh
+        // look).
+        let sent_for = from
+            .as_ref()
+            .map(|f| f.key.clone())
+            .or_else(|| self.answer_key.clone());
+        // Its read's own flight: by the card it was sent for, else, for a read that never had
+        // one, the only one for its id, never another source's card's with the same number
+        // (Codex's sixth and seventh looks).
         let flight = if reads {
-            self.edit_flights
-                .iter()
-                .position(|f| f.id == id)
-                .map(|i| self.edit_flights.remove(i))
+            let at = match sent_for.as_deref() {
+                Some(key) => self.edit_flights.iter().position(|x| x.key == key),
+                None => {
+                    let mut found = self
+                        .edit_flights
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, x)| x.id == id)
+                        .map(|(i, _)| i);
+                    match (found.next(), found.next()) {
+                        (Some(i), None) => Some(i),
+                        _ => None,
+                    }
+                }
+            };
+            at.map(|i| self.edit_flights.remove(i))
         } else {
             None
         };
         if let Some(flight) = &flight {
             self.unsay(&flight.said);
         }
-        let Some(key) = self.edit_key(&id, flight.as_ref()) else {
+        let sent_for = sent_for.or_else(|| flight.as_ref().map(|f| f.key.clone()));
+        let Some(key) = self.edit_key(&id, sent_for.as_deref()) else {
             // Its card is gone from the board, and Kerdr holds nothing of it: only a problem is
-            // worth saying.
+            // worth saying, and never on another card.
             let problem = match result {
                 Ok(r) if r.ok && partial(&r) => return self.fail(partly_saved(&reference, r)),
                 Ok(r) if r.ok => return,
@@ -1002,8 +1100,13 @@ impl App {
             // that part is said where it can't be missed.
             Ok(r) if r.ok => {
                 self.edits.remove(key);
+                // Saved somewhere other than the backlog card it shows on (as a new intent made
+                // from done work, or with its agent told): its backend's words say where.
+                let elsewhere = self.card(key).is_some_and(|c| !waiting_work(c));
                 if partial(&r) {
                     self.fail(partly_saved(reference, r));
+                } else if elsewhere && !r.message.trim().is_empty() {
+                    self.say(r.message.trim().to_string(), Tone::Good);
                 } else if let Some(left) =
                     r.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
                 {
@@ -1695,6 +1798,467 @@ mod tests {
         assert!(said(&app).contains("has started"), "{}", said(&app));
     }
 
+    /// Every machine's backend does each key's step first (intent 0591): its feed says "steps".
+    fn steps_everywhere(app: &mut App) {
+        for machine in &mut app.machines {
+            if let Some(feed) = machine.feed.as_mut() {
+                feed.supports.push("steps".into());
+            }
+        }
+    }
+
+    #[test]
+    fn e_edits_done_started_and_wont_do_work_where_a_backend_does_steps() {
+        // Intent 0591, K1-79 to K1-81: the backend edits it where it is, so e reads its text
+        // rather than refuse; one still being written up is still refused.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let (key, id, reference) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        let changes: [&dyn Fn(&mut Card); 3] = [
+            &|c| {
+                c.stage = Stage::Build;
+                c.state = Some("active".into());
+            },
+            &|c| c.stage = Stage::Maintain,
+            &|c| c.detail.as_mut().unwrap().disposition = Some("wont_do".into()),
+        ];
+        for change in changes {
+            let was = app.board.cards[i].clone();
+            change(&mut app.board.cards[i]);
+            select(&mut app, &key);
+            e_reads(&mut app, &id);
+            app.edit_flights.clear();
+            app.board.cards[i] = was;
+        }
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        select(&mut app, &key);
+        assert_eq!(press(&mut app, 'e'), Action::None);
+        assert!(said(&app).contains(&format!("{reference} is still being written up")));
+    }
+
+    #[test]
+    fn a_save_its_backend_asks_about_is_asked_with_his_words_and_kept_until_answered() {
+        // Intent 0591: done work's save asks to become a new intent made from it. The question
+        // comes up on its card, a yes sends his words again with its token, and a no keeps them.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id, reference) = (
+            done.key.clone(),
+            done.detail.as_ref().unwrap().id.clone(),
+            done.reference.clone(),
+        );
+        select(&mut app, &key);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        let asked = || {
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-1".into()),
+                message: format!(
+                    "{reference} is done, so its words stay as they were. Save yours as a new intent made from {reference} instead?"
+                ),
+                ..Default::default()
+            })
+        };
+        answer(&mut app, &sent, asked());
+        let Mode::Confirm { title, request, .. } = &app.mode else {
+            panic!("no question: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(title, &format!("Save {reference}'s new words?"));
+        assert_eq!(request["text"], "New words.");
+        // No: nothing is sent, and his version is kept for e.
+        esc(&mut app);
+        assert!(app.edits.get(&key).and_then(|h| h.mine.as_ref()).is_some());
+        // Asked again, and yes: his words go with its token.
+        let sent = saves(&mut app, &key, wrote("New words."));
+        answer(&mut app, &sent, asked());
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["confirm"], "done-edit-1");
+        assert_eq!(request["override"], true);
+        let machine = app.card(&key).unwrap().machine_index;
+        let sent = send(&mut app, machine, request);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                status: Some("saved".into()),
+                message: format!(
+                    "Saved your words as #9001, a new intent made from {reference}; {reference} stays as it was."
+                ),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            said(&app).contains("a new intent made from"),
+            "{}",
+            said(&app)
+        );
+        assert!(!app.edits.contains_key(&key));
+    }
+
+    #[test]
+    fn a_save_question_on_done_work_come_after_you_moved_on_waits_on_its_card() {
+        // Codex's review: a question about saving done work's words, come once you'd moved on,
+        // waits on its card as the backend's question, not dropped as if it were backlog work's.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id) = (done.key.clone(), done.detail.as_ref().unwrap().id.clone());
+        select(&mut app, &key);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.detail.is_some())
+            .unwrap()
+            .key
+            .clone();
+        select(&mut app, &other);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-2".into()),
+                message: "It's done, so its words stay as they were. Save yours as a new intent made from it instead?".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            app.waiting_on(&key).is_some(),
+            "dropped: {:?}",
+            app.message()
+        );
+        // Back on it, e opens it, and its yes sends his words with its token.
+        select(&mut app, &key);
+        assert_eq!(press(&mut app, 'e'), Action::None);
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate { request, .. } = press(&mut app, 'y') else {
+            panic!("the yes sent nothing: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["confirm"], "done-edit-2");
+    }
+
+    #[test]
+    fn a_yes_to_a_save_question_after_its_card_changed_sends_his_words_again() {
+        // Codex's review: asked again for the card as it is now, it's still his save, never
+        // another key's request; its backend checks it against the card now and asks again.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id) = (done.key.clone(), done.detail.as_ref().unwrap().id.clone());
+        select(&mut app, &key);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-3".into()),
+                message: "It's done. Save yours as a new intent made from it instead?".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "{:?}",
+            app.message()
+        );
+        // Set aside while he decided.
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().disposition = Some("wont_do".into());
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'y')
+        else {
+            panic!("the yes sent nothing: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(to, machine);
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["was"], "sha256:aa");
+        assert!(request.get("confirm").is_none() && request.get("override").is_none());
+        assert!(said(&app).contains("asking again"), "{}", said(&app));
+    }
+
+    #[test]
+    fn a_save_sent_on_to_its_home_carries_its_own_cards_words_when_two_sources_share_its_number() {
+        // Codex's sixth look, swept: source A's #N and source B's #N, each with his words saved
+        // and on their way. A's save is refused: it lives on another machine now. It goes on
+        // there with A's words, never B's, and its answer settles A's. Tried on several boards,
+        // since what's held is in a map whose order differs on each.
+        for _ in 0..8 {
+            let mut app = app();
+            let (ka, id, _) = waiting(&mut app);
+            let (kb, there) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+            for m in &mut app.machines {
+                for c in m.feed.iter_mut().flat_map(|f| f.cards.iter_mut()) {
+                    if c.id == id {
+                        c.intake = None;
+                    }
+                }
+            }
+            app.rebuild();
+            select(&mut app, &ka);
+            opened(&mut app, &ka, &id, "Old words.", "sha256:aa");
+            let sa = saves(&mut app, &ka, wrote("A's words."));
+            select(&mut app, &kb);
+            opened(&mut app, &kb, &id, "Other words.", "sha256:bb");
+            saves(&mut app, &kb, wrote("B's words."));
+            let name = app.machines[there].name();
+            answer(
+                &mut app,
+                &sa,
+                Ok(Response {
+                    ok: false,
+                    message: format!("It lives on {name} now; ⏎ again opens it there."),
+                    home: Some(format!("{name}/web")),
+                    ..Default::default()
+                }),
+            );
+            let (n, to, again, _) = app
+                .resolver
+                .ready()
+                .into_iter()
+                .find(|(n, ..)| *n == sa.n)
+                .expect("A's save wasn't sent on");
+            assert_eq!(to, there);
+            assert_eq!(again["text"], "A's words.", "sent on with B's words");
+            assert_eq!(again["was"], "sha256:aa");
+            app.job_started(n);
+            app.resolver.handed(n);
+            app.finish_job(
+                n,
+                crate::actions::request_metadata(&again),
+                Ok(Response {
+                    ok: true,
+                    message: "Saved.".into(),
+                    ..Default::default()
+                }),
+            );
+            assert!(
+                app.edits.get(&ka).is_none_or(|h| h.mine.is_none()),
+                "A's words still unsaved"
+            );
+            assert_eq!(
+                app.edits
+                    .get(&kb)
+                    .and_then(|h| h.mine.as_ref())
+                    .map(|m| m.text.as_str()),
+                Some("B's words."),
+                "B's words taken as saved"
+            );
+        }
+    }
+
+    #[test]
+    fn reads_of_two_sources_cards_with_the_same_number_open_each_ones_own_text() {
+        // Codex's sixth look, swept: e on source A's #N, then on source B's #N, both reads on
+        // their way. B's answer comes first: B's text opens on B's card, and A's read still waits
+        // for its own answer, which opens on A's.
+        let mut app = app();
+        let (ka, id, _) = waiting(&mut app);
+        let (kb, _) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+        for m in &mut app.machines {
+            for c in m.feed.iter_mut().flat_map(|f| f.cards.iter_mut()) {
+                if c.id == id {
+                    c.intake = None;
+                }
+            }
+        }
+        app.rebuild();
+        select(&mut app, &ka);
+        let ra = read(&mut app, &id);
+        select(&mut app, &kb);
+        let rb = read(&mut app, &id);
+        answer(&mut app, &rb, text_answer("B's text.", "sha256:bb"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(kb.as_str()));
+        assert_eq!(
+            app.edits.get(&kb).map(|h| h.current.as_str()),
+            Some("B's text.")
+        );
+        assert!(
+            app.edit_flights.iter().any(|f| f.key == ka),
+            "A's read lost"
+        );
+        select(&mut app, &ka);
+        answer(&mut app, &ra, text_answer("A's text.", "sha256:aa"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(ka.as_str()));
+        assert_eq!(
+            app.edits.get(&ka).map(|h| h.current.as_str()),
+            Some("A's text.")
+        );
+    }
+
+    #[test]
+    fn a_read_whose_card_went_from_the_board_never_lands_on_another_sources_card_with_its_number() {
+        // Codex's seventh look: source B's #N has its text held, read a moment ago. e on source
+        // A's #N, and A goes from the board before the read's answer. That answer is A's or
+        // nobody's: B's text stays as it was, and nothing opens.
+        let mut app = app();
+        let (ka, id, _) = waiting(&mut app);
+        let (kb, _) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+        for m in &mut app.machines {
+            for c in m.feed.iter_mut().flat_map(|f| f.cards.iter_mut()) {
+                if c.id == id {
+                    c.intake = None;
+                }
+            }
+        }
+        app.rebuild();
+        select(&mut app, &kb);
+        let rb = read(&mut app, &id);
+        answer(&mut app, &rb, text_answer("B's text.", "sha256:bb"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(kb.as_str()));
+        select(&mut app, &ka);
+        let ra = read(&mut app, &id);
+        crate::app::tests::gone_from_board(&mut app, &ka);
+        answer(&mut app, &ra, text_answer("A's text.", "sha256:aa"));
+        assert_eq!(app.edit_open, None, "opened on another card");
+        let b = app.edits.get(&kb).expect("B's text held");
+        assert_eq!(
+            (b.current.as_str(), b.was.as_str()),
+            ("B's text.", "sha256:bb"),
+            "A's answer landed on B"
+        );
+        assert!(!app.edits.contains_key(&ka));
+        assert!(!said(&app).contains("A's text"), "{}", said(&app));
+    }
+
+    #[test]
+    fn a_save_sent_on_for_a_card_whose_words_went_asks_for_its_text_never_takes_anothers() {
+        // Codex's seventh look: a save for source A's #N goes on to its record's home, but Kerdr
+        // no longer holds A's words, and A has gone from the board. Source B's #N still has
+        // words of yours held. The save asks for its text again; B's words never go as A's.
+        let mut app = app();
+        let (ka, id, _) = waiting(&mut app);
+        let (kb, there) = crate::app::tests::same_number_elsewhere(&mut app, &ka);
+        app.edits.insert(
+            kb.clone(),
+            Held {
+                id: id.clone(),
+                machine: there,
+                current: "B's text.".into(),
+                was: "sha256:bb".into(),
+                read_at: Instant::now(),
+                mine: Some(Mine {
+                    text: "B's words.".into(),
+                    from: "B's text.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        crate::app::tests::gone_from_board(&mut app, &ka);
+        let mut request =
+            json!({"action":"edit","id":id,"text":"counted: 9 words","was":"sha256:aa"});
+        app.edit_resend(&mut request, Some(&ka));
+        assert_eq!(
+            request,
+            json!({"action":"edit","id":id}),
+            "another source's words went as A's"
+        );
+        // A save that never had a card still takes the only words held for its number.
+        let mut request = json!({"action":"edit","id":id,"text":"counted","was":"sha256:bb"});
+        app.edit_resend(&mut request, None);
+        assert_eq!(request["text"], "B's words.");
+    }
+
+    #[test]
+    fn a_yes_to_a_save_question_after_its_card_moved_home_goes_to_its_new_home() {
+        // Codex's review: the card moved to another machine while he decided. His words go
+        // again, as they were, to the machine its record lives on now, not the first one.
+        let mut app = app();
+        steps_everywhere(&mut app);
+        let done = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.done() && c.detail.is_some() && !c.is_open_workspace())
+            .expect("done work in the demo")
+            .clone();
+        let (key, id) = (done.key.clone(), done.detail.as_ref().unwrap().id.clone());
+        select(&mut app, &key);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let sent = saves(&mut app, &key, wrote("New words."));
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("done-edit-4".into()),
+                message: "It's done. Save yours as a new intent made from it instead?".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        let other = (0..app.machines.len()).find(|&m| m != machine).unwrap();
+        let name = app.machines[other].name().to_string();
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().home = Some(crate::feed::Home {
+            machine: Some(name),
+            session: Some("web".into()),
+        });
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'y')
+        else {
+            panic!("the yes sent nothing: {:?} {:?}", app.mode, app.message())
+        };
+        assert_eq!(to, other, "sent where its record no longer lives");
+        assert_eq!(request["text"], "New words.");
+        assert_eq!(request["was"], "sha256:aa");
+        assert_eq!(app.edits.get(&key).map(|h| h.machine), Some(other));
+    }
+
     #[test]
     fn e_goes_at_once_while_other_changes_run_and_waits_as_the_other_card_keys_do() {
         let mut app = app();
@@ -1872,9 +2436,24 @@ mod tests {
         assert!(app.edits.is_empty());
         assert_eq!(app.resolver.unanswered(), 0, "nothing was sent");
         opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        // Emptied: nothing is saved, and it asks whether to set it aside instead (intent 0591,
+        // K1-91); no leaves it as it was.
         assert_eq!(app.edit_ended(&key, wrote("")), Action::None);
-        assert!(said(&app).contains("can't be empty"), "{}", said(&app));
-        seen(&mut app);
+        let Mode::Confirm {
+            title,
+            message,
+            request,
+            ..
+        } = &app.mode
+        else {
+            panic!("an emptied text asked nothing: {}", said(&app))
+        };
+        assert!(title.starts_with("Won't do"), "{title}");
+        assert!(message.contains("can't be empty"), "{message}");
+        assert_eq!(request, &json!({"action": "dismiss", "id": id}));
+        assert_eq!(app.resolver.unanswered(), 0, "nothing was sent");
+        app.on_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::NONE));
+        assert!(!matches!(app.mode, Mode::Confirm { .. }));
         // A cancel forgets an unsaved version too.
         let sent = saves(&mut app, &key, wrote("Mine."));
         answer(&mut app, &sent, refused("No."));
@@ -1882,14 +2461,13 @@ mod tests {
         assert!(app.edits[&key].mine.is_some());
         press(&mut app, 'e');
         assert_eq!(app.edit_open.take().as_deref(), Some(key.as_str()));
-        // Emptied, it keeps his version, and says so where it can't be missed.
+        // Emptied, it keeps his version, and says so in its question.
         assert_eq!(app.edit_ended(&key, wrote("")), Action::None);
-        assert!(
-            said(&app).contains("e opens your last version"),
-            "{}",
-            said(&app)
-        );
-        seen(&mut app);
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("an emptied text asked nothing: {}", said(&app))
+        };
+        assert!(message.contains("e opens your last version"), "{message}");
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
         app.edit_ended(&key, cancelled());
         assert!(app.edits.is_empty());

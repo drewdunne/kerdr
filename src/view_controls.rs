@@ -180,7 +180,7 @@ impl App {
             if self
                 .machines
                 .iter()
-                .any(|m| m.is_shown() && m.answers_to(&name))
+                .any(|m| m.on_board() && m.answers_to(&name))
             {
                 tabs = vec![Scope::Machine(name.clone())];
                 for r in self

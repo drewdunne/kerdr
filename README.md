@@ -229,7 +229,18 @@ tab, for a child running in its parent's workspace), and sets the work aside in 
 its conversation, without touching the session's other agents or its owner's list, which is what
 `S` edits. On a card with no agent running, `s` asks which account and starts it there: a fresh
 start for work nobody started, as `d` does, or a reopen that resumes its conversation, as `Enter`
-does. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
+does. On a workspace with no intent and nothing running, `s` starts a fresh agent there, in a new
+tab, on the account you pick, and goes in. When a workspace with no intent has closed since the board
+last read it, `⏎` or `s` on its card asks to resume its agent's conversation in a new workspace of that session, and goes in once it's
+open. See [docs/feed.md](docs/feed.md#cancelling-work-an-agent-is-at).
+
+Each key does what it means whatever state its card is in. `d` on work that has started does what
+`⏎` does, and `X` on a card with nothing running asks to set it aside. With a backend that does each
+key's step first, `d` on work in Won't do brings it back and starts it, `C` and `x` on work an agent
+is at ask before they stop it, and `e` edits started or done work too. A question offers the answers
+that move things on beside yes and no (queue it, say, or ask the agent to wrap up). One that comes
+back while you're elsewhere waits on its card, yellow, saying what it asks, and `n` goes to it. See
+[docs/feed.md](docs/feed.md#each-keys-step-first-and-questions-with-choices).
 
 ![On the road: a dropped machine's cards stay on the board, dimmed, with the time they were last seen](docs/screenshots/reconnecting.png)
 
@@ -280,8 +291,8 @@ peek alike:
   written up, or a new intent's card still being saved, says so instead. When a save can't land (a refusal, a change made meanwhile, no
   answer), the card goes back as it was, the red **Not done** box says so, and Kerdr keeps your
   version: the next `e` opens it, with any newer text below it. Once the item has started, `e`
-  still opens your version so you can copy it, and sends nothing; so does a machine that isn't
-  answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
+  still opens your version so you can copy it, and sends nothing, unless its backend does each
+  key's step first, which edits it where it is; so does a machine that isn't answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
   `q` says first when quitting would lose a version only Kerdr keeps, and a second `q` quits. An editor that opens a window of
   its own needs its waiting form, such as `code --wait`: without it Kerdr doesn't start it, and
   says which flag to add.
@@ -393,7 +404,10 @@ viewed session’s list as a draft (with no session chosen with `[ ]`, the selec
 owner's list: its session's, its home session's, else its tenant's or organization's), each line naming its provider, so the list reads as a
 provider order: whatever is first and ready is what new work runs. Reorder, optionally tick
 “move waiting sessions,” then save.
-The tick sends a separate move request to every reachable configured feed machine.
+The tick sends a separate move request to every reachable configured feed machine. When the saved
+list leaves running agents on accounts that aren't on it, Kerdr asks once whether to move them to
+it now; `y` moves them one at a time, asking each one's own question first, `n` on one of those
+leaves that one, and `Esc` stops the rest, saying how many moved and which didn't.
 
 A **current account** puts one account ahead of every owner's list, on every machine: new
 sessions start on it wherever it's ready, and on their lists where it's out or has no sign-in.
@@ -408,7 +422,10 @@ already running stay where they are; `s` on a card moves one.
 
 `s` opens the selected agent’s move picker. Choosing an account sends the request to that
 agent’s machine and session. If its backend asks about a step or background job in progress,
-a separate question appears. A confirmation applies only to that same conversation.
+a separate question appears, with any other answers its backend offers ("move it when the job ends")
+listed beside yes and no. A confirmation applies only to that same conversation. When the account
+isn't signed in on that machine, the box that signs it in opens, and the move goes on by itself once
+it's signed in.
 An agent the feed has no record of yet can be moved too, if its program is one the machine's
 accounts run: Kerdr sends its pane with an empty `conversation`, and the backend takes the
 conversation from herdr and records it. The backend owns fallback and resuming: same program,
@@ -605,7 +622,9 @@ kerdr demo
 ```
 
 `kerdr doctor` checks every machine: whether Kerdr can reach it, which herdr it runs, whether
-its feed works, and whether Kerdr's keys are in its herdr config.
+its feed works, and whether Kerdr's keys are in its herdr config. `kerdr doctor --fix` adds the keys
+where this machine's config lacks them and reloads each running session's config; on another
+machine, run it there.
 
 ## Configure
 

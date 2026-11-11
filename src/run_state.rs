@@ -30,6 +30,10 @@ pub enum StartHow {
     /// Work that ran and has no agent now (its workspace closed, or open with its agent gone), or
     /// done work: `reopen`, as ⏎ sends, which resumes its conversation.
     Reopen,
+    /// An open workspace with no intent and nothing running: `account-start`, a fresh agent of the
+    /// account's own program in a new tab there, since there's no conversation to resume (intent
+    /// 0591, K1-105).
+    Fresh,
 }
 
 impl StartHow {
@@ -37,6 +41,7 @@ impl StartHow {
         match self {
             StartHow::Dispatch => "dispatch",
             StartHow::Reopen => "reopen",
+            StartHow::Fresh => "account-start",
         }
     }
 }
@@ -107,6 +112,9 @@ pub struct OwedAccount {
     /// failure said why, and nothing starts.
     pub restore: bool,
     pub restore_sent: bool,
+    /// Its start found its agent running already, so nothing restarted on the account picked: that
+    /// agent moves to it once Kerdr sees it, and nothing is started again (intent 0591, K1-126).
+    pub moving: bool,
 }
 
 impl OwedAccount {
@@ -120,6 +128,7 @@ impl OwedAccount {
             failed: None,
             restore: false,
             restore_sent: false,
+            moving: false,
         }
     }
 }
@@ -172,6 +181,21 @@ impl App {
             ));
         }
         if card.detail.is_none() {
+            // An open workspace with nothing running and no intent: a fresh agent starts in a new
+            // tab there, on the account picked, where its backend can (intent 0591, K1-105). Only
+            // the workspace s was pressed on, on its own machine.
+            if card.is_open_workspace()
+                && self.actions_on()
+                && self
+                    .account_feed(card.machine_index)
+                    .is_some_and(|f| f.starts_on(StartHow::Fresh.action()))
+            {
+                return RunState::Stopped(Start {
+                    how: StartHow::Fresh,
+                    machine: card.machine_index,
+                    ..Start::default()
+                });
+            }
             return RunState::Unavailable(format!(
                 "{} has no agent running and no intent to start: s starts or moves an intent's agent.",
                 card.workspace_name()
@@ -464,7 +488,14 @@ impl App {
             );
             return Action::None;
         }
-        // In won't do: brought back first; its start goes once that's answered (intent 0591).
+        // In won't do, to a backend that does the step first: one start with the account, as d
+        // sends it, which its backend brings back first and answers saying each step, `partial`
+        // when the start fails after the restore stood (the end-to-end check's fifth failure).
+        if start.restore && self.steps_on(start.machine) {
+            return self.send_start(card, &start, to);
+        }
+        // In won't do, to an older backend: brought back first; its start goes once that's
+        // answered (intent 0591).
         if start.restore {
             let mut owed = OwedAccount::new(&card.key, to);
             owed.restore = true;
@@ -499,11 +530,41 @@ impl App {
         match start.how {
             StartHow::Dispatch => self.intent_action_on(card, "dispatch", extra),
             StartHow::Reopen => self.reopen_action_with(&card, extra),
+            StartHow::Fresh => self.start_fresh(card, to),
         }
     }
 
+    /// A fresh agent in a new tab of this open workspace, on the account picked; you go in once it
+    /// starts, while you're still on its card (intent 0591, K1-105).
+    fn start_fresh(&mut self, card: Card, to: &str) -> Action {
+        let (Some(session), Some(workspace)) = (card.session.clone(), card.workspace_id.clone())
+        else {
+            self.say(
+                format!(
+                    "{} isn't open any more, so nothing started.",
+                    card.workspace_name()
+                ),
+                Tone::Info,
+            );
+            return Action::None;
+        };
+        if !self.can_write(card.machine_index) {
+            return Action::None;
+        }
+        // The card it's asked on goes in its own record, which its answer finds by the request,
+        // through a question or a sign-in (Codex's third look).
+        let machine = card.machine_index;
+        let request =
+            json!({"action":"account-start","session":session,"workspace":workspace,"to":to});
+        self.keep_asked(machine, &request, None, Some(CardSnapshot::of(&card)), None);
+        self.send_account(machine, request)
+    }
+
     /// The running agent at this card moved to the account picked for it, as the move picker sends
-    /// it. Nothing when it's on that account already.
+    /// it. Nothing when it's on that account already. Made as every account request is, with the
+    /// agent it's for kept in its record from the start, so a question it brings, a question that
+    /// changes after his yes, or a sign-in it waits on is still about that agent (Codex's fourth
+    /// look).
     fn move_to_account(&mut self, card: &Card, agent: &AccountAgent, to: &str) -> Action {
         if to != "list" && agent.account == to {
             self.say(
@@ -520,27 +581,48 @@ impl App {
             ),
             Tone::Info,
         );
-        Action::Mutate {
-            machine: card.machine_index,
-            request: json!({"action":"account-move","pane":agent.pane,"session":agent.session,"conversation":agent.conversation,"to":to}),
-        }
+        let machine = card.machine_index;
+        let request = json!({"action":"account-move","pane":agent.pane,"session":agent.session,"conversation":agent.conversation,"to":to});
+        let target = MoveTarget {
+            machine,
+            key: card.key.clone(),
+            reference: card.reference.clone(),
+            agent: agent.clone(),
+        };
+        self.keep_asked(machine, &request, Some(Box::new(target)), None, None);
+        self.send_account(machine, request)
     }
 
     /// A start on an account sent on to the machine an intent lives on now, whose backend can't
     /// take an account yet: owed until that machine's ark-sdlc is brought up to date (intent 0591).
     /// False when the card isn't on the board.
-    pub(super) fn owe_after_update(&mut self, id: &str, machine: usize, to: &str) -> bool {
-        let Some(key) = self
-            .board
-            .cards
-            .iter()
-            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
-            .map(|c| c.key.clone())
-        else {
+    pub(super) fn owe_after_update(
+        &mut self,
+        id: &str,
+        asked: usize,
+        from: Option<&CardSnapshot>,
+        machine: usize,
+        to: &str,
+    ) -> bool {
+        // Its own card, never another source's with the same number (Codex's review).
+        let Some(key) = self.intent_card(asked, id, from).map(|c| c.key.clone()) else {
             return false;
         };
         let mut owed = OwedAccount::new(&key, to);
         owed.update = Some(machine);
+        self.owe(owed);
+        true
+    }
+
+    /// A start on an account that found the card's agent running already, so nothing restarted:
+    /// that agent moves to the account picked once Kerdr sees it, as s on a running card does
+    /// (intent 0591, K1-126). False when the card isn't on the board.
+    pub(super) fn owe_move(&mut self, key: &str, to: &str) -> bool {
+        if self.card(key).is_none() {
+            return false;
+        }
+        let mut owed = OwedAccount::new(key, to);
+        owed.moving = true;
         self.owe(owed);
         true
     }
@@ -556,6 +638,12 @@ impl App {
     /// one was given up. Only where an answer can't take keys meant for something else.
     pub fn account_owed(&mut self) -> Action {
         if !self.enter_can_land_here() {
+            return Action::None;
+        }
+        // An account question held while you were elsewhere: asked now, the one held longest first,
+        // the rest each in turn once you're back (intent 0591, K2-27; Codex's third look).
+        if let Some(question) = self.take_held_question() {
+            self.ask_held_move(question);
             return Action::None;
         }
         let mut i = 0;
@@ -632,8 +720,27 @@ impl App {
             o.update = None;
             o.since = Instant::now();
         }
-        // 2. Brought back from won't do.
+        // 2. Brought back from won't do: by its start itself, where its backend now does the step
+        // first (the end-to-end check's fifth failure), else by a restore of its own first.
         if owed.restore && card.dismissed() {
+            if !owed.restore_sent
+                && let RunState::Stopped(start) = self.run_state(&card)
+                && start.restore
+                && !start.update
+                && self.steps_on(start.machine)
+            {
+                if owed.to != "list" && !self.start_choices(&start).contains(&owed.to) {
+                    self.say(
+                        format!(
+                            "{reference} can't start on {} as it is now: s on it offers what can.",
+                            owed.to
+                        ),
+                        Tone::Info,
+                    );
+                    return Owed::Done(Action::None);
+                }
+                return Owed::Done(self.send_start(card, &start, &owed.to));
+            }
             if !owed.restore_sent {
                 let o = &mut self.owed_accounts[i];
                 o.restore_sent = true;
@@ -648,15 +755,22 @@ impl App {
                 return Owed::Send(self.intent_action_on(card, "restore", json!({})));
             }
             // Gone: held while it's on its way (or answered yes and not in the feed yet), or sent on
-            // to the machine the record lives on (Codex's review).
+            // to the machine the record lives on (Codex's review). Its own card's restore, by key:
+            // another source's card's with the same number isn't this one coming back (Codex's
+            // seventh look).
             let restoring = self
                 .resolver
-                .holds_where(|r| r["id"] == id.as_str() && r["action"] == "restore")
-                || self
-                    .resend
-                    .iter()
-                    .any(|(_, r, _)| r["id"] == id.as_str() && r["action"] == "restore")
-                || self.resent.iter().any(|(_, r)| *r == id);
+                .holds_for(&card.key, &id, |r| r["action"] == "restore")
+                || self.resend.iter().any(|(_, r, _, k)| {
+                    r["action"] == "restore"
+                        && self.resolver.for_card(
+                            k.as_deref(),
+                            r["id"].as_str().unwrap_or_default(),
+                            &card.key,
+                            &id,
+                        )
+                })
+                || self.resent.iter().any(|(_, k)| *k == card.key);
             if !restoring {
                 // It didn't happen: its own failure said why.
                 return Owed::Drop;
@@ -671,6 +785,25 @@ impl App {
                 return given_up(self, "it never came to where it could start");
             }
             return Owed::Wait;
+        }
+        // Running already: only ever moved, never started again.
+        if owed.moving {
+            return match self.run_state(&card) {
+                RunState::Running(agent) => {
+                    Owed::Done(self.move_to_account(&card, &agent, &owed.to))
+                }
+                _ if self.owed_accounts[i].since.elapsed() > APPLY_WAIT => {
+                    self.say(
+                        format!(
+                            "{reference} wasn't moved to {}: Kerdr hasn't seen its agent running. s on its card moves it once it shows.",
+                            account_words(&owed.to)
+                        ),
+                        Tone::Warn,
+                    );
+                    Owed::Drop
+                }
+                _ => Owed::Wait,
+            };
         }
         // 3. Started on that account, or the agent running it now moved there.
         match self.run_state(&card) {
@@ -721,12 +854,12 @@ impl App {
         let Some(id) = card.detail.as_ref().map(|d| d.id.as_str()) else {
             return false;
         };
-        self.resolver.starting(id).is_some()
+        self.resolver.starting(&card.key, id).is_some()
             || self
                 .resolver
-                .unanswered_where(|r| r["id"] == id && r["action"] == "restore")
+                .unanswered_for_card(&card.key, id, |r| r["action"] == "restore")
                 .is_some()
-            || self.following(id).is_some()
+            || self.following_card(card).is_some()
     }
 
     /// The request that asks an old backend to bring its ark-sdlc up to date, when it's due, with
@@ -1404,6 +1537,70 @@ mod tests {
         assert_eq!(a.account_owed(), Action::None, "and nothing later either");
     }
 
+    /// Every machine's backend does each key's step first: its feed says "steps".
+    fn steps(a: &mut App) {
+        for m in a.machines.iter_mut() {
+            if let Some(f) = m.feed.as_mut()
+                && !f.supports.iter().any(|s| s == "steps")
+            {
+                f.supports.push("steps".into());
+            }
+        }
+    }
+
+    /// The end-to-end check's fifth failure: to a backend that does the step first, s on a card in
+    /// won't do is one start with the account, as d sends it, which its backend brings back first
+    /// and answers saying each step. Never a restore of its own and then a start.
+    #[test]
+    fn s_on_a_card_in_wont_do_is_one_start_with_the_account_where_its_backend_does_steps() {
+        let mut a = app();
+        steps(&mut a);
+        let k = set_aside(&mut a);
+        let id = a.card(&k).unwrap().detail.as_ref().unwrap().id.clone();
+        select(&mut a, &k);
+        press(&mut a, 's');
+        assert!(start_screen(&a).0.restore);
+        let (machine, request) = choose(&mut a, "ARK_C");
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["id"].as_str(), Some(id.as_str()));
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty(), "nothing owed after it");
+        on_its_way(&mut a, machine, &request);
+        assert_eq!(a.account_owed(), Action::None, "and nothing sent after it");
+        // An older backend brought up to date, that now does the step first: one start too.
+        let mut a = app();
+        let k = set_aside(&mut a);
+        let mi = a.card(&k).unwrap().machine_index;
+        a.machines[mi].feed.as_mut().unwrap().starts_on.clear();
+        a.machines[mi]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .retain(|s| s != "steps");
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let at = start_screen(&a)
+            .1
+            .iter()
+            .position(|c| c == "ARK_C")
+            .unwrap();
+        for _ in 0..at {
+            key(&mut a, KeyCode::Down);
+        }
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert_eq!(a.update_due().map(|(m, ..)| m), Some(mi));
+        a.machines[mi].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        steps(&mut a);
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("nothing started: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["account"], "ARK_C");
+        assert!(a.owed_accounts.is_empty(), "paid once");
+    }
+
     /// Codex's review: an old backend and won't do at once. The update comes first, then the
     /// restore, then the start, each after the one before.
     #[test]
@@ -1788,7 +1985,46 @@ mod tests {
             json!({"ok":true,"message":"#1 is open already, in web. Its agent was running already, so it stays on its own account, not ARK_C: s on its card moves it.","session":"web","workspace":"w9","account_unchanged":true}),
         );
         assert_eq!(a.open_after, None);
-        assert!(a.message().unwrap().0.contains("not ARK_C"));
+        // What he picked still holds: its agent moves to it once Kerdr sees it (intent 0591,
+        // K1-126), and nothing is started again meanwhile.
+        let said = a.message().unwrap().0.to_string();
+        assert!(said.contains("wasn't restarted"), "{said}");
+        assert!(said.contains("moves it to ARK_C once it sees it"), "{said}");
+        assert_eq!(a.owed_accounts.len(), 1);
+        assert!(a.owed_accounts[0].moving);
+        assert_eq!(a.account_owed(), Action::None);
+        // Its agent shows: it moves.
+        let other = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#44")
+            .unwrap()
+            .clone();
+        let card = a.board.cards.iter_mut().find(|c| c.key == k).unwrap();
+        card.workspace_id = other.workspace_id;
+        card.session = other.session;
+        card.agents = other.agents;
+        let Action::Mutate { request, .. } = a.account_owed() else {
+            panic!("nothing moved: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "account-move");
+        assert_eq!(request["to"], "ARK_C");
+        assert!(a.owed_accounts.is_empty());
+    }
+
+    #[test]
+    fn a_move_owed_to_an_agent_never_seen_gives_up_without_starting_anything() {
+        let mut a = app();
+        let k = closed_card(&mut a);
+        assert!(a.owe_move(&k, "ARK_C"));
+        assert_eq!(a.account_owed(), Action::None);
+        a.owed_accounts[0].since -= APPLY_WAIT + Duration::from_secs(1);
+        assert_eq!(a.account_owed(), Action::None);
+        let (said, tone) = a.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(said.contains("wasn't moved to ARK_C"), "{said}");
+        assert!(a.owed_accounts.is_empty());
     }
 
     #[test]
@@ -1811,5 +2047,591 @@ mod tests {
             panic!("expected the model list, got {:?}", a.message())
         };
         assert_eq!(owner.id, "platform", "web's owner here isn't this card's");
+    }
+
+    /// The demo's bare workspace, emptied of agents, on a machine whose backend can start a fresh
+    /// agent there when `fresh` (intent 0591, K1-105).
+    fn bare_workspace(a: &mut App, fresh: bool) -> String {
+        let i = a
+            .board
+            .cards
+            .iter()
+            .position(|c| {
+                c.source == crate::model::Source::Workspace
+                    && c.is_open_workspace()
+                    && a.account_feed(c.machine_index).is_some()
+            })
+            .expect("the demo has a bare workspace on a machine with accounts");
+        a.board.cards[i].agents.clear();
+        let mi = a.board.cards[i].machine_index;
+        let mut starts: Vec<String> = STARTS_ON.iter().map(|s| s.to_string()).collect();
+        if fresh {
+            starts.push("account-start".into());
+        }
+        a.machines[mi].feed.as_mut().unwrap().starts_on = starts;
+        a.board.cards[i].key.clone()
+    }
+
+    /// Intent 0591, K1-105: s on an empty workspace with no intent starts a fresh agent there on
+    /// the account picked, and goes in while you're still on it.
+    #[test]
+    fn a_starts_sign_in_that_comes_while_he_types_opens_once_he_is_back_and_the_start_goes_on() {
+        // Codex's fourth look: he starts typing a new intent while the start is on its way. Its
+        // sign-in isn't put over his typing, nor dropped: it opens once he's back, and the start
+        // goes again once it's signed in, going in as it would have.
+        let mut a = app();
+        let (card, machine, asked) = fresh_start(&mut a);
+        press(&mut a, 'c');
+        assert!(matches!(a.mode, Mode::Compose { .. }), "{:?}", a.mode);
+        answer_with(
+            &mut a,
+            machine,
+            asked.clone(),
+            json!({"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C needs signing in on this machine first; nothing started"}),
+        );
+        assert!(matches!(a.mode, Mode::Compose { .. }), "{:?}", a.mode);
+        assert_eq!(a.held_questions().count(), 1);
+        assert!(a.after_signin.is_none());
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .ends_with("Its sign-in opens once you're back on the board."),
+            "{:?}",
+            a.message()
+        );
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_owed(), Action::None);
+        assert!(
+            matches!(
+                a.mode,
+                Mode::Accounts {
+                    screen: AccountScreen::Where { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            a.mode
+        );
+        assert_eq!(a.account_tick(), Action::None, "kept while its box is up");
+        assert_eq!(
+            a.after_signin.as_ref().map(|s| s.request.clone()),
+            Some(asked.clone())
+        );
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = key(&mut a, KeyCode::Enter)
+        else {
+            panic!("no sign-in")
+        };
+        answer_with(
+            &mut a,
+            m,
+            request,
+            json!({"ok":true,"message":"Authorize in your browser.","status":"waiting","url":"https://example.com/authorize?state=example","ticket":"login-ticket","needs_code":true}),
+        );
+        if let Mode::Accounts {
+            screen: AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now();
+        }
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = a.account_tick()
+        else {
+            panic!("no poll")
+        };
+        answer_with(
+            &mut a,
+            m,
+            request,
+            json!({"ok":true,"status":"done","message":"ARK_C is signed in."}),
+        );
+        let Action::Mutate {
+            machine: m,
+            request,
+        } = a.account_tick()
+        else {
+            panic!("the start didn't go again: {:?}", a.message())
+        };
+        assert_eq!(request, asked);
+        answer_with(
+            &mut a,
+            m,
+            request,
+            json!({"ok":true,"session":card.session,"workspace":card.workspace_id,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        assert_eq!(
+            a.open_after.take().expect("didn't go in").tab.as_deref(),
+            Some("t9")
+        );
+    }
+
+    #[test]
+    fn an_automatic_moves_question_that_changes_after_his_yes_is_asked_again_about_its_agent() {
+        // Codex's fourth look: a move Kerdr makes by itself (an account owed to a card whose agent
+        // now runs) keeps its agent from the start, so its question, and the new question its yes
+        // brings, are each asked about that agent, never "open the move picker again".
+        let mut a = app();
+        let card = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.reference == "#44")
+            .unwrap()
+            .clone();
+        let RunState::Running(agent) = a.run_state(&card) else {
+            panic!("#44 has no running agent")
+        };
+        let to = if agent.account == "ARK_C" {
+            "KBZ_C"
+        } else {
+            "ARK_C"
+        };
+        select(&mut a, &card.key);
+        assert!(a.owe_move(&card.key, to));
+        let Action::Mutate { machine, request } = a.account_owed() else {
+            panic!("nothing moved: {:?}", a.message())
+        };
+        assert_eq!(request["action"], "account-move");
+        let asked_about = |a: &App| match &a.mode {
+            Mode::Accounts {
+                screen:
+                    AccountScreen::Confirm {
+                        request, target, ..
+                    },
+                ..
+            } => (
+                request["confirm"].as_str().unwrap_or_default().to_string(),
+                target.as_ref().map(|t| t.reference.clone()),
+            ),
+            _ => panic!("not asked: {:?} {:?}", a.mode, a.message()),
+        };
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"confirmation":true,"confirm":"m-1","message":"#44's agent is mid-step. Move it when it stops?"}),
+        );
+        assert_eq!(
+            asked_about(&a),
+            ("m-1".to_string(), Some("#44".to_string()))
+        );
+        ready(&mut a);
+        let Action::Mutate { machine, request } = press(&mut a, 'y') else {
+            panic!("the yes sent nothing: {:?}", a.message())
+        };
+        assert_eq!(request["confirm"], "m-1");
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"confirmation":true,"confirm":"m-2","message":"#44's agent is at a question now. Move it once that's answered?"}),
+        );
+        assert_eq!(
+            asked_about(&a),
+            ("m-2".to_string(), Some("#44".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_fresh_agents_start_whose_account_isnt_signed_in_signs_it_in_then_starts_and_goes_in() {
+        // Round 2b: the start's account isn't signed in on that machine. The box that signs it
+        // in opens, the start goes again by itself once it's done, and Kerdr goes in.
+        let answer = |a: &mut App, action: Action, reply: Value| {
+            let Action::Mutate { machine, request } = action else {
+                panic!("nothing sent: {action:?} {:?}", a.message())
+            };
+            a.finish_action(
+                machine,
+                crate::actions::with_op(request),
+                Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+            );
+        };
+        let needs = json!({"ok":false,"sign_in":true,"code":"ARK_C","message":"ARK_C needs signing in on this machine first: A, then Enter on ARK_C signs it in, and s starts it then; nothing started"});
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let first = key(&mut a, KeyCode::Enter);
+        let Action::Mutate { request: asked, .. } = first.clone() else {
+            panic!("nothing sent")
+        };
+        answer(&mut a, first, needs.clone());
+        assert!(
+            matches!(
+                a.mode,
+                Mode::Accounts {
+                    screen: crate::app::account_controls::AccountScreen::Where { .. },
+                    ..
+                }
+            ),
+            "{:?}",
+            a.mode
+        );
+        let start = key(&mut a, KeyCode::Enter);
+        answer(
+            &mut a,
+            start,
+            json!({"ok":true,"message":"Authorize in your browser.","status":"waiting","url":"https://example.com/authorize?state=example","ticket":"login-ticket","needs_code":true}),
+        );
+        if let Mode::Accounts {
+            screen: crate::app::account_controls::AccountScreen::Signin(s),
+            ..
+        } = &mut a.mode
+        {
+            s.poll_at = Instant::now();
+        }
+        let poll = a.account_tick();
+        answer(
+            &mut a,
+            poll,
+            json!({"ok":true,"status":"done","message":"ARK_C is signed in."}),
+        );
+        assert!(
+            a.message().unwrap().0.contains("so the start goes on"),
+            "{:?}",
+            a.message()
+        );
+        let again = a.account_tick();
+        let Action::Mutate { request, .. } = &again else {
+            panic!("the start didn't go again: {:?}", a.message())
+        };
+        assert_eq!(*request, asked, "the same start, as a new request");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        answer(
+            &mut a,
+            again,
+            json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        assert_eq!(
+            a.open_after.take().expect("didn't go in").tab.as_deref(),
+            Some("t9")
+        );
+        // Leaving the box drops it, said as a start.
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card);
+        let first = key(&mut a, KeyCode::Enter);
+        answer(&mut a, first, needs);
+        key(&mut a, KeyCode::Esc);
+        assert_eq!(a.account_tick(), Action::None);
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .starts_with("Nothing started: ARK_C isn't signed in"),
+            "{:?}",
+            a.message()
+        );
+    }
+
+    /// A bare workspace's s, its picker's first account, and the start that sends: its card and
+    /// what was sent.
+    fn fresh_start(a: &mut App) -> (Card, usize, Value) {
+        let k = bare_workspace(a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(a, &k);
+        a.s_on_card(card.clone());
+        let Action::Mutate { machine, request } = key(a, KeyCode::Enter) else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        (card, machine, request)
+    }
+
+    fn answer_with(a: &mut App, machine: usize, request: Value, reply: Value) {
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+    }
+
+    fn ready(a: &mut App) {
+        if let Mode::Accounts {
+            screen: AccountScreen::Confirm { ready_at, .. },
+            ..
+        } = &mut a.mode
+        {
+            *ready_at = Instant::now() - Duration::from_secs(1);
+        }
+    }
+
+    #[test]
+    fn a_fresh_agents_start_question_covered_by_another_still_goes_in_after_its_yes() {
+        // Codex's third look: another account question asked over the start's, answered, and
+        // the start's yes still goes in once it starts. Nothing settles a question because
+        // something else covers it on screen.
+        let mut a = app();
+        let (card, machine, request) = fresh_start(&mut a);
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":false,"confirmation":true,"confirm":"a-1","message":"ARK_C is past its usual limit. Start anyway?"}),
+        );
+        // Another question over it: here a sign-in's removal, as any account question would be.
+        a.push_account_screen(AccountScreen::Confirm {
+            machine,
+            request: json!({"action":"account-remove","code":"KBZ_C","confirm":"r-1"}),
+            message: "That's this machine's own sign-in. Remove it?".into(),
+            yes: "remove".into(),
+            no: "keep it".into(),
+            target: None,
+            ready_at: Instant::now(),
+            choices: vec![],
+        });
+        assert_eq!(a.account_tick(), Action::None);
+        assert_eq!(press(&mut a, 'n'), Action::None);
+        assert_eq!(a.account_tick(), Action::None);
+        // Back on the start's question.
+        ready(&mut a);
+        let Action::Mutate { machine, request } = press(&mut a, 'y') else {
+            panic!(
+                "the start's yes sent nothing: {:?} {:?}",
+                a.mode,
+                a.message()
+            )
+        };
+        assert_eq!(request["action"], "account-start");
+        assert_eq!(request["confirm"], "a-1");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        let open = a.open_after.take().expect("didn't go in after the yes");
+        assert_eq!(open.from, card.key);
+        assert!(a.asked_about.is_empty(), "kept after it was settled");
+    }
+
+    #[test]
+    fn a_fresh_agents_start_sent_again_after_retry_says_so_on_its_card_and_goes_in_once_started() {
+        // The start answered `retry`: Kerdr sends it again by itself with the same op (the
+        // transport's own, tested in actions.rs), and meanwhile its card and the busy line say
+        // so quietly, never a warning. Its answer then goes in, as any start's does.
+        let mut a = app();
+        let (card, machine, request) = fresh_start(&mut a);
+        a.busy = true;
+        a.busy_label = a.working_on(&request);
+        a.resending(
+            None,
+            machine,
+            &crate::actions::Resend::Retry {
+                wait: Duration::from_secs(3),
+                message: "herdr in web isn't answering yet; Kerdr asks again shortly.".into(),
+            },
+        );
+        assert_eq!(a.busy_label, "Starting a fresh agent… trying again…");
+        assert_eq!(a.account_retrying.as_deref(), Some(card.key.as_str()));
+        assert!(a.message().is_none_or(|(_, tone)| tone != Tone::Warn));
+        // On its card, in the list of workspaces with no intent, besides the busy line.
+        a.mode = Mode::Misc { sel: 0 };
+        let shown = crate::ui::tests_render(&a, 200, 60);
+        let shown = shown.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            shown.contains(&format!("◐ {} trying again…", card.title)),
+            "{shown}"
+        );
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        answer_with(
+            &mut a,
+            machine,
+            request,
+            json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."}),
+        );
+        assert_eq!(a.account_retrying, None);
+        assert_eq!(
+            a.open_after.take().expect("didn't go in").tab.as_deref(),
+            Some("t9")
+        );
+    }
+
+    #[test]
+    fn a_fresh_agents_start_that_asks_first_still_goes_in_after_the_yes() {
+        // Codex's review: the start asks first; once its yes starts it while you're still on the
+        // workspace, Kerdr goes in, as it does when nothing was asked.
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        let question = json!({"ok":false,"confirmation":true,"confirm":"a-1","message":"ARK_C is past its usual limit. Start anyway?"});
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request.clone()),
+            Ok(crate::actions::parse_response(&question.to_string()).unwrap()),
+        );
+        let Mode::Accounts { screen, .. } = &mut a.mode else {
+            panic!("not asked: {:?} {:?}", a.mode, a.message())
+        };
+        let crate::app::account_controls::AccountScreen::Confirm { ready_at, .. } = screen else {
+            panic!("not asked: {screen:?}")
+        };
+        *ready_at = Instant::now() - Duration::from_secs(1);
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Char('y')) else {
+            panic!("the yes sent nothing: {:?}", a.message())
+        };
+        assert_eq!(request["confirm"], "a-1");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        let reply = json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."});
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+        let open = a.open_after.take().expect("didn't go in after the yes");
+        assert_eq!(open.workspace, workspace);
+        assert_eq!(open.from, k);
+    }
+
+    #[test]
+    fn s_on_an_empty_workspace_starts_a_fresh_agent_there_and_goes_in() {
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let card = a.card(&k).unwrap().clone();
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let (start, choices) = start_screen(&a);
+        assert_eq!(start.how, StartHow::Fresh);
+        assert_eq!(start.machine, card.machine_index);
+        assert_eq!(choices.last().map(String::as_str), Some("list"));
+        let at = choices.iter().position(|c| c != "list").unwrap();
+        let code = choices[at].clone();
+        for _ in 0..at {
+            key(&mut a, KeyCode::Down);
+        }
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        assert_eq!(machine, card.machine_index);
+        assert_eq!(
+            request,
+            json!({"action":"account-start","session":card.session,"workspace":card.workspace_id,"to":code})
+        );
+        assert_eq!(a.working_on(&request), "Starting a fresh agent…");
+        let session = card.session.clone().unwrap();
+        let workspace = card.workspace_id.clone().unwrap();
+        let reply = json!({"ok":true,"session":session,"workspace":workspace,"label":"scratch","tab":"t9","message":"Started a new Claude Code agent in scratch on ARK_C."});
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request.clone()),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+        let open = a.open_after.take().expect("went in");
+        assert_eq!(
+            (open.session.as_str(), open.workspace.as_str()),
+            (session.as_str(), workspace.as_str())
+        );
+        assert_eq!(open.tab.as_deref(), Some("t9"));
+        assert_eq!(open.from, k);
+        // Gone on to another card meanwhile: said, with how to go in, and you stay put.
+        select(&mut a, &k);
+        a.s_on_card(card.clone());
+        let Action::Mutate { machine, request } = key(&mut a, KeyCode::Enter) else {
+            panic!()
+        };
+        let other = a
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != k)
+            .unwrap()
+            .key
+            .clone();
+        select(&mut a, &other);
+        a.finish_action(
+            machine,
+            crate::actions::with_op(request),
+            Ok(crate::actions::parse_response(&reply.to_string()).unwrap()),
+        );
+        assert!(a.open_after.is_none());
+        let (said, tone) = a.message().unwrap();
+        assert_eq!(
+            said,
+            "Started a new Claude Code agent in scratch on ARK_C. ⏎ on its card goes in."
+        );
+        assert_eq!(tone, Tone::Good);
+    }
+
+    /// Intent 0591, K1-105: a backend that can't start a fresh agent there is never sent one; s
+    /// says why as before. Nor is one started beside something running in it.
+    #[test]
+    fn an_empty_workspace_on_an_older_backend_keeps_the_refusal() {
+        let mut a = app();
+        let k = bare_workspace(&mut a, false);
+        let card = a.card(&k).unwrap().clone();
+        assert!(
+            matches!(a.run_state(&card), RunState::Unavailable(why) if why.contains("no intent to start"))
+        );
+        let mut a = app();
+        let k = bare_workspace(&mut a, true);
+        let mut card = a.card(&k).unwrap().clone();
+        card.workspace_id = None;
+        assert!(matches!(a.run_state(&card), RunState::Unavailable(_)));
+    }
+
+    /// Codex's review: the yes to a start's question, given after its card moved home, starts it
+    /// where it lives now on the account he picked, never on its owner's list.
+    #[test]
+    fn a_start_on_an_account_asked_again_after_its_card_moved_keeps_the_account() {
+        let mut a = app();
+        let k = backlog_card(&a);
+        in_feed(&mut a, &k, |c| c.kickoff = None);
+        select(&mut a, &k);
+        press(&mut a, 's');
+        let (machine, request) = choose(&mut a, "ARK_C");
+        assert_eq!(request["action"], "dispatch");
+        assert_eq!(request["account"], "ARK_C");
+        on_its_way(&mut a, machine, &request);
+        answered(
+            &mut a,
+            &request,
+            json!({"ok":false,"confirmation":true,"message":"web has 3 workspaces. Start anyway?","used":3,"limit":3,"session":"web","confirm":"t-1"}),
+        );
+        assert!(matches!(a.mode, Mode::Confirm { .. }), "{:?}", a.message());
+        // Its home moved meanwhile, to another machine that starts work on its accounts.
+        let other = (0..a.machines.len())
+            .find(|&m| m != machine && a.account(m, "ARK_C").is_some())
+            .expect("another machine with ARK_C");
+        a.machines[other].feed.as_mut().unwrap().starts_on =
+            STARTS_ON.iter().map(|s| s.to_string()).collect();
+        let name = a.machines[other].name();
+        in_feed(&mut a, &k, |c| {
+            c.home = Some(crate::feed::Home {
+                machine: Some(name.clone()),
+                session: Some("web".into()),
+            })
+        });
+        if let Mode::Confirm { ready_at, .. } = &mut a.mode {
+            *ready_at = None;
+        }
+        let Action::Mutate {
+            machine: to,
+            request: again,
+        } = press(&mut a, 'y')
+        else {
+            panic!("the yes sent nothing: {:?} {:?}", a.mode, a.message())
+        };
+        assert_eq!(to, other);
+        assert_eq!(again["action"], "dispatch");
+        assert_eq!(again["account"], "ARK_C");
+        assert!(again.get("confirm").is_none() && again.get("override").is_none());
     }
 }
