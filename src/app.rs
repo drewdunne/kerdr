@@ -2901,7 +2901,13 @@ impl App {
             // This machine too: only its cards leave the board, and it's still read for its
             // accounts and the actions it runs (intent 0591, K1-10).
             KeyCode::Char('x') => return Action::ToggleHidden(i),
+            // An intent to update herdr there, through that machine's infrastructure code, when
+            // a backend that makes intents answers; else herdr's own setup, as before (intent
+            // 0591, release 4).
             KeyCode::Char('u') => {
+                if let Some(action) = self.herdr_intent(i) {
+                    return action;
+                }
                 if self.machines[i].machine.is_local() {
                     self.say("Update herdr here with: herdr update", Tone::Info);
                 } else {

@@ -1095,6 +1095,13 @@ impl App {
         match target {
             Some(name) => {
                 let found = self.machine_index(&name);
+                // Not one of Kerdr's machines: a machine that forwards sends it there (intent
+                // 0591, release 4; route names it in `forward_to`).
+                if found.is_none()
+                    && let Some(via) = self.forwarder_for(Some(&name))
+                {
+                    return Some(via);
+                }
                 if found.is_none() {
                     self.say(format!("The home machine {name} is not configured. Add it before changing this intent."), Tone::Warn);
                 }
@@ -1986,7 +1993,7 @@ impl App {
     /// send went unanswered may be saved already: they go again where they went then, with the
     /// same submission, wherever you are now, so the adapter finds the first one rather than
     /// making a second.
-    fn send_draft(&mut self, mut draft: Draft) -> Action {
+    pub(super) fn send_draft(&mut self, mut draft: Draft) -> Action {
         // Its machine stopped answering meanwhile (a read that took a while): nothing is lost.
         if !self.can_write(draft.machine) {
             self.give_back(draft.words, draft.images, draft.came_back);
@@ -3794,6 +3801,9 @@ impl App {
                 // Answered at last: no longer being sent again (intent 0591).
                 self.account_retrying = None;
             }
+            // A move for later, or one queued behind another: its card says so (intent 0591,
+            // release 4, K2-30 and K2-31).
+            self.account_pending(machine, &request, &result);
             self.finish_account_action(machine, request, result);
             return;
         }
@@ -3845,7 +3855,23 @@ impl App {
                 .unwrap_or_default();
             // A save of an item's text that can't go on: his version stays (intent 0414).
             let kept = self.edit_kept(&request);
+            // Sent on through a machine that forwards, when Kerdr can't reach that home itself,
+            // once (intent 0591, release 4).
+            let through = (!was_resent && request.get("forward_to").is_none())
+                .then(|| self.forwarder_for(Some(host)))
+                .flatten();
             match self.machine_index(host) {
+                None if through.is_some() => {
+                    let mut request = request;
+                    request["forward_to"] = json!(host);
+                    if request["action"] == "edit" {
+                        self.edit_resend(&mut request, Some(&key));
+                    }
+                    let via = through.unwrap_or(machine);
+                    self.resent.push((via, key.clone()));
+                    self.resend.push_back((via, request, from, Some(key)));
+                    return;
+                }
                 None => {
                     self.fail(
                         format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't change it there.{kept}"),
@@ -3870,6 +3896,24 @@ impl App {
                     self.moved_home.retain(|(k, ..)| *k != key);
                     self.moved_home.push((key.clone(), to, old_home));
                     let name = self.machines[to].name();
+                    // Its home isn't answering: sent through a machine that forwards, else held
+                    // for it, shown on its card (intent 0591, release 4, K1-54).
+                    if !self.machines[to].conn.is_live() && (through.is_some() || self.holds_on(to))
+                    {
+                        let mut request = request;
+                        if request["action"] == "edit" {
+                            self.edit_resend(&mut request, Some(&key));
+                        }
+                        if let Some(via) = through {
+                            request["forward_to"] = json!(name);
+                            self.resent.push((via, key.clone()));
+                            self.resend.push_back((via, request, from, Some(key)));
+                        } else {
+                            let rev = self.card_rev(&key);
+                            self.hold_request(name, request, Some(key), rev, None);
+                        }
+                        return;
+                    }
                     if !self.machines[to].conn.is_live() {
                         self.fail(
                             format!("{reference} lives on {name} now, and {name} isn't answering; nothing changed. Try again once it's back.{kept}"),

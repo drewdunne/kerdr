@@ -148,6 +148,22 @@ impl App {
         let Some(m) = self.machines.get(machine) else {
             return Some((machine, request));
         };
+        // Its card's home isn't one of Kerdr's machines: home_machine picked one that forwards,
+        // and this names where it goes.
+        let home = key
+            .and_then(|k| self.card(k))
+            .and_then(|c| c.detail.as_ref())
+            .and_then(|d| d.home.as_ref())
+            .and_then(|h| h.machine.clone())
+            .filter(|h| self.machine_index(h).is_none());
+        if let Some(home) = home
+            && request.get("forward_to").is_none()
+            && m.conn.is_live()
+            && m.feed.as_ref().is_some_and(|f| f.supports(FORWARD))
+        {
+            request["forward_to"] = Value::String(home);
+            return Some((machine, request));
+        }
         // A read isn't held: only a change waits for its machine.
         if m.conn.is_live() || !self.actions_on() || crate::resolve::reads(&request) {
             return Some((machine, request));
@@ -368,6 +384,53 @@ impl App {
         false
     }
 
+    /// An account request its backend accepted and holds (a move for later, or one queued
+    /// behind a move under way): its `pending` words show on the card of the agent it moves.
+    pub(crate) fn account_pending(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        result: &Result<Response, String>,
+    ) {
+        let Some(words) = result
+            .as_ref()
+            .ok()
+            .filter(|r| r.ok && !r.confirmation)
+            .and_then(|r| r.pending.clone())
+            .filter(|w| !w.is_empty())
+        else {
+            return;
+        };
+        let pane = request["pane"].as_str();
+        let session = request["session"].as_str();
+        let workspace = request["workspace"].as_str();
+        let Some(key) = self
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                c.machine_index == machine
+                    && session.is_none_or(|s| c.session.as_deref() == Some(s))
+                    && (pane.is_some_and(|p| c.agents.iter().any(|a| a.pane_id == p))
+                        || (pane.is_none()
+                            && workspace.is_some_and(|w| c.workspace_id.as_deref() == Some(w))))
+            })
+            .map(|c| c.key.clone())
+        else {
+            return;
+        };
+        let op = request["op"].as_str().unwrap_or_default().to_string();
+        self.pendings.retain(|p| !(p.key == key && p.op == op));
+        self.pendings.push(Pending {
+            key,
+            machine,
+            op,
+            words,
+            reads: 0,
+        });
+        self.rebuild();
+    }
+
     /// After an answer: one that went through another machine says so.
     pub(crate) fn note_via(&mut self, to: Option<String>, via: Option<String>) {
         let (Some(to), Some(via)) = (to, via) else {
@@ -391,9 +454,14 @@ impl App {
             .iter()
             .filter(|c| c.machine_index == machine)
             .flat_map(|c| {
+                let agent = self
+                    .account_agent(c)
+                    .into_iter()
+                    .flat_map(|a| a.held.iter());
                 c.detail
                     .iter()
                     .flat_map(|d| d.held.iter())
+                    .chain(agent)
                     .map(|h| (c.key.clone(), h.op.clone()))
                     .collect::<Vec<_>>()
             })
@@ -570,6 +638,53 @@ impl App {
             return true;
         }
         false
+    }
+
+    /// u on a machine's row: an intent to update herdr there, made by a machine whose backend is
+    /// ark-sdlc's, this one first. It's done through that machine's infrastructure code, or
+    /// omarchy-config on an Omarchy machine: Kerdr installs nothing itself. None when no such
+    /// backend answers.
+    pub(crate) fn herdr_intent(&mut self, i: usize) -> Option<super::Action> {
+        if !self.actions_on() {
+            return None;
+        }
+        let at = self.machines.iter().position(|m| {
+            m.conn.is_live()
+                && m.feed
+                    .as_ref()
+                    .is_some_and(|f| f.source.as_deref() == Some("ark-sdlc"))
+        })?;
+        let m = self.machines.get(i)?;
+        let name = m.name();
+        let why = match &m.conn {
+            Conn::HerdrMissing => "herdr isn't installed there".to_string(),
+            Conn::HerdrTooOld { version } => {
+                format!("its herdr is {version}, older than Kerdr needs")
+            }
+            _ => "Andrew asked for it from Kerdr's list of machines".to_string(),
+        };
+        let words = format!(
+            "Update herdr on {name}: {why}. Do it through {name}'s infrastructure code, or omarchy-config on an Omarchy machine, and run it there; nothing installed by hand."
+        );
+        let draft = super::Draft {
+            words,
+            machine: at,
+            session: "default".into(),
+            images: vec![],
+            came_back: None,
+            filed: super::Filed::default(),
+            unfiled: None,
+        };
+        let action = self.send_draft(draft);
+        if matches!(action, super::Action::Mutate { .. }) {
+            self.say(
+                format!(
+                    "Making an intent to update herdr on {name}, through its infrastructure code: Kerdr installs nothing itself."
+                ),
+                Tone::Info,
+            );
+        }
+        Some(action)
     }
 
     /// What q waits for before quitting, in words: "your new intent is saved". None when nothing
@@ -1271,5 +1386,149 @@ mod tests {
         assert!(app.resolver.ready().is_empty());
         assert!(app.kept.held.is_empty());
         assert!(said(&app).contains("wasn't started"), "{}", said(&app));
+    }
+
+    fn home(app: &mut App, id: &str, m: usize, home: &str) {
+        for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.home = Some(crate::feed::Home {
+                    machine: Some(home.into()),
+                    session: Some("web".into()),
+                });
+            }
+        }
+        app.rebuild();
+    }
+
+    #[test]
+    fn a_card_homed_on_a_machine_kerdr_doesnt_know_goes_through_one_that_forwards() {
+        let mut app = app();
+        let (key, id, _, m) = waiting(&mut app);
+        home(&mut app, &id, m, "elsewhere");
+        select(&mut app, &key);
+        // No machine forwards: said, as before.
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert!(said(&app).contains("not configured"), "{}", said(&app));
+        supports(&mut app, m, FORWARD);
+        let Action::Mutate { machine, request } = press(&mut app, 'd') else {
+            panic!("nothing sent: {}", said(&app))
+        };
+        assert_eq!(machine, m);
+        app.queue_action(machine, request);
+        let (_, machine, request, _) = app.resolver.ready()[0].clone();
+        assert_eq!(machine, m);
+        assert_eq!(request["forward_to"], "elsewhere");
+    }
+
+    #[test]
+    fn a_refusal_naming_a_home_kerdr_cant_reach_goes_through_a_forwarder_or_is_held() {
+        let refused = |home: &str| {
+            Ok(Response {
+                ok: false,
+                message: format!("It lives on {home} now; ⏎ again opens it there."),
+                home: Some(home.into()),
+                ..Default::default()
+            })
+        };
+        // A home Kerdr doesn't know, and a machine that forwards: sent on through it, once.
+        let mut app = app();
+        let (_, id, _, m) = waiting(&mut app);
+        supports(&mut app, m, FORWARD);
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request.clone(), refused("elsewhere/ARK"));
+        // The same change, its op too, goes to the runner again, now through the forwarder.
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        let (again_n, via, again, _) = ready[0].clone();
+        assert_eq!((again_n, via), (n, m));
+        assert_eq!(again["forward_to"], "elsewhere");
+        assert_eq!(again["op"], request["op"]);
+        // A home Kerdr knows that isn't answering, whose backend holds: held for it.
+        let mut app = self::app();
+        let (key, id, reference, m) = waiting(&mut app);
+        let other = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(&mut app, other, HOLD);
+        away(&mut app, other, 5);
+        let name = app.machines[other].name();
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request.clone(), refused(&format!("{name}/ARK")));
+        assert!(app.resend.is_empty());
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].machine, name);
+        assert_eq!(app.kept.held[0].key.as_deref(), Some(key.as_str()));
+        assert_eq!(app.kept.held[0].op(), request["op"].as_str().unwrap());
+        assert_eq!(
+            said(&app),
+            format!("Held: d on {reference} goes when {name} answers (it dropped 5 s ago).")
+        );
+    }
+
+    #[test]
+    fn u_on_a_machine_makes_an_intent_to_update_its_herdr_and_installs_nothing() {
+        let mut app = app();
+        let i = app.machines.len() - 1;
+        app.machines[i].conn = Conn::HerdrTooOld {
+            version: "0.4.1".into(),
+        };
+        // No backend that makes intents: herdr's own setup, as before.
+        app.mode = super::super::Mode::Machines { sel: 0 };
+        let row = app.machine_rows().iter().position(|&r| r == i).unwrap();
+        app.mode = super::super::Mode::Machines { sel: row };
+        let before = press(&mut app, 'u');
+        assert!(
+            matches!(before, Action::Setup(_)) || said(&app).contains("herdr update"),
+            "{before:?}"
+        );
+        // ark-sdlc's backend answers here: an intent, made there.
+        app.machines[0].feed.as_mut().unwrap().source = Some("ark-sdlc".into());
+        app.mode = super::super::Mode::Machines { sel: row };
+        let Action::Mutate { machine, request } = press(&mut app, 'u') else {
+            panic!("no intent: {}", said(&app))
+        };
+        assert_eq!(machine, 0);
+        assert_eq!(request["action"], "create");
+        let name = app.machines[i].name();
+        let words = request["words"].as_str().unwrap();
+        assert!(
+            words.starts_with(&format!(
+                "Update herdr on {name}: its herdr is 0.4.1, older than Kerdr needs."
+            )),
+            "{words}"
+        );
+        assert!(words.contains("infrastructure code"), "{words}");
+        assert!(
+            said(&app).contains("Kerdr installs nothing itself"),
+            "{}",
+            said(&app)
+        );
+    }
+
+    #[test]
+    fn an_account_move_its_backend_holds_says_so_on_the_agents_card() {
+        let mut app = app();
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| !c.agents.is_empty() && c.session.is_some())
+            .expect("a card with an agent in the demo")
+            .clone();
+        let pane = card.agents[0].pane_id.clone();
+        let request = json!({"action":"account-move","pane":pane,"session":card.session,"to":"ARK_C","op":"k-1"});
+        app.busy = true;
+        app.finish_action(
+            card.machine_index,
+            request,
+            ok(json!({"message": "ARK_C is out until 02:00; it moves then.", "pending": "moves to ARK_C at 02:00"})),
+        );
+        let card = app.card(&card.key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some("⧗ moves to ARK_C at 02:00")
+        );
     }
 }
