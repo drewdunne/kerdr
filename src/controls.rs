@@ -2776,7 +2776,18 @@ impl App {
         // Its machine isn't answering: sent through one that forwards, or held for it (intent
         // 0591, release 4). A held change shows on its card, not as done.
         let home = machine;
-        let Some((machine, request)) = self.route(machine, request, key.as_deref()) else {
+        // The same change kept held because its backend doesn't check one: it goes as that
+        // record, with its op, never as a second copy. Held for its machine again, it waits as
+        // itself (route's `carrying`).
+        let again = self.pressed_again(machine, &request, key.as_deref());
+        if again.is_some() {
+            self.carrying = again.clone();
+        }
+        let routed = self.route(machine, request, key.as_deref());
+        if again.is_some() {
+            self.carrying = None;
+        }
+        let Some((machine, request)) = routed else {
             return;
         };
         let rev = key
@@ -2785,6 +2796,11 @@ impl App {
             .and_then(|k| self.card_rev(k));
         let n = self.resolver.add(machine, request, from, key, effect);
         self.resolver.set_rev(n, rev);
+        if let Some(op) = again {
+            self.resolver.keep_op(n, &op);
+            self.held_unchecked.remove(&op);
+            self.held_sending.insert(n, op);
+        }
         if by_enter {
             self.resolver.mark_by_enter(n);
         }

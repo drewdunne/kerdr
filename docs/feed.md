@@ -724,7 +724,9 @@ backend's after.
   only to a backend that lists `"hold"` or `"steps"`, which asks again; with any other it stays held,
   and Kerdr says once "X on #41 stays held: LAB-Server's backend wouldn't ask again before stopping
   it, so Kerdr won't send the yes you gave before it last closed. Press X again to be asked now, or m
-  then D drops it."
+  then D drops it." The entry keeps why it stays (`stays` in the hold file). Pressing its key again
+  on that card sends the change now as that same entry, with its `op`, unmarked, and its answer
+  takes it out of the file, so it never stays behind as a second copy.
 
 **Kerdr's hold file.** A change to a card whose machine isn't answering, to a backend that listed
 `"hold"` when Kerdr last read it, goes into `held.json` in Kerdr's state folder (readable by you
@@ -742,7 +744,8 @@ waits for them to agree, then goes once more from the file, or leaves it when Ke
 disagree. So a Kerdr that ends meanwhile leaves it for the next one, which sends it there once.
 Quitting doesn't lose it: the next Kerdr opened sends it, and nothing sends it while no Kerdr is
 open. One older than a day isn't sent: the card says "⧗ d dropped: LAB-Server didn't answer for a
-day".
+day", or, for one that stayed held though its machine answered, why: "⧗ d dropped after a day:
+build-box's backend doesn't check a held change again".
 
 Several Kerdrs open at once share the file. Each change to `held.json`, or to `words.json` (below),
 holds `kept.lock` in the state folder while it reads the file, changes it and writes it whole, a new

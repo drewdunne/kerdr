@@ -404,6 +404,7 @@ impl App {
                 pressed: self.now().timestamp(),
                 after: None,
                 by: None,
+                stays: None,
             });
             return Some(format!(
                 "Your new text for {reference} is held for {name}: the next Kerdr sends it once {name} answers."
@@ -524,6 +525,7 @@ pub(crate) mod tests {
             pressed,
             after: None,
             by: None,
+            stays: None,
         });
         app.catch_up_read(0, true);
         assert_eq!(
@@ -576,6 +578,7 @@ pub(crate) mod tests {
             pressed: app.now().timestamp(),
             after: None,
             by: None,
+            stays: None,
         });
         answers(&mut app, 1);
         // Before what sending it says.

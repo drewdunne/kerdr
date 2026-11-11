@@ -62,6 +62,11 @@ pub struct HeldRequest {
     /// the file. Another Kerdr sends it only once that one has gone.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// Why it stays in the file though its machine answers, while that's so: "build-box's backend
+    /// doesn't check a held change again". What its card says if its day runs out. Its key pressed
+    /// again sends it as itself, with its op.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stays: Option<String>,
 }
 
 impl HeldRequest {
@@ -106,6 +111,8 @@ enum Change {
     /// there, a refusal said.
     Moved(String, String, Value),
     Holds(String, bool),
+    /// Why it stays held though its machine answers, by its op, or None once it goes.
+    Stays(String, Option<String>),
 }
 
 impl Change {
@@ -134,6 +141,11 @@ impl Change {
                 file.holds.retain(|m| m != name);
                 if *yes {
                     file.holds.push(name.clone());
+                }
+            }
+            Change::Stays(op, why) => {
+                for h in file.held.iter_mut().filter(|h| h.op() == op) {
+                    h.stays = why.clone();
                 }
             }
         }
@@ -324,12 +336,17 @@ impl Kept {
                 old
             }
         };
+        // Why it was never sent: its machine didn't answer, or it did, with a backend Kerdr won't
+        // send it to unchecked.
         let dropped: Vec<Dropped> = old
             .iter()
             .map(|h| Dropped {
                 key: h.key.clone(),
                 reference: h.reference.clone(),
-                said: format!("{} dropped: {} didn't answer for a day", h.what, h.machine),
+                said: match &h.stays {
+                    Some(why) => format!("{} dropped after a day: {why}", h.what),
+                    None => format!("{} dropped: {} didn't answer for a day", h.what, h.machine),
+                },
             })
             .collect();
         self.dropped.extend(dropped.clone());
@@ -454,6 +471,19 @@ impl Kept {
             }
         }
         self.write(Change::Unclaim(op.to_string(), me));
+    }
+
+    /// Notes why a held change stays in the file though its machine answers, or, with None, that
+    /// it's on its way after all. Written only when that changes.
+    pub fn stays(&mut self, op: &str, why: Option<String>) {
+        let mut changed = false;
+        for h in self.held.iter_mut().filter(|h| h.op() == op) {
+            changed |= h.stays != why;
+            h.stays = why.clone();
+        }
+        if changed {
+            self.write(Change::Stays(op.to_string(), why));
+        }
     }
 
     /// A held change whose card, a refusal said, lives on another machine: it's for that one now,
@@ -960,6 +990,7 @@ mod tests {
             pressed,
             after: None,
             by: None,
+            stays: None,
         }
     }
 
@@ -1149,6 +1180,27 @@ mod tests {
         drop(two);
         assert_eq!(one.expire(1001 + HOLD_MOST_SECS).len(), 1);
         assert!(ops(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn why_a_change_stays_held_is_kept_with_it_for_the_next_kerdr_until_it_goes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut kept = Kept::at(dir.path(), 1000);
+        kept.hold(entry("unchecked", 1000));
+        kept.hold(entry("sent-since", 1000));
+        let why = "build-box's backend doesn't check a held change again";
+        kept.stays("unchecked", Some(why.into()));
+        kept.stays("sent-since", Some(why.into()));
+        kept.stays("sent-since", None);
+        let next = Kept::at(dir.path(), 1001 + HOLD_MOST_SECS);
+        let said: Vec<&str> = next.dropped.iter().map(|d| d.said.as_str()).collect();
+        assert_eq!(
+            said,
+            [
+                format!("d dropped after a day: {why}").as_str(),
+                "d dropped: LAB-Server didn't answer for a day",
+            ]
+        );
     }
 
     #[test]

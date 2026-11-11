@@ -1192,6 +1192,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: Some("start".into()),
             by: None,
+            stays: None,
         });
         app.feed_read(m);
         let ready = app.resolver.ready();
@@ -1245,6 +1246,7 @@ mod tests {
                 pressed: app.now().timestamp(),
                 after: Some("start".into()),
                 by: None,
+                stays: None,
             });
             app.feed_read(m);
             (app, card, m)

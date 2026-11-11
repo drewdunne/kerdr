@@ -216,6 +216,38 @@ impl App {
         Some((machine, request))
     }
 
+    /// A key pressed again on a card whose same change stays in the file because its machine's
+    /// backend doesn't check one (`stays`): that record, claimed, by its op. The change the key
+    /// makes now goes as that record, with its op, and its answer takes it out of the file, so it's
+    /// never left behind as a second copy. None for anything else, or when another Kerdr has it.
+    pub(crate) fn pressed_again(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        key: Option<&str>,
+    ) -> Option<String> {
+        if self.carrying.is_some() || request.get("op").is_some() {
+            return None;
+        }
+        let (key, name) = (key?, self.machines.get(machine)?.name());
+        let what = held_what(request);
+        let op = self
+            .kept
+            .held
+            .iter()
+            .find(|h| {
+                h.stays.is_some()
+                    && h.key.as_deref() == Some(key)
+                    && h.machine == name
+                    && h.what == what
+                    && h.request["action"] == request["action"]
+                    && !self.held_sending.values().any(|op| op == h.op())
+            })?
+            .op()
+            .to_string();
+        (self.kept.claim(&op) == crate::kept::Claim::Mine).then_some(op)
+    }
+
     /// A card's `rev`, as its feed gave it.
     pub(crate) fn card_rev(&self, key: &str) -> Option<String> {
         self.card(key)
@@ -266,6 +298,7 @@ impl App {
             pressed: self.epoch_now(),
             after,
             by: None,
+            stays: None,
         };
         let written = self.kept.hold(entry.clone());
         self.say_held(&entry, written);
@@ -491,8 +524,14 @@ impl App {
         self.held_unsure.remove(&op);
         let Some(request) = self.held_marked(machine, &entry) else {
             self.kept.unclaim(&op);
+            let name = self.machines[machine].name();
+            // Kept with it, for its card to say if its day runs out.
+            let why = match entry.after {
+                Some(_) => format!("{name}'s backend wouldn't ask again before stopping it"),
+                None => format!("{name}'s backend doesn't check a held change again"),
+            };
+            self.kept.stays(&op, Some(why));
             if self.held_unchecked.insert(op) {
-                let name = self.machines[machine].name();
                 let (what, reference) = (&entry.what, &entry.reference);
                 let said = if entry.after.is_some() {
                     format!(
@@ -507,6 +546,10 @@ impl App {
             }
             return;
         };
+        if entry.stays.is_some() {
+            self.kept.stays(&op, None);
+        }
+        self.held_unchecked.remove(&op);
         // A key that waited behind a start or a save when Kerdr quit: decided again now, as it
         // would have been (crate::app::behind), still the same record, with its op and its
         // markers, until it's answered (Codex's review 60).
@@ -743,6 +786,8 @@ impl App {
                 self.resent
                     .retain(|(m, k)| !(*m == to && Some(k) == key.as_ref()));
                 self.kept.unclaim(&op);
+                let why = format!("{name}'s backend doesn't check a held change again");
+                self.kept.stays(&op, Some(why));
                 self.held_unchecked.insert(op.clone());
                 if let Some(h) = self.kept.find(&op).cloned() {
                     self.say(
@@ -1453,6 +1498,7 @@ impl App {
                 pressed: self.epoch_now(),
                 after: None,
                 by: Some(me.clone()),
+                stays: None,
             });
         }
         let unsent: Vec<u64> = self
@@ -1484,6 +1530,7 @@ impl App {
                     pressed: self.epoch_now(),
                     after: None,
                     by: Some(me.clone()),
+                    stays: None,
                 });
             }
         }
@@ -1585,6 +1632,7 @@ impl App {
                 pressed: self.epoch_now(),
                 after: Some(after),
                 by: Some(me.clone()),
+                stays: None,
             });
         }
     }
@@ -2368,6 +2416,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: Some("write-up".into()),
             by: None,
+            stays: None,
         });
         // Still waiting: it goes back to waiting for its write-up, with its op.
         let op = app.kept.held[0].op().to_string();
@@ -2389,6 +2438,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: Some("write-up".into()),
             by: None,
+            stays: None,
         });
         for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
             if c.id == id {
@@ -2563,6 +2613,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: None,
             by: None,
+            stays: None,
         });
         // Andrew is elsewhere meanwhile.
         app.sel.key = None;
@@ -3266,6 +3317,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: None,
             by: None,
+            stays: None,
         });
         app.feed_read(m);
         let ready = app.resolver.ready();
@@ -3293,6 +3345,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: None,
             by: None,
+            stays: None,
         });
         back(&mut app, m);
         assert!(app.resolver.ready().is_empty(), "sent unchecked");
@@ -3306,6 +3359,93 @@ mod tests {
         app.say("Something else.", Tone::Info);
         app.feed_read(m);
         assert_eq!(said(&app), "Something else.");
+    }
+
+    /// A d kept in a hold file in its own folder for a machine whose backend doesn't check a held
+    /// change, which has just answered: the folder, the card's key, id and reference, the
+    /// machine, and the record's op.
+    fn kept_unchecked(app: &mut App) -> (tempfile::TempDir, String, String, String, usize, String) {
+        let dir = tempfile::tempdir().unwrap();
+        app.fixed_now = Some(app.now());
+        app.kept = Kept::at(dir.path(), app.now().timestamp());
+        let (key, id, reference, m) = waiting(app);
+        app.kept.hold(HeldRequest {
+            machine: app.machines[m].name(),
+            request: crate::actions::with_op(json!({"action":"dispatch","id":id})),
+            rev: Some("r1".into()),
+            key: Some(key.clone()),
+            reference: reference.clone(),
+            what: "d".into(),
+            pressed: app.now().timestamp(),
+            after: None,
+            by: None,
+            stays: None,
+        });
+        let op = app.kept.held[0].op().to_string();
+        back(app, m);
+        assert!(app.resolver.ready().is_empty(), "sent unchecked");
+        (dir, key, id, reference, m, op)
+    }
+
+    /// The hold file's records as written: each one's op and who has it.
+    fn on_file(dir: &std::path::Path) -> Vec<(String, Option<String>)> {
+        let file: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("held.json")).unwrap()).unwrap();
+        file["held"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|h| {
+                (
+                    h["request"]["op"].as_str().unwrap_or_default().to_string(),
+                    h["by"].as_str().map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn d_pressed_again_on_a_change_kept_held_for_a_backend_that_doesnt_check_goes_as_that_record() {
+        // The team lead, after round 4: pressing d again sends the change now, and uses up the
+        // record kept held, with its op, rather than leaving it behind as a second copy.
+        let mut app = app();
+        let (dir, _, _, _, _, op) = kept_unchecked(&mut app);
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        let (n, _, request, _) = ready[0].clone();
+        assert_eq!(
+            request["op"],
+            op.as_str(),
+            "a second copy, with an op of its own"
+        );
+        assert!(request.get("held").is_none(), "{request}");
+        assert_eq!(
+            on_file(dir.path()),
+            [(op.clone(), Some(app.kept.me().to_string()))],
+            "on its way from this Kerdr"
+        );
+        app.finish_job(n, request, ok(json!({})));
+        assert!(app.kept.held.is_empty(), "left behind once answered");
+        assert!(on_file(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_change_kept_held_for_a_backend_that_doesnt_check_says_why_when_its_day_runs_out() {
+        // The team lead, after round 4: not "didn't answer for a day", since its machine did.
+        let mut app = app();
+        let (_dir, _, _, reference, m, _) = kept_unchecked(&mut app);
+        let name = app.machines[m].name();
+        app.fixed_now =
+            Some(app.now() + chrono::Duration::seconds(crate::kept::HOLD_MOST_SECS + 1));
+        app.feed_read(m);
+        assert!(app.kept.held.is_empty());
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference}: d dropped after a day: {name}'s backend doesn't check a held change again."
+            )
+        );
     }
 
     fn refused_for(home: &str) -> Result<Response, String> {
@@ -3540,6 +3680,7 @@ mod tests {
             pressed: app.now().timestamp(),
             after: Some("write-up".into()),
             by: None,
+            stays: None,
         });
         let carried = app.kept.held[0].op().to_string();
         back(app, m);
