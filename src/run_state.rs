@@ -737,7 +737,7 @@ impl App {
                 .holds_for(&card.key, &id, |r| r["action"] == "restore")
                 || self.resend.iter().any(|(_, r, _, k)| {
                     r["action"] == "restore"
-                        && crate::resolve::for_card(
+                        && self.resolver.for_card(
                             k.as_deref(),
                             r["id"].as_str().unwrap_or_default(),
                             &card.key,

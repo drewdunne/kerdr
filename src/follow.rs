@@ -218,13 +218,14 @@ impl App {
     }
 
     /// The followed work shown on this card, if any: by its card's key, and by its record's number
-    /// only where a key can't tell (`resolve::for_card`). Another source's card with the same
+    /// only where a key can't tell (`Resolver::for_card`). Another source's card with the same
     /// number never shows it or waits on it (Codex's sixth and seventh looks).
     pub fn following_card(&self, card: &Card) -> Option<&Following> {
         let id = card.detail.as_ref()?.id.as_str();
-        self.follows
-            .iter()
-            .find(|f| crate::resolve::for_card(f.key.as_deref(), &f.id, &card.key, id))
+        self.follows.iter().find(|f| {
+            self.resolver
+                .for_card(f.key.as_deref(), &f.id, &card.key, id)
+        })
     }
 
     /// The progress requests due now, each with its token and machine, marked as on their way.

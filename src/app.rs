@@ -1276,6 +1276,8 @@ impl App {
     pub fn rebuild(&mut self) {
         self.refresh_accounts();
         let current = self.scope().clone();
+        // Which cards' keys can't tell a record's copies apart: noted as the feeds are read.
+        self.resolver.note_unnamed(&self.machines);
         // Changes still on their way show as done (intent 0416).
         self.board = if self.resolver.shows() {
             board::build(&self.resolver.overlay(&self.machines), &self.cfg)
@@ -9956,6 +9958,54 @@ pub(crate) mod tests {
         assert_eq!(
             (to, request["action"].as_str(), request["id"].as_str()),
             (there, Some("dispatch"), Some(id.as_str()))
+        );
+    }
+
+    #[test]
+    fn a_source_named_with_a_feed_prefix_holds_up_only_its_own_cards_start() {
+        // Codex's eighth look: source A is named "feed:alpha", so its #N's key starts the way a
+        // feed naming no source would. It's still a named source: going into source B's #N leaves
+        // A's start free to take you in, d on B starts B's at once, and ⏎ on B isn't held up by
+        // A's start answered lately.
+        let mut app = demo_app();
+        room_in_every_session(&mut app);
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (first, id, machine) = waiting_card(&app);
+        let (b, there) = same_number_elsewhere(&mut app, &first);
+        app.machines[machine].feed.as_mut().unwrap().source = Some("feed:alpha".into());
+        app.rebuild();
+        let a = format!("feed:alpha:{id}");
+        assert!(app.card(&a).is_some(), "no card keyed {a}");
+        select_key(&mut app, &a);
+        let Action::Mutate { request, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        app.went_into(&b);
+        let job = app.resolver.starting(&a, &id).expect("A's start");
+        assert!(
+            !job.entered && job.from.is_some(),
+            "going into B marked A's start entered"
+        );
+        select_key(&mut app, &b);
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = press(&mut app, 'd')
+        else {
+            panic!("d on B waited for A's start: {:?}", app.message())
+        };
+        assert_eq!(
+            (to, request["action"].as_str(), request["id"].as_str()),
+            (there, Some("dispatch"), Some(id.as_str()))
+        );
+        app.resolver = Default::default();
+        app.started = Some((a.clone(), id.clone(), Instant::now()));
+        select_key(&mut app, &b);
+        assert!(
+            matches!(enter(&mut app), Action::Mutate { .. }),
+            "⏎ on B waited for A's start: {:?}",
+            app.message()
         );
     }
 

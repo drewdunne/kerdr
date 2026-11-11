@@ -3368,11 +3368,11 @@ impl App {
     }
 
     /// Whether this card's start was answered yes lately: its workspace may yet come. Its own,
-    /// by `resolve::for_card`: another source's card with the same number isn't held up by it
+    /// by `Resolver::for_card`: another source's card with the same number isn't held up by it
     /// (Codex's seventh look).
     pub(super) fn started_lately(&self, key: &str, id: &str) -> bool {
         self.started.as_ref().is_some_and(|(k, s, at)| {
-            crate::resolve::for_card(Some(k), s, key, id) && at.elapsed() < Duration::from_secs(120)
+            self.resolver.for_card(Some(k), s, key, id) && at.elapsed() < Duration::from_secs(120)
         })
     }
 

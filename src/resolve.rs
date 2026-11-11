@@ -10,7 +10,7 @@
 //! then the feed alone speaks. When it fails, or the backend asks a question first, the effect goes
 //! at once, so the card is back as it really is, and the app says so where it can't be missed.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -281,27 +281,31 @@ impl Effect {
     }
 }
 
-/// Whether a feed's words for a record are this text: the same words, whatever the spacing. Words
-/// the feed cut short with "…" (ark-sdlc's feed keeps 200 characters) prove nothing, since the old
-/// text may start the same way: the effect then goes as any other does, after two reads or a
-/// minute.
 /// Whether what's kept for a record, by its card's key (when it had one) and its number, is for
-/// this card. By key wherever both keys name their feed's source: the same record shares one key
-/// on every machine that shows it, and another source's card with the same number has another.
-/// By number only where a key can't tell: kept with no card, or keyed from a feed that doesn't
-/// name its source, whose copy of a record may show as a second card (Codex's seventh look).
-pub fn for_card(kept_key: Option<&str>, kept_id: &str, key: &str, id: &str) -> bool {
+/// this card. By key wherever both keys come from a feed that names its source: the same record
+/// shares one key on every machine that shows it, and another source's card with the same number
+/// has another. By number only where a key can't tell: kept with no card, or a key in `unnamed`,
+/// made for a feed that names no source, whose copy of a record may show as a second card
+/// (Codex's seventh look). Which keys those are is noted as the feeds are read, never guessed
+/// from how a key looks, since a source may be named anything, "feed:alpha" too (Codex's eighth
+/// look).
+fn for_card(
+    unnamed: &HashSet<String>,
+    kept_key: Option<&str>,
+    kept_id: &str,
+    key: &str,
+    id: &str,
+) -> bool {
     match kept_key {
-        Some(kept) if names_source(kept) && names_source(key) => kept == key,
+        Some(kept) if !unnamed.contains(kept) && !unnamed.contains(key) => kept == key,
         _ => kept_id == id,
     }
 }
 
-/// Whether a card's key names its feed's source: a feed that names none is keyed "feed".
-fn names_source(key: &str) -> bool {
-    !key.starts_with("feed:")
-}
-
+/// Whether a feed's words for a record are this text: the same words, whatever the spacing. Words
+/// the feed cut short with "…" (ark-sdlc's feed keeps 200 characters) prove nothing, since the old
+/// text may start the same way: the effect then goes as any other does, after two reads or a
+/// minute.
 fn same_words(feed: &str, text: &str) -> bool {
     let words = |s: &str| s.split_whitespace().collect::<Vec<_>>().join(" ");
     let feed = words(feed);
@@ -416,9 +420,9 @@ impl Job {
     }
 
     /// Whether it changes this card's record, by `for_card`.
-    pub fn is_for(&self, key: &str, id: &str) -> bool {
+    fn is_for(&self, unnamed: &HashSet<String>, key: &str, id: &str) -> bool {
         self.record()
-            .is_some_and(|record| for_card(self.key.as_deref(), record, key, id))
+            .is_some_and(|record| for_card(unnamed, self.key.as_deref(), record, key, id))
     }
 
     /// Whether it's a start still waiting for its intent's write-up: not started, nor shown.
@@ -620,9 +624,29 @@ pub struct Resolver {
     next: u64,
     /// Changes the runner holds that were dropped before they started: it's told on its next pass.
     dropped: Vec<u64>,
+    /// The card keys made for a feed that names no `source`, noted as each feed is read and kept
+    /// for the session: only these go by number (`for_card`, Codex's eighth look).
+    unnamed: HashSet<String>,
 }
 
 impl Resolver {
+    /// Notes the card keys made for each feed that names no `source`: Kerdr keys those cards
+    /// "feed:" and their number, as the board does.
+    pub fn note_unnamed(&mut self, machines: &[MachineState]) {
+        for feed in machines.iter().filter_map(|m| m.feed.as_ref()) {
+            if feed.source.is_none() {
+                self.unnamed
+                    .extend(feed.cards.iter().map(|c| format!("feed:{}", c.id)));
+            }
+        }
+    }
+
+    /// Whether what's kept for a record, by its card's key and number, is this card's
+    /// (`for_card`).
+    pub fn for_card(&self, kept_key: Option<&str>, kept_id: &str, key: &str, id: &str) -> bool {
+        for_card(&self.unnamed, kept_key, kept_id, key, id)
+    }
+
     /// Takes a change: it shows at once, and runs once nothing else for its record is running.
     /// One that can change something gets an op of its own (intent 0591): every key Andrew
     /// presses is a new request, and only Kerdr's own resends of it keep its op.
@@ -823,7 +847,10 @@ impl Resolver {
     /// (Codex's seventh look).
     pub fn went_in(&mut self, key: &str, id: &str) {
         for j in self.jobs.iter_mut().filter(|j| {
-            j.settled.is_none() && j.starts() && !j.waits_for_write_up() && j.is_for(key, id)
+            j.settled.is_none()
+                && j.starts()
+                && !j.waits_for_write_up()
+                && j.is_for(&self.unnamed, key, id)
         }) {
             j.from = None;
             j.entered = true;
@@ -1167,7 +1194,7 @@ impl Resolver {
     pub fn starting(&self, key: &str, id: &str) -> Option<&Job> {
         self.jobs
             .iter()
-            .find(|j| j.starts() && !j.waits_for_write_up() && j.is_for(key, id))
+            .find(|j| j.starts() && !j.waits_for_write_up() && j.is_for(&self.unnamed, key, id))
     }
 
     /// The newest unanswered change shown on this card, by its key.
@@ -1209,7 +1236,7 @@ impl Resolver {
     pub fn holds_for(&self, key: &str, id: &str, matches: impl Fn(&Value) -> bool) -> bool {
         self.jobs
             .iter()
-            .any(|j| j.is_for(key, id) && matches(&j.request))
+            .any(|j| j.is_for(&self.unnamed, key, id) && matches(&j.request))
     }
 
     /// The oldest unanswered change to this card whose request `matches`, by `for_card`.
@@ -1221,7 +1248,9 @@ impl Resolver {
     ) -> Option<u64> {
         self.jobs
             .iter()
-            .find(|j| j.settled.is_none() && j.is_for(key, id) && matches(&j.request))
+            .find(|j| {
+                j.settled.is_none() && j.is_for(&self.unnamed, key, id) && matches(&j.request)
+            })
             .map(|j| j.n)
     }
 
@@ -1971,6 +2000,15 @@ mod tests {
         assert!(r.starting("s:7", "7").is_some(), "its own card");
         assert!(r.starting("other:7", "7").is_none(), "another source's");
         assert!(
+            r.starting("feed:7", "7").is_none(),
+            "nothing read yet names no source"
+        );
+        let mut unnamed = MachineState::new(here());
+        let mut f = feed(json!([{"id":"7","title":"a"}]));
+        f.source = None;
+        unnamed.feed = Some(f);
+        r.note_unnamed(std::slice::from_ref(&unnamed));
+        assert!(
             r.starting("feed:7", "7").is_some(),
             "a feed naming no source"
         );
@@ -1992,6 +2030,44 @@ mod tests {
         r.add(0, json!({"action":"dispatch","id":"7"}), None, None, None);
         assert!(r.starting("other:7", "7").is_some(), "asked with no card");
         assert!(r.starting("s:8", "8").is_none());
+    }
+
+    #[test]
+    fn a_source_named_with_a_feed_prefix_is_still_told_apart_by_its_key() {
+        // Codex's eighth look: a feed that names its source "feed:alpha" keys its #7
+        // "feed:alpha:7". That's a named source, so its start holds only its own card, and going
+        // into another source's #7 never marks it entered. Only a feed read with no source goes by
+        // number.
+        for named in ["feed:alpha", "feed"] {
+            let mut r = Resolver::default();
+            let mut m = MachineState::new(here());
+            let mut f = feed(json!([{"id":"7","title":"a"}]));
+            f.source = Some(named.into());
+            m.feed = Some(f);
+            r.note_unnamed(std::slice::from_ref(&m));
+            let key = format!("{named}:7");
+            r.add(
+                0,
+                json!({"action":"dispatch","id":"7"}),
+                Some(CardSnapshot::default()),
+                Some(key.clone()),
+                None,
+            );
+            assert!(r.starting(&key, "7").is_some(), "{named}: its own card");
+            assert!(
+                r.starting("other:7", "7").is_none(),
+                "{named}: another source's card held up"
+            );
+            assert!(r.for_card(Some(&key), "7", &key, "7"));
+            assert!(!r.for_card(Some(&key), "7", "other:7", "7"));
+            r.went_in("other:7", "7");
+            assert!(
+                !r.starting(&key, "7").unwrap().entered,
+                "{named}: going into another source's card marked it entered"
+            );
+            r.went_in(&key, "7");
+            assert!(r.starting(&key, "7").unwrap().entered);
+        }
     }
 
     #[test]
