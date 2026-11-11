@@ -366,6 +366,13 @@ fn event_loop(
         }
         app.settle_refresh(&fed);
         holds.borrow_mut().sync(app);
+        // e that waited for a write-up or a save: its text is read, or opens (intent 0591,
+        // K1-78); a start kept waiting for an editor that won't open goes (K1-82).
+        if let Action::Mutate { machine, request } = app.edit_after_due().unwrap_or(Action::None) {
+            start_action(app, &action_tx, &runner, machine, request);
+        }
+        app.edit_pauses_due();
+        run_ready(app, &runner);
         match app.pending_jump_ready() {
             Some(Action::Jump(key)) => jump_cards(
                 terminal,
@@ -759,6 +766,9 @@ enum ToRunner {
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
     Drop(u64),
+    /// A start waiting for its write-up kept waiting whatever that says (true), or let go to it
+    /// again: e is open on its card (intent 0591, K1-82).
+    Pause(u64, bool),
     /// A machine's feed as its reader brought it: each record by id, with its intake.
     Feed {
         machine: usize,
@@ -822,6 +832,16 @@ impl Runner {
                         waiting.insert(n, (machine, target, command, request, resends, rev));
                     }
                     ToRunner::Done(n) => queue.done(n),
+                    // Let go again, it's judged by its machine's newest read at once.
+                    ToRunner::Pause(n, paused) => {
+                        queue.pause(n, paused);
+                        let machine = waiting.get(&n).map(|w| w.0);
+                        if let (false, Some(machine)) = (paused, machine)
+                            && let Some(intakes) = seen.get(&machine)
+                        {
+                            failed = queue.written(machine, intakes);
+                        }
+                    }
                     // Said either way, so the board keeps a start Esc came too late for.
                     ToRunner::Drop(n) => {
                         let dropped = queue.drop_unstarted(n);
@@ -1077,6 +1097,11 @@ fn run_ready(app: &mut App, runner: &Runner) {
             resends,
             rev,
         });
+    }
+    // After the changes just handed over: a save of a text reaches the runner before the start it
+    // lets go again, so that start waits behind the save (intent 0591, K1-82).
+    for (n, paused) in app.resolver.take_pauses() {
+        let _ = runner.tx.send(ToRunner::Pause(n, paused));
     }
 }
 

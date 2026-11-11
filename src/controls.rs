@@ -17,6 +17,11 @@ const MAX_ANSWER: usize = 300;
 
 /// What the busy line of an account request adds while it's sent again by itself (intent 0591).
 const RETRYING_TAIL: &str = " trying again…";
+
+/// How long ⏎ on a card just started waits for its workspace to show, and how long a second ⏎
+/// or d meanwhile starts nothing again (intent 0591, K1-43): a start may wait for a place, or
+/// take minutes to open on a busy machine.
+const START_WAIT: Duration = Duration::from_secs(600);
 /// The backend's words when a yes doesn't fit the question it answers: nothing started.
 const YES_NOT_MATCHED: &str = "couldn't be matched to the question";
 
@@ -1002,6 +1007,17 @@ impl App {
         from: Option<&CardSnapshot>,
         forwarded: bool,
     ) -> Option<&'static str> {
+        // A stop once its workspace opens waits behind the start, and names that workspace when
+        // it goes to a backend that doesn't ask first (K1-41).
+        if crate::app::behind::is_cancel_once_open(request)
+            && let Some(f) = from
+            && self
+                .resolver
+                .starting(&f.key, request["id"].as_str().unwrap_or_default())
+                .is_some()
+        {
+            return None;
+        }
         needs(request, from, forwarded).filter(|what| {
             !self
                 .machines
@@ -1276,7 +1292,13 @@ impl App {
             );
             return Action::None;
         };
-        if self.still_saving(&card) || self.still_changing(&card, action) {
+        // A new intent still saving: its key waits for its number (intent 0591, K1-42).
+        if self.still_changing(&card, action) {
+            return Action::None;
+        }
+        // C or x while its start is on its way, with nothing open yet: a stop once it opens
+        // (K1-41).
+        if matches!(action, "close" | "dismiss") && self.cancel_once_open(&card) {
             return Action::None;
         }
         // The question this key asked while you were elsewhere, waiting on it (intent 0591).
@@ -1287,7 +1309,11 @@ impl App {
         // rather than be refused until then. The runner holds the start until its home's feed
         // shows it written up, so it goes even while he's inside a workspace (intent 0445).
         if action == "dispatch" && card.intake() == Some("pending") && waiting_work(&card) {
-            if self.resolver.waiting_for_write_up(&card.key).is_none() {
+            if self
+                .resolver
+                .start_waiting_for_write_up(&card.key)
+                .is_none()
+            {
                 let Some(machine) = self.home_machine(&card) else {
                     return Action::None;
                 };
@@ -1378,8 +1404,6 @@ impl App {
                 format!(
                     "{reference} has a workspace open, so an agent may be at it: C and x are for work with none. ⏎ goes in."
                 )
-            } else if card.intake() == Some("pending") {
-                format!("{reference} is still being written up.")
             } else if ordering && finished {
                 format!("{reference} is done, so it has no place in the backlog order.")
             } else if ordering {
@@ -1522,7 +1546,7 @@ impl App {
         let Some(detail) = &card.detail else {
             return self.bare_cancel(&card);
         };
-        if self.still_saving(&card) || self.still_changing(&card, "cancel") {
+        if self.still_changing(&card, "cancel") || self.cancel_once_open(&card) {
             return Action::None;
         }
         if self.key_opens_waiting(&card.key, "cancel") {
@@ -1583,8 +1607,6 @@ impl App {
                 format!("{reference} is in won't do already.")
             } else if finished {
                 format!("{reference} is done already; there's nothing to cancel.")
-            } else if card.intake() == Some("pending") {
-                format!("{reference} is still being written up.")
             } else if card.closable() || waiting_work(&card) {
                 // Nothing to stop: X's end is Won't do, so it sets it aside, after its question
                 // (intent 0591, K1-30, K1-31).
@@ -2732,6 +2754,11 @@ impl App {
                     only(here)
                 }
             });
+        // A key on a card whose start, save or write-up is on its way waits for that, and is
+        // decided again then (intent 0591, release 4).
+        if self.hold_behind(machine, &request, from.as_ref(), key.as_deref()) {
+            return;
+        }
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         // A workspace with no intent shows nothing until it closes: said meanwhile (K1-27).
         if crate::app::cancels::is_bare_cancel(&request)
@@ -3061,12 +3088,24 @@ impl App {
             return;
         };
         let reference = self.reference_for(&id);
-        self.say(
+        let starts = self
+            .resolver
+            .job_request(n)
+            .is_some_and(|r| r["action"] == "dispatch");
+        let said = if starts {
+            format!("{reference} couldn't be written up, so it starts from your words as they are.")
+        } else {
+            // Another key that waited for its write-up (intent 0591, K1-23): it goes now.
+            let what = self
+                .resolver
+                .job_request(n)
+                .map(super::holding::held_what)
+                .unwrap_or_default();
             format!(
-                "{reference} couldn't be written up, so it starts from your words as they are."
-            ),
-            Tone::Info,
-        );
+                "{reference} couldn't be written up; {what} goes now, with its words as they are."
+            )
+        };
+        self.say(said, Tone::Info);
     }
 
     /// A change's answer, from the action resolution tool: one that went as shown keeps showing
@@ -3088,6 +3127,8 @@ impl App {
         let via = result.as_ref().ok().and_then(|r| r.via.clone());
         self.finish_job_answered(n, request, result);
         self.note_via(to, via);
+        // A start or a save answered: what waited behind it is decided again.
+        self.release_behind();
     }
 
     fn finish_job_answered(&mut self, n: u64, request: Value, result: Result<Response, String>) {
@@ -3264,6 +3305,11 @@ impl App {
             if action == "cancel" {
                 return false;
             }
+        }
+        // Any other key waits behind it, and is decided again once it's answered (intent 0591,
+        // release 4, K1-39 to K1-41): held by queue_action, not refused here.
+        if !matches!(action, "dispatch" | "reopen" | "enter") {
+            return false;
         }
         let verb = if job.request["action"] == "reopen" {
             "reopening"
@@ -3449,14 +3495,35 @@ impl App {
         if self.resolver.starting(&card.key, &id).is_some() {
             return self.go_into_opened(&card);
         }
+        // Its start was queued, or is held by its backend: said, rather than waited for (intent
+        // 0591, K1-43).
+        let held = self
+            .held_lines(&card)
+            .into_iter()
+            .find(|l| matches!(l.drop, Some(super::holding::DropOf::Backend(_))));
+        if let Some(line) = held {
+            self.forget_enter();
+            self.say(
+                format!(
+                    "{} has no workspace yet: {}. ⏎ goes in once it's under way.",
+                    card.reference, line.words
+                ),
+                Tone::Info,
+            );
+            return None;
+        }
         // Followed work still going: it goes in once the card shows it open (intent 0591).
         if self.started_lately(&card.key, &id) || self.following_card(&card).is_some() {
             return None;
         }
         self.forget_enter();
+        let says = Some(card.why.trim())
+            .filter(|w| !w.is_empty())
+            .map(|w| format!(": its card says \"{w}\""))
+            .unwrap_or_default();
         self.say(
             format!(
-                "{} has no workspace to show for its start yet, so Kerdr stopped waiting; ⏎ tries again.",
+                "{} still has no workspace ten minutes after its start, so Kerdr stopped waiting{says}. ⏎ tries again.",
                 card.reference
             ),
             Tone::Info,
@@ -3464,12 +3531,13 @@ impl App {
         None
     }
 
-    /// Whether this card's start was answered yes lately: its workspace may yet come. Its own,
+    /// Whether this card's start was answered yes in the last ten minutes (START_WAIT): its
+    /// workspace may yet come, and nothing starts it twice meanwhile (intent 0591, K1-43). Its own,
     /// by `Resolver::for_card`: another source's card with the same number isn't held up by it
     /// (Codex's seventh look).
     pub(super) fn started_lately(&self, key: &str, id: &str) -> bool {
         self.started.as_ref().is_some_and(|(k, s, at)| {
-            self.resolver.for_card(Some(k), s, key, id) && at.elapsed() < Duration::from_secs(120)
+            self.resolver.for_card(Some(k), s, key, id) && at.elapsed() < START_WAIT
         })
     }
 
@@ -3566,7 +3634,7 @@ impl App {
 
     /// Whether a start d asked for waits for this card's write-up.
     pub fn starts_when_written(&self, key: &str) -> bool {
-        self.resolver.waiting_for_write_up(key).is_some()
+        self.resolver.start_waiting_for_write_up(key).is_some()
     }
 
     /// What a card's own screen and its peek say while a change to it is on its way: "◐ Starting
@@ -4515,8 +4583,22 @@ impl App {
                     Some("close") if target.is_some_and(|t| t.dismissed) => {
                         c.dismissed() && target.is_some_and(|t| t.same_work(c))
                     }
-                    // Still open with no workspace, the same work (intent 0289).
-                    Some("close") => c.closable() && target.is_some_and(|t| t.same_work(c)),
+                    // Still open with no workspace, the same work (intent 0289), or that once
+                    // it's written up (K1-23).
+                    Some("close") => {
+                        crate::app::behind::closable_once_written(c)
+                            && target.is_some_and(|t| t.same_work(c))
+                    }
+                    // Its stop once it opens: only while its start is still on its way, as when
+                    // it was asked (K1-41).
+                    Some("cancel") if crate::app::behind::is_cancel_once_open(request) => {
+                        !c.is_open_workspace()
+                            && target.is_some_and(|t| t.same_work(c))
+                            && self
+                                .resolver
+                                .starting(&c.key, id)
+                                .is_some_and(|job| !job.asking)
+                    }
                     // Still the same work, open where the yes was given (intent 0321); done work
                     // or work in Won't do only while it's still that (intent 0591).
                     Some("cancel") => {

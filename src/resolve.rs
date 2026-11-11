@@ -73,6 +73,16 @@ pub enum Effect {
     Text(String),
 }
 
+/// What a change waits for in Kerdr before it goes to the runner (intent 0591, release 4): a key
+/// pressed on a card that's on its way somewhere is held, and decided again once that's done.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Behind {
+    /// Its card's start or reopen, until that's answered and shown, or has failed.
+    Start,
+    /// A new intent's save, by its submission, until the feed has its card with a number.
+    Save(String),
+}
+
 /// The card a new intent shows as while it's saved: Andrew's first words, in the backlog of the
 /// machine and session they went to.
 #[derive(Clone, Debug, PartialEq)]
@@ -372,6 +382,9 @@ pub struct Job {
     /// Its card's `rev` when the key was pressed, for a backend that holds requests: a resend
     /// carries it, so the backend checks it against the card as it was (intent 0591, release 4).
     pub rev: Option<String>,
+    /// Held in Kerdr until what it waits for is done (Behind): not handed to the runner, and
+    /// shown only as what's held for its card.
+    pub behind: Option<Behind>,
 }
 
 impl Job {
@@ -473,6 +486,9 @@ struct Queued {
     started: bool,
     /// Waiting for its record's write-up (a start d asked for while it was written up).
     gated: bool,
+    /// Kept waiting whatever its write-up says: e is open on its card, and the start waits for
+    /// the edit (intent 0591, K1-82).
+    paused: bool,
 }
 
 impl Queued {
@@ -499,10 +515,36 @@ impl Queue {
             writes: request["action"] == "edit" && request.get("text").is_some(),
             started: false,
             gated: false,
+            paused: false,
         };
+        let writes = item.writes;
         match self.items.iter_mut().find(|j| j.n == n) {
             Some(held) => *held = item,
             None => self.items.push(item),
+        }
+        // A save of a text goes before a start still waiting for that record's write-up, which
+        // then waits for the save's own write-up: the start uses the new text (intent 0591, K1-82).
+        if writes && let Some(at) = self.items.iter().position(|j| j.n == n) {
+            let saved = &self.items[at];
+            let waiting: Vec<usize> = (0..at)
+                .filter(|&i| {
+                    let j = &self.items[i];
+                    j.gated && !j.started && j.same(saved)
+                })
+                .collect();
+            for i in waiting.into_iter().rev() {
+                let start = self.items.remove(i);
+                let at = self.items.iter().position(|j| j.n == n).unwrap_or(0);
+                self.items.insert(at + 1, start);
+            }
+        }
+    }
+
+    /// Keeps a start waiting for its write-up waiting whatever that says (`paused`), or lets its
+    /// write-up decide again.
+    pub fn pause(&mut self, n: u64, paused: bool) {
+        if let Some(item) = self.items.iter_mut().find(|j| j.n == n) {
+            item.paused = paused;
         }
     }
 
@@ -527,7 +569,7 @@ impl Queue {
         let mut failed = vec![];
         for i in 0..self.items.len() {
             let q = &self.items[i];
-            if !q.gated || q.machine != machine {
+            if !q.gated || q.paused || q.machine != machine {
                 continue;
             }
             let rewriting = self.items[..i].iter().any(|j| j.writes && q.same(j))
@@ -590,8 +632,13 @@ impl Queue {
             if job.started || job.gated {
                 continue;
             }
+            // A read doesn't wait behind a change still waiting for its write-up: e reads the
+            // text while a start waits (intent 0591, K1-82).
+            let waits_unstarted = |j: &Queued| job.reads && j.gated && !j.started;
             let clashes = |j: &Queued| {
-                !j.reads && (job.same(j) || (job.moves && j.moves && j.machine == job.machine))
+                !j.reads
+                    && !waits_unstarted(j)
+                    && (job.same(j) || (job.moves && j.moves && j.machine == job.machine))
             };
             let ahead = self.items[..i].iter().any(clashes);
             let running_behind = self.items[i + 1..].iter().any(|j| j.started && clashes(j));
@@ -627,6 +674,8 @@ pub struct Resolver {
     next: u64,
     /// Changes the runner holds that were dropped before they started: it's told on its next pass.
     dropped: Vec<u64>,
+    /// Starts waiting for their write-up that the runner is to keep waiting, or let go again.
+    pauses: Vec<(u64, bool)>,
     /// The card keys made for a feed that names no `source`, noted as each feed is read and kept
     /// for the session: only these go by number (`for_card`, Codex's eighth look).
     unnamed: HashSet<String>,
@@ -685,8 +734,76 @@ impl Resolver {
             by_enter: false,
             retrying: false,
             rev: None,
+            behind: None,
         });
         self.next
+    }
+
+    /// Takes a change pressed on a card that's on its way somewhere: it waits in Kerdr, shows
+    /// nothing but its held line, and goes only once `release_behind` lets it.
+    pub fn add_behind(
+        &mut self,
+        machine: usize,
+        request: Value,
+        from: Option<CardSnapshot>,
+        key: Option<String>,
+        behind: Behind,
+    ) -> u64 {
+        let n = self.add(machine, request, from, key, None);
+        if let Some(j) = self.jobs.last_mut() {
+            j.behind = Some(behind);
+        }
+        n
+    }
+
+    /// The changes held in Kerdr, each with what it waits for.
+    pub fn behind_jobs(&self) -> Vec<(u64, Behind)> {
+        self.jobs
+            .iter()
+            .filter_map(|j| j.behind.clone().map(|b| (j.n, b)))
+            .collect()
+    }
+
+    /// Takes out a change that's held, before it goes: one held in Kerdr at once; one the runner
+    /// holds for its write-up once the runner says it never started (`drop_answered`). Its job, if
+    /// it was held in Kerdr.
+    pub fn drop_held_job(&mut self, n: u64) -> Option<Job> {
+        let i = self.jobs.iter().position(|j| j.n == n)?;
+        if self.jobs[i].behind.is_some() {
+            return Some(self.jobs.remove(i));
+        }
+        let j = &mut self.jobs[i];
+        if j.waits_for_write_up() && !j.dropping {
+            j.dropping = true;
+            self.dropped.push(n);
+        }
+        None
+    }
+
+    /// Asks the runner to keep a start waiting for its write-up (`paused`), or to let it go again:
+    /// e opened on its card meanwhile, and the start waits for the edit (intent 0591, K1-82).
+    pub fn pause(&mut self, n: u64, paused: bool) {
+        self.pauses.push((n, paused));
+    }
+
+    /// The pauses since the runner was last told.
+    pub fn take_pauses(&mut self) -> Vec<(u64, bool)> {
+        std::mem::take(&mut self.pauses)
+    }
+
+    /// The start waiting for this card's write-up, if one is: not another change held for it.
+    pub fn start_waiting_for_write_up(&self, key: &str) -> Option<&Job> {
+        self.jobs.iter().find(|j| {
+            j.starts() && j.waits_for_write_up() && !j.dropping && j.key.as_deref() == Some(key)
+        })
+    }
+
+    /// Changes other than a start that the runner holds for their card's write-up.
+    pub fn gated_changes(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| !j.starts() && j.waits_for_write_up() && !j.dropping)
+            .collect()
     }
 
     /// Keeps the op a held change had when its key was pressed, in place of the new one `add`
@@ -768,7 +885,7 @@ impl Resolver {
     pub fn ready(&mut self) -> Vec<(u64, usize, Value, bool)> {
         self.jobs
             .iter_mut()
-            .filter(|j| !j.sent && j.settled.is_none())
+            .filter(|j| !j.sent && j.settled.is_none() && j.behind.is_none())
             .map(|j| {
                 j.sent = true;
                 (j.n, j.machine, j.request.clone(), j.gated)
@@ -847,7 +964,7 @@ impl Resolver {
         for j in self
             .jobs
             .iter_mut()
-            .filter(|j| j.waits_for_write_up() && !j.dropping)
+            .filter(|j| j.starts() && j.waits_for_write_up() && !j.dropping)
         {
             j.dropping = true;
             self.dropped.push(j.n);
@@ -912,6 +1029,7 @@ impl Resolver {
             .filter(|j| {
                 j.settled.is_none()
                     && !j.waits_for_write_up()
+                    && j.behind.is_none()
                     && !j.reads()
                     && (!j.handed || j.request["action"] == "create")
             })
@@ -1233,9 +1351,12 @@ impl Resolver {
     /// same number goes ahead (Codex's seventh look); by number only where a key can't tell
     /// (`for_card`).
     pub fn starting(&self, key: &str, id: &str) -> Option<&Job> {
-        self.jobs
-            .iter()
-            .find(|j| j.starts() && !j.waits_for_write_up() && j.is_for(&self.unnamed, key, id))
+        self.jobs.iter().find(|j| {
+            j.starts()
+                && !j.waits_for_write_up()
+                && j.behind.is_none()
+                && j.is_for(&self.unnamed, key, id)
+        })
     }
 
     /// The newest unanswered change shown on this card, by its key.
@@ -2378,6 +2499,59 @@ mod tests {
         assert_eq!(r.running().len(), 2, "the read isn't running work");
         assert_eq!(r.unanswered(), 2);
         assert_eq!(r.on_its_way().count(), 3);
+    }
+
+    #[test]
+    fn a_start_waiting_for_an_edit_goes_after_its_save_and_the_saves_write_up() {
+        // d while it was written up, then e (intent 0591, K1-82): the start waits while the editor
+        // is open, whatever the write-up says; e's read doesn't wait behind it; and the save goes
+        // before it, the start then waiting for the save's own write-up.
+        let key = || Some("s:7".to_string());
+        let start = json!({"action":"dispatch","id":"7"});
+        let read = json!({"action":"edit","id":"7"});
+        let save = json!({"action":"edit","id":"7","text":"New.","was":"sha256:aa"});
+        let intakes = |v: Option<&str>| HashMap::from([("7".to_string(), v.map(str::to_string))]);
+        let mut q = Queue::default();
+        q.push_gated(1, 0, key(), &start);
+        q.pause(1, true);
+        assert!(q.written(0, &intakes(None)).is_empty());
+        assert!(
+            q.startable().is_empty(),
+            "written up, but the editor is open"
+        );
+        q.push(2, 0, key(), &read);
+        assert_eq!(
+            q.startable(),
+            vec![2],
+            "the read goes past the waiting start"
+        );
+        q.done(2);
+        q.push(3, 0, key(), &save);
+        q.pause(1, false);
+        assert_eq!(q.startable(), vec![3], "the save goes first");
+        let read_once = |q: &mut Queue, intake: Option<&str>| {
+            assert!(q.written(0, &intakes(intake)).is_empty());
+            q.read_passed(0);
+            q.startable()
+        };
+        assert!(read_once(&mut q, None).is_empty(), "the save is on its way");
+        q.done(3);
+        assert!(
+            read_once(&mut q, None).is_empty(),
+            "a read from before it landed"
+        );
+        assert!(
+            read_once(&mut q, Some("pending")).is_empty(),
+            "written up again"
+        );
+        assert_eq!(read_once(&mut q, None), vec![1], "then the start goes");
+        // No save: let go, the start goes on the next read that shows it written up.
+        let mut q = Queue::default();
+        q.push_gated(1, 0, key(), &start);
+        q.pause(1, true);
+        assert!(read_once(&mut q, None).is_empty());
+        q.pause(1, false);
+        assert_eq!(read_once(&mut q, None), vec![1]);
     }
 
     #[test]

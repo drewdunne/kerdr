@@ -156,7 +156,7 @@ impl App {
     /// Whether a request for this card's text is on its way: its read (`reads`), or a save. By
     /// its card, `key`, never another source's card with the same number; by number only for one
     /// asked with no card (Codex's sixth look, swept).
-    fn edit_on_its_way(&self, key: &str, id: &str, reads: bool) -> bool {
+    pub(crate) fn edit_on_its_way(&self, key: &str, id: &str, reads: bool) -> bool {
         self.resolver.on_its_way().any(|j| {
             j.request["action"] == "edit"
                 && j.reads() == reads
@@ -178,9 +178,13 @@ impl App {
             );
             return Action::None;
         };
-        // As the other card keys: nothing on a new intent's card while its words are saved, nor
-        // while a start or a reopen of it is on its way.
-        if self.still_saving(&card) || self.still_changing(&card, "edit") {
+        // A new intent's card while its words are saved: its text opens once it has its number
+        // and is written up (intent 0591, K1-42).
+        if card.intake() == Some(crate::resolve::SAVING) {
+            self.edit_once_written(&card);
+            return Action::None;
+        }
+        if self.still_changing(&card, "edit") {
             return Action::None;
         }
         // The question its last save asked while you were elsewhere, waiting on it (intent 0591).
@@ -189,12 +193,10 @@ impl App {
         }
         self.backlog_focus = Some(card.key.clone());
         let reference = card.reference.clone();
-        // Its new text on its way, then written up again: the card shows ✎ meanwhile.
+        // Its new text on its way, then written up again: the card shows ✎ meanwhile, and its
+        // text opens once that's done (intent 0591, K1-78).
         if self.edit_on_its_way(&card.key, &detail.id, false) {
-            self.say(
-                format!("{reference} is still being written up; edit it once that's done."),
-                Tone::Info,
-            );
+            self.edit_once_written(&card);
             return Action::None;
         }
         // Asked already: it opens when it comes, counted from now.
@@ -226,14 +228,14 @@ impl App {
                 "{reference} has started, so its text can't be edited here."
             ))
         } else if card.intake() == Some("pending") {
-            Some(format!(
-                "{reference} is still being written up; edit it once that's done."
-            ))
-        } else if self.starts_when_written(&card.key) {
-            // d was pressed while it was written up: its start goes in a moment (intent 0445).
-            Some(format!(
-                "{reference} starts as soon as its write-up is read, so its text can't be edited here. Esc on the board drops the start."
-            ))
+            // Its text opens once it's written up (intent 0591, K1-78).
+            self.edit_once_written(&card);
+            return Action::None;
+        } else if self.starts_when_written(&card.key) && !self.demo {
+            // d was pressed while it was written up: that start waits for this edit, and goes
+            // after its save and the save's own write-up (intent 0591, K1-82).
+            self.hold_start_for_edit(&card.key);
+            None
         } else if self.demo {
             Some(
                 "This is the demo: on your own board, e opens this item's text in your editor."
@@ -528,8 +530,15 @@ impl App {
     /// The editor has closed on this card's text. A changed text is sent as a save, which the
     /// card shows at once; closing with nothing changed, or with `:cq`, says nothing. What you
     /// wrote that can't be sent says so where it can't be missed, and your version is kept until a
-    /// save of it succeeds.
+    /// save of it succeeds. A start that waited for this edit goes after the save, or as it would
+    /// have with none (intent 0591, K1-82).
     pub fn edit_ended(&mut self, key: &str, ended: Ended) -> Action {
+        let action = self.edit_ended_saving(key, ended);
+        self.edit_closed_for(key);
+        action
+    }
+
+    fn edit_ended_saving(&mut self, key: &str, ended: Ended) -> Action {
         let Some(mut held) = self.edits.get(key).cloned() else {
             return Action::None;
         };
@@ -1467,9 +1476,12 @@ mod tests {
         assert_eq!(press(&mut app, 'e'), Action::None);
         assert_eq!(
             said(&app),
-            format!("{reference} is still being written up; edit it once that's done.")
+            format!(
+                "{reference} is still being written up: its text opens once that's done. Esc on the board stops waiting."
+            )
         );
         assert_eq!(app.edit_open, None);
+        app.edit_after = None;
         app.message = None;
         // Saved: nothing more is said, and the card keeps showing it until the feed does.
         answer(&mut app, &sent, saved());
@@ -1763,13 +1775,14 @@ mod tests {
         check(
             &mut app,
             &|c| c.detail.as_mut().unwrap().intake = Some("pending".into()),
-            &format!("{reference} is still being written up; edit it once that's done."),
+            &format!("{reference} is still being written up: its text opens once that's done."),
         );
-        // A new intent's card while its words are saved: no record yet (intent 0445).
+        // A new intent's card while its words are saved: no record yet (intent 0445), so its
+        // text opens once it has one (intent 0591, K1-42).
         check(
             &mut app,
             &|c| c.detail.as_mut().unwrap().intake = Some(crate::resolve::SAVING.into()),
-            "This new intent is still being saved",
+            "Your new intent is still being saved: its text opens once it's saved and written up.",
         );
         check(
             &mut app,
@@ -2327,15 +2340,19 @@ mod tests {
             said(&app),
             format!("{reference}'s text is on its way; it opens when it comes.")
         );
-        // A start on its way: as d and ⏎, e waits for it.
+        // A start on its way: e's read waits its turn behind it in the runner (intent 0591,
+        // K1-41).
         let mut app = self::app();
         crate::app::tests::room_in_every_session(&mut app);
         let (key, id, _) = waiting(&mut app);
         let machine = app.card(&key).unwrap().machine_index;
         app.queue_action(machine, json!({"action":"dispatch","id":id}));
         select(&mut app, &key);
-        assert_eq!(press(&mut app, 'e'), Action::None);
-        assert!(said(&app).contains("is starting"), "{}", said(&app));
+        let Action::Mutate { request, .. } = press(&mut app, 'e') else {
+            panic!("e read nothing: {}", said(&app))
+        };
+        assert_eq!(request["action"], "edit");
+        assert!(request.get("text").is_none(), "a read");
         // Without an action backend, as d.
         let mut app = self::app();
         waiting(&mut app);
@@ -2349,9 +2366,10 @@ mod tests {
     }
 
     #[test]
-    fn e_on_a_card_whose_start_waits_for_its_write_up_says_so_and_queues_nothing() {
-        // d on work still being written up starts it once that's done (intent 0445); e there
-        // still says it's being written up, and once the write-up is read, that it's starting.
+    fn e_on_a_card_being_written_up_opens_its_text_once_written_and_a_start_waits_for_the_edit() {
+        // d on work still being written up starts it once that's done (intent 0445). e there
+        // waits for the write-up too, and that start waits for the edit, going after its save
+        // (intent 0591, K1-78, K1-82).
         let mut app = app();
         let (key, _, reference) = waiting(&mut app);
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
@@ -2359,26 +2377,68 @@ mod tests {
         select(&mut app, &key);
         assert_eq!(press(&mut app, 'd'), Action::None);
         assert!(app.starts_when_written(&key));
-        let handed = app.resolver.ready().len();
-        assert_eq!(handed, 1, "the start, held for its write-up");
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "the start, held for its write-up");
+        let start = ready[0].0;
         select(&mut app, &key);
         assert_eq!(press(&mut app, 'e'), Action::None);
         assert_eq!(
             said(&app),
-            format!("{reference} is still being written up; edit it once that's done.")
+            format!(
+                "{reference} is still being written up: its text opens once that's done, and its start waits for your edit. Esc on the board stops waiting."
+            )
         );
-        // The board has read the write-up before the runner started it.
+        assert_eq!(app.resolver.take_pauses(), vec![(start, true)]);
+        assert!(app.edit_after_due().is_none(), "not written up yet");
+        // Written up, and he's still on the card: its text is read, and the start goes on
+        // waiting while the editor is open.
         app.board.cards[i].detail.as_mut().unwrap().intake = None;
-        assert_eq!(press(&mut app, 'e'), Action::None);
+        let Some(Action::Mutate { request, .. }) = app.edit_after_due() else {
+            panic!("nothing read: {}", said(&app))
+        };
+        assert_eq!(request["action"], "edit");
+        assert!(request.get("text").is_none());
+        assert_eq!(app.edit_paused.get(&key), Some(&start));
+        assert!(app.resolver.take_pauses().is_empty());
+        // The editor closes: the start waits no more (the runner puts it behind any save).
+        app.edit_closed_for(&key);
+        assert_eq!(app.resolver.take_pauses(), vec![(start, false)]);
+        // Moved off it before the write-up: said to be ready, and the start goes.
+        let mut app = self::app();
+        let (key, _, reference) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        select(&mut app, &key);
+        press(&mut app, 'd');
+        let start = app.resolver.ready()[0].0;
+        select(&mut app, &key);
+        press(&mut app, 'e');
+        app.resolver.take_pauses();
+        app.sel.key = None;
+        app.board.cards[i].detail.as_mut().unwrap().intake = None;
+        assert!(app.edit_after_due().is_none());
+        assert_eq!(
+            said(&app),
+            format!("{reference} is written up: e opens its text.")
+        );
+        assert_eq!(app.resolver.take_pauses(), vec![(start, false)]);
+        // Written up, its start not yet gone: e opens the editor, and the start waits for it.
+        let mut app = self::app();
+        let (key, _, _) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        select(&mut app, &key);
+        press(&mut app, 'd');
+        let start = app.resolver.ready()[0].0;
+        app.board.cards[i].detail.as_mut().unwrap().intake = None;
+        select(&mut app, &key);
+        let action = press(&mut app, 'e');
         assert!(
-            said(&app).starts_with(&format!(
-                "{reference} starts as soon as its write-up is read"
-            )),
+            matches!(action, Action::Mutate { .. }) || app.edit_open.is_some(),
             "{}",
             said(&app)
         );
-        assert!(app.resolver.ready().is_empty(), "no read was queued");
-        assert!(app.edit_flights.is_empty() && app.edit_open.is_none());
+        assert_eq!(app.resolver.take_pauses(), vec![(start, true)]);
     }
 
     #[test]

@@ -15,6 +15,8 @@ use crate::poll::{Conn, Event};
 pub mod account_controls;
 #[path = "asking.rs"]
 pub mod asking;
+#[path = "behind.rs"]
+pub mod behind;
 #[path = "cancels.rs"]
 pub mod cancels;
 #[path = "catch_up.rs"]
@@ -858,6 +860,11 @@ pub struct App {
     pub quitting: Option<Instant>,
     /// Where q keeps your words for the next Kerdr: the state folder; None keeps nothing.
     pub words_dir: Option<std::path::PathBuf>,
+    /// e pressed on a card being written up or saved: its text opens once that's done (intent
+    /// 0591, K1-78).
+    pub(crate) edit_after: Option<behind::EditAfter>,
+    /// Starts the runner keeps waiting while e is open on their card, by card key (K1-82).
+    pub(crate) edit_paused: std::collections::HashMap<String, u64>,
 }
 
 impl App {
@@ -978,6 +985,8 @@ impl App {
             pendings: vec![],
             quitting: None,
             words_dir: None,
+            edit_after: None,
+            edit_paused: Default::default(),
         };
         app.rebuild();
         app
@@ -2127,8 +2136,9 @@ impl App {
         let Some(card) = self.card(&key).cloned() else {
             return Action::None;
         };
-        if self.still_saving(&card) {
-            return Action::None;
+        // A new intent still saving: ⏎ starts it once it has its number (intent 0591, K1-42).
+        if card.intake() == Some(crate::resolve::SAVING) {
+            return self.intent_action_on(card, "dispatch", serde_json::json!({}));
         }
         // The question its start asked while you were elsewhere, waiting on it (intent 0591).
         if self.key_opens_waiting(&key, "enter") {
@@ -2386,6 +2396,8 @@ impl App {
             }
         }
         if key.code == KeyCode::Esc && on_board {
+            // e waiting for a write-up stops waiting (intent 0591, K1-78).
+            stopped.extend(self.stop_edit_after());
             let reopen = self.pending_reopen.take().map(|k| (k, "reopen"));
             let written: Vec<(String, &str)> = self
                 .resolver
@@ -5282,11 +5294,24 @@ pub(crate) mod tests {
             "Fix the wifi after sleep. It bites \"every\" morning."
         );
         assert!(app.draft.is_empty(), "the box is free for the next one");
-        // Nothing may be done to it until it has a record.
-        assert_eq!(press(&mut app, 'd'), Action::None);
-        assert!(app.message().unwrap().0.contains("still being saved"));
-        assert_eq!(press(&mut app, 'x'), Action::None);
-        assert!(matches!(app.mode, Mode::Backlog { .. }), "nothing asked");
+        // A key on it waits for its number (intent 0591, K1-42): d is held behind its save, and
+        // m's D would drop it.
+        let Action::Mutate {
+            machine: m,
+            request: d,
+        } = press(&mut app, 'd')
+        else {
+            panic!("d sent nothing: {:?}", app.message())
+        };
+        app.queue_action(m, d);
+        assert_eq!(
+            app.message().unwrap().0,
+            "Held: d on your new intent goes once it's saved and has its number."
+        );
+        assert_eq!(app.resolver.behind_jobs().len(), 1, "nothing goes yet");
+        for (n, _) in app.resolver.behind_jobs() {
+            app.resolver.drop_held_job(n);
+        }
         app.message = None;
         // It worked: the new intent is picked out in the backlog once its card arrives.
         reply_to(
@@ -10014,6 +10039,63 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn enter_remembered_waits_ten_minutes_for_a_workspace_and_says_where_a_queued_start_went() {
+        // K1-43: three minutes after its start answered, it still waits for the workspace.
+        let (mut app, key, id, machine) = entered_while_starting();
+        let n = app
+            .resolver
+            .unanswered_where(|r| r["action"] == "dispatch")
+            .unwrap();
+        app.resolver.take(n);
+        if let Some(three) = Instant::now().checked_sub(Duration::from_secs(180)) {
+            app.started = Some((key.clone(), id.clone(), three));
+            assert_eq!(app.enter_when_open_due(), None);
+            assert_eq!(app.enter_when_open.as_deref(), Some(key.as_str()));
+        }
+        // Past ten minutes, it stops, and says what its card says.
+        if let Some(eleven) = Instant::now().checked_sub(Duration::from_secs(660)) {
+            app.started = Some((key.clone(), id.clone(), eleven));
+            assert_eq!(app.enter_when_open_due(), None);
+            assert_eq!(app.enter_when_open, None);
+            let said = app.message().unwrap().0.to_string();
+            assert!(said.contains("ten minutes after its start"), "{said}");
+        }
+        // Queued by its backend: it says where the start went, and stops waiting for it.
+        let (mut app, key, id, _) = entered_while_starting();
+        let n = app
+            .resolver
+            .unanswered_where(|r| r["action"] == "dispatch")
+            .unwrap();
+        app.resolver.take(n);
+        let queued = "queued in pick4me: starts when a workspace there frees up";
+        for c in app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+            .filter(|c| c.id == id)
+        {
+            c.held = vec![crate::feed::Held {
+                op: "op-q".into(),
+                action: "dispatch".into(),
+                pending: queued.into(),
+                ..Default::default()
+            }];
+        }
+        app.rebuild();
+        select_key(&mut app, &key);
+        app.started = Some((key.clone(), id, Instant::now()));
+        assert_eq!(app.enter_when_open_due(), None);
+        assert_eq!(app.enter_when_open, None);
+        let reference = app.card(&key).unwrap().reference.clone();
+        assert_eq!(
+            app.message().unwrap().0,
+            format!("{reference} has no workspace yet: {queued}. ⏎ goes in once it's under way.")
+        );
+    }
+
+    #[test]
     fn enter_on_work_it_is_still_asking_about_remembers_nothing() {
         // A question is all that can come, so nothing would ever go in.
         let mut app = demo_app();
@@ -10101,9 +10183,14 @@ pub(crate) mod tests {
         // Its card says so too, wherever it's looked at.
         let card = app.card(&key).cloned().unwrap();
         assert!(app.starting_line(&card).unwrap().contains("Starting up"));
-        // x (or C, X) on it says what will work, and when.
+        // x (or C, X) on it asks for what it will be: a stop once it opens (intent 0591, K1-41).
         assert_eq!(press(&mut app, 'x'), Action::None);
-        assert!(app.message().unwrap().0.contains("X stops it"));
+        let Mode::Confirm { title, request, .. } = &app.mode else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert_eq!(title, &format!("Cancel {} once it opens?", card.reference));
+        assert_eq!(request["action"], "cancel");
+        press_code(&mut app, KeyCode::Esc);
         // A workspace that was already there isn't its; one named for it that opened since is.
         let name = app.machines[machine].name();
         let two = &id[id.len() - 2..];
@@ -10223,14 +10310,22 @@ pub(crate) mod tests {
             Some(card.key.clone()),
             None,
         );
-        // Unanswered: X goes ahead (its cancel waits its turn behind the start); anything else
-        // says what's really happening.
+        // Unanswered: X goes ahead (its cancel waits its turn behind the start), and any other
+        // key is held behind the start, to be decided again once it's answered (intent 0591,
+        // release 4, K1-40).
         assert!(!app.still_changing(&card, "cancel"));
-        assert!(app.still_changing(&card, "close"));
-        let said = app.message().unwrap().0.to_string();
-        assert!(said.contains("workspace is open"), "{said}");
-        assert!(said.contains("X stops it"), "{said}");
-        assert!(!said.contains("Once its workspace opens"), "{said}");
+        assert!(!app.still_changing(&card, "close"));
+        app.queue_action(
+            card.machine_index,
+            serde_json::json!({"action":"close","id":id}),
+        );
+        assert_eq!(
+            app.message().unwrap().0,
+            format!(
+                "Held: C on {} goes once its start is answered.",
+                card.reference
+            )
+        );
         // Answered (here, or by a start that ran elsewhere), the copy with its workspace is
         // under way, and nothing is refused for it.
         app.resolver.ready();

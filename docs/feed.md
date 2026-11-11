@@ -700,6 +700,50 @@ answers again, with what's held for it that goes now: "LAB-Server is answering a
 held for it go now." A machine whose backend doesn't list `"hold"` or `"forward"` is refused as
 before: "That machine is not answering."
 
+**Keys on a card that's on its way.** A key on a card whose start or reopen is still on its way
+(sent and unanswered, waiting for its backend's question, or with its workspace open while its agent
+takes its brief), on a card still being written up (`intake: "pending"`), or on a new intent still
+being saved, is taken, never refused. Any question it asks (C's "Mark #41 done?", x's and X's) is
+asked first; the change then waits in Kerdr, and nothing of it reaches the backend meanwhile:
+
+- **Behind a start:** "Held: J on #41 goes once its start is answered.", and the card says "⧗ J goes
+  once its start is answered". Once the start is answered, and its card shows what it did, the change
+  is decided again against the card as it is now. It goes when it still fits: C or x while the work
+  still waits, J, K, t, B or y while it's still in the backlog, `restore` while it's still set aside.
+  Otherwise it's dropped and said: "#41 started meanwhile, so the move wasn't done: it has no place in
+  the backlog order now." C or x on work that started meanwhile goes only to a backend that lists
+  `"steps"`, which asks what it stops (its question waits on the card); with any other it's dropped:
+  "#41 started meanwhile and has a workspace open, so C wasn't done: an agent may be at it. ⏎ goes
+  in, and X stops it."
+- **x, C or X on a start with no workspace yet** asks "Cancel #41 once it opens?" instead. Its yes
+  waits behind the start as `{"action": "cancel", "id": "0041"}` and goes once the workspace opens:
+  as it is to a backend that lists `"steps"`, which asks its own question, and naming the workspace
+  (`session`, `workspace`, `tab`) to any other. When the start opened nothing, it's dropped: "#41
+  didn't open a workspace, so there was nothing to stop: x sets it aside." On a start waiting for its
+  backend's question, nothing will open, so the key asks its usual question and its yes waits the same
+  way.
+- **Behind a write-up:** "Held: C on #41 goes once it's written up.", and the card says "⧗ C goes
+  once it's written up". It waits in the order its record's changes run, as `d` does, and goes once a
+  read shows the record written up.
+- **Behind a save:** "Held: d on your new intent goes once it's saved and has its number.", and the
+  card says "✎ d goes once it's saved". Once a card with its `submission` is read, it goes to that
+  number, decided again as above. When the save fails, or its backend stops saving it, the change is
+  dropped and said after the failure: "d on your new intent was dropped: it wasn't saved."
+
+Each is listed in the peek (`m`), and `D` there drops it: "Dropped: C on #41 won't be sent." When you
+quit, a change waiting behind a start or a save goes into the hold file, its entry's `after` saying
+`"start"` or `"save:<submission>"`, and one waiting for a write-up with `after` `"write-up"`. The next
+Kerdr decides each again the same way once its machine answers. A write-up that fails sends the
+change as it was, as `d` does for a start: "#41 couldn't be written up; C goes now, with its words as
+they are."
+
+**`⏎` on a card just started** waits for its workspace up to ten minutes after the start was
+answered, reading the feed as it goes. When the card's `held` (or the start's `pending`) says its
+backend holds the start, Kerdr says that instead and stops waiting: "#41 has no workspace yet: queued
+in pick4me: starts when a workspace there frees up. ⏎ goes in once it's under way." Past ten minutes:
+"#41 still has no workspace ten minutes after its start, so Kerdr stopped waiting: its card says
+"…". ⏎ tries again." Waiting sends nothing.
+
 **`"forward"` in `supports`** says the backend sends a request on to another machine it can reach.
 When a card's machine Y isn't answering, or isn't one of Kerdr's machines at all, Kerdr sends the
 request to a machine X that's answering and lists `"forward"`, with `"forward_to": "Y"` and the same
@@ -792,10 +836,18 @@ that isn't waiting in the backlog (started, done or in won't do) itself, unless 
 `"steps"`: then the backend edits it where it is (in Won't do it stays there; started work's agent is
 told; a save of done work's text may ask to save it as a new intent made from it, and Kerdr asks that
 question, sending the same text again with `override` and the `confirm` on a yes, and showing your
-`message` once it's saved). Kerdr refuses one still being written
-up (`intake: "pending"`) with "#416 is still being written up; edit it once that's done.", without
-asking the backend; so too a new intent's card while its words are still being saved, a card whose
-start or reopen is on its way, and one `d` asked to start once it's written up. A card whose feed
+`message` once it's saved). On a card still being written up (`intake: "pending"`), or just saved and
+being written up again, or a new intent's card whose words are still being saved, `e` waits: "#416
+is still being written up: its text opens once that's done. Esc on the board stops waiting." Once a
+read shows it written up, its text opens by itself if you're still on that card and haven't been into
+a workspace since; otherwise Kerdr says "#416 is written up: e opens its text." On a card `d` asked to
+start once it's written up, `e` opens its text, and the start waits for your edit: once the editor
+closes it goes, after the save and the save's own write-up when you saved, so it starts from your new
+text. Kerdr's runner puts a save of a record's text ahead of a start for that record still waiting
+for a write-up, and the start then waits for the save's write-up too. On a card whose start or
+reopen is on its way, `e`'s read waits its turn behind the start, and its save follows the rules for
+the card as it is by then: on started work it sends nothing, unless its backend lists `"steps"`. A
+card whose feed
 carries `item_text` and `item_was`, read within the last five minutes, opens from those with no read,
 and only its save asks the backend anything; so whatever a read would refuse that the feed can't show,
 the save must refuse. Otherwise Kerdr says it's reading, and reads the text:
@@ -982,8 +1034,9 @@ anything:
 {"action":"close","id":"0117"}
 ```
 
-Kerdr offers it for an open record that isn't dismissed or still being written up, in the backlog
-or in a working column, with no workspace open. `x` (`dismiss`) works on the same started work,
+Kerdr offers it for an open record that isn't dismissed, in the backlog or in a working column, with
+no workspace open. On one still being written up, its yes waits for the write-up (see [Holding and
+sending on a request](#holding-and-sending-on-a-request)). `x` (`dismiss`) works on the same started work,
 not only on the backlog: the record leaves the board for the Won't do view, keeping its state, and
 `restore` brings it back where it was. Kerdr refuses a card with a workspace open itself, since its
 agent may be there; refuse in the backend, with a plain `message`, whatever only it can tell. Done

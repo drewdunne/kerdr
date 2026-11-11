@@ -298,8 +298,9 @@ peek alike:
   the card up again, and you can carry on meanwhile; when the save lands nothing more is said.
   Changes already on their way carry on while the editor is open. `d` on it meanwhile starts it
   once it's written up again, as for any card being written up.
-  `:cq`, or quitting with nothing changed, leaves it as it was, saying nothing. A card still being
-  written up, or a new intent's card still being saved, says so instead. When a save can't land (a refusal, a change made meanwhile, no
+  `:cq`, or quitting with nothing changed, leaves it as it was, saying nothing. On a card still being
+  written up, or a new intent's card still being saved, `e` waits and opens its text once it's
+  written up, if you're still on the card; `Esc` on the board stops waiting. When a save can't land (a refusal, a change made meanwhile, no
   answer), the card goes back as it was, the red **Not done** box says so, and Kerdr keeps your
   version: the next `e` opens it, with any newer text below it. Once the item has started, `e`
   still opens your version so you can copy it, and sends nothing, unless its backend does each

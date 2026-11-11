@@ -45,6 +45,9 @@ pub enum DropOf {
     /// An account request waiting in Kerdr for its machine to answer, by the request: dropping it
     /// only takes it out.
     Account(Value),
+    /// A change waiting behind its card's start, save or write-up, by Kerdr's number for it
+    /// (crate::app::behind): dropping it only takes it out.
+    Job(u64),
 }
 
 /// What an answer said a backend holds for a card, shown until its feed says so itself, or two
@@ -267,6 +270,8 @@ impl App {
         if live {
             self.release_held(machine);
         }
+        // A start or a save the feed now shows: what waited behind it is decided again.
+        self.release_behind();
     }
 
     /// Sends what's held for this machine, now that it answers. Each goes as it was asked, with
@@ -330,19 +335,53 @@ impl App {
                 request["rev"] = Value::String(rev.to_string());
             }
         }
-        // A start that waited for its write-up as well: only while its card still waits to
-        // start, which Kerdr checks itself, since an older backend checks no `rev`.
+        // A key that waited behind a start or a save when Kerdr quit: decided again now, as it
+        // would have been (crate::app::behind).
+        let behind = match entry.after.as_deref() {
+            Some("start") => Some(crate::resolve::Behind::Start),
+            Some(after) => after
+                .strip_prefix("save:")
+                .map(|s| crate::resolve::Behind::Save(s.to_string())),
+            None => None,
+        };
+        if let Some(behind) = behind {
+            self.kept.release(&op);
+            let from = entry
+                .key
+                .as_deref()
+                .and_then(|k| self.card(k))
+                .map(crate::model::CardSnapshot::of);
+            self.resolver.add_behind(
+                machine,
+                entry.request.clone(),
+                from,
+                entry.key.clone(),
+                behind,
+            );
+            self.release_behind();
+            return;
+        }
+        // A change that waited for its write-up as well: only while its card still waits, which
+        // Kerdr checks itself, since an older backend checks no `rev`.
         if entry.after.as_deref() == Some("write-up") {
             let card = entry.key.as_deref().and_then(|k| self.card(k)).cloned();
-            let Some(card) = card.filter(|c| crate::app::waiting_work(c) && !c.dismissed()) else {
+            let restores = request["action"] == "restore";
+            let Some(card) = card.filter(|c| {
+                crate::app::waiting_work(c) && !c.dismissed() || (restores && c.dismissed())
+            }) else {
                 self.kept.release(&op);
-                self.say(
+                let said = if request["action"] == "dispatch" {
                     format!(
                         "{} wasn't started: it changed since you pressed {}, so Kerdr dropped that start.",
                         entry.reference, entry.what
-                    ),
-                    Tone::Warn,
-                );
+                    )
+                } else {
+                    format!(
+                        "{} changed since you pressed {}, so Kerdr dropped that change.",
+                        entry.reference, entry.what
+                    )
+                };
+                self.say(said, Tone::Warn);
                 return;
             };
             let effect = self.effect_for(&card.key, &request);
@@ -562,6 +601,13 @@ impl App {
                 drop: Some(DropOf::Kerdr(h.op().to_string())),
             });
         }
+        for (words, n) in self.behind_lines(c) {
+            lines.push(HeldLine {
+                words,
+                since: None,
+                drop: Some(DropOf::Job(n)),
+            });
+        }
         for (words, since, request) in self.account_waits_for(c) {
             lines.push(HeldLine {
                 words,
@@ -668,6 +714,10 @@ impl App {
             Some(DropOf::Backend(op)) => self.drop_backend(&card, &op, &line.words),
             Some(DropOf::Account(request)) => {
                 self.drop_account_wait(&request);
+                super::Action::None
+            }
+            Some(DropOf::Job(n)) => {
+                self.drop_behind(n, &card);
                 super::Action::None
             }
             None => super::Action::None,
@@ -956,6 +1006,39 @@ impl App {
                 reference,
                 pressed: self.epoch_now(),
                 after: Some("write-up".into()),
+            });
+        }
+        // Keys held behind a start or a save: the next Kerdr decides them again (intent 0591,
+        // release 4).
+        let behind: Vec<(String, Value, Option<String>, String)> = self
+            .resolver
+            .behind_jobs()
+            .into_iter()
+            .filter_map(|(n, behind)| {
+                let j = self.resolver.job(n)?;
+                let after = match behind {
+                    crate::resolve::Behind::Start => "start".to_string(),
+                    crate::resolve::Behind::Save(submission) => format!("save:{submission}"),
+                };
+                let machine = self.machines.get(j.machine).map(|m| m.name())?;
+                Some((machine, j.request.clone(), j.key.clone(), after))
+            })
+            .collect();
+        for (machine, request, key, after) in behind {
+            let reference = key
+                .as_deref()
+                .and_then(|k| self.card(k))
+                .map(|c| c.reference.clone())
+                .unwrap_or_default();
+            self.kept.hold(HeldRequest {
+                machine,
+                what: held_what(&request),
+                request,
+                rev: None,
+                key,
+                reference,
+                pressed: self.epoch_now(),
+                after: Some(after),
             });
         }
         if let Some(dir) = self.words_dir.clone() {
