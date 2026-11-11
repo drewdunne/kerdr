@@ -678,8 +678,14 @@ backend's after.
   before. Its card shows as asking him ("asks you: its move for later"), said once ("#44 asks you
   first, about its move for later: n goes to it, and s on it asks."). n landing on it, or s on it,
   asks the question. y sends `request` with `confirm` and an `op` of its own, and a choice adds
-  `choice`; n drops it with `account-drop`, as `D` does; Esc leaves it asking. Answered, its card
-  asks no more until the feed says what came of it. An older Kerdr ignores `asks` and shows
+  `choice`; n drops it with `account-drop`, as `D` does; Esc leaves it asking. The question keeps the
+  machine and the held request it opened for: n drops that request's `op` on that machine, even when
+  a read meanwhile gave the question another token, and y sends the token he was shown, which the
+  backend checks. Two machines' questions with the same token are each their own. While his answer is
+  on its way (waiting its turn or its machine, or under way), and once its machine has taken it (`ok`,
+  or a question of its own), its card asks no more until the feed says what came of it. An answer
+  that fails (`ok: false` with no question, or no answer back), or that never went, is forgotten: its
+  card asks again while the feed still carries the question, and s opens it again. An older Kerdr ignores `asks` and shows
   `pending`, so `pending` should name the key that asks again ("waits for your answer: it started a
   background job since you asked; s asks again").
 - **A save finishing in the background**: a `create` answered `ok` with `pending` and no `id`
@@ -744,7 +750,15 @@ backend's after.
   held: it lives on build-box now, whose backend wouldn't ask again before stopping it, …"). The
   entry keeps why it stays (`stays` in the hold file). Pressing its key again
   on that card sends the change now as that same entry, with its `op`, unmarked, and its answer
-  takes it out of the file, so it never stays behind as a second copy.
+  takes it out of the file, so it never stays behind as a second copy. Sending it clears `stays`. A
+  key pressed again on a card whose same change is on its way from the file already sends nothing,
+  under its `op` or a new one: from this Kerdr, the key says Kerdr is still asking, as for any change
+  on its way; from another Kerdr open now, "d on #41 is already on its way to build-box from another
+  Kerdr open now, so it isn't sent again from here." When
+  Kerdr can't record that the entry is this one's to send (the file can't be written), nothing is
+  sent either, under its `op` or a new one: "d on #41 wasn't sent: Kerdr couldn't write …/held.json
+  (why), so Kerdr can't tell whether another Kerdr is sending it. Press d again once it can be
+  written."
 
 **Kerdr's hold file.** A change to a card whose machine isn't answering, to a backend that listed
 `"hold"` when Kerdr last read it, goes into `held.json` in Kerdr's state folder (readable by you
@@ -763,7 +777,9 @@ disagree. So a Kerdr that ends meanwhile leaves it for the next one, which sends
 Quitting doesn't lose it: the next Kerdr opened sends it, and nothing sends it while no Kerdr is
 open. One older than a day isn't sent: the card says "⧗ d dropped: LAB-Server didn't answer for a
 day", or, for one that stayed held though its machine answered, why: "⧗ d dropped after a day:
-build-box's backend doesn't check a held change again, so it wasn't sent".
+build-box's backend doesn't check a held change again, so it wasn't sent". One that was sent and got
+no answer back (`unanswered` in the file) may have gone ahead, so it never says it wasn't sent: "⧗ d
+dropped after a day: build-box never answered after it was sent, so it may have gone ahead".
 
 Several Kerdrs open at once share the file. Each change to `held.json`, or to `words.json` (below),
 holds `kept.lock` in the state folder while it reads the file, changes it and writes it whole, a new

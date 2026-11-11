@@ -405,6 +405,7 @@ impl App {
                 after: None,
                 by: None,
                 stays: None,
+                unanswered: false,
             });
             return Some(format!(
                 "Your new text for {reference} is held for {name}: the next Kerdr sends it once {name} answers."
@@ -526,6 +527,7 @@ pub(crate) mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         });
         app.catch_up_read(0, true);
         assert_eq!(
@@ -579,6 +581,7 @@ pub(crate) mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         });
         answers(&mut app, 1);
         // Before what sending it says.

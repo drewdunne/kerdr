@@ -67,6 +67,10 @@ pub struct HeldRequest {
     /// 63, 3). Its key pressed again sends it as itself, with its op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stays: Option<String>,
+    /// Sent at least once with no answer back: it may have gone ahead, so its card never says it
+    /// wasn't sent (Codex's review 64, 4).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unanswered: bool,
 }
 
 impl HeldRequest {
@@ -113,6 +117,8 @@ enum Change {
     Holds(String, bool),
     /// Why it stays held though its machine answers, by its op, or None once it goes.
     Stays(String, Option<String>),
+    /// Sent with no answer back, by its op.
+    Unanswered(String),
 }
 
 impl Change {
@@ -146,6 +152,11 @@ impl Change {
             Change::Stays(op, why) => {
                 for h in file.held.iter_mut().filter(|h| h.op() == op) {
                     h.stays = why.clone();
+                }
+            }
+            Change::Unanswered(op) => {
+                for h in file.held.iter_mut().filter(|h| h.op() == op) {
+                    h.unanswered = true;
                 }
             }
         }
@@ -336,18 +347,25 @@ impl Kept {
                 old
             }
         };
-        // Why it was never sent: its machine didn't answer, or it did, with a backend Kerdr won't
-        // send it to unchecked.
+        // Why it wasn't sent again: its machine didn't answer, or it did, with a backend Kerdr won't
+        // send it to unchecked. One sent before with no answer back may have gone ahead, and its
+        // card says so (Codex's review 64, 4).
         let dropped: Vec<Dropped> = old
             .iter()
             .map(|h| Dropped {
                 key: h.key.clone(),
                 reference: h.reference.clone(),
-                said: match &h.stays {
-                    Some(why) => {
+                said: match (&h.stays, h.unanswered) {
+                    (_, true) => format!(
+                        "{} dropped after a day: {} never answered after it was sent, so it may have gone ahead",
+                        h.what, h.machine
+                    ),
+                    (Some(why), false) => {
                         format!("{} dropped after a day: {why}, so it wasn't sent", h.what)
                     }
-                    None => format!("{} dropped: {} didn't answer for a day", h.what, h.machine),
+                    (None, false) => {
+                        format!("{} dropped: {} didn't answer for a day", h.what, h.machine)
+                    }
                 },
             })
             .collect();
@@ -485,6 +503,18 @@ impl Kept {
         }
         if changed {
             self.write(Change::Stays(op.to_string(), why));
+        }
+    }
+
+    /// A held change was sent and no answer came back: it may have gone ahead.
+    pub fn unanswered(&mut self, op: &str) {
+        let mut changed = false;
+        for h in self.held.iter_mut().filter(|h| h.op() == op) {
+            changed |= !h.unanswered;
+            h.unanswered = true;
+        }
+        if changed {
+            self.write(Change::Unanswered(op.to_string()));
         }
     }
 
@@ -998,6 +1028,7 @@ mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         }
     }
 

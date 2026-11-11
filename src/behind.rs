@@ -1193,6 +1193,7 @@ mod tests {
             after: Some("start".into()),
             by: None,
             stays: None,
+            unanswered: false,
         });
         app.feed_read(m);
         let ready = app.resolver.ready();
@@ -1247,6 +1248,7 @@ mod tests {
                 after: Some("start".into()),
                 by: None,
                 stays: None,
+                unanswered: false,
             });
             app.feed_read(m);
             (app, card, m)

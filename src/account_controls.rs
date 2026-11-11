@@ -2087,62 +2087,137 @@ impl App {
     /// third look).
     /// The question a request its backend holds for this card waits on (`asks`, r4-b's shape), not
     /// yet answered here: the card's machine, that request's op, and the question.
-    pub(crate) fn held_asks(&self, c: &Card) -> Option<(usize, String, crate::feed::HeldAsks)> {
+    /// Its question is answered by one he gave here that's on its way, or that its machine took:
+    /// that machine's, about that held request, and, for a yes or a choice, that question.
+    pub(crate) fn held_asks(&self, c: &Card) -> Option<(usize, crate::feed::Held)> {
+        let machine = c.machine_index;
         let feed_held = c.detail.iter().flat_map(|d| d.held.iter());
         let agent_held = self
             .account_agent(c)
             .into_iter()
             .flat_map(|a| a.held.iter());
-        feed_held.chain(agent_held).find_map(|h| {
-            h.asks
-                .as_ref()
-                .filter(|a| !self.asks_answered.contains(&a.confirm))
-                .map(|a| (c.machine_index, h.op.clone(), a.clone()))
-        })
+        feed_held
+            .chain(agent_held)
+            .find(|h| {
+                h.asks.as_ref().is_some_and(|a| {
+                    !self.asks_answers.iter().any(|x| {
+                        x.machine == machine
+                            && x.op == h.op
+                            && (x.drops || x.token == a.confirm)
+                            && self.asks_answer_stands(x)
+                    })
+                })
+            })
+            .map(|h| (machine, h.clone()))
     }
 
-    /// The card, and the held request's op and words, whose question this request answers, by its
-    /// token.
-    fn held_asks_answered_by(&self, request: &Value) -> Option<(Card, String, String)> {
-        let token = request["confirm"].as_str()?;
-        self.board.cards.iter().find_map(|c| {
-            let feed_held = c.detail.iter().flat_map(|d| d.held.iter());
-            let agent_held = self
-                .account_agent(c)
-                .into_iter()
-                .flat_map(|a| a.held.iter());
-            feed_held
-                .chain(agent_held)
-                .find(|h| h.asks.as_ref().is_some_and(|a| a.confirm == token))
-                .map(|h| (c.clone(), h.op.clone(), h.pending.clone()))
-        })
+    /// An answer to a held request's question stands while it's on its way (waiting its turn or
+    /// its machine, or the account request under way), for a moment after it's given, before it
+    /// goes, and once its machine took it. One that never went, or whose request was dropped, no
+    /// longer does, and its card asks again (Codex's review 64, 3).
+    fn asks_answer_stands(&self, x: &AsksAnswer) -> bool {
+        let Some(at) = x.sending else {
+            return true;
+        };
+        self.busy
+            || self.now() < at + ASKS_HANDED_OVER
+            || self
+                .account_later
+                .iter()
+                .any(|(p, r)| x.answered_by(p.machine, r))
+            || self.account_queue.iter().any(|(m, r)| x.answered_by(*m, r))
+    }
+
+    /// His answer to a held request's question is on its way.
+    fn asks_sending(&mut self, machine: usize, op: &str, token: &str, drops: bool) {
+        self.asks_answers.retain(|x| {
+            !(x.machine == machine && x.op == op && x.token == token && x.drops == drops)
+        });
+        self.asks_answers.push(AsksAnswer {
+            machine,
+            op: op.to_string(),
+            token: token.to_string(),
+            drops,
+            sending: Some(self.now()),
+        });
+    }
+
+    /// An account request's answer, or that it was never sent: one that answers a held request's
+    /// question is taken (ok, or a question of its own), or else forgotten, and its card asks
+    /// again while the feed does (Codex's review 64, 3).
+    pub(crate) fn asks_answer_came(
+        &mut self,
+        machine: usize,
+        request: &Value,
+        result: &Result<crate::actions::Response, String>,
+    ) {
+        let Some(i) = self
+            .asks_answers
+            .iter()
+            .position(|x| x.sending.is_some() && x.answered_by(machine, request))
+        else {
+            return;
+        };
+        match result {
+            Ok(r) if r.ok || r.confirmation => self.asks_answers[i].sending = None,
+            _ => {
+                self.asks_answers.remove(i);
+                self.rebuild();
+            }
+        }
+    }
+
+    /// An answer to a held request's question that send_account neither sent nor kept to send: it
+    /// never goes, so its card asks again (Codex's review 64, 3).
+    fn asks_unsent(&mut self, machine: usize, request: &Value) {
+        let waits = self.account_later.iter().any(|(p, r)| {
+            p.machine == machine
+                && crate::actions::without_op(r) == crate::actions::without_op(request)
+        });
+        let before = self.asks_answers.len();
+        self.asks_answers
+            .retain(|x| waits || !(x.sending.is_some() && x.answered_by(machine, request)));
+        if self.asks_answers.len() != before {
+            self.rebuild();
+        }
+    }
+
+    /// The held request a question on screen is about, as it was when it opened, taken now that
+    /// it's answered (Codex's review 64, 2).
+    fn asks_open_take(&mut self, machine: usize, request: &Value) -> Option<AsksOpen> {
+        let i = self
+            .asks_open
+            .iter()
+            .position(|o| o.machine == machine && o.request == *request)?;
+        Some(self.asks_open.remove(i))
     }
 
     /// Cards whose backend holds a request that waits on his answer show as asking him, as a
     /// question that waits on its card does, said once (intent 0591, release 4, r4-b's shape).
     pub(super) fn show_held_asks(&mut self) {
-        let asking: Vec<(String, String, String, String)> = self
+        type Asking = (String, String, (usize, String, String), String);
+        let asking: Vec<Asking> = self
             .board
             .cards
             .iter()
             .filter(|c| self.waiting_on(&c.key).is_none())
             .filter_map(|c| {
-                let (_, op, asks) = self.held_asks(c)?;
-                let action = held_action(c, self.account_agent(c), &op);
+                let (machine, held) = self.held_asks(c)?;
+                let token = held.asks.map(|a| a.confirm).unwrap_or_default();
                 Some((
                     c.key.clone(),
                     c.reference.clone(),
-                    asks.confirm,
-                    asks_about(&action).to_string(),
+                    (machine, held.op, token),
+                    asks_about(&held.action).to_string(),
                 ))
             })
             .collect();
-        for (key, reference, token, about) in asking {
+        for (key, reference, asked, about) in asking {
             if let Some(card) = self.board.cards.iter_mut().find(|c| c.key == key) {
                 card.attention = Attention::NeedsYou;
                 card.why = format!("asks you: {about}");
             }
-            if self.asks_said.insert(token) {
+            if self.asks_said.insert(asked) {
                 self.say(
                     format!(
                         "{reference} asks you first, about {about}: n goes to it, and s on it asks."
@@ -2160,11 +2235,25 @@ impl App {
         let Some(card) = self.card(key).cloned() else {
             return false;
         };
-        let Some((machine, _, asks)) = self.held_asks(&card) else {
+        let Some((machine, held)) = self.held_asks(&card) else {
+            return false;
+        };
+        let Some(asks) = held.asks.clone() else {
             return false;
         };
         let mut request = asks.request.clone();
         request["confirm"] = json!(asks.confirm);
+        // What it's about, as it is now: its answer goes to that one, whatever the feed says by
+        // the time he gives it (Codex's review 64, 2).
+        self.asks_open
+            .retain(|o| !(o.machine == machine && o.request == request));
+        self.asks_open.push(AsksOpen {
+            machine,
+            key: card.key.clone(),
+            op: held.op.clone(),
+            words: held.pending.clone(),
+            request: request.clone(),
+        });
         self.push_account_screen(AccountScreen::Confirm {
             machine,
             request,
@@ -2908,6 +2997,7 @@ impl App {
     /// seventh look).
     fn account_not_sent(&mut self, origin: Pending, request: &Value, why: String) {
         let machine = origin.machine;
+        self.asks_answer_came(machine, request, &Err(why.clone()));
         let on_its_way = self.account_pending.replace(origin);
         self.finish_account_action(machine, crate::actions::request_metadata(request), Err(why));
         // Its own record, should its failure not have taken it, goes; the other's is back.
@@ -4063,13 +4153,22 @@ impl App {
                         self.off_list_ended(OffListEnd::Kept);
                     }
                     // What its backend holds waited on this answer: no drops it there (intent
-                    // 0591, release 4, r4-b's shape).
-                    if let Some((card, op, words)) = self.held_asks_answered_by(&request) {
-                        if let Some(token) = request["confirm"].as_str() {
-                            self.asks_answered.insert(token.to_string());
+                    // 0591, release 4, r4-b's shape), the one it opened for, on its machine
+                    // (Codex's review 64, 2). Its card asks no more while that's on its way, and
+                    // again if it fails (Codex's review 64, 3).
+                    if let Some(open) = self.asks_open_take(machine, &request) {
+                        let action = self.drop_account_backend(
+                            open.machine,
+                            &open.key,
+                            &open.op,
+                            &open.words,
+                        );
+                        if matches!(action, Action::Mutate { .. }) {
+                            let token = request["confirm"].as_str().unwrap_or_default();
+                            self.asks_sending(open.machine, &open.op, token, true);
+                            self.rebuild();
                         }
-                        self.rebuild();
-                        return self.drop_account_backend(&card, &op, &words);
+                        return action;
                     }
                     return Action::None;
                 }
@@ -4124,13 +4223,15 @@ impl App {
                                 answer["choice"] = json!(id);
                             }
                             // What its backend holds waited on this answer: its card asks no more
-                            // until the feed says what came of it.
-                            if let Some(token) = pending["confirm"].as_str()
-                                && self.held_asks_answered_by(pending).is_some()
-                            {
-                                self.asks_answered.insert(token.to_string());
+                            // while it's on its way, nor once taken, until the feed says what came
+                            // of it; and again if it fails or never goes (Codex's review 64, 3).
+                            let (machine, pending) = (*machine, pending.clone());
+                            let open = self.asks_open_take(machine, &pending);
+                            if let Some(open) = &open {
+                                let token = pending["confirm"].as_str().unwrap_or_default();
+                                self.asks_sending(open.machine, &open.op, token, false);
                             }
-                            request = Some((*machine, answer));
+                            request = Some((machine, answer));
                             let target = target.clone();
                             self.mode = *back;
                             if let Some((mi, r)) = request {
@@ -4138,7 +4239,11 @@ impl App {
                                 // question it brings is about, and (in send_account) the card a
                                 // start goes into.
                                 self.keep_asked(mi, &r, target, None, None);
-                                return self.send_account(mi, r);
+                                let action = self.send_account(mi, r.clone());
+                                if open.is_some() && matches!(action, Action::None) {
+                                    self.asks_unsent(mi, &r);
+                                }
+                                return action;
                             }
                             return Action::None;
                         }
@@ -5647,16 +5752,53 @@ fn same_screen(a: &AccountScreen, b: &AccountScreen) -> bool {
     }
 }
 
-/// The action of the request its backend holds, by its op, for the words a card asks with.
-fn held_action(c: &Card, agent: Option<&AccountAgent>, op: &str) -> String {
-    c.detail
-        .iter()
-        .flat_map(|d| d.held.iter())
-        .chain(agent.into_iter().flat_map(|a| a.held.iter()))
-        .find(|h| h.op == op)
-        .map(|h| h.action.clone())
-        .unwrap_or_default()
+/// A question a request its backend holds waits on (`asks`), as it was when it opened: the machine,
+/// the card and the held request it's about, by its op, with that request's words, and the request
+/// its yes sends, token and all. Its answer goes to that one, whatever the feed says by then
+/// (Codex's review 64, 2).
+#[derive(Clone, Debug)]
+pub(crate) struct AsksOpen {
+    pub machine: usize,
+    pub key: String,
+    pub op: String,
+    pub words: String,
+    pub request: Value,
 }
+
+/// His answer to such a question, by the machine and held op it's about and the question's token:
+/// a yes or a choice, or a no (`drops`), which drops the held request whatever it asks. While it's
+/// on its way, and once its machine took it, the card asks no more; one that failed, or never
+/// went, is forgotten, and the card asks again while the feed does (Codex's review 64, 3).
+#[derive(Clone, Debug)]
+pub(crate) struct AsksAnswer {
+    pub machine: usize,
+    pub op: String,
+    pub token: String,
+    pub drops: bool,
+    /// When it was given: None once its machine took it.
+    pub sending: Option<chrono::DateTime<chrono::Local>>,
+}
+
+impl AsksAnswer {
+    /// Whether this account request, to this machine, is this answer.
+    fn answered_by(&self, machine: usize, request: &Value) -> bool {
+        machine == self.machine
+            && match self.drops {
+                true => {
+                    request["action"] == "account-drop"
+                        && request["held"].as_str() == Some(self.op.as_str())
+                }
+                false => {
+                    request["action"] != "account-drop"
+                        && request["confirm"].as_str() == Some(self.token.as_str())
+                }
+            }
+    }
+}
+
+/// How long an answer to a held request's question stands before it's on its way: the moment
+/// between his key and its request going out.
+const ASKS_HANDED_OVER: chrono::Duration = chrono::Duration::seconds(60);
 
 /// What a held request that asks him is, in a few words for its card: "its move for later".
 fn asks_about(action: &str) -> &'static str {
@@ -7101,36 +7243,69 @@ mod tests {
     /// #44's backend holds its move for later, which waits on his answer (r4-b's shape): its card
     /// feed's `held` says so, with the question.
     fn held_move_asks(a: &mut App) -> String {
+        held_asks_on(a, "#44", "k-0000000000000044", "t-held")
+    }
+
+    /// A card's backend holds a move for later that waits on his answer, with this op and this
+    /// question's token: its card feed's `held` says so, read from JSON as a feed's is, so this
+    /// runs on a Kerdr that doesn't know `asks` too (Codex's review 64). The card's key.
+    fn held_asks_on(a: &mut App, reference: &str, op: &str, token: &str) -> String {
         let card = a
             .board
             .cards
             .iter()
-            .find(|c| c.reference == "#44")
+            .find(|c| c.reference == reference)
             .unwrap()
             .clone();
         let (m, id) = (card.machine_index, card.detail.as_ref().unwrap().id.clone());
         let feed = a.machines[m].feed.as_mut().unwrap();
-        feed.supports.push("hold".into());
-        let asks: crate::feed::HeldAsks = serde_json::from_value(json!({
-            "message": "#44 started a background job since you asked to move it, and moving it now ends that job. Move it now?",
-            "confirm": "t-held",
-            "yes": "move it now",
-            "no": "don't move it",
-            "choices": [{"id":"after-job","key":"j","label":"move it when the job ends"}],
-            "request": {"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C"},
+        if !feed.supports.iter().any(|s| s == "hold") {
+            feed.supports.push("hold".into());
+        }
+        let held: crate::feed::Held = serde_json::from_value(json!({
+            "op": op,
+            "action": "account-move",
+            "pending": "waits for your answer: it started a background job since you asked; s asks again",
+            "since": 1_700_000_000,
+            "asks": {
+                "message": format!("{reference} started a background job since you asked to move it, and moving it now ends that job. Move it now?"),
+                "confirm": token,
+                "yes": "move it now",
+                "no": "don't move it",
+                "choices": [{"id":"after-job","key":"j","label":"move it when the job ends"}],
+                "request": {"action":"account-move","pane":"w1:p1","session":"api","conversation":"demo-api-w1:p1","to":"ARK_C"},
+            },
         }))
         .unwrap();
         for c in feed.cards.iter_mut().filter(|c| c.id == id) {
-            c.held = vec![crate::feed::Held {
-                op: "k-0000000000000044".into(),
-                action: "account-move".into(),
-                pending: "waits for your answer: it started a background job since you asked; s asks again".into(),
-                asks: Some(asks.clone()),
-                ..Default::default()
-            }];
+            c.held = vec![held.clone()];
         }
         a.rebuild();
         card.key
+    }
+
+    /// The question on screen, as its request and message.
+    fn asked_now(a: &App) -> (Value, String) {
+        let Mode::Accounts {
+            screen: AccountScreen::Confirm {
+                request, message, ..
+            },
+            ..
+        } = &a.mode
+        else {
+            panic!("not asked: {:?} {:?}", a.mode, a.message())
+        };
+        (request.clone(), message.clone())
+    }
+
+    /// s on this card.
+    fn s_on(a: &mut App, card_key: &str) {
+        let c = a.card(card_key).unwrap();
+        a.sel = Selection {
+            col: c.stage.index(),
+            key: Some(c.key.clone()),
+        };
+        press(a, 's');
     }
 
     #[test]
@@ -7220,6 +7395,197 @@ mod tests {
         assert_eq!(
             a.card(&card_key).unwrap().why,
             "asks you: its move for later"
+        );
+    }
+
+    #[test]
+    fn a_held_question_answered_after_its_token_changed_goes_to_the_request_it_opened_for() {
+        // Codex's review 64, 2: the question opened with one token, and a feed read meanwhile
+        // gave it another. n still drops the held request it opened for, on its machine; y still
+        // sends the move with the token he was shown, which its backend checks.
+        let mut a = app();
+        let card_key = held_move_asks(&mut a);
+        let machine = a.card(&card_key).unwrap().machine_index;
+        s_on(&mut a, &card_key);
+        assert_eq!(asked_now(&a).0["confirm"], "t-held");
+        settle(&mut a);
+        held_asks_on(&mut a, "#44", "k-0000000000000044", "t-later");
+        assert_eq!(
+            sent(press(&mut a, 'n')),
+            (
+                machine,
+                json!({"action":"account-drop","held":"k-0000000000000044"})
+            )
+        );
+        let mut a = app();
+        let card_key = held_move_asks(&mut a);
+        s_on(&mut a, &card_key);
+        settle(&mut a);
+        held_asks_on(&mut a, "#44", "k-0000000000000044", "t-later");
+        let (to, r) = sent(press(&mut a, 'y'));
+        assert_eq!((to, r["confirm"].clone()), (machine, json!("t-held")));
+    }
+
+    #[test]
+    fn the_same_question_token_on_two_machines_answers_only_the_one_asked() {
+        // Codex's review 64, 2: two machines' backends each hold a move that asks, with the same
+        // token. Each card asks, and is said; n on one drops that one's held request on its
+        // machine, and the other still asks.
+        let mut a = app();
+        let on_44 = held_move_asks(&mut a);
+        let m44 = a.card(&on_44).unwrap().machine_index;
+        let other = a
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                c.machine_index != m44
+                    && c.detail.is_some()
+                    && a.machines[c.machine_index].feed.is_some()
+            })
+            .map(|c| c.reference.clone())
+            .unwrap();
+        let on_other = held_asks_on(&mut a, &other, "k-0000000000000041", "t-held");
+        let m_other = a.card(&on_other).unwrap().machine_index;
+        for key in [&on_44, &on_other] {
+            assert_eq!(
+                a.card(key).unwrap().why,
+                "asks you: its move for later",
+                "{key}"
+            );
+        }
+        assert_eq!(
+            a.message().map(|(t, _)| t.to_string()).unwrap_or_default(),
+            format!(
+                "{other} asks you first, about its move for later: n goes to it, and s on it asks."
+            )
+        );
+        s_on(&mut a, &on_other);
+        assert!(asked_now(&a).1.starts_with(&other), "{}", asked_now(&a).1);
+        settle(&mut a);
+        let action = press(&mut a, 'n');
+        assert_eq!(
+            sent(action.clone()),
+            (
+                m_other,
+                json!({"action":"account-drop","held":"k-0000000000000041"})
+            )
+        );
+        complete(
+            &mut a,
+            action,
+            json!({"ok":true,"message":"Dropped its move for later.","dropped":true}),
+        );
+        a.rebuild();
+        assert_eq!(a.card(&on_44).unwrap().why, "asks you: its move for later");
+        assert_ne!(
+            a.card(&on_other).unwrap().why,
+            "asks you: its move for later"
+        );
+    }
+
+    #[test]
+    fn a_held_question_whose_answer_fails_asks_again_while_its_feed_does() {
+        // Codex's review 64, 3: his answer is on its way, and the card asks no more meanwhile.
+        // The move his y sends fails, or its answer is lost, or the drop his n sends fails: the
+        // feed still asks, and so does the card, and s opens it again. One its machine took asks
+        // no more, though the feed still carries it until it's read again.
+        let failed = [
+            (
+                'y',
+                Ok(json!({"ok":false,"message":"ARK_C couldn't take #44 just now."})),
+            ),
+            (
+                'y',
+                Err(format!(
+                    "build-box didn't answer: {}",
+                    crate::actions::UNKNOWN
+                )),
+            ),
+            (
+                'n',
+                Ok(
+                    json!({"ok":false,"message":"build-box couldn't drop it: its accounts file is locked."}),
+                ),
+            ),
+            (
+                'n',
+                Err(format!(
+                    "build-box didn't answer: {}",
+                    crate::actions::UNKNOWN
+                )),
+            ),
+        ];
+        for (answer, reply) in failed {
+            let mut a = app();
+            let card_key = held_move_asks(&mut a);
+            s_on(&mut a, &card_key);
+            settle(&mut a);
+            let action = press(&mut a, answer);
+            let (machine, request) = sent(action);
+            a.rebuild();
+            assert_ne!(
+                a.card(&card_key).unwrap().why,
+                "asks you: its move for later",
+                "{answer}: asks while its answer is on its way"
+            );
+            let request = crate::actions::with_op(request);
+            let result = reply.map(|r| crate::actions::parse_response(&r.to_string()).unwrap());
+            a.finish_action(machine, request, result);
+            a.message = None;
+            a.mode = Mode::Board;
+            held_move_asks(&mut a);
+            assert_eq!(
+                a.card(&card_key).unwrap().why,
+                "asks you: its move for later",
+                "{answer}: its answer failed, and the feed still asks"
+            );
+            s_on(&mut a, &card_key);
+            assert_eq!(asked_now(&a).0["confirm"], "t-held", "{answer}");
+        }
+        for (answer, reply) in [
+            ('y', json!({"ok":true,"message":"Moved #44 to ARK_C."})),
+            (
+                'n',
+                json!({"ok":true,"message":"Dropped its move for later.","dropped":true}),
+            ),
+        ] {
+            let mut a = app();
+            let card_key = held_move_asks(&mut a);
+            s_on(&mut a, &card_key);
+            settle(&mut a);
+            let action = press(&mut a, answer);
+            complete(&mut a, action, reply);
+            a.mode = Mode::Board;
+            held_move_asks(&mut a);
+            assert_ne!(
+                a.card(&card_key).unwrap().why,
+                "asks you: its move for later",
+                "{answer}: taken, yet it asks again"
+            );
+        }
+        // Given, and never on its way: no request under way, none waiting its turn. A moment
+        // later its card asks again; while one is under way, it doesn't.
+        let mut a = app();
+        let card_key = held_move_asks(&mut a);
+        a.fixed_now = Some(a.now());
+        s_on(&mut a, &card_key);
+        settle(&mut a);
+        sent(press(&mut a, 'y'));
+        a.fixed_now = Some(a.now() + chrono::Duration::seconds(61));
+        a.busy = true;
+        a.rebuild();
+        assert_ne!(
+            a.card(&card_key).unwrap().why,
+            "asks you: its move for later",
+            "asks while an account request is under way"
+        );
+        a.busy = false;
+        a.rebuild();
+        assert_eq!(
+            a.card(&card_key).unwrap().why,
+            "asks you: its move for later",
+            "its answer never went"
         );
     }
 

@@ -848,10 +848,13 @@ pub struct App {
     pub(crate) confirm_by_enter: Option<String>,
     /// Questions that came while you were elsewhere, each waiting on its card (intent 0591).
     pub(crate) waiting: Vec<asking::Waiting>,
-    /// Questions a held request waits on (`asks`, intent 0591, release 4) answered here, by their
-    /// token, so a card doesn't ask again before the feed says what came of it; and those said.
-    pub(crate) asks_answered: std::collections::HashSet<String>,
-    pub(crate) asks_said: std::collections::HashSet<String>,
+    /// Questions a held request waits on (`asks`, intent 0591, release 4): each as it opened, so
+    /// its answer goes to the request it's about (Codex's review 64, 2); his answers, on their way
+    /// or taken, so a card doesn't ask again meanwhile, or before the feed says what came of it
+    /// (Codex's review 64, 3); and those said, by machine, held op and token.
+    pub(crate) asks_open: Vec<account_controls::AsksOpen>,
+    pub(crate) asks_answers: Vec<account_controls::AsksAnswer>,
+    pub(crate) asks_said: std::collections::HashSet<(usize, String, String)>,
     /// When a peek was opened from the backlog, whose ⏎ peeks: a second ⏎ held or doubled with
     /// it never starts the work it shows (intent 0591, K1-07).
     pub(crate) peek_opened: Option<Instant>,
@@ -1017,7 +1020,8 @@ impl App {
             answer_by_enter: false,
             confirm_by_enter: None,
             waiting: vec![],
-            asks_answered: Default::default(),
+            asks_open: vec![],
+            asks_answers: vec![],
             asks_said: Default::default(),
             peek_opened: None,
             catch_up: Default::default(),

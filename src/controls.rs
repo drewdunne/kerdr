@@ -2761,6 +2761,14 @@ impl App {
         if self.hold_behind(machine, &request, from.as_ref(), key.as_deref()) {
             return;
         }
+        // The same change in the hold file, kept held because its backend doesn't check one, or
+        // on its way from a Kerdr already: it goes as that record, with its op, never as a second
+        // copy; or, on its way, or when Kerdr can't tell, not at all (Codex's review 64, 1).
+        let again = match self.pressed_again(machine, &request, key.as_deref()) {
+            super::holding::Again::Busy => return,
+            super::holding::Again::Record(op) => Some(op),
+            super::holding::Again::Fresh => None,
+        };
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         // A workspace with no intent shows nothing until it closes: said meanwhile (K1-27).
         if crate::app::cancels::is_bare_cancel(&request)
@@ -2776,10 +2784,8 @@ impl App {
         // Its machine isn't answering: sent through one that forwards, or held for it (intent
         // 0591, release 4). A held change shows on its card, not as done.
         let home = machine;
-        // The same change kept held because its backend doesn't check one: it goes as that
-        // record, with its op, never as a second copy. Held for its machine again, it waits as
-        // itself (route's `carrying`).
-        let again = self.pressed_again(machine, &request, key.as_deref());
+        // A record pressed again, held for its machine again, waits as itself (route's
+        // `carrying`).
         if again.is_some() {
             self.carrying = again.clone();
         }
@@ -2797,6 +2803,9 @@ impl App {
         let n = self.resolver.add(machine, request, from, key, effect);
         self.resolver.set_rev(n, rev);
         if let Some(op) = again {
+            // On its way now: why it stayed held no longer holds, so if its answer is lost and
+            // its day runs out, its card never says it wasn't sent (Codex's review 64, 4).
+            self.kept.stays(&op, None);
             self.resolver.keep_op(n, &op);
             self.held_unchecked.remove(&op);
             self.held_sending.insert(n, op);
@@ -3934,6 +3943,9 @@ impl App {
                 // Answered at last: no longer being sent again (intent 0591).
                 self.account_retrying = None;
             }
+            // His answer to a question a held request waits on: taken, or its card asks again
+            // (Codex's review 64, 3).
+            self.asks_answer_came(machine, &request, &result);
             // A drop of an account request its backend held: said as any drop (r4-b's shape).
             if let Ok(response) = &result
                 && self.drop_answered(&request, response)

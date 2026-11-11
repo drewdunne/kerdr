@@ -100,6 +100,18 @@ pub fn span(secs: i64) -> String {
     }
 }
 
+/// What a key pressed again on a card does about the same change in the hold file
+/// (App::pressed_again).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Again {
+    /// None there: it goes as a new change.
+    Fresh,
+    /// That record, claimed by this Kerdr, by its op: it goes as that one.
+    Record(String),
+    /// That record is on its way already, or Kerdr can't tell: nothing is sent, said why.
+    Busy,
+}
+
 impl App {
     fn epoch_now(&self) -> i64 {
         self.now().timestamp()
@@ -219,36 +231,77 @@ impl App {
         Some((machine, request))
     }
 
-    /// A key pressed again on a card whose same change stays in the file because its machine's
-    /// backend doesn't check one (`stays`): that record, claimed, by its op. The change the key
-    /// makes now goes as that record, with its op, and its answer takes it out of the file, so it's
-    /// never left behind as a second copy. None for anything else, or when another Kerdr has it.
+    /// A key pressed again on a card whose same change is in the file, kept there because its
+    /// machine's backend doesn't check one (`stays`), or on its way from a Kerdr already. Kept
+    /// held, it goes as that record, claimed, with its op, and its answer takes it out of the
+    /// file, so it's never left behind as a second copy. On its way, or when Kerdr can't record
+    /// that it's this one's to send, nothing is sent again, said why (Codex's review 64, 1).
     pub(crate) fn pressed_again(
         &mut self,
         machine: usize,
         request: &Value,
         key: Option<&str>,
-    ) -> Option<String> {
+    ) -> Again {
         if self.carrying.is_some() || request.get("op").is_some() {
-            return None;
+            return Again::Fresh;
         }
-        let (key, name) = (key?, self.machines.get(machine)?.name());
+        let (Some(key), Some(name)) = (key, self.machines.get(machine).map(|m| m.name())) else {
+            return Again::Fresh;
+        };
         let what = held_what(request);
-        let op = self
+        let sending_here = |op: &str| self.held_sending.values().any(|o| o == op);
+        let Some(entry) = self
             .kept
             .held
             .iter()
             .find(|h| {
-                h.stays.is_some()
-                    && h.key.as_deref() == Some(key)
+                h.key.as_deref() == Some(key)
                     && h.machine == name
                     && h.what == what
                     && h.request["action"] == request["action"]
-                    && !self.held_sending.values().any(|op| op == h.op())
-            })?
-            .op()
-            .to_string();
-        (self.kept.claim(&op) == crate::kept::Claim::Mine).then_some(op)
+                    && (h.stays.is_some() || sending_here(h.op()) || self.kept.taken_elsewhere(h))
+            })
+            .cloned()
+        else {
+            return Again::Fresh;
+        };
+        let op = entry.op().to_string();
+        let (what, reference) = (&entry.what, &entry.reference);
+        if sending_here(&op) {
+            self.say(
+                format!("{what} on {reference} is already on its way to {name}."),
+                Tone::Info,
+            );
+            return Again::Busy;
+        }
+        match self.kept.claim(&op) {
+            crate::kept::Claim::Mine => Again::Record(op),
+            // Answered or dropped by another Kerdr meanwhile: this press is a new change.
+            crate::kept::Claim::Gone => Again::Fresh,
+            crate::kept::Claim::Taken => {
+                self.say(
+                    format!(
+                        "{what} on {reference} is already on its way to {name} from another Kerdr open now, so it isn't sent again from here."
+                    ),
+                    Tone::Info,
+                );
+                self.rebuild();
+                Again::Busy
+            }
+            crate::kept::Claim::Unsure => {
+                let why = self
+                    .kept
+                    .held_trouble()
+                    .unwrap_or_else(|| "Kerdr couldn't write its hold file".to_string());
+                self.say(
+                    format!(
+                        "{what} on {reference} wasn't sent: {why}, so Kerdr can't tell whether another Kerdr is sending it. Press {what} again once it can be written."
+                    ),
+                    Tone::Warn,
+                );
+                Again::Busy
+            }
+        }
     }
 
     /// A card's `rev`, as its feed gave it.
@@ -302,6 +355,7 @@ impl App {
             after,
             by: None,
             stays: None,
+            unanswered: false,
         };
         let written = self.kept.hold(entry.clone());
         self.say_held(&entry, written);
@@ -702,7 +756,17 @@ impl App {
                 Some(_) => {
                     self.kept.release(op);
                 }
-                None => self.kept.unclaim(op),
+                // No answer back, though it may have reached its machine: if its day runs out its
+                // card says it may have gone ahead, never that it wasn't sent (Codex's review
+                // 64, 4).
+                None => {
+                    if let Err(e) = result
+                        && crate::actions::result_unknown(e)
+                    {
+                        self.kept.unanswered(op);
+                    }
+                    self.kept.unclaim(op);
+                }
             }
         }
         if let Some(to) = response.and_then(|r| r.unreachable.clone()) {
@@ -1182,7 +1246,9 @@ impl App {
                 super::Action::None
             }
             Some(DropOf::Backend(op)) => self.drop_backend(&card, &op, &line.words),
-            Some(DropOf::AccountBackend(op)) => self.drop_account_backend(&card, &op, &line.words),
+            Some(DropOf::AccountBackend(op)) => {
+                self.drop_account_backend(card.machine_index, &card.key, &op, &line.words)
+            }
             Some(DropOf::Account(request)) => {
                 self.drop_account_wait(&request);
                 super::Action::None
@@ -1245,11 +1311,11 @@ impl App {
     /// account request does (r4-b's shape).
     pub(crate) fn drop_account_backend(
         &mut self,
-        card: &Card,
+        machine: usize,
+        key: &str,
         op: &str,
         words: &str,
     ) -> super::Action {
-        let machine = card.machine_index;
         if !self.holds_on(machine) {
             self.say(
                 format!(
@@ -1263,7 +1329,7 @@ impl App {
         if !self.can_write(machine) {
             return super::Action::None;
         }
-        self.action_key = Some(card.key.clone());
+        self.action_key = Some(key.to_string());
         super::Action::Mutate {
             machine,
             request: json!({"action": "account-drop", "held": op}),
@@ -1530,6 +1596,7 @@ impl App {
                 after: None,
                 by: Some(me.clone()),
                 stays: None,
+                unanswered: false,
             });
         }
         let unsent: Vec<u64> = self
@@ -1562,6 +1629,7 @@ impl App {
                     after: None,
                     by: Some(me.clone()),
                     stays: None,
+                    unanswered: false,
                 });
             }
         }
@@ -1664,6 +1732,7 @@ impl App {
                 after: Some(after),
                 by: Some(me.clone()),
                 stays: None,
+                unanswered: false,
             });
         }
     }
@@ -2502,6 +2571,7 @@ mod tests {
             after: Some("write-up".into()),
             by: None,
             stays: None,
+            unanswered: false,
         });
         // Still waiting: it goes back to waiting for its write-up, with its op.
         let op = app.kept.held[0].op().to_string();
@@ -2524,6 +2594,7 @@ mod tests {
             after: Some("write-up".into()),
             by: None,
             stays: None,
+            unanswered: false,
         });
         for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
             if c.id == id {
@@ -2699,6 +2770,7 @@ mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         });
         // Andrew is elsewhere meanwhile.
         app.sel.key = None;
@@ -3405,6 +3477,7 @@ mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         });
         app.feed_read(m);
         let ready = app.resolver.ready();
@@ -3433,6 +3506,7 @@ mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         });
         back(&mut app, m);
         assert!(app.resolver.ready().is_empty(), "sent unchecked");
@@ -3467,6 +3541,7 @@ mod tests {
             after: None,
             by: None,
             stays: None,
+            unanswered: false,
         });
         let op = app.kept.held[0].op().to_string();
         back(app, m);
@@ -3497,7 +3572,7 @@ mod tests {
         // record kept held, with its op, rather than leaving it behind as a second copy.
         let mut app = app();
         let (dir, _, _, _, _, op) = kept_unchecked(&mut app);
-        d(&mut app);
+        let pressed = d(&mut app);
         let ready = app.resolver.ready();
         assert_eq!(ready.len(), 1, "{}", said(&app));
         let (n, _, request, _) = ready[0].clone();
@@ -3511,6 +3586,26 @@ mod tests {
             on_file(dir.path()),
             [(op.clone(), Some(app.kept.me().to_string()))],
             "on its way from this Kerdr"
+        );
+        // The same change once more while it's on its way, even from below the key, which itself
+        // says Kerdr is still asking: nothing more goes (Codex's review 64, 1).
+        let Action::Mutate {
+            machine,
+            request: again,
+        } = pressed
+        else {
+            panic!("d sent nothing")
+        };
+        app.queue_action(machine, again);
+        let again = app.resolver.ready();
+        assert!(again.is_empty(), "sent again: {again:?}");
+        let (reference, name) = (
+            app.kept.held[0].reference.clone(),
+            app.kept.held[0].machine.clone(),
+        );
+        assert_eq!(
+            said(&app),
+            format!("d on {reference} is already on its way to {name}.")
         );
         app.finish_job(n, request, ok(json!({})));
         assert!(app.kept.held.is_empty(), "left behind once answered");
@@ -3531,6 +3626,109 @@ mod tests {
             said(&app),
             format!(
                 "{reference}: d dropped after a day: {name}'s backend doesn't check a held change again, so it wasn't sent."
+            )
+        );
+    }
+
+    #[test]
+    fn d_pressed_again_while_another_kerdr_sends_that_record_sends_nothing_from_here() {
+        // Codex's review 64, 1: another Kerdr open now has claimed the record d kept held. Pressing
+        // d again here sends nothing, under its op or a new one, and says why; the record stays
+        // that Kerdr's. So too once that Kerdr has cleared why it stayed held, as its send does.
+        let mut app = app();
+        let (dir, _, _, reference, m, op) = kept_unchecked(&mut app);
+        let name = app.machines[m].name();
+        let mut other = Kept::at(dir.path(), app.now().timestamp());
+        assert_eq!(other.claim(&op), crate::kept::Claim::Mine);
+        let theirs = [(op.clone(), Some(other.me().to_string()))];
+        let busy = format!(
+            "d on {reference} is already on its way to {name} from another Kerdr open now, so it isn't sent again from here."
+        );
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert!(ready.is_empty(), "sent again: {ready:?}");
+        assert_eq!(said(&app), busy);
+        assert_eq!(on_file(dir.path()), theirs);
+        other.stays(&op, None);
+        app.kept.sync();
+        app.say("Something else.", Tone::Info);
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert!(ready.is_empty(), "sent again: {ready:?}");
+        assert_eq!(said(&app), busy);
+        assert_eq!(on_file(dir.path()), theirs);
+    }
+
+    #[test]
+    fn d_pressed_again_when_its_claim_cant_be_written_sends_nothing_until_it_can() {
+        // Codex's review 64, 1: the hold file can't be written, so Kerdr can't record that the
+        // record d kept held is this one's to send, and another may be sending it. Nothing is sent,
+        // said why; once the file can be written, d sends it as that record.
+        let mut app = app();
+        let (dir, _, _, reference, _, op) = kept_unchecked(&mut app);
+        let lock = dir.path().join("kept.lock");
+        std::fs::remove_file(&lock).unwrap();
+        std::fs::create_dir(&lock).unwrap();
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert!(ready.is_empty(), "sent unclaimed: {ready:?}");
+        let held = dir.path().join("held.json").display().to_string();
+        let line = said(&app);
+        assert!(
+            line.starts_with(&format!("d on {reference} wasn't sent: Kerdr couldn't write {held} ("))
+                && line.ends_with(
+                    "so Kerdr can't tell whether another Kerdr is sending it. Press d again once it can be written."
+                ),
+            "{line}"
+        );
+        std::fs::remove_dir(&lock).unwrap();
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        assert_eq!(ready[0].2["op"], op.as_str());
+        assert_eq!(
+            on_file(dir.path()),
+            [(op.clone(), Some(app.kept.me().to_string()))]
+        );
+    }
+
+    #[test]
+    fn d_pressed_again_whose_answer_is_lost_says_it_may_have_gone_ahead_when_its_day_runs_out() {
+        // Codex's review 64, 4: d pressed again sends the record kept held; its answer is lost. It
+        // may have gone ahead, so the record no longer says why it stayed unsent, and if its day
+        // runs out its card says it may have gone ahead, never that it wasn't sent, though Kerdr
+        // keeps it held again meanwhile for the same backend.
+        let mut app = app();
+        let (dir, _, _, reference, m, op) = kept_unchecked(&mut app);
+        let name = app.machines[m].name();
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{}", said(&app));
+        let (n, _, request, _) = ready[0].clone();
+        let file: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("held.json")).unwrap())
+                .unwrap();
+        assert!(
+            file["held"][0].get("stays").is_none(),
+            "still says why it stayed unsent: {file}"
+        );
+        app.finish_job(
+            n,
+            request,
+            Err(format!("{name} didn't answer: {}", crate::actions::UNKNOWN)),
+        );
+        assert_eq!(on_file(dir.path()), [(op.clone(), None)]);
+        // Its failure, seen.
+        app.message = None;
+        app.feed_read(m);
+        app.fixed_now =
+            Some(app.now() + chrono::Duration::seconds(crate::kept::HOLD_MOST_SECS + 1));
+        app.feed_read(m);
+        assert!(app.kept.held.is_empty());
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference}: d dropped after a day: {name} never answered after it was sent, so it may have gone ahead."
             )
         );
     }
@@ -3605,6 +3803,7 @@ mod tests {
                 after: Some("start".into()),
                 by: None,
                 stays: None,
+                unanswered: false,
             });
             let op = app.kept.held[0].op().to_string();
             app.feed_read(m);
@@ -3847,6 +4046,7 @@ mod tests {
             after: Some("write-up".into()),
             by: None,
             stays: None,
+            unanswered: false,
         });
         let carried = app.kept.held[0].op().to_string();
         back(app, m);
