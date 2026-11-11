@@ -25,6 +25,8 @@ pub mod edit_controls;
 pub(crate) mod errors;
 #[path = "follow.rs"]
 pub mod follow;
+#[path = "holding.rs"]
+pub mod holding;
 #[path = "inside.rs"]
 pub mod inside;
 #[path = "kickoff_controls.rs"]
@@ -817,6 +819,17 @@ pub struct App {
     /// When a peek was opened from the backlog, whose ⏎ peeks: a second ⏎ held or doubled with
     /// it never starts the work it shows (intent 0591, K1-07).
     pub(crate) peek_opened: Option<Instant>,
+    /// Kerdr's hold file: changes held for machines that weren't answering (intent 0591,
+    /// release 4). In memory alone until open_board points it at the state folder.
+    pub kept: crate::kept::Kept,
+    /// Changes sent from the hold file, by job, with their op: each leaves the file once answered.
+    pub(crate) held_sending: std::collections::HashMap<u64, String>,
+    /// What answers said backends hold for cards, until their feeds say so (holding::Pending).
+    pub(crate) pendings: Vec<holding::Pending>,
+    /// q is waiting for a hand-over to finish, since when: Kerdr quits by itself once it has.
+    pub quitting: Option<Instant>,
+    /// Where q keeps your words for the next Kerdr: the state folder; None keeps nothing.
+    pub words_dir: Option<std::path::PathBuf>,
 }
 
 impl App {
@@ -924,6 +937,11 @@ impl App {
             confirm_by_enter: None,
             waiting: vec![],
             peek_opened: None,
+            kept: crate::kept::Kept::in_memory(),
+            held_sending: Default::default(),
+            pendings: vec![],
+            quitting: None,
+            words_dir: None,
         };
         app.rebuild();
         app
@@ -1271,6 +1289,11 @@ impl App {
                 .read(ev.machine, self.machines[ev.machine].feed.as_ref());
         }
         self.rebuild();
+        // What's held for it goes now it answers, and what its backend holds is counted (intent
+        // 0591, release 4).
+        if read {
+            self.feed_read(ev.machine);
+        }
     }
 
     pub fn rebuild(&mut self) {
@@ -2096,7 +2119,7 @@ impl App {
             let Some(machine) = self.home_machine(card) else {
                 return Action::None;
             };
-            if !self.can_write(machine) {
+            if !self.can_change(machine) {
                 return Action::None;
             }
             (
@@ -2183,6 +2206,10 @@ impl App {
 
     pub fn on_key(&mut self, key: KeyEvent) -> Action {
         if key.kind == KeyEventKind::Release {
+            return Action::None;
+        }
+        // Esc while q waits for a hand-over: Kerdr stays open (intent 0591, release 4).
+        if key.code == KeyCode::Esc && self.stay() {
             return Action::None;
         }
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
@@ -2468,6 +2495,7 @@ impl App {
                     self.open_inside(&k);
                 }
             }
+
             KeyCode::Char('j') | KeyCode::Down => {
                 self.mode = Mode::Peek {
                     scroll: scroll.saturating_add(1),

@@ -309,6 +309,10 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
         return started_hints(app);
     };
     let mut spans = card_badge(card, YELLOW);
+    // Something held for it: m lists it, with a key to drop it (intent 0591, release 4).
+    if !app.held_lines(card).is_empty() {
+        spans.extend(key_hints(&[("m", "peek: what's held, and drop it")]));
+    }
     // On the board ⏎ starts it too (intent 0404); the backlog screen's ⏎ peeks.
     let start = if matches!(app.mode, Mode::Board) && app.actions_on() {
         "d ⏎"
@@ -377,6 +381,10 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
     };
     let mut spans = card_badge(card, if card.no_agent() { YELLOW } else { CYAN });
     let mut hints: Vec<(&str, String)> = vec![];
+    // Something held for it: m lists it, with a key to drop it (intent 0591, release 4).
+    if !app.held_lines(card).is_empty() {
+        hints.push(("m", "peek: what's held, and drop it".into()));
+    }
     if card.outside_herdr().is_some() && !card.done() {
         // ⏎ moves its conversation into herdr, and goes in (intent 0591).
         hints.push(("⏎", "move it into herdr".into()));
@@ -2057,6 +2065,10 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         // Its account request is being sent again by itself, with the same op: quietly, as a
         // change's card says it (intent 0591).
         ("trying again…".to_string(), BLUE)
+    } else if let Some(line) = app.held_line_for(c) {
+        // A change that waits for its machine, or what its backend holds for it, until it
+        // happens (intent 0591, release 4).
+        (line, CYAN)
     } else if let Some(outside) = c.outside_herdr().filter(|_| !cached) {
         (format!("outside herdr · {}", outside.short()), CYAN)
     } else if c.no_agent() && !cached {
@@ -2431,6 +2443,46 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             lines.extend(wrapped(problem, w, fg(RED), None));
         }
         lines.push(line_for_account_keys());
+    }
+    // What's held for it, Kerdr's and its backend's, each with its key to drop it (intent 0591,
+    // release 4).
+    let held = app.held_lines(c);
+    if !held.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section("HELD"));
+        let droppable = held.iter().filter(|h| h.drop.is_some()).count();
+        let mut k = 0;
+        for h in &held {
+            // Numbered when there are several, for the count before D.
+            let key = match (&h.drop, droppable) {
+                (Some(_), 2..) => {
+                    k += 1;
+                    format!("{k} ")
+                }
+                _ => String::new(),
+            };
+            let since = h
+                .since
+                .map(|t| {
+                    let secs = now.timestamp() - t;
+                    format!(" · {} ago", crate::app::holding::span(secs))
+                })
+                .unwrap_or_default();
+            lines.extend(wrapped(
+                &format!("{key}⧗ {}{since}", h.words),
+                w,
+                fg(CYAN),
+                None,
+            ));
+        }
+        let keys: &[(&str, &str)] = match droppable {
+            0 => &[],
+            1 => &[("D", "drop it")],
+            _ => &[("D", "drop the first"), ("2D", "the second")],
+        };
+        if !keys.is_empty() {
+            lines.push(Line::from(key_hints(keys)));
+        }
     }
     if let Some(story) = c.detail.as_ref().and_then(|d| d.story.clone()) {
         lines.push(Line::raw(""));

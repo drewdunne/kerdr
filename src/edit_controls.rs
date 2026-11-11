@@ -284,7 +284,7 @@ impl App {
         let Some(machine) = self.home_machine(&card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         // Its feed holds the text: it opens now, as `d` opens a card's questions (intent 0491).
@@ -2332,7 +2332,11 @@ mod tests {
         waiting(&mut app);
         app.cfg.actions.command = None;
         assert_eq!(press(&mut app, 'e'), Action::None);
-        assert!(said(&app).contains("not configured"), "{}", said(&app));
+        assert!(
+            said(&app).contains("no action backend here"),
+            "{}",
+            said(&app)
+        );
     }
 
     #[test]

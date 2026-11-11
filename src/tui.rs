@@ -199,8 +199,6 @@ fn event_loop(
         inbox,
         holds: &holds,
     };
-    // When q last said what still runs: a second q soon after quits (intent 0445).
-    let mut quit_asked: Option<Instant> = None;
     // Colours from the desktop theme, read again when it changes (palette.rs).
     let mut theme = crate::palette::ThemeWatch::new(app.cfg.theme.colors.as_deref());
     theme.check(true);
@@ -282,6 +280,11 @@ fn event_loop(
                     let _ = poller.wake.send(Wake::Feed);
                 }
             }
+        }
+        // q waited for a hand-over, which is done: Kerdr quits by itself (intent 0591).
+        if app.quit_due() {
+            app.keep_on_quit();
+            return Ok(());
         }
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
         run_ready(app, &runner);
@@ -470,9 +473,6 @@ fn event_loop(
             Event::Paste(text) => app.on_paste(&text),
             _ => continue,
         };
-        if !matches!(action, Action::Quit) {
-            quit_asked = None;
-        }
         match action {
             Action::None => {}
             Action::LoadImages(source) => {
@@ -500,28 +500,13 @@ fn event_loop(
             }
             Action::OpenLink(url) => open_signin(app, &url),
             Action::Quit => {
-                // Only what would be lost holds Kerdr open: a change whose command doesn't have
-                // all of it yet, or a new intent until it's answered. A start or move whose
-                // command has the whole request carries on without Kerdr, so a second q quits
-                // (intent 0445).
-                if let Some(text) = app.quit_held() {
-                    app.say(text, Tone::Warn);
-                } else if app.busy || !app.account_queue.is_empty() {
-                    app.say(
-                        "An account change is still running. Wait for its result before quitting.",
-                        Tone::Warn,
-                    );
-                } else if let Some((text, tone)) = app
-                    .quit_loses()
-                    .map(|t| (t, Tone::Warn))
-                    .or_else(|| app.still_running().map(|t| (t, Tone::Info)))
-                    && quit_asked.is_none_or(|at| at.elapsed() > Duration::from_secs(5))
-                {
-                    // What only Kerdr keeps, or what finishes without it: said once, and a
-                    // second q soon after quits (intent 0445).
-                    quit_asked = Some(Instant::now());
-                    app.say(format!("{text} q again quits."), tone);
-                } else {
+                // Only what's being handed over holds Kerdr open, and only for the moment that
+                // takes: it quits by itself once it's done, and Esc stays. A start or move whose
+                // command has the whole request carries on without Kerdr, starts waiting for
+                // their write-up go into the hold file, and your words into the words file, so
+                // nothing else stops q (intent 0591, release 4).
+                if app.quit_key() {
+                    app.keep_on_quit();
                     return Ok(());
                 }
             }
@@ -768,6 +753,8 @@ enum ToRunner {
         gated: bool,
         /// Its machine's backend keeps ops: an answer lost on the way is asked for again.
         resends: bool,
+        /// Its card's `rev` when the key was pressed, which a resend carries (intent 0591).
+        rev: Option<String>,
     },
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
@@ -778,6 +765,17 @@ enum ToRunner {
         intakes: std::collections::HashMap<String, Option<String>>,
     },
 }
+
+/// A change waiting its turn in the runner: its machine, where and how it's sent, its request,
+/// whether its backend keeps ops, and its card's `rev`.
+type Waiting = (
+    usize,
+    Machine,
+    String,
+    serde_json::Value,
+    bool,
+    Option<String>,
+);
 
 /// Runs changes to cards in their turn on a thread of its own, which never touches App: a change
 /// whose turn comes while Andrew is inside a workspace starts then, not once he's back (intent
@@ -792,10 +790,7 @@ impl Runner {
         let back = tx.clone();
         std::thread::spawn(move || {
             let mut queue = crate::resolve::Queue::default();
-            let mut waiting: std::collections::HashMap<
-                u64,
-                (usize, Machine, String, serde_json::Value, bool),
-            > = Default::default();
+            let mut waiting: std::collections::HashMap<u64, Waiting> = Default::default();
             // Each machine's newest feed, by record: a start that waits for its write-up checks
             // it as soon as it's asked for, not only at the next read.
             let mut seen: std::collections::HashMap<
@@ -814,6 +809,7 @@ impl Runner {
                         request,
                         gated,
                         resends,
+                        rev,
                     } => {
                         if gated {
                             queue.push_gated(n, machine, key, &request);
@@ -823,7 +819,7 @@ impl Runner {
                         } else {
                             queue.push(n, machine, key, &request);
                         }
-                        waiting.insert(n, (machine, target, command, request, resends));
+                        waiting.insert(n, (machine, target, command, request, resends, rev));
                     }
                     ToRunner::Done(n) => queue.done(n),
                     // Said either way, so the board keeps a start Esc came too late for.
@@ -850,7 +846,8 @@ impl Runner {
                     let _ = answers.send(Answer::NotWrittenUp(n));
                 }
                 for n in queue.startable() {
-                    let Some((machine, target, command, request, resends)) = waiting.remove(&n)
+                    let Some((machine, target, command, request, resends, rev)) =
+                        waiting.remove(&n)
                     else {
                         continue;
                     };
@@ -862,10 +859,11 @@ impl Runner {
                         let told = answers.clone();
                         // Sent again by itself, same op, while it holds its record's turn: what
                         // comes after it for the same card waits (intent 0591).
-                        let answered = crate::actions::run_resending(
+                        let answered = crate::actions::run_resending_rev(
                             &target,
                             &command,
                             &request,
+                            rev.as_deref(),
                             Some(Box::new(move || {
                                 let _ = handed.send(Answer::Handed(n));
                             })),
@@ -1067,6 +1065,7 @@ fn run_ready(app: &mut App, runner: &Runner) {
         };
         let key = app.resolver.key_of(n);
         let resends = app.resends_to(machine);
+        let rev = app.resolver.rev_of(n);
         let _ = runner.tx.send(ToRunner::Run {
             n,
             machine,
@@ -1076,6 +1075,7 @@ fn run_ready(app: &mut App, runner: &Runner) {
             request,
             gated,
             resends,
+            rev,
         });
     }
 }
@@ -1733,6 +1733,7 @@ mod tests {
                     request: serde_json::json!({"action":"move","id":"7","delta":1}),
                     gated: false,
                     resends: false,
+                    rev: None,
                 })
                 .unwrap();
         }
@@ -1780,6 +1781,7 @@ mod tests {
                     ),
                     gated: false,
                     resends: true,
+                    rev: None,
                 })
                 .unwrap();
         }
@@ -1835,6 +1837,7 @@ mod tests {
             request: serde_json::json!({"action":"move","id":"7","delta":1}),
             gated: false,
             resends: false,
+            rev: None,
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
@@ -1871,6 +1874,7 @@ mod tests {
             request: serde_json::json!({"action":"dispatch","id":n.to_string()}),
             gated,
             resends: false,
+            rev: None,
         };
         let next = || heard(rx.recv_timeout(Duration::from_secs(10)).unwrap());
         // Not yet written up: taken out before it started.
@@ -1995,6 +1999,7 @@ mod tests {
                     request: serde_json::json!({"action":"dispatch","id":id}),
                     gated: true,
                     resends: false,
+                    rev: None,
                 })
                 .unwrap();
         }

@@ -1,0 +1,1275 @@
+//! Holding and routing a change (intent 0591, release 4): a change for a machine that isn't
+//! answering is never refused when it can still happen. Sent through another machine whose
+//! backend forwards it (`"forward"` in its feed's `supports`), else kept in Kerdr's hold file
+//! (crate::kept) for a backend that checks a held request again (`"hold"`), and sent once that
+//! machine answers. What a backend holds for a card, and what Kerdr does, shows on the card, and
+//! m lists it with a key to drop it. q waits the moment a hand-over takes, then quits by itself,
+//! and keeps your words for the next Kerdr.
+
+use std::time::Instant;
+
+use serde_json::{Value, json};
+
+use super::{App, Tone};
+use crate::actions::Response;
+use crate::kept::{HeldRequest, KeptEdit, KeptImage, KeptWords, Words};
+use crate::model::Card;
+use crate::poll::Conn;
+
+/// A backend that holds a request, checks it again by `rev` when it's sent, and takes `drop`.
+pub const HOLD: &str = "hold";
+/// A backend that sends a request on to another machine it can reach (`forward_to`).
+pub const FORWARD: &str = "forward";
+
+/// One thing held for a card, as its card and its peek say it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct HeldLine {
+    /// "d waits for LAB-Server", or the backend's own words: "moves to ARK_C at 02:00".
+    pub words: String,
+    /// When it was asked for, in seconds since 1970, where that's known.
+    pub since: Option<i64>,
+    /// How m drops it; None for a note that it was dropped already.
+    pub drop: Option<DropOf>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum DropOf {
+    /// One in Kerdr's hold file, by its op: dropping it only takes it out.
+    Kerdr(String),
+    /// One its backend holds, by its op: dropping it asks that backend.
+    Backend(String),
+}
+
+/// What an answer said a backend holds for a card, shown until its feed says so itself, or two
+/// reads of that feed after the answer don't list it (it ran, or the backend lists no `held`).
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub key: String,
+    pub machine: usize,
+    pub op: String,
+    pub words: String,
+    pub reads: u8,
+}
+
+/// How a held change names the key that asked for it: "d", or the change in words.
+pub fn held_what(request: &Value) -> String {
+    match request["action"].as_str().unwrap_or_default() {
+        "dispatch" => "d",
+        "reopen" => "⏎",
+        "refresh" => "y",
+        "dismiss" => "x",
+        "close" => "C",
+        "cancel" => "X",
+        "restore" => "u",
+        "move" => "the move",
+        "edit" => "your new text",
+        "answer" => "your answers",
+        _ => "the change",
+    }
+    .to_string()
+}
+
+/// A short span of time: "40 s", "3 min", "2 h".
+pub fn span(secs: i64) -> String {
+    let secs = secs.max(0);
+    if secs < 60 {
+        format!("{secs} s")
+    } else if secs < 3600 {
+        format!("{} min", secs / 60)
+    } else {
+        format!("{} h", secs / 3600)
+    }
+}
+
+impl App {
+    fn epoch_now(&self) -> i64 {
+        self.now().timestamp()
+    }
+
+    /// Whether this machine's backend holds requests: its feed says so, or, before Kerdr has read
+    /// it, the hold file remembers that it did.
+    pub fn holds_on(&self, machine: usize) -> bool {
+        let Some(m) = self.machines.get(machine) else {
+            return false;
+        };
+        match &m.feed {
+            Some(feed) => feed.supports(HOLD),
+            None => self.kept.holds_for(&m.name()),
+        }
+    }
+
+    /// A machine that's answering and forwards requests, other than `home`.
+    pub fn forwarder(&self, home: usize) -> Option<usize> {
+        let name = self.machines.get(home).map(|m| m.name());
+        self.forwarder_for(name.as_deref())
+    }
+
+    /// A machine that's answering and forwards requests, other than the one named.
+    pub fn forwarder_for(&self, not: Option<&str>) -> Option<usize> {
+        if !self.actions_on() {
+            return None;
+        }
+        self.machines
+            .iter()
+            .enumerate()
+            .find(|(_, m)| {
+                m.conn.is_live()
+                    && not.is_none_or(|n| !m.answers_to(n))
+                    && m.feed.as_ref().is_some_and(|f| f.supports(FORWARD))
+            })
+            .map(|(i, _)| i)
+    }
+
+    /// As can_write, for a change to a card: a machine that isn't answering takes it too when
+    /// Kerdr can send it through another machine, or hold it for this one.
+    pub(crate) fn can_change(&mut self, machine: usize) -> bool {
+        let away = self
+            .machines
+            .get(machine)
+            .is_some_and(|m| !m.conn.is_live());
+        if self.actions_on()
+            && away
+            && (self.holds_on(machine) || self.forwarder(machine).is_some())
+        {
+            return true;
+        }
+        self.can_write(machine)
+    }
+
+    /// Where a change goes when its machine isn't answering: through a machine that forwards, or
+    /// into the hold file. Some(the machine to send it to, and the request) to send it now; None
+    /// when it's held.
+    pub(crate) fn route(
+        &mut self,
+        machine: usize,
+        mut request: Value,
+        key: Option<&str>,
+    ) -> Option<(usize, Value)> {
+        let Some(m) = self.machines.get(machine) else {
+            return Some((machine, request));
+        };
+        // A read isn't held: only a change waits for its machine.
+        if m.conn.is_live() || !self.actions_on() || crate::resolve::reads(&request) {
+            return Some((machine, request));
+        }
+        let name = m.name();
+        if let Some(via) = self.forwarder(machine) {
+            request["forward_to"] = Value::String(name);
+            return Some((via, request));
+        }
+        if self.holds_on(machine) {
+            let request = crate::actions::with_op(request);
+            let rev = key.and_then(|k| self.card_rev(k));
+            self.hold_request(name, request, key.map(str::to_string), rev, None);
+            return None;
+        }
+        Some((machine, request))
+    }
+
+    /// A card's `rev`, as its feed gave it.
+    pub(crate) fn card_rev(&self, key: &str) -> Option<String> {
+        self.card(key)
+            .and_then(|c| c.detail.as_ref())
+            .and_then(|d| d.rev.clone())
+            .filter(|r| !r.is_empty())
+    }
+
+    /// Keeps a change in the hold file for the machine named, and says so.
+    pub(crate) fn hold_request(
+        &mut self,
+        machine: String,
+        request: Value,
+        key: Option<String>,
+        rev: Option<String>,
+        after: Option<String>,
+    ) {
+        let reference = key
+            .as_deref()
+            .and_then(|k| self.card(k))
+            .map(|c| c.reference.clone())
+            .or_else(|| request["id"].as_str().map(|id| self.reference_for(id)))
+            .unwrap_or_else(|| "its card".into());
+        let what = held_what(&request);
+        let entry = HeldRequest {
+            machine: machine.clone(),
+            request,
+            rev,
+            key,
+            reference: reference.clone(),
+            what: what.clone(),
+            pressed: self.epoch_now(),
+            after,
+        };
+        self.kept.hold(entry);
+        let dropped = self
+            .machine_index(&machine)
+            .and_then(|i| self.dropped_ago(i))
+            .map(|ago| format!(" ({ago})"))
+            .unwrap_or_default();
+        self.say(
+            format!("Held: {what} on {reference} goes when {machine} answers{dropped}."),
+            Tone::Info,
+        );
+        self.rebuild();
+    }
+
+    /// How long ago a machine stopped answering, in words: "it dropped 40 s ago".
+    fn dropped_ago(&self, machine: usize) -> Option<String> {
+        let since = match &self.machines.get(machine)?.conn {
+            Conn::Reconnecting { since, .. } | Conn::Unreachable { since, .. } => *since,
+            _ => return None,
+        };
+        let secs = (self.now() - since).num_seconds();
+        Some(format!("it dropped {} ago", span(secs)))
+    }
+
+    /// A machine's feed was just read: whether its backend holds is noted, what an answer said it
+    /// holds is counted down, and what's held for it in Kerdr's hold file goes now. Over a day
+    /// old, it's dropped instead, and its card says so.
+    pub(crate) fn feed_read(&mut self, machine: usize) {
+        let Some(m) = self.machines.get(machine) else {
+            return;
+        };
+        let name = m.name();
+        let holds = m.feed.as_ref().is_some_and(|f| f.supports(HOLD));
+        let live = m.conn.is_live();
+        if !self.demo {
+            self.kept.note_holds(&name, holds);
+        }
+        self.count_pending(machine);
+        let dropped = self.kept.expire(self.epoch_now());
+        if let Some(first) = dropped.first() {
+            self.say(format!("{}: {}.", first.reference, first.said), Tone::Warn);
+        }
+        if live {
+            self.release_held(machine);
+        }
+    }
+
+    /// Sends what's held for this machine, now that it answers. Each goes as it was asked, with
+    /// its op, the card's `rev` then, and `held: true`, so its backend checks it again; a start
+    /// that waited for its write-up waits for it still.
+    fn release_held(&mut self, machine: usize) {
+        let entries: Vec<HeldRequest> = self
+            .kept
+            .held
+            .iter()
+            .filter(|h| {
+                self.machines[machine].answers_to(&h.machine)
+                    && !self.held_sending.values().any(|op| op == h.op())
+            })
+            .cloned()
+            .collect();
+        for entry in entries {
+            self.send_held(machine, entry);
+        }
+    }
+
+    fn send_held(&mut self, machine: usize, entry: HeldRequest) {
+        let op = entry.op().to_string();
+        let mut request = entry.request.clone();
+        if self.holds_on(machine) {
+            request["held"] = Value::Bool(true);
+            if let Some(rev) = entry
+                .rev
+                .as_deref()
+                .filter(|_| request.get("rev").is_none())
+            {
+                request["rev"] = Value::String(rev.to_string());
+            }
+        }
+        // A start that waited for its write-up as well: only while its card still waits to
+        // start, which Kerdr checks itself, since an older backend checks no `rev`.
+        if entry.after.as_deref() == Some("write-up") {
+            let card = entry.key.as_deref().and_then(|k| self.card(k)).cloned();
+            let Some(card) = card.filter(|c| crate::app::waiting_work(c) && !c.dismissed()) else {
+                self.kept.release(&op);
+                self.say(
+                    format!(
+                        "{} wasn't started: it changed since you pressed {}, so Kerdr dropped that start.",
+                        entry.reference, entry.what
+                    ),
+                    Tone::Warn,
+                );
+                return;
+            };
+            let effect = self.effect_for(&card.key, &request);
+            let n = self.resolver.add_gated(
+                machine,
+                request,
+                Some(crate::model::CardSnapshot::of(&card)),
+                Some(card.key.clone()),
+                effect,
+            );
+            self.resolver.keep_op(n, &op);
+            self.held_sending.insert(n, op);
+            return;
+        }
+        let before = self.resolver.last_added();
+        self.action_key = entry.key.clone();
+        self.queue_action(machine, request);
+        let n = self.resolver.last_added();
+        if n == before {
+            // Not sent, and said why (its backend no longer takes it, say): it isn't kept.
+            self.kept.release(&op);
+            return;
+        }
+        self.resolver.keep_op(n, &op);
+        if self.holds_on(machine) {
+            self.resolver.set_rev(n, entry.rev.clone());
+        }
+        self.held_sending.insert(n, op);
+    }
+
+    /// Before a change's answer is taken: one sent from the hold file leaves it once answered;
+    /// one a forwarding machine couldn't get through is held for the machine it was for; and one
+    /// its backend holds says so on its card. Whether the answer is dealt with here.
+    pub(crate) fn held_answer(&mut self, n: u64, result: &Result<Response, String>) -> bool {
+        let from_file = self.held_sending.remove(&n);
+        let response = result.as_ref().ok();
+        if let Some(op) = &from_file
+            && response.is_some_and(|r| r.unreachable.is_none())
+        {
+            self.kept.release(op);
+        }
+        if let Some(to) = response.and_then(|r| r.unreachable.clone()) {
+            let Some(job) = self.resolver.take(n) else {
+                return false;
+            };
+            let mut request = job.request.clone();
+            if let Some(fields) = request.as_object_mut() {
+                fields.remove("forward_to");
+                fields.remove("held");
+            }
+            if from_file.is_none() {
+                self.hold_request(to, request, job.key.clone(), job.rev.clone(), None);
+            } else {
+                self.rebuild();
+            }
+            return true;
+        }
+        if let Some(r) = response
+            && r.ok
+            && let Some(words) = r.pending.clone().filter(|w| !w.is_empty())
+            && let Some(job) = self.resolver.job(n)
+            && let Some(key) = job.key.clone()
+        {
+            let op = job.request["op"].as_str().unwrap_or_default().to_string();
+            let machine = job.machine;
+            self.pendings.retain(|p| !(p.key == key && p.op == op));
+            self.pendings.push(Pending {
+                key,
+                machine,
+                op,
+                words,
+                reads: 0,
+            });
+        }
+        false
+    }
+
+    /// After an answer: one that went through another machine says so.
+    pub(crate) fn note_via(&mut self, to: Option<String>, via: Option<String>) {
+        let (Some(to), Some(via)) = (to, via) else {
+            return;
+        };
+        let line = format!("Sent through {via}, since {to} isn't answering here.");
+        match &self.message {
+            Some((text, Tone::Fail, _)) => {
+                let text = format!("{text}\n{line}");
+                self.message = Some((text, Tone::Fail, Instant::now()));
+            }
+            _ => self.say(line, Tone::Info),
+        }
+    }
+
+    /// Counts a read against what answers said each backend holds.
+    fn count_pending(&mut self, machine: usize) {
+        let listed: Vec<(String, String)> = self
+            .board
+            .cards
+            .iter()
+            .filter(|c| c.machine_index == machine)
+            .flat_map(|c| {
+                c.detail
+                    .iter()
+                    .flat_map(|d| d.held.iter())
+                    .map(|h| (c.key.clone(), h.op.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        for p in self.pendings.iter_mut().filter(|p| p.machine == machine) {
+            if listed.iter().any(|(k, op)| *k == p.key && *op == p.op) {
+                p.reads = 0;
+            } else {
+                p.reads = p.reads.saturating_add(1);
+            }
+        }
+        self.pendings.retain(|p| p.reads < 3);
+    }
+
+    /// Everything held for a card, Kerdr's first, then its backend's, then what was dropped.
+    pub fn held_lines(&self, c: &Card) -> Vec<HeldLine> {
+        let mut lines = vec![];
+        for h in self.kept.for_card(&c.key) {
+            lines.push(HeldLine {
+                words: format!("{} waits for {}", h.what, h.machine),
+                since: Some(h.pressed),
+                drop: Some(DropOf::Kerdr(h.op().to_string())),
+            });
+        }
+        let mut ops: Vec<String> = vec![];
+        let feed_held = c.detail.iter().flat_map(|d| d.held.iter());
+        let agent_held = self
+            .account_agent(c)
+            .into_iter()
+            .flat_map(|a| a.held.iter());
+        for h in feed_held.chain(agent_held) {
+            if ops.contains(&h.op) {
+                continue;
+            }
+            ops.push(h.op.clone());
+            lines.push(HeldLine {
+                words: h.pending.clone(),
+                since: h.since,
+                drop: Some(DropOf::Backend(h.op.clone())),
+            });
+        }
+        for p in self.pendings.iter().filter(|p| p.key == c.key) {
+            if ops.contains(&p.op) {
+                continue;
+            }
+            ops.push(p.op.clone());
+            lines.push(HeldLine {
+                words: p.words.clone(),
+                since: None,
+                drop: (!p.op.is_empty()).then(|| DropOf::Backend(p.op.clone())),
+            });
+        }
+        for d in self
+            .kept
+            .dropped
+            .iter()
+            .filter(|d| d.key.as_deref() == Some(c.key.as_str()))
+        {
+            lines.push(HeldLine {
+                words: d.said.clone(),
+                since: None,
+                drop: None,
+            });
+        }
+        lines
+    }
+
+    /// The card's line for what's held for it: "⧗ d waits for LAB-Server".
+    pub fn held_line_for(&self, c: &Card) -> Option<String> {
+        let lines = self.held_lines(c);
+        let first = lines.first()?;
+        let more = match lines.len() {
+            1 => String::new(),
+            n => format!(" (+{})", n - 1),
+        };
+        Some(format!("⧗ {}{more}", first.words))
+    }
+
+    /// The peek's key to drop what's held: D for the only one (None), or with a count the one of
+    /// that number (2D, the second).
+    pub(crate) fn drop_held(&mut self, index: Option<usize>) -> super::Action {
+        let Some(card) = self.selected().cloned() else {
+            return super::Action::None;
+        };
+        let droppable: Vec<HeldLine> = self
+            .held_lines(&card)
+            .into_iter()
+            .filter(|l| l.drop.is_some())
+            .collect();
+        if index.is_none() && droppable.len() > 1 {
+            self.say(
+                format!(
+                    "{} things are held for {}: D drops the first, 2D the second.",
+                    droppable.len(),
+                    card.reference,
+                ),
+                Tone::Info,
+            );
+            return super::Action::None;
+        }
+        let Some(line) = droppable.get(index.unwrap_or(0)) else {
+            return super::Action::None;
+        };
+        match line.drop.clone() {
+            Some(DropOf::Kerdr(op)) => {
+                if let Some(h) = self.kept.release(&op) {
+                    self.say(
+                        format!("Dropped: {} on {} won't be sent.", h.what, card.reference),
+                        Tone::Info,
+                    );
+                }
+                self.rebuild();
+                super::Action::None
+            }
+            Some(DropOf::Backend(op)) => self.drop_backend(&card, &op, &line.words),
+            None => super::Action::None,
+        }
+    }
+
+    /// Asks a card's backend to drop a request it holds.
+    fn drop_backend(&mut self, card: &Card, op: &str, words: &str) -> super::Action {
+        let machine = match card.detail.as_ref() {
+            Some(_) => match self.home_machine(card) {
+                Some(m) => m,
+                None => return super::Action::None,
+            },
+            None => card.machine_index,
+        };
+        if !self.holds_on(machine) {
+            self.say(
+                format!(
+                    "{}'s backend can't drop what it holds, so \"{words}\" stays.",
+                    self.machines[machine].name()
+                ),
+                Tone::Info,
+            );
+            return super::Action::None;
+        }
+        if !self.can_write(machine) {
+            return super::Action::None;
+        }
+        let mut request = json!({"action": "drop", "held": op});
+        match (&card.detail, &card.session, &card.workspace_id) {
+            (Some(d), _, _) => request["id"] = Value::String(d.id.clone()),
+            (None, Some(session), Some(workspace)) => {
+                request["session"] = Value::String(session.clone());
+                request["workspace"] = Value::String(workspace.clone());
+            }
+            _ => return super::Action::None,
+        }
+        self.action_key = Some(card.key.clone());
+        super::Action::Mutate { machine, request }
+    }
+
+    /// What a drop's answer says, and the card stops showing what it dropped.
+    pub(crate) fn drop_answered(&mut self, request: &Value, response: &Response) -> bool {
+        if request["action"] != "drop" {
+            return false;
+        }
+        let op = request["held"].as_str().unwrap_or_default();
+        if response.ok {
+            self.pendings.retain(|p| p.op != op);
+            let said = if response.message.is_empty() {
+                match response.dropped {
+                    Some(false) => "It had already gone ahead, so there was nothing to drop.",
+                    _ => "Dropped: it won't happen.",
+                }
+                .to_string()
+            } else {
+                response.message.clone()
+            };
+            self.say(said, Tone::Info);
+            self.rebuild();
+            return true;
+        }
+        false
+    }
+
+    /// What q waits for before quitting, in words: "your new intent is saved". None when nothing
+    /// would be lost, and q quits at once: a change its command has whole carries on without
+    /// Kerdr, and your words are kept for the next one.
+    pub fn quit_waits_for(&self) -> Option<String> {
+        let held = self.resolver.holding_quit();
+        if held.iter().any(|j| j.request["action"] == "create") {
+            return Some("your new intent is saved".into());
+        }
+        if self.send_after_load.is_some() {
+            return Some("your new intent's image is in and it's sent".into());
+        }
+        if let Some(first) = held.first() {
+            let reference = first
+                .id()
+                .map(|id| self.reference_for(id))
+                .unwrap_or_else(|| "a card".into());
+            return Some(format!("{reference}'s change is handed over"));
+        }
+        if self.busy || !self.account_queue.is_empty() {
+            return Some("the account change answers".into());
+        }
+        None
+    }
+
+    /// q: whether Kerdr quits now. Otherwise it says what it waits for, and quits by itself
+    /// once that's done (quit_due); Esc stays. A second q quits at once when what's left can be
+    /// kept: an account change, or a change whose backend holds requests, which goes into the
+    /// hold file with its op.
+    pub fn quit_key(&mut self) -> bool {
+        let Some(what) = self.quit_waits_for() else {
+            return true;
+        };
+        if self.quitting.is_some() {
+            self.hold_unsent();
+            match self.quit_waits_for() {
+                None => return true,
+                Some(w) if w == "the account change answers" => return true,
+                Some(w) => {
+                    self.say(
+                        format!("Quitting once {w}: quitting before would lose it. Esc stays."),
+                        Tone::Info,
+                    );
+                    return false;
+                }
+            }
+        }
+        self.quitting = Some(Instant::now());
+        let again = if what == "the account change answers" {
+            "q again quits now, "
+        } else {
+            ""
+        };
+        self.say(
+            format!("Quitting once {what}… {again}Esc stays."),
+            Tone::Info,
+        );
+        false
+    }
+
+    /// Whether q is waiting and nothing holds it any more.
+    pub fn quit_due(&self) -> bool {
+        self.quitting.is_some() && self.quit_waits_for().is_none()
+    }
+
+    /// Changes not yet in their command's hands, for a machine whose backend holds requests,
+    /// go into the hold file with their op, for the next Kerdr to send.
+    fn hold_unsent(&mut self) {
+        let unsent: Vec<u64> = self
+            .resolver
+            .holding_quit()
+            .iter()
+            .filter(|j| j.request["action"] != "create" && self.holds_on(j.machine))
+            .map(|j| j.n)
+            .collect();
+        for n in unsent {
+            if let Some(job) = self.resolver.take(n) {
+                let machine = self.machines[job.machine].name();
+                self.kept.hold(HeldRequest {
+                    machine,
+                    reference: job
+                        .id()
+                        .map(|id| self.reference_for(id))
+                        .unwrap_or_default(),
+                    what: held_what(&job.request),
+                    request: job.request,
+                    rev: job.rev,
+                    key: job.key,
+                    pressed: self.epoch_now(),
+                    after: None,
+                });
+            }
+        }
+    }
+
+    /// Esc while q waits: Kerdr stays open.
+    pub(crate) fn stay(&mut self) -> bool {
+        if self.quitting.take().is_none() {
+            return false;
+        }
+        self.say("Staying open.", Tone::Info);
+        true
+    }
+
+    /// As Kerdr quits: starts waiting for their write-up go into the hold file, for the next
+    /// Kerdr to send once that's done, and your words into the words file.
+    pub fn keep_on_quit(&mut self) {
+        let awaited: Vec<(String, Value, Option<String>, Option<String>)> = self
+            .resolver
+            .write_ups_awaited()
+            .iter()
+            .map(|j| {
+                (
+                    self.machines
+                        .get(j.machine)
+                        .map(|m| m.name())
+                        .unwrap_or_default(),
+                    j.request.clone(),
+                    j.key.clone(),
+                    j.rev.clone(),
+                )
+            })
+            .collect();
+        for (machine, request, key, rev) in awaited {
+            let reference = key
+                .as_deref()
+                .and_then(|k| self.card(k))
+                .map(|c| c.reference.clone())
+                .unwrap_or_default();
+            self.kept.hold(HeldRequest {
+                machine,
+                what: held_what(&request),
+                request,
+                rev,
+                key,
+                reference,
+                pressed: self.epoch_now(),
+                after: Some("write-up".into()),
+            });
+        }
+        if let Some(dir) = self.words_dir.clone() {
+            let _ = self.words().keep(&dir);
+        }
+    }
+
+    /// Your words, as the words file keeps them.
+    pub fn words(&self) -> Words {
+        let kept = |words: &str, images: &[crate::images::Image]| KeptWords {
+            words: words.to_string(),
+            images: images.iter().map(KeptImage::of).collect(),
+        };
+        let mut words = Words::default();
+        if !self.draft.trim().is_empty() {
+            words.draft = Some(kept(&self.draft, &self.draft_images));
+        }
+        for r in &self.returned {
+            words.returned.push(kept(&r.words, &r.images));
+        }
+        // Words sent once their image is in, which quitting would drop: given back next time.
+        if let Some((_, draft)) = &self.send_after_load {
+            words.returned.push(kept(&draft.words, &draft.images));
+        }
+        let mut edits: Vec<KeptEdit> = self
+            .edits
+            .iter()
+            .filter_map(|(key, held)| {
+                let mine = held.mine.as_ref()?;
+                Some(KeptEdit {
+                    key: key.clone(),
+                    id: held.id.clone(),
+                    machine: self.machines.get(held.machine)?.name(),
+                    current: held.current.clone(),
+                    was: held.was.clone(),
+                    text: mine.text.clone(),
+                    from: mine.from.clone(),
+                })
+            })
+            .collect();
+        edits.sort_by(|a, b| a.key.cmp(&b.key));
+        words.edits = edits;
+        words
+    }
+
+    /// Words the last Kerdr kept: the box's draft back in the box (c), words given back after it,
+    /// and your versions of item texts, which e opens, reading the text first to see whether a
+    /// save of them landed meanwhile.
+    pub fn restore_words(&mut self, words: Words) {
+        let images = |kept: &[KeptImage]| kept.iter().filter_map(KeptImage::image).collect();
+        if let Some(draft) = words.draft {
+            if self.draft.trim().is_empty() {
+                self.draft = draft.words;
+                self.draft_images = images(&draft.images);
+            } else {
+                self.returned.push_back(super::Returned {
+                    words: draft.words,
+                    images: images(&draft.images),
+                    from: None,
+                });
+            }
+        }
+        for r in words.returned {
+            self.returned.push_back(super::Returned {
+                words: r.words,
+                images: images(&r.images),
+                from: None,
+            });
+        }
+        for e in words.edits {
+            let Some(machine) = self.machine_index(&e.machine) else {
+                continue;
+            };
+            self.edits.insert(
+                e.key,
+                super::edit_controls::Held {
+                    id: e.id,
+                    machine,
+                    current: e.current,
+                    was: e.was,
+                    read_at: Instant::now(),
+                    mine: Some(super::edit_controls::Mine {
+                        text: e.text,
+                        from: e.from,
+                    }),
+                    check_first: true,
+                    read_only: None,
+                },
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::Action;
+    use crate::app::tests::{press, press_code};
+    use crate::app::waiting_work;
+    use crate::config::Config;
+    use crate::kept::Kept;
+    use ratatui::crossterm::event::KeyCode;
+
+    fn app() -> App {
+        let mut app = App::new(Config::default(), crate::demo::machines(false));
+        app.cfg.actions.command = Some("test-adapter".into());
+        app
+    }
+
+    /// A card waiting in the backlog, selected, with `rev` "r1" in its feed: its key, id,
+    /// reference and machine.
+    fn waiting(app: &mut App) -> (String, String, String, usize) {
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| waiting_work(c) && c.intake().is_none() && !c.dismissed())
+            .expect("a waiting backlog card in the demo")
+            .clone();
+        let id = card.detail.as_ref().unwrap().id.clone();
+        let m = card.machine_index;
+        for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.rev = Some("r1".into());
+            }
+        }
+        app.rebuild();
+        select(app, &card.key);
+        (card.key, id, card.reference, m)
+    }
+
+    fn select(app: &mut App, key: &str) {
+        let col = app.card(key).unwrap().stage.index();
+        app.mode = super::super::Mode::Board;
+        app.sel = super::super::Selection {
+            col,
+            key: Some(key.to_string()),
+        };
+    }
+
+    fn supports(app: &mut App, machine: usize, what: &str) {
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(what.into());
+    }
+
+    fn away(app: &mut App, machine: usize, secs: i64) {
+        let since = app.now() - chrono::Duration::seconds(secs);
+        app.machines[machine].conn = Conn::Reconnecting {
+            since,
+            attempt: 1,
+            retry_at: since,
+            detail: "no answer".into(),
+        };
+    }
+
+    fn back(app: &mut App, machine: usize) {
+        app.machines[machine].conn = Conn::Live {
+            latency: Default::default(),
+        };
+        app.feed_read(machine);
+    }
+
+    fn said(app: &App) -> String {
+        app.message()
+            .map(|(t, _)| t.to_string())
+            .unwrap_or_default()
+    }
+
+    fn ok(extra: Value) -> Result<Response, String> {
+        let mut reply = json!({"ok": true, "message": ""});
+        if let (Some(fields), Some(more)) = (reply.as_object_mut(), extra.as_object()) {
+            fields.extend(more.clone());
+        }
+        Ok(crate::actions::parse_response(&reply.to_string()).unwrap())
+    }
+
+    /// d, as the board's loop takes it.
+    fn d(app: &mut App) -> Action {
+        let action = press(app, 'd');
+        if let Action::Mutate { machine, request } = action.clone() {
+            app.queue_action(machine, request);
+        }
+        action
+    }
+
+    #[test]
+    fn a_change_for_a_machine_that_isnt_answering_is_held_and_goes_when_it_answers() {
+        let mut app = app();
+        let (key, id, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        away(&mut app, m, 40);
+        let name = app.machines[m].name();
+        assert!(
+            matches!(d(&mut app), Action::Mutate { .. }),
+            "{}",
+            said(&app)
+        );
+        // Nothing goes yet: it's in the hold file, and its card says so.
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(
+            said(&app),
+            format!("Held: d on {reference} goes when {name} answers (it dropped 40 s ago).")
+        );
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some(format!("⧗ d waits for {name}").as_str())
+        );
+        let held = app.kept.held[0].clone();
+        assert_eq!(held.rev.as_deref(), Some("r1"));
+        assert_eq!(held.request["action"], "dispatch");
+        assert_eq!(held.request["id"], id.as_str());
+        assert!(!held.op().is_empty());
+        // Its machine answers: it goes with the op it had, the card's rev then, and held: true.
+        back(&mut app, m);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        let (n, machine, request, _) = ready[0].clone();
+        assert_eq!(machine, m);
+        assert_eq!(request["op"], held.op());
+        assert_eq!(request["rev"], "r1");
+        assert_eq!(request["held"], true);
+        // A second read meanwhile doesn't send it twice.
+        app.feed_read(m);
+        assert!(app.resolver.ready().is_empty());
+        // Answered: it leaves the hold file, and its card stops saying it waits.
+        assert_eq!(app.kept.held.len(), 1);
+        app.finish_job(n, request, ok(json!({})));
+        assert!(app.kept.held.is_empty());
+    }
+
+    #[test]
+    fn a_held_change_dropped_with_m_is_never_sent() {
+        let mut app = app();
+        let (key, _, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        away(&mut app, m, 5);
+        d(&mut app);
+        assert_eq!(app.kept.held.len(), 1);
+        // m peeks, and the peek's D drops it.
+        press(&mut app, 'm');
+        assert!(matches!(app.mode, super::super::Mode::Peek { .. }));
+        assert_eq!(press(&mut app, 'D'), Action::None);
+        assert!(app.kept.held.is_empty());
+        assert_eq!(
+            said(&app),
+            format!("Dropped: d on {reference} won't be sent.")
+        );
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(app.held_line_for(&card), None);
+        back(&mut app, m);
+        assert!(app.resolver.ready().is_empty());
+    }
+
+    #[test]
+    fn without_hold_or_forward_a_machine_that_isnt_answering_refuses_as_before() {
+        let mut app = app();
+        let (_, _, _, m) = waiting(&mut app);
+        away(&mut app, m, 5);
+        assert_eq!(press(&mut app, 'd'), Action::None);
+        assert!(said(&app).contains("not answering"), "{}", said(&app));
+        assert!(app.kept.held.is_empty());
+    }
+
+    /// A card waiting on a machine that isn't answering, and another machine that forwards: the
+    /// forwarder, and both machines' names.
+    fn forwarding(app: &mut App) -> (usize, usize, String, String, String) {
+        let (_, _, reference, m) = waiting(app);
+        let via = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .expect("a second machine with a feed in the demo");
+        supports(app, via, FORWARD);
+        supports(app, m, HOLD);
+        away(app, m, 5);
+        let name = app.machines[m].name();
+        let via_name = app.machines[via].name();
+        (m, via, reference, name, via_name)
+    }
+
+    #[test]
+    fn a_change_goes_through_a_machine_that_forwards_and_says_so() {
+        let mut app = app();
+        let (_, via, _, name, via_name) = forwarding(&mut app);
+        d(&mut app);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1);
+        let (n, machine, request, _) = ready[0].clone();
+        assert_eq!(machine, via);
+        assert_eq!(request["forward_to"], name.as_str());
+        assert!(app.kept.held.is_empty());
+        app.finish_job(n, request, ok(json!({"via": via_name})));
+        assert!(
+            said(&app).contains(&format!(
+                "Sent through {via_name}, since {name} isn't answering"
+            )),
+            "{}",
+            said(&app)
+        );
+    }
+
+    #[test]
+    fn a_change_a_forwarder_cant_get_through_is_held_for_its_machine() {
+        let mut app = app();
+        let (m, _, reference, name, _) = forwarding(&mut app);
+        d(&mut app);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request.clone(), ok(json!({"unreachable": name})));
+        assert_eq!(app.kept.held.len(), 1);
+        let held = app.kept.held[0].clone();
+        assert_eq!(held.machine, name);
+        assert_eq!(held.op(), request["op"].as_str().unwrap());
+        assert_eq!(held.rev.as_deref(), Some("r1"));
+        assert!(held.request.get("forward_to").is_none());
+        assert_eq!(
+            said(&app),
+            format!("Held: d on {reference} goes when {name} answers (it dropped 5 s ago).")
+        );
+        // Its machine answers: it goes there, with the same op.
+        back(&mut app, m);
+        let (_, machine, again, _) = app.resolver.ready()[0].clone();
+        assert_eq!(machine, m);
+        assert_eq!(again["op"], held.op());
+        assert!(again.get("forward_to").is_none());
+    }
+
+    #[test]
+    fn what_a_backend_holds_shows_on_the_card_and_m_drops_it_there() {
+        let mut app = app();
+        let (key, id, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        // The answer's pending words, until the feed says so itself.
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request.clone(),
+            ok(json!({"pending": "queued in ARK: starts when a place frees"})),
+        );
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some("⧗ queued in ARK: starts when a place frees")
+        );
+        // Its feed lists it: shown from there, once.
+        let op = request["op"].as_str().unwrap().to_string();
+        let since = app.now().timestamp() - 120;
+        for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.held = vec![crate::feed::Held {
+                    op: op.clone(),
+                    action: "dispatch".into(),
+                    pending: "queued in ARK: starts when a place frees".into(),
+                    since: Some(since),
+                    until: None,
+                }];
+            }
+        }
+        app.rebuild();
+        for _ in 0..4 {
+            app.feed_read(m);
+        }
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(app.held_lines(&card).len(), 1);
+        // m, then D: a drop to its backend, naming the record and the op.
+        select(&mut app, &key);
+        press(&mut app, 'm');
+        let Action::Mutate { machine, request } = press(&mut app, 'D') else {
+            panic!("no drop: {}", said(&app))
+        };
+        assert_eq!(machine, m);
+        assert_eq!(request, json!({"action":"drop","held":op,"id":id}));
+        // Its answer says what was dropped.
+        app.queue_action(machine, request);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request,
+            ok(json!({"message": "Dropped the start of #41: it won't start.", "dropped": true})),
+        );
+        assert_eq!(said(&app), "Dropped the start of #41: it won't start.");
+    }
+
+    #[test]
+    fn pending_words_go_once_two_reads_of_the_feed_dont_list_them() {
+        let mut app = app();
+        let (key, id, _, m) = waiting(&mut app);
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request,
+            ok(json!({"pending": "moves to ARK_C at 02:00"})),
+        );
+        assert!(app.held_line_for(&app_card(&app, &key)).is_some());
+        app.feed_read(m);
+        app.feed_read(m);
+        assert!(app.held_line_for(&app_card(&app, &key)).is_some());
+        app.feed_read(m);
+        assert_eq!(app.held_line_for(&app_card(&app, &key)), None);
+    }
+
+    fn app_card(app: &App, key: &str) -> Card {
+        app.card(key).unwrap().clone()
+    }
+
+    #[test]
+    fn q_waits_for_a_hand_over_then_quits_by_itself_and_esc_stays() {
+        let mut app = app();
+        let (_, id, reference, m) = waiting(&mut app);
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        assert!(!app.quit_key());
+        assert_eq!(
+            said(&app),
+            format!("Quitting once {reference}'s change is handed over… Esc stays.")
+        );
+        assert!(!app.quit_due());
+        // Esc stays.
+        press_code(&mut app, KeyCode::Esc);
+        assert_eq!(app.quitting, None);
+        assert_eq!(said(&app), "Staying open.");
+        // q again, and the hand-over finishes: Kerdr quits by itself.
+        assert!(!app.quit_key());
+        app.job_started(n);
+        app.resolver.handed(n);
+        assert!(app.quit_due());
+        // Nothing waiting: q quits at once, though the start still runs without Kerdr.
+        let mut app2 = self::app();
+        assert!(app2.quit_key());
+        drop(request);
+    }
+
+    #[test]
+    fn q_waits_for_an_account_change_and_a_second_q_quits_now() {
+        let mut app = app();
+        app.busy = true;
+        assert!(!app.quit_key());
+        assert_eq!(
+            said(&app),
+            "Quitting once the account change answers… q again quits now, Esc stays."
+        );
+        assert!(app.quit_key());
+    }
+
+    #[test]
+    fn a_second_q_holds_a_change_not_yet_sent_for_a_backend_that_holds() {
+        let mut app = app();
+        let (_, id, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        app.queue_action(m, json!({"action":"dispatch","id":id}));
+        let (_, _, request, _) = app.resolver.ready()[0].clone();
+        assert!(!app.quit_key());
+        assert!(app.quit_key());
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].op(), request["op"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_new_intent_holds_q_until_it_is_saved_and_its_words_coming_back_stay() {
+        let mut app = app();
+        app.queue_action(
+            0,
+            json!({"action":"create","words":"Fix it","submission":"s-1","session":"ark"}),
+        );
+        app.resolver.ready();
+        assert!(!app.quit_key());
+        assert_eq!(
+            said(&app),
+            "Quitting once your new intent is saved… Esc stays."
+        );
+        // A second q doesn't drop it.
+        assert!(!app.quit_key());
+        assert!(
+            said(&app).contains("quitting before would lose it"),
+            "{}",
+            said(&app)
+        );
+    }
+
+    #[test]
+    fn q_keeps_words_and_a_start_waiting_for_its_write_up_for_the_next_kerdr() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = Kept::at(dir.path(), app.now().timestamp());
+        app.words_dir = Some(dir.path().to_path_buf());
+        let (key, id, _, m) = waiting(&mut app);
+        app.resolver.add_gated(
+            m,
+            json!({"action":"dispatch","id":id}),
+            None,
+            Some(key.clone()),
+            None,
+        );
+        app.draft = "Words not yet sent".into();
+        app.returned.push_back(super::super::Returned {
+            words: "Words a save gave back".into(),
+            images: vec![],
+            from: None,
+        });
+        // Nothing is lost by quitting, so q quits at once.
+        assert!(app.quit_key());
+        app.keep_on_quit();
+        let next = Kept::at(dir.path(), app.now().timestamp());
+        assert_eq!(next.held.len(), 1);
+        assert_eq!(next.held[0].after.as_deref(), Some("write-up"));
+        assert_eq!(next.held[0].key.as_deref(), Some(key.as_str()));
+        // The next Kerdr has the words back where they were.
+        let mut later = self::app();
+        later.restore_words(Words::take(dir.path()));
+        assert_eq!(later.draft, "Words not yet sent");
+        assert_eq!(later.returned.len(), 1);
+        assert_eq!(later.returned[0].words, "Words a save gave back");
+    }
+
+    #[test]
+    fn a_held_start_waiting_for_its_write_up_is_dropped_if_its_card_changed() {
+        let mut app = app();
+        let (key, id, reference, m) = waiting(&mut app);
+        app.kept.hold(HeldRequest {
+            machine: app.machines[m].name(),
+            request: crate::actions::with_op(json!({"action":"dispatch","id":id})),
+            rev: None,
+            key: Some(key.clone()),
+            reference: reference.clone(),
+            what: "d".into(),
+            pressed: app.now().timestamp(),
+            after: Some("write-up".into()),
+        });
+        // Still waiting: it goes back to waiting for its write-up, with its op.
+        let op = app.kept.held[0].op().to_string();
+        back(&mut app, m);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1);
+        assert!(ready[0].3, "gated");
+        assert_eq!(ready[0].2["op"], op.as_str());
+        // Set aside meanwhile: dropped, and said.
+        let mut app = self::app();
+        let (key, id, reference, m) = waiting(&mut app);
+        app.kept.hold(HeldRequest {
+            machine: app.machines[m].name(),
+            request: crate::actions::with_op(json!({"action":"dispatch","id":id})),
+            rev: None,
+            key: Some(key.clone()),
+            reference: reference.clone(),
+            what: "d".into(),
+            pressed: app.now().timestamp(),
+            after: Some("write-up".into()),
+        });
+        for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.disposition = Some("wont_do".into());
+            }
+        }
+        app.rebuild();
+        back(&mut app, m);
+        assert!(app.resolver.ready().is_empty());
+        assert!(app.kept.held.is_empty());
+        assert!(said(&app).contains("wasn't started"), "{}", said(&app));
+    }
+}

@@ -369,6 +369,9 @@ pub struct Job {
     /// Being sent again by itself, with the same op: refused for something passing, or its answer
     /// lost (intent 0591). Its card says so quietly meanwhile, not in red.
     pub retrying: bool,
+    /// Its card's `rev` when the key was pressed, for a backend that holds requests: a resend
+    /// carries it, so the backend checks it against the card as it was (intent 0591, release 4).
+    pub rev: Option<String>,
 }
 
 impl Job {
@@ -452,7 +455,7 @@ pub struct Queue {
 
 /// Whether a request only reads: `edit` without a text (intent 0414), or the check behind a Kickoff
 /// Questions box already open (intent 0491).
-fn reads(request: &Value) -> bool {
+pub(crate) fn reads(request: &Value) -> bool {
     request["action"] == "kickoff" || (request["action"] == "edit" && request.get("text").is_none())
 }
 
@@ -681,8 +684,35 @@ impl Resolver {
             follow: None,
             by_enter: false,
             retrying: false,
+            rev: None,
         });
         self.next
+    }
+
+    /// Keeps the op a held change had when its key was pressed, in place of the new one `add`
+    /// gave it: it's the same request, sent at last, and its backend may have it already.
+    pub fn keep_op(&mut self, n: u64, op: &str) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n)
+            && !op.is_empty()
+            && j.request.get("op").is_some()
+        {
+            j.request["op"] = Value::String(op.to_string());
+        }
+    }
+
+    /// Notes the card's `rev` when the key was pressed (Job::rev).
+    pub fn set_rev(&mut self, n: u64, rev: Option<String>) {
+        if let Some(j) = self.jobs.iter_mut().find(|j| j.n == n) {
+            j.rev = rev.filter(|r| !r.is_empty());
+        }
+    }
+
+    /// The `rev` a change's resends carry.
+    pub fn rev_of(&self, n: u64) -> Option<String> {
+        self.jobs
+            .iter()
+            .find(|j| j.n == n)
+            .and_then(|j| j.rev.clone())
     }
 
     /// The request of a change still on its way.

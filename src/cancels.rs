@@ -159,7 +159,7 @@ impl App {
             self.say(NO_INTENT, Tone::Info);
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         if self.resolver.unanswered_on(&card.key).is_some() {

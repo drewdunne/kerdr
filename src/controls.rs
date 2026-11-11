@@ -893,7 +893,17 @@ impl App {
     }
 
     pub(super) fn emit_mutation(&mut self, machine: usize, request: Value) -> Action {
-        if self.can_write(machine) {
+        // Only a change to a card is held or sent through another machine (intent 0591, release
+        // 4): a new intent or an account request needs its machine answering.
+        let routed = request["action"]
+            .as_str()
+            .is_some_and(|a| a != "create" && !a.starts_with("account-"));
+        let can = if routed {
+            self.can_change(machine)
+        } else {
+            self.can_write(machine)
+        };
+        if can {
             Action::Mutate { machine, request }
         } else {
             Action::None
@@ -921,7 +931,7 @@ impl App {
         let Some(machine) = self.home_machine(card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         let reference = &card.reference;
@@ -1133,7 +1143,7 @@ impl App {
         let Some(machine) = self.home_machine(card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         // Its home session, else the session tab you're on, if it's that machine's.
@@ -1274,7 +1284,7 @@ impl App {
                 let Some(machine) = self.home_machine(&card) else {
                     return Action::None;
                 };
-                if !self.can_write(machine) {
+                if !self.can_change(machine) {
                     return Action::None;
                 }
                 let mut request = json!({"action":"dispatch","id":detail.id});
@@ -1401,7 +1411,7 @@ impl App {
         let Some(machine) = self.home_machine(&card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         let mut request = json!({"action":action,"id":detail.id});
@@ -1524,7 +1534,7 @@ impl App {
             let Some(machine) = self.home_machine(&card) else {
                 return Action::None;
             };
-            if !self.can_write(machine) {
+            if !self.can_change(machine) {
                 return Action::None;
             }
             // `outside_since` names the window this yes was for: its backend stops only that one.
@@ -1580,7 +1590,7 @@ impl App {
         }
         // Its workspace is where the card came from: that machine's herdr closes it.
         let machine = card.machine_index;
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         // Work an agent is at, to a backend that does the step first: sent as C and x send theirs,
@@ -2084,6 +2094,9 @@ impl App {
         images: Vec<images::Image>,
         from: Option<crate::app::Submission>,
     ) -> bool {
+        // Words that came back while q waited for them to be saved: Kerdr stays open with them
+        // (intent 0591, K1-45).
+        self.quitting = None;
         let open = matches!(self.mode, Mode::Compose { .. }) || self.send_after_load.is_some();
         if !open && self.draft.trim().is_empty() {
             self.draft = words;
@@ -2589,12 +2602,19 @@ impl App {
             }
             return Some(Action::None);
         }
+        let counted = !self.count.is_empty();
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
             KeyCode::Char(
                 c @ ('d' | 'e' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X'),
             ) => {
                 return Some(self.card_action(c, count));
+            }
+            // In a peek, D drops what's held for its card: the only one, or with a count the one
+            // of that number, 2D the second (intent 0591, release 4).
+            KeyCode::Char('D') if matches!(self.mode, Mode::Peek { .. }) => {
+                let index = counted.then(|| usize::try_from(count - 1).unwrap_or(0));
+                return Some(self.drop_held(index));
             }
             KeyCode::Char('{') | KeyCode::Char('}')
                 if matches!(self.mode, Mode::Backlog { .. }) =>
@@ -2713,7 +2733,18 @@ impl App {
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
         let asking = (!shows).then(|| self.asking_line(&request)).flatten();
         let by_enter = enter_sent.is_some_and(|e| key.as_deref() == Some(e.as_str()));
+        // Its machine isn't answering: sent through one that forwards, or held for it (intent
+        // 0591, release 4). A held change shows on its card, not as done.
+        let home = machine;
+        let Some((machine, request)) = self.route(machine, request, key.as_deref()) else {
+            return;
+        };
+        let rev = key
+            .as_deref()
+            .filter(|_| self.holds_on(home))
+            .and_then(|k| self.card_rev(k));
         let n = self.resolver.add(machine, request, from, key, effect);
+        self.resolver.set_rev(n, rev);
         if by_enter {
             self.resolver.mark_by_enter(n);
         }
@@ -3031,6 +3062,24 @@ impl App {
     /// until the feed has it; any other takes its effect with it, so the card is back as it really
     /// is before anything is said or asked.
     pub fn finish_job(&mut self, n: u64, request: Value, result: Result<Response, String>) {
+        // Sent from the hold file, through another machine, or held by its backend (intent 0591,
+        // release 4).
+        if self.held_answer(n, &result) {
+            return;
+        }
+        if let Ok(response) = &result
+            && self.drop_answered(&request, response)
+        {
+            self.resolver.take(n);
+            return;
+        }
+        let to = request["forward_to"].as_str().map(str::to_string);
+        let via = result.as_ref().ok().and_then(|r| r.via.clone());
+        self.finish_job_answered(n, request, result);
+        self.note_via(to, via);
+    }
+
+    fn finish_job_answered(&mut self, n: u64, request: Value, result: Result<Response, String>) {
         let Some(job) = self.resolver.take(n) else {
             return;
         };
