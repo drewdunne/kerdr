@@ -67,8 +67,9 @@ pub struct HeldRequest {
     /// 63, 3). Its key pressed again sends it as itself, with its op.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stays: Option<String>,
-    /// Sent at least once with no answer back: it may have gone ahead, so its card never says it
-    /// wasn't sent (Codex's review 64, 4).
+    /// Handed to its machine at least once with no answer back: it may have gone ahead, so its card
+    /// never says it wasn't sent. Written before it's handed over, so a Kerdr that ends before the
+    /// answer leaves it so (Codex's reviews 64, 4, and 65, 2).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unanswered: bool,
 }
@@ -117,8 +118,8 @@ enum Change {
     Holds(String, bool),
     /// Why it stays held though its machine answers, by its op, or None once it goes.
     Stays(String, Option<String>),
-    /// Sent with no answer back, by its op.
-    Unanswered(String),
+    /// Handed to its machine with no answer back yet, by its op, or, with false, not after all.
+    Unanswered(String, bool),
 }
 
 impl Change {
@@ -154,9 +155,9 @@ impl Change {
                     h.stays = why.clone();
                 }
             }
-            Change::Unanswered(op) => {
+            Change::Unanswered(op, yes) => {
                 for h in file.held.iter_mut().filter(|h| h.op() == op) {
-                    h.unanswered = true;
+                    h.unanswered = *yes;
                 }
             }
         }
@@ -506,15 +507,16 @@ impl Kept {
         }
     }
 
-    /// A held change was sent and no answer came back: it may have gone ahead.
-    pub fn unanswered(&mut self, op: &str) {
+    /// A held change is handed to its machine, and no answer has come back: it may have gone
+    /// ahead. With false, an answer said it never arrived. Written only when that changes.
+    pub fn unanswered(&mut self, op: &str, yes: bool) {
         let mut changed = false;
         for h in self.held.iter_mut().filter(|h| h.op() == op) {
-            changed |= !h.unanswered;
-            h.unanswered = true;
+            changed |= h.unanswered != yes;
+            h.unanswered = yes;
         }
         if changed {
-            self.write(Change::Unanswered(op.to_string()));
+            self.write(Change::Unanswered(op.to_string(), yes));
         }
     }
 

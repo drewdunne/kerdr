@@ -867,6 +867,9 @@ pub struct App {
     /// and stays in it, marked as this Kerdr's, until then: waiting behind a start, a save or a
     /// write-up, with the runner, or with its backend (Codex's review 60).
     pub(crate) held_sending: std::collections::HashMap<u64, String>,
+    /// Those, by op, handed over for the first time it may reach its machine: an answer that says
+    /// it never arrived marks it as not sent again (Codex's review 65, 2).
+    pub(crate) held_first_go: std::collections::HashSet<String>,
     /// The op of the hold-file record a change being queued again is (release_behind, send_held):
     /// held again for its machine, it waits in the file as itself, never as a second record.
     pub(crate) carrying: Option<String>,
@@ -1027,6 +1030,7 @@ impl App {
             catch_up: Default::default(),
             kept: crate::kept::Kept::in_memory(),
             held_sending: Default::default(),
+            held_first_go: Default::default(),
             carrying: None,
             redirecting: None,
             drops_asked: Default::default(),

@@ -1142,7 +1142,8 @@ fn run_ready(app: &mut App, runner: &Runner) {
     for n in app.resolver.take_dropped() {
         let _ = runner.tx.send(ToRunner::Drop(n));
     }
-    for (n, machine, request, gated) in app.resolver.ready() {
+    // One from the hold file is written as possibly gone ahead first (Codex's review 65, 2).
+    for (n, machine, request, gated) in app.hand_over() {
         let command = app.cfg.actions.command.clone();
         let target = app.machines.get(machine).map(|m| m.machine.clone());
         let (Some(command), Some(target)) = (command, target) else {

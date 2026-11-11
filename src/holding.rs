@@ -739,6 +739,33 @@ impl App {
         Some(request)
     }
 
+    /// The changes ready to go, as the runner is handed them. One from the hold file is written as
+    /// one that may have gone ahead (`unanswered`) before it's handed over, so a Kerdr that ends
+    /// before its answer comes leaves it saying so; an answer that says it never arrived puts back
+    /// what it said before (Codex's review 65, 2).
+    pub(crate) fn hand_over(&mut self) -> Vec<(u64, usize, Value, bool)> {
+        let ready = self.resolver.ready();
+        for (n, ..) in &ready {
+            let Some(op) = self.held_sending.get(n).cloned() else {
+                continue;
+            };
+            if !self.kept.find(&op).is_some_and(|h| h.unanswered) {
+                self.held_first_go.insert(op.clone());
+            }
+            self.kept.unanswered(&op, true);
+        }
+        ready
+    }
+
+    /// A change from the hold file whose answer says it never arrived, or was refused before
+    /// anything was done: if this was the first time it may have reached its machine, it's marked
+    /// as not sent again.
+    fn held_not_arrived(&mut self, op: &str) {
+        if self.held_first_go.remove(op) {
+            self.kept.unanswered(op, false);
+        }
+    }
+
     /// Before a change's answer is taken: one sent from the hold file leaves it once answered;
     /// one a forwarding machine couldn't get through is held for the machine it was for; and one
     /// its backend holds says so on its card. Whether the answer is dealt with here.
@@ -749,21 +776,30 @@ impl App {
             match response {
                 // Its forwarder couldn't get through, or no answer: it waits in the file again,
                 // for any Kerdr to send with the same op (Codex's review 60).
-                Some(r) if r.unreachable.is_some() => self.kept.unclaim(op),
+                Some(r) if r.unreachable.is_some() => {
+                    self.held_not_arrived(op);
+                    self.kept.unclaim(op);
+                }
                 // Refused because its card lives on another machine: it stays in the file while
                 // the answer is taken, which may send it on there (redirected).
-                Some(r) if r.sends_on() => self.redirecting = Some((n, op.clone())),
+                Some(r) if r.sends_on() => {
+                    self.held_not_arrived(op);
+                    self.redirecting = Some((n, op.clone()));
+                }
                 Some(_) => {
+                    self.held_first_go.remove(op);
                     self.kept.release(op);
                 }
                 // No answer back, though it may have reached its machine: if its day runs out its
-                // card says it may have gone ahead, never that it wasn't sent (Codex's review
-                // 64, 4).
+                // card says it may have gone ahead, never that it wasn't sent (Codex's reviews
+                // 64, 4, and 65, 2). Nothing sent, it's as it was.
                 None => {
-                    if let Err(e) = result
-                        && crate::actions::result_unknown(e)
-                    {
-                        self.kept.unanswered(op);
+                    match result {
+                        Err(e) if crate::actions::result_unknown(e) => {
+                            self.held_first_go.remove(op);
+                            self.kept.unanswered(op, true);
+                        }
+                        _ => self.held_not_arrived(op),
                     }
                     self.kept.unclaim(op);
                 }
@@ -3694,43 +3730,77 @@ mod tests {
 
     #[test]
     fn d_pressed_again_whose_answer_is_lost_says_it_may_have_gone_ahead_when_its_day_runs_out() {
-        // Codex's review 64, 4: d pressed again sends the record kept held; its answer is lost. It
-        // may have gone ahead, so the record no longer says why it stayed unsent, and if its day
-        // runs out its card says it may have gone ahead, never that it wasn't sent, though Kerdr
-        // keeps it held again meanwhile for the same backend.
-        let mut app = app();
-        let (dir, _, _, reference, m, op) = kept_unchecked(&mut app);
-        let name = app.machines[m].name();
-        d(&mut app);
-        let ready = app.resolver.ready();
-        assert_eq!(ready.len(), 1, "{}", said(&app));
-        let (n, _, request, _) = ready[0].clone();
-        let file: Value =
-            serde_json::from_str(&std::fs::read_to_string(dir.path().join("held.json")).unwrap())
-                .unwrap();
-        assert!(
-            file["held"][0].get("stays").is_none(),
-            "still says why it stayed unsent: {file}"
-        );
-        app.finish_job(
-            n,
-            request,
-            Err(format!("{name} didn't answer: {}", crate::actions::UNKNOWN)),
-        );
-        assert_eq!(on_file(dir.path()), [(op.clone(), None)]);
-        // Its failure, seen.
-        app.message = None;
-        app.feed_read(m);
-        app.fixed_now =
-            Some(app.now() + chrono::Duration::seconds(crate::kept::HOLD_MOST_SECS + 1));
-        app.feed_read(m);
-        assert!(app.kept.held.is_empty());
-        assert_eq!(
-            said(&app),
-            format!(
-                "{reference}: d dropped after a day: {name} never answered after it was sent, so it may have gone ahead."
+        // Codex's reviews 64, 4, and 65, 2: d pressed again sends the record kept held. Before it's
+        // handed over, the file says it may have gone ahead, and no longer why it stayed unsent.
+        // Its answer is lost, or Kerdr ends before it comes and the next one opens on the same
+        // folder: either way, Kerdr keeps it held again for the same backend, and if its day runs
+        // out its card says it may have gone ahead, never that it wasn't sent. An answer that says
+        // nothing reached its machine puts it back as it was.
+        enum End {
+            Lost,
+            Ended,
+            NotSent,
+        }
+        for end in [End::Lost, End::Ended, End::NotSent] {
+            let mut app = app();
+            let (dir, _, _, reference, m, op) = kept_unchecked(&mut app);
+            let name = app.machines[m].name();
+            d(&mut app);
+            let ready = app.hand_over();
+            assert_eq!(ready.len(), 1, "{}", said(&app));
+            let (n, _, request, _) = ready[0].clone();
+            let file: Value = serde_json::from_str(
+                &std::fs::read_to_string(dir.path().join("held.json")).unwrap(),
             )
-        );
+            .unwrap();
+            assert!(
+                file["held"][0].get("stays").is_none(),
+                "still says why it stayed unsent: {file}"
+            );
+            assert_eq!(
+                file["held"][0]["unanswered"], true,
+                "handed over, not yet written as possibly gone: {file}"
+            );
+            let mut app = match end {
+                End::Lost | End::NotSent => {
+                    let why = match end {
+                        End::Lost => crate::actions::UNKNOWN,
+                        _ => crate::actions::NOT_SENT,
+                    };
+                    app.finish_job(n, request, Err(format!("{name} didn't answer, {why}")));
+                    assert_eq!(on_file(dir.path()), [(op.clone(), None)]);
+                    // Its failure, seen.
+                    app.message = None;
+                    app.feed_read(m);
+                    app
+                }
+                End::Ended => {
+                    let now = app.now();
+                    drop(app);
+                    let mut next = self::app();
+                    next.fixed_now = Some(now);
+                    next.kept = Kept::at(dir.path(), now.timestamp());
+                    let (_, _, _, m) = waiting(&mut next);
+                    back(&mut next, m);
+                    assert!(next.resolver.ready().is_empty(), "sent unchecked");
+                    next
+                }
+            };
+            assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
+            app.fixed_now =
+                Some(app.now() + chrono::Duration::seconds(crate::kept::HOLD_MOST_SECS + 1));
+            app.feed_read(m);
+            assert!(app.kept.held.is_empty());
+            let dropped = match end {
+                End::NotSent => format!(
+                    "{reference}: d dropped after a day: {name}'s backend doesn't check a held change again, so it wasn't sent."
+                ),
+                _ => format!(
+                    "{reference}: d dropped after a day: {name} never answered after it was sent, so it may have gone ahead."
+                ),
+            };
+            assert_eq!(said(&app), dropped);
+        }
     }
 
     fn refused_for(home: &str) -> Result<Response, String> {

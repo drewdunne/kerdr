@@ -681,11 +681,15 @@ backend's after.
   `choice`; n drops it with `account-drop`, as `D` does; Esc leaves it asking. The question keeps the
   machine and the held request it opened for: n drops that request's `op` on that machine, even when
   a read meanwhile gave the question another token, and y sends the token he was shown, which the
-  backend checks. Two machines' questions with the same token are each their own. While his answer is
-  on its way (waiting its turn or its machine, or under way), and once its machine has taken it (`ok`,
-  or a question of its own), its card asks no more until the feed says what came of it. An answer
-  that fails (`ok: false` with no question, or no answer back), or that never went, is forgotten: its
-  card asks again while the feed still carries the question, and s opens it again. An older Kerdr ignores `asks` and shows
+  backend checks. Two machines' questions with the same token are each their own. When the backend
+  answers his yes with another question (`confirmation` with a new `confirm`), Kerdr asks it as the
+  first was, about the same held request: its n drops that request, and its yes or a choice goes as
+  the first's did, with the new token. While his answer is on its way (waiting its turn or its
+  machine, or under way), while the backend asks him more about it, and once its machine has taken it
+  (`ok`), its card asks no more until the feed says what came of it. An answer that fails (`ok:
+  false` with no question, or no answer back), that never went, or whose next question he leaves
+  with Esc, is forgotten: its card asks again while the feed still carries the question, and s opens
+  it again. An older Kerdr ignores `asks` and shows
   `pending`, so `pending` should name the key that asks again ("waits for your answer: it started a
   background job since you asked; s asks again").
 - **A save finishing in the background**: a `create` answered `ok` with `pending` and no `id`
@@ -779,7 +783,11 @@ open. One older than a day isn't sent: the card says "⧗ d dropped: LAB-Server 
 day", or, for one that stayed held though its machine answered, why: "⧗ d dropped after a day:
 build-box's backend doesn't check a held change again, so it wasn't sent". One that was sent and got
 no answer back (`unanswered` in the file) may have gone ahead, so it never says it wasn't sent: "⧗ d
-dropped after a day: build-box never answered after it was sent, so it may have gone ahead".
+dropped after a day: build-box never answered after it was sent, so it may have gone ahead". Kerdr
+writes `unanswered` before it hands the change over, so a Kerdr that ends before the answer comes
+leaves it so for the next. An answer that says nothing reached the machine (the connection never
+carried it, a forwarder couldn't get it through, or a refusal because its card lives elsewhere)
+puts back what it said before, when this was the first time it could have reached it.
 
 Several Kerdrs open at once share the file. Each change to `held.json`, or to `words.json` (below),
 holds `kept.lock` in the state folder while it reads the file, changes it and writes it whole, a new
