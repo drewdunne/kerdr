@@ -1335,6 +1335,33 @@ impl App {
             .map(|(n, _)| *n)
     }
 
+    /// Why a drop answered with `home` wasn't dropped: the machine that answer names holds what it
+    /// drops, and this Kerdr can't reach it (r4-a's round 4). Said in the same shape as a drop that
+    /// can't get through, never as the card's record having moved.
+    pub(crate) fn drop_unreached(
+        &self,
+        key: &str,
+        reference: &str,
+        request: &Value,
+        host: &str,
+    ) -> String {
+        let target = request["held"].as_str().unwrap_or_default();
+        let held = self
+            .card(key)
+            .and_then(|c| c.detail.as_ref())
+            .and_then(|d| d.held.iter().find(|h| h.op == target));
+        let what = match held {
+            Some(h) if matches!(h.action.as_str(), "dispatch" | "reopen") => {
+                "queued start".to_string()
+            }
+            Some(h) if !h.pending.is_empty() => format!("\"{}\"", h.pending),
+            _ => "held request".to_string(),
+        };
+        format!(
+            "{reference}'s {what} is held on {host}, which this Kerdr can't reach, so it wasn't dropped. Once {host} answers, m then D drops it."
+        )
+    }
+
     /// Asks a card's backend to drop a request it holds.
     fn drop_backend(&mut self, card: &Card, op: &str, words: &str) -> super::Action {
         let machine = match card.detail.as_ref() {
@@ -2839,6 +2866,71 @@ mod tests {
             machine, m,
             "its next key went to the machine that held the drop"
         );
+    }
+
+    #[test]
+    fn a_drop_whose_holder_cant_be_reached_says_where_it_is_held_not_that_the_card_moved() {
+        // The team lead, after 971bd0d: a drop answered `home` whose holder this Kerdr can't
+        // reach says what's true, in the shape of a drop that can't get through, never "#41
+        // lives on X now". Nothing is sent on, kept or moved.
+        let check = |holder_on_board: bool, held: Option<&str>, words: &str| {
+            let mut app = self::app();
+            let (key, id, reference, m) = waiting(&mut app);
+            supports(&mut app, m, HOLD);
+            if let Some(action) = held {
+                for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+                    if c.id == id {
+                        c.held = vec![crate::feed::Held {
+                            op: "k-target".into(),
+                            action: action.into(),
+                            pending: "moves to ARK_C at 02:00".into(),
+                            ..Default::default()
+                        }];
+                    }
+                }
+                app.rebuild();
+                select(&mut app, &key);
+            }
+            // Not one of the board's machines, or one that isn't answering and whose feed doesn't
+            // list "hold"; no forwarder either way.
+            let host = if holder_on_board {
+                let other = (0..app.machines.len())
+                    .find(|&i| i != m && app.machines[i].feed.is_some())
+                    .unwrap();
+                away(&mut app, other, 30);
+                app.machines[other].name()
+            } else {
+                "elsewhere".to_string()
+            };
+            app.action_key = Some(key.clone());
+            app.queue_action(m, json!({"action":"drop","id":id,"held":"k-target"}));
+            let (n, _, request, _) = app.resolver.ready()[0].clone();
+            app.finish_job(
+                n,
+                request,
+                Ok(Response {
+                    ok: false,
+                    message: format!("Its start is held on {host}, which decides."),
+                    home: Some(format!("{host}/ARK")),
+                    ..Default::default()
+                }),
+            );
+            assert!(app.resolver.ready().is_empty());
+            assert!(app.resend.is_empty(), "{:?}", app.resend);
+            assert!(app.kept.held.is_empty(), "kept: {:?}", app.kept.held);
+            assert!(app.moved_home.is_empty(), "{:?}", app.moved_home);
+            assert!(!app.failing(), "said as a failure: {}", said(&app));
+            assert_eq!(
+                said(&app),
+                format!(
+                    "{reference}'s {words} is held on {host}, which this Kerdr can't reach, so it wasn't dropped. Once {host} answers, m then D drops it."
+                )
+            );
+        };
+        check(false, Some("dispatch"), "queued start");
+        check(true, Some("reopen"), "queued start");
+        check(false, Some("move"), "\"moves to ARK_C at 02:00\"");
+        check(false, None, "held request");
     }
 
     #[test]

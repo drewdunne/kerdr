@@ -4034,6 +4034,11 @@ impl App {
                     self.resend.push_back((via, request, from, Some(key)));
                     return;
                 }
+                None if !moves => {
+                    let said = self.drop_unreached(&key, &reference, &request, host);
+                    self.say(said, Tone::Warn);
+                    return;
+                }
                 None => {
                     self.fail(
                         format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't change it there.{kept}"),
@@ -4082,6 +4087,11 @@ impl App {
                             let rev = self.card_rev(&key);
                             self.hold_request(name, request, Some(key), rev, None);
                         }
+                        return;
+                    }
+                    if !self.machines[to].conn.is_live() && !moves {
+                        let said = self.drop_unreached(&key, &reference, &request, &name);
+                        self.say(said, Tone::Warn);
                         return;
                     }
                     if !self.machines[to].conn.is_live() {

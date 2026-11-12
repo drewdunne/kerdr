@@ -727,7 +727,12 @@ backend's after.
   machine that doesn't hold what it drops (the one that queued a start on another, say) may answer
   `ok: false` with `home`, naming the machine that holds it: Kerdr sends the same drop there once,
   with its `op` and `held`, as for any `home` refusal, but never takes it as the card's record having
-  moved, so the card's later actions still go to the home its feed shows. A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
+  moved, so the card's later actions still go to the home its feed shows. When this Kerdr can't reach
+  that machine (not one of its machines, with no forwarder, or one that isn't answering), nothing is
+  dropped, and Kerdr says so in the same way: "#41's queued start is held on X, which this Kerdr can't
+  reach, so it wasn't dropped. Once X answers, m then D drops it." It names the held request by its
+  card's `held` entry: "queued start" for a `dispatch` or `reopen`, else its `pending` words, else
+  "held request". A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
   "k-…"}` alone; once it's dropped, its card goes and Kerdr gives your words back, as a failed save
   does. A save still finishing when you quit is kept in `words.json` with its words and its `op`, so
   the next Kerdr shows it again and `D` drops it the same way. One whose words aren't here (sent from
