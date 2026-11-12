@@ -20,6 +20,10 @@ pub const CANCEL_BACKLOG: &str = "cancel-backlog";
 /// intent is behind.
 pub const CANCEL_WORKSPACE: &str = "cancel-workspace";
 
+/// What a backend's feed lists in `supports` when it checks `conversations` on the cancel of a
+/// workspace no intent is behind (r4-a's point 13).
+pub const CANCEL_CONVERSATIONS: &str = "cancel-conversations";
+
 /// The action of Kerdr's own question whether to stop a start Esc came too late for: never sent
 /// to a backend.
 pub(crate) const STOP_START: &str = "kerdr:stop-start";
@@ -198,8 +202,9 @@ impl App {
     }
 
     /// The conversations herdr's agent list shows running in a workspace, sorted, for the cancel of
-    /// a workspace with no intent (r4-a's point 13). Only for a machine whose feed carries
-    /// `workspace.conversations` on its cards, so a backend that doesn't know them never gets them.
+    /// a workspace with no intent (r4-a's point 13). Only for a machine whose feed lists
+    /// "cancel-conversations" in `supports`, or carries `workspace.conversations` on its cards, so
+    /// a backend that doesn't know them never gets them.
     /// More than 64, or one its backend couldn't read, and it's left out: that backend then checks
     /// the workspace by its id alone, as it did before.
     fn workspace_conversations(
@@ -210,11 +215,12 @@ impl App {
     ) -> Option<Vec<String>> {
         let m = self.machines.get(card.machine_index)?;
         let announced = m.feed.as_ref().is_some_and(|f| {
-            f.cards.iter().any(|c| {
-                c.workspace
-                    .as_ref()
-                    .is_some_and(|w| w.conversations.is_some())
-            })
+            f.supports(CANCEL_CONVERSATIONS)
+                || f.cards.iter().any(|c| {
+                    c.workspace
+                        .as_ref()
+                        .is_some_and(|w| w.conversations.is_some())
+                })
         });
         if !announced {
             return None;
@@ -947,8 +953,8 @@ mod tests {
         // r4-a's point 13, as the team lead scoped it: the cancel of a workspace with no intent
         // carries the conversations herdr's agent list showed running there when X was pressed,
         // sorted, so a held or late cancel never closes a workspace remade under the same id with
-        // other agents. Only to a machine whose feed carries `workspace.conversations`: to any
-        // other, the request is as it was.
+        // other agents. Only to a machine whose feed lists "cancel-conversations", or carries
+        // `workspace.conversations` on its cards: to any other, the request is as it was.
         let mut a = demo_app();
         let card = bare(&mut a, true);
         let m = card.machine_index;
@@ -995,7 +1001,17 @@ mod tests {
         press(&mut a, 'X');
         assert_eq!(asked(&a).0, plain, "to a feed that doesn't announce it");
         press_code(&mut a, KeyCode::Esc);
-        // Its feed announces it: a card's workspace carries `conversations`.
+        // Its feed lists "cancel-conversations", though no card's workspace carries the field.
+        supports(&mut a, m, CANCEL_CONVERSATIONS, true);
+        a.rebuild();
+        select(&mut a, &card.key);
+        press(&mut a, 'X');
+        let mut with = plain.clone();
+        with["conversations"] = json!(["c-alpha", "c-zed"]);
+        assert_eq!(asked(&a).0, with, "to a feed that lists the token");
+        press_code(&mut a, KeyCode::Esc);
+        supports(&mut a, m, CANCEL_CONVERSATIONS, false);
+        // Its feed announces it the other way: a card's workspace carries `conversations`.
         let feed = a.machines[m].feed.as_mut().unwrap();
         let announcing = feed
             .cards
@@ -1006,9 +1022,7 @@ mod tests {
         a.rebuild();
         select(&mut a, &card.key);
         press(&mut a, 'X');
-        let mut with = plain.clone();
-        with["conversations"] = json!(["c-alpha", "c-zed"]);
-        assert_eq!(asked(&a).0, with);
+        assert_eq!(asked(&a).0, with, "to a feed whose cards carry the field");
         // herdr's list changes after X: what goes is what it showed then.
         if let Some(Ok(snap)) = a.machines[m]
             .data
