@@ -2784,6 +2784,64 @@ mod tests {
     }
 
     #[test]
+    fn a_drop_answered_home_goes_to_the_machine_that_holds_it_and_its_card_stays_home() {
+        // r4-a's round 4: a drop sent to the machine that queued a start for another answers
+        // `home`, naming the machine that holds the start. The drop goes there once, with the same
+        // op and target, and the card's home doesn't move: its feed still shows where its record
+        // lives, and its next key goes there.
+        let mut app = app();
+        let (key, id, _, m) = waiting(&mut app);
+        let holder = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(&mut app, m, HOLD);
+        supports(&mut app, holder, HOLD);
+        let name = app.machines[holder].name();
+        app.action_key = Some(key.clone());
+        app.queue_action(m, json!({"action":"drop","id":id,"held":"k-target"}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request.clone(),
+            Ok(Response {
+                ok: false,
+                message: format!("Its start is held on {name}, which decides."),
+                home: Some(name.clone()),
+                ..Default::default()
+            }),
+        );
+        let ready = app.resolver.ready();
+        let [(again_n, to, again, _)] = &ready[..] else {
+            panic!("not sent on once: {ready:?}")
+        };
+        assert_eq!(*to, holder);
+        assert_eq!(
+            (&again["op"], &again["held"], &again["id"]),
+            (&request["op"], &json!("k-target"), &json!(id))
+        );
+        app.finish_job(
+            *again_n,
+            again.clone(),
+            Ok(Response {
+                ok: true,
+                message: "Dropped: it won't start.".into(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(said(&app), "Dropped: it won't start.");
+        assert!(app.moved_home.is_empty(), "{:?}", app.moved_home);
+        app.rebuild();
+        select(&mut app, &key);
+        let Action::Mutate { machine, .. } = press(&mut app, 'd') else {
+            panic!("d sent nothing: {}", said(&app))
+        };
+        assert_eq!(
+            machine, m,
+            "its next key went to the machine that held the drop"
+        );
+    }
+
+    #[test]
     fn a_refusal_naming_a_home_kerdr_cant_reach_goes_through_a_forwarder_or_is_held() {
         let refused = |home: &str| {
             Ok(Response {

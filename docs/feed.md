@@ -723,7 +723,11 @@ backend's after.
   `held` names what it drops and a change sent from the file is marked `held: true`: when it can't
   get through (a forwarder answers `unreachable`, or its machine isn't answering), nothing is
   dropped, and Kerdr says so: "#41: "queued in ARK: starts when a place frees" wasn't dropped:
-  build-box can't be reached from here. Once it answers, m then D drops it." A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
+  build-box can't be reached from here. Once it answers, m then D drops it." A drop sent to a
+  machine that doesn't hold what it drops (the one that queued a start on another, say) may answer
+  `ok: false` with `home`, naming the machine that holds it: Kerdr sends the same drop there once,
+  with its `op` and `held`, as for any `home` refusal, but never takes it as the card's record having
+  moved, so the card's later actions still go to the home its feed shows. A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
   "k-…"}` alone; once it's dropped, its card goes and Kerdr gives your words back, as a failed save
   does. A save still finishing when you quit is kept in `words.json` with its words and its `op`, so
   the next Kerdr shows it again and `D` drops it the same way. One whose words aren't here (sent from

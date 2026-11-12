@@ -4006,6 +4006,9 @@ impl App {
             && let Some(home) = response.home.as_deref()
         {
             let (host, session) = home.split_once('/').unwrap_or((home, ""));
+            // A drop's `home` names the machine that holds what it drops, not where its record
+            // lives (r4-a's round 4): the drop goes there, once, and its card's home never moves.
+            let moves = request["action"] != "drop";
             let reference = self.reference_for(&id);
             let asked = self
                 .machines
@@ -4039,7 +4042,9 @@ impl App {
                 }
                 Some(to) if to == machine => {}
                 Some(named) if was_resent => {
-                    self.moved_home.retain(|(k, ..)| *k != key);
+                    if moves {
+                        self.moved_home.retain(|(k, ..)| *k != key);
+                    }
                     // Once more by itself, after both copies are read and agree (K1-53).
                     if self.wait_for_agreement(machine, named, &id, &key, request, from) {
                         return;
@@ -4056,8 +4061,10 @@ impl App {
                         .and_then(|c| c.detail.as_ref())
                         .and_then(|d| d.home.as_ref())
                         .and_then(|h| h.machine.clone());
-                    self.moved_home.retain(|(k, ..)| *k != key);
-                    self.moved_home.push((key.clone(), to, old_home));
+                    if moves {
+                        self.moved_home.retain(|(k, ..)| *k != key);
+                        self.moved_home.push((key.clone(), to, old_home));
+                    }
                     let name = self.machines[to].name();
                     // Its home isn't answering: sent through a machine that forwards, else held
                     // for it, shown on its card (intent 0591, release 4, K1-54).
