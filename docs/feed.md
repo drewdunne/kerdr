@@ -715,7 +715,11 @@ backend's after.
   in `message` what was dropped, or that it had already run or is running, and `"dropped": true` or
   `false`, or `state`: `dropped`, or `running`, `ran`, `ended`, `replaced` or `unknown` when it
   wasn't dropped. An answer with neither counts as dropped. Kerdr sends `drop` only to a backend
-  that lists `"hold"`, from the peek's `D`. A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
+  that lists `"hold"`, from the peek's `D`. A drop is never kept in Kerdr's hold file, since its
+  `held` names what it drops and a change sent from the file is marked `held: true`: when it can't
+  get through (a forwarder answers `unreachable`, or its machine isn't answering), nothing is
+  dropped, and Kerdr says so: "#41: "queued in ARK: starts when a place frees" wasn't dropped:
+  build-box can't be reached from here. Once it answers, m then D drops it." A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
   "k-…"}` alone; once it's dropped, its card goes and Kerdr gives your words back, as a failed save
   does. A save still finishing when you quit is kept in `words.json` with its words and its `op`, so
   the next Kerdr shows it again and `D` drops it the same way. One whose words aren't here (sent from

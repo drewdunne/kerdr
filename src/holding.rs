@@ -321,6 +321,33 @@ impl App {
         rev: Option<String>,
         after: Option<String>,
     ) {
+        // A drop is never kept: sent later from the file it would carry Kerdr's `held: true` in
+        // place of what it drops, and what it drops may run meanwhile anyway. It wasn't dropped,
+        // said plainly, with what to do once that machine answers.
+        if request["action"] == "drop" {
+            let card = key.as_deref().and_then(|k| self.card(k));
+            let reference = card
+                .map(|c| c.reference.clone())
+                .or_else(|| request["id"].as_str().map(|id| self.reference_for(id)))
+                .unwrap_or_else(|| "its card".into());
+            let target = request["held"].as_str().unwrap_or_default();
+            let words = card
+                .and_then(|c| c.detail.as_ref())
+                .and_then(|d| d.held.iter().find(|h| h.op == target))
+                .map(|h| h.pending.clone())
+                .filter(|w| !w.is_empty());
+            let said = match words {
+                Some(words) => format!(
+                    "{reference}: \"{words}\" wasn't dropped: {machine} can't be reached from here. Once it answers, m then D drops it."
+                ),
+                None => format!(
+                    "Nothing held for {reference} was dropped: {machine} can't be reached from here. Once it answers, m then D drops it."
+                ),
+            };
+            self.say(said, Tone::Warn);
+            self.rebuild();
+            return;
+        }
         // A record from the hold file refused because its card lives on this machine, which
         // isn't answering: it waits for it as itself, with its op, never as a second record.
         if let Some((_, op)) = self
@@ -812,7 +839,10 @@ impl App {
             let mut request = job.request.clone();
             if let Some(fields) = request.as_object_mut() {
                 fields.remove("forward_to");
-                fields.remove("held");
+                // Kerdr's own mark alone: a drop's `held` names what it drops.
+                if fields.get("held").is_some_and(Value::is_boolean) {
+                    fields.remove("held");
+                }
             }
             if from_file.is_none() {
                 self.hold_request(to, request, job.key.clone(), job.rev.clone(), None);
@@ -2674,6 +2704,83 @@ mod tests {
         let (_, machine, request, _) = app.resolver.ready()[0].clone();
         assert_eq!(machine, m);
         assert_eq!(request["forward_to"], "elsewhere");
+    }
+
+    #[test]
+    fn a_drop_that_cant_get_through_is_never_kept_and_says_it_wasnt_dropped() {
+        // A drop's `held` names what it drops, and Kerdr's own mark on a change sent from its hold
+        // file is `held: true` too, so a drop kept there would go later naming nothing. It's never
+        // kept: through a forwarder that can't reach the card's machine, or for a machine that
+        // isn't answering, it wasn't dropped, and Kerdr says so and what to do then.
+        let queued = |app: &mut App, id: &str, m: usize| {
+            let held: crate::feed::Held = serde_json::from_value(json!({
+                "op": "k-target",
+                "action": "dispatch",
+                "pending": "queued in ARK: starts when a place frees",
+            }))
+            .unwrap();
+            for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+                if c.id == id {
+                    c.held = vec![held.clone()];
+                }
+            }
+            app.rebuild();
+        };
+        // Through a forwarder that answers `unreachable`.
+        let mut app = app();
+        let (key, id, reference, m) = waiting(&mut app);
+        home(&mut app, &id, m, "elsewhere");
+        supports(&mut app, m, FORWARD);
+        supports(&mut app, m, HOLD);
+        queued(&mut app, &id, m);
+        let card = app.card(&key).unwrap().clone();
+        let Action::Mutate { machine, request } = app.drop_backend(
+            &card,
+            "k-target",
+            "queued in ARK: starts when a place frees",
+        ) else {
+            panic!("no drop: {}", said(&app))
+        };
+        app.queue_action(machine, request);
+        let (n, _, sent, _) = app.resolver.ready()[0].clone();
+        assert_eq!(
+            (sent["held"].clone(), sent["forward_to"].clone()),
+            (json!("k-target"), json!("elsewhere"))
+        );
+        app.finish_job(
+            n,
+            sent,
+            Ok(Response {
+                ok: false,
+                message: "elsewhere can't be reached from here".into(),
+                unreachable: Some("elsewhere".into()),
+                ..Default::default()
+            }),
+        );
+        assert!(app.kept.held.is_empty(), "kept: {:?}", app.kept.held);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference}: \"queued in ARK: starts when a place frees\" wasn't dropped: elsewhere can't be reached from here. Once it answers, m then D drops it."
+            )
+        );
+        // For its own machine, which isn't answering.
+        let mut app = self::app();
+        let (key, id, reference, m) = waiting(&mut app);
+        let name = app.machines[m].name();
+        supports(&mut app, m, HOLD);
+        away(&mut app, m, 30);
+        app.action_key = Some(key);
+        app.queue_action(m, json!({"action":"drop","id":id,"held":"k-other"}));
+        assert!(app.kept.held.is_empty(), "kept: {:?}", app.kept.held);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(
+            said(&app),
+            format!(
+                "Nothing held for {reference} was dropped: {name} can't be reached from here. Once it answers, m then D drops it."
+            )
+        );
     }
 
     #[test]
