@@ -560,6 +560,11 @@ pub struct FeedWorkspace {
     /// never on a tab work inside the card runs in. `tab` keeps meaning work confined to one tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own_tab: Option<String>,
+    /// The conversations herdr shows running there, sorted (r4-a's point 13). Kerdr reads only
+    /// whether a feed carries it: a machine whose feed does takes `conversations` on the cancel of
+    /// a workspace with no intent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversations: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]

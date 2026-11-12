@@ -2548,6 +2548,7 @@ mod tests {
         child.attention = Some("needs_you".into());
         child.workspace = Some(FeedWorkspace {
             own_tab: None,
+            conversations: None,
             session: Some("default".into()),
             id: Some("w4".into()),
             label: None,
@@ -2707,6 +2708,7 @@ mod tests {
     fn a_card_in_a_tab_reads_that_tabs_agents_and_the_workspaces_card_the_rest() {
         let in_w1 = |tab: Option<&str>| FeedWorkspace {
             own_tab: None,
+            conversations: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
@@ -2831,6 +2833,7 @@ mod tests {
         let mut child = feed_card("0246", "test", "active");
         child.workspace = Some(FeedWorkspace {
             own_tab: None,
+            conversations: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
@@ -2891,6 +2894,7 @@ mod tests {
         let mut child = feed_card("0246", "build", "active");
         child.workspace = Some(FeedWorkspace {
             own_tab: None,
+            conversations: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,
@@ -2934,6 +2938,7 @@ mod tests {
         near.status = Some("from the laptop".into());
         near.workspace = Some(FeedWorkspace {
             own_tab: None,
+            conversations: None,
             session: Some("default".into()),
             id: Some("w1".into()),
             label: None,

@@ -3978,6 +3978,7 @@ pub(crate) mod tests {
             stage: Some("test".into()),
             workspace: Some(crate::feed::FeedWorkspace {
                 own_tab: None,
+                conversations: None,
                 session: Some(session),
                 id: misc.workspace_id.clone(),
                 label: None,

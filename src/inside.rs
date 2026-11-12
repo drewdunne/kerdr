@@ -1054,6 +1054,7 @@ mod tests {
             label: Some(label.into()),
             tab: tab.map(Into::into),
             own_tab: own.map(Into::into),
+            conversations: None,
         })
     }
 

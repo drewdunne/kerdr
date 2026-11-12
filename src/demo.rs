@@ -56,6 +56,7 @@ fn card(c: C) -> FeedCard {
             label: Some(label.into()),
             tab: None,
             own_tab: None,
+            conversations: None,
         }),
         ..Default::default()
     }

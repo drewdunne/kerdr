@@ -83,7 +83,7 @@ know rather than guessing.
 | `priority` | `high` cards go first, with a ▲. |
 | `lane` | `background` adds a `bg` tag. |
 | `home` | The machine and session the work belongs to. A record with no home can still name the machine alone, with no `session`, where its work is (the one holding its agent's conversation, say): that copy wins over copies that name none, and `Enter` sends its reopen there. When copies name different machines, one that gives `resume` wins over one that doesn't. |
-| `workspace` | The herdr workspace it runs in, on the machine the feed ran on. Without it, Kerdr looks in `home` for one workspace whose label starts with the id's last two digits and a dash (`41-...`). Add `"tab": "w1:t2"` when the work runs in one tab of a workspace other work shares, such as a helper in a tab of the workspace that started it: `Enter` lands on that tab (on the workspace alone once the tab has closed), the card shows only that tab's agents, and the card the workspace belongs to leaves that tab's agents out. |
+| `workspace` | The herdr workspace it runs in, on the machine the feed ran on. Without it, Kerdr looks in `home` for one workspace whose label starts with the id's last two digits and a dash (`41-...`). Add `"tab": "w1:t2"` when the work runs in one tab of a workspace other work shares, such as a helper in a tab of the workspace that started it: `Enter` lands on that tab (on the workspace alone once the tab has closed), the card shows only that tab's agents, and the card the workspace belongs to leaves that tab's agents out. A backend may add `"conversations": ["<id>", …]`, the conversations herdr shows running there; Kerdr reads only that a feed carries it, which says the backend checks `conversations` on the cancel of a workspace with no intent (see [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace)). |
 | `attention` | Your records' view: `needs_you`, `waiting`, `running`, `blocked`, `idle` or `done`. Kerdr combines it with herdr's agent state: an agent asking something always needs you, and an agent that stopped while the record says it's running needs you too, since nothing says what it's waiting on. A card's own agent back at work after the feed was made no longer needs you, even while the record still says `needs_you`: Kerdr saw it stopped in a read after the feed was made, and now it's working, so you've answered it, and the card turns at the next herdr read rather than the next feed. One working all along (a workflow or a background job still running in its pane after its turn ended on a question) still needs you until the record says otherwise; coming back from herdr, Kerdr reads that machine's feed at once, so an answer there shows within a read. Kerdr times the feed by `generated_at`, else by when it read it. An agent in a pane with herdr's `role=helper` token, a reviewer's, isn't the card's own unless the card names that tab. |
 | `status`, `needs`, `message`, `blockers` | Shown on the card and in its peek: what it's doing, what it needs from you, its last update, what's in its way. |
 | `waits_on` | Work it can't start before; shown in the backlog and the peek. |
@@ -646,7 +646,17 @@ the same key there then does what that backend takes.
   with no `id` to the machine the workspace runs on. Stop everything running there and close it; refuse
   in plain words one an intent's work is in. Kerdr says your `message`. A question you ask goes as any
   other, with its `confirm` token, and its yes with `override`. When the workspace closed, or an intent
-  took it, while you decided, Kerdr says so and sends nothing.
+  took it, while you decided, Kerdr says so and sends nothing. To a machine whose feed carries
+  `workspace.conversations` on its cards (below), the cancel also carries `"conversations":
+  ["<id>", …]`: the conversations herdr's agent list showed running in that workspace when `X` was
+  pressed (its panes' `agent_session` values), sorted, without repeats, `[]` for none. Its yes, a
+  resend, and the yes to a question you ask carry the same list, never a fresh one. Just before
+  stopping, compare the workspace and those conversations with herdr then, and ask again if they
+  changed, so a held or late cancel never closes a workspace remade under the same id with other
+  agents in it. Kerdr leaves the list out when there would be more than 64, or one with a control
+  character: check the workspace by its id alone then, as for a request with none. A machine whose
+  feed doesn't carry `workspace.conversations` never gets the field. `X` on a card with an intent
+  sends `{"action":"cancel","id":"0041"}` as before, with no `conversations`.
 
 ## Holding and sending on a request
 

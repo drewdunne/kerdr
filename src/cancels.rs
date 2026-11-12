@@ -174,9 +174,16 @@ impl App {
             .clone()
             .unwrap_or_else(|| workspace.clone());
         let what = self.stops_what(card, machine);
+        let mut request = json!({"action":"cancel","session":session,"workspace":workspace});
+        // What runs there now, so a held or late cancel never closes a workspace remade under the
+        // same id with other agents in it (r4-a's point 13). Its yes, and any resend, carry it as
+        // it is now.
+        if let Some(conversations) = self.workspace_conversations(card, &session, &workspace) {
+            request["conversations"] = json!(conversations);
+        }
         self.mode = Mode::Confirm {
             machine,
-            request: json!({"action":"cancel","session":session,"workspace":workspace}),
+            request,
             title: format!("Stop {what} and close workspace {name} ({session})?"),
             message: "Everything running in it stops, and it closes with every tab in it. No intent is behind it, so no record changes. Anything it hadn't committed stays as it left it.".to_string(),
             back: Box::new(self.mode.clone()),
@@ -188,6 +195,51 @@ impl App {
             enter_queues: false,
         };
         Action::None
+    }
+
+    /// The conversations herdr's agent list shows running in a workspace, sorted, for the cancel of
+    /// a workspace with no intent (r4-a's point 13). Only for a machine whose feed carries
+    /// `workspace.conversations` on its cards, so a backend that doesn't know them never gets them.
+    /// More than 64, or one its backend couldn't read, and it's left out: that backend then checks
+    /// the workspace by its id alone, as it did before.
+    fn workspace_conversations(
+        &self,
+        card: &Card,
+        session: &str,
+        workspace: &str,
+    ) -> Option<Vec<String>> {
+        let m = self.machines.get(card.machine_index)?;
+        let announced = m.feed.as_ref().is_some_and(|f| {
+            f.cards.iter().any(|c| {
+                c.workspace
+                    .as_ref()
+                    .is_some_and(|w| w.conversations.is_some())
+            })
+        });
+        if !announced {
+            return None;
+        }
+        let snapshot = m.data.as_ref().and_then(|d| {
+            d.snapshots
+                .get(session)
+                .and_then(|s| s.as_ref().ok())
+                .or_else(|| d.kept_snapshots.get(session))
+        });
+        let mut ids: Vec<String> = match snapshot {
+            Some(s) => s
+                .agents_in(workspace)
+                .filter_map(|a| a.agent_session.as_ref()?.value.clone())
+                .collect(),
+            None => card
+                .agents
+                .iter()
+                .filter_map(|a| a.conversation.clone())
+                .collect(),
+        };
+        ids.retain(|c| !c.is_empty());
+        ids.sort();
+        ids.dedup();
+        (ids.len() <= 64 && ids.iter().all(|c| !c.chars().any(char::is_control))).then_some(ids)
     }
 
     /// The workspace a bare cancel's yes was for, as the board shows it now: still there, on the
@@ -888,6 +940,106 @@ mod tests {
             format!("Stopped its Claude Code agent in workspace {name} and closed it.")
         );
         assert!(!a.failing());
+    }
+
+    #[test]
+    fn x_on_a_workspace_with_no_intent_sends_what_runs_there_only_to_a_feed_that_announces_it() {
+        // r4-a's point 13, as the team lead scoped it: the cancel of a workspace with no intent
+        // carries the conversations herdr's agent list showed running there when X was pressed,
+        // sorted, so a held or late cancel never closes a workspace remade under the same id with
+        // other agents. Only to a machine whose feed carries `workspace.conversations`: to any
+        // other, the request is as it was.
+        let mut a = demo_app();
+        let card = bare(&mut a, true);
+        let m = card.machine_index;
+        let (session, workspace) = (
+            card.session.clone().unwrap(),
+            card.workspace_id.clone().unwrap(),
+        );
+        // herdr shows two conversations there, one twice, and a pane whose conversation it
+        // doesn't know.
+        let snap = match a.machines[m]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut(&session)
+            .unwrap()
+        {
+            Ok(snap) => snap,
+            Err(e) => panic!("{e}"),
+        };
+        let here = snap
+            .agents
+            .iter()
+            .find(|g| g.workspace_id == workspace)
+            .expect("an agent in that workspace")
+            .clone();
+        snap.agents.retain(|g| g.workspace_id != workspace);
+        for (pane, conversation) in [
+            ("p-1", Some("c-zed")),
+            ("p-2", Some("c-alpha")),
+            ("p-3", Some("c-zed")),
+            ("p-4", None),
+        ] {
+            let mut agent = here.clone();
+            agent.pane_id = pane.into();
+            agent.agent_session = conversation.map(|c| crate::herdr::AgentSession {
+                value: Some(c.into()),
+            });
+            snap.agents.push(agent);
+        }
+        a.rebuild();
+        select(&mut a, &card.key);
+        let plain = json!({"action":"cancel","session":session,"workspace":workspace});
+        press(&mut a, 'X');
+        assert_eq!(asked(&a).0, plain, "to a feed that doesn't announce it");
+        press_code(&mut a, KeyCode::Esc);
+        // Its feed announces it: a card's workspace carries `conversations`.
+        let feed = a.machines[m].feed.as_mut().unwrap();
+        let announcing = feed
+            .cards
+            .iter_mut()
+            .find(|c| c.workspace.is_some())
+            .expect("a feed card with a workspace");
+        announcing.workspace.as_mut().unwrap().conversations = Some(vec![]);
+        a.rebuild();
+        select(&mut a, &card.key);
+        press(&mut a, 'X');
+        let mut with = plain.clone();
+        with["conversations"] = json!(["c-alpha", "c-zed"]);
+        assert_eq!(asked(&a).0, with);
+        // herdr's list changes after X: what goes is what it showed then.
+        if let Some(Ok(snap)) = a.machines[m]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut(&session)
+        {
+            snap.agents.retain(|g| g.workspace_id != workspace);
+        }
+        let Action::Mutate { machine, request } = press(&mut a, 'y') else {
+            panic!("nothing sent: {:?}", a.message())
+        };
+        a.queue_action(machine, request.clone());
+        let [(n, _, out)] = &sent(&mut a)[..] else {
+            panic!("one change")
+        };
+        assert_eq!(out, &with);
+        // Its backend asks again, what runs there having changed: the yes sends the same list.
+        a.finish_job(
+            *n,
+            request,
+            reply(
+                "What runs in workspace w9 changed since you pressed X: another conversation is there now. Stop it and close it?",
+                json!({"ok":false,"confirmation":true,"confirm":"t-1"}),
+            ),
+        );
+        let (again, _) = asked(&a);
+        let mut confirmed = with.clone();
+        confirmed["confirm"] = json!("t-1");
+        assert_eq!(crate::actions::without_op(&again), confirmed);
     }
 
     #[test]
