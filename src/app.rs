@@ -11820,6 +11820,168 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn x_upper_asked_by_kerdr_names_what_its_feed_showed_running_there() {
+        // The team lead's widening of r4-a's point 13: every cancel Kerdr sends that names a
+        // workspace carries the conversations the card's feed showed running there when X was
+        // pressed, to a machine whose feed announces them ("cancel-conversations" in `supports`,
+        // or `workspace.conversations` on its cards), so a yes sent after the workspace was remade
+        // under the same id, before the board caught up, never stops the new one. X sent
+        // unanswered to a "steps" backend stays as it was: its backend's question binds its yes.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        // An older-style backend: Kerdr asks first about work an agent is at.
+        let (key, id) = running_card(&mut app);
+        let shows = |app: &mut App, place: (&str, Option<&str>), conversations: Option<&[&str]>| {
+            let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+            card.detail.as_mut().unwrap().workspace = Some(crate::feed::FeedWorkspace {
+                session: Some("web".into()),
+                id: Some(place.0.into()),
+                label: Some("07-build".into()),
+                tab: place.1.map(Into::into),
+                own_tab: None,
+                conversations: conversations.map(|c| c.iter().map(|s| s.to_string()).collect()),
+            });
+        };
+        let token = |app: &mut App, on: bool| {
+            let feed = app.machines[0].feed.as_mut().unwrap();
+            feed.supports.retain(|s| s != "cancel-conversations");
+            if on {
+                feed.supports.push("cancel-conversations".into());
+            }
+        };
+        let asked = |app: &mut App| -> serde_json::Value {
+            app.mode = Mode::Board;
+            app.busy = false;
+            app.message = None;
+            assert_eq!(press(app, 'X'), Action::None);
+            let Mode::Confirm { request, .. } = &app.mode else {
+                panic!("X asked nothing: {:?}", app.message())
+            };
+            request.clone()
+        };
+        let plain =
+            serde_json::json!({"action": "cancel", "id": id, "session": "web", "workspace": "w7"});
+        let mut with = plain.clone();
+        with["conversations"] = serde_json::json!(["c-alpha", "c-zed"]);
+        // Its card's feed shows two conversations there, one twice; a machine whose feed doesn't
+        // announce them never gets them.
+        shows(
+            &mut app,
+            ("w7", None),
+            Some(&["c-zed", "c-alpha", "c-zed", ""]),
+        );
+        token(&mut app, false);
+        assert_eq!(asked(&mut app), plain, "to a feed that doesn't announce it");
+        // Its feed lists the token.
+        token(&mut app, true);
+        assert_eq!(asked(&mut app), with, "to a feed that lists the token");
+        // Or its feed's cards carry the field, though not the token.
+        token(&mut app, false);
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+            .find(|c| c.workspace.is_some())
+            .expect("a feed card with a workspace")
+            .workspace
+            .as_mut()
+            .unwrap()
+            .conversations = Some(vec![]);
+        assert_eq!(
+            asked(&mut app),
+            with,
+            "to a feed whose cards carry the field"
+        );
+        // Its feed's list changes between X and the yes, as when the board catches up with a
+        // workspace remade under the same id: the yes sends what it showed when X was pressed.
+        shows(&mut app, ("w7", None), Some(&["c-new"]));
+        let mut new = plain.clone();
+        new["conversations"] = serde_json::json!(["c-new"]);
+        assert_eq!(asked(&mut app), new);
+        shows(&mut app, ("w7", None), Some(&["c-zed", "c-alpha"]));
+        settle(&mut app);
+        let Action::Mutate { machine, request } = enter(&mut app) else {
+            panic!("the yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request, new, "the yes sent a fresh list");
+        // Its backend asks again: the yes to that carries the same list, with its token.
+        reply_to(
+            &mut app,
+            machine,
+            request,
+            Ok(crate::actions::Response {
+                ok: false,
+                message: "What runs in workspace 07-build changed since you pressed X. Stop it?"
+                    .into(),
+                confirmation: true,
+                confirm: Some("t-1".into()),
+                ..Default::default()
+            }),
+        );
+        let Mode::Confirm { request, .. } = &app.mode else {
+            panic!("the question wasn't asked: {:?}", app.message())
+        };
+        let mut confirmed = new.clone();
+        confirmed["confirm"] = serde_json::json!("t-1");
+        assert_eq!(request, &confirmed);
+        // A feed workspace that isn't the place X names says nothing about it: another
+        // workspace, or the whole workspace when X closes one tab of it.
+        shows(&mut app, ("w9", None), Some(&["c-alpha"]));
+        assert_eq!(asked(&mut app), plain, "another workspace's list");
+        app.board
+            .cards
+            .iter_mut()
+            .find(|c| c.key == key)
+            .unwrap()
+            .tab_id = Some("w7:t2".into());
+        let mut tab = plain.clone();
+        tab["tab"] = serde_json::json!("w7:t2");
+        shows(&mut app, ("w7", None), Some(&["c-alpha"]));
+        assert_eq!(asked(&mut app), tab, "the workspace's list for its tab");
+        shows(&mut app, ("w7", Some("w7:t2")), Some(&["c-alpha"]));
+        tab["conversations"] = serde_json::json!(["c-alpha"]);
+        assert_eq!(asked(&mut app), tab, "its tab's list");
+        app.board
+            .cards
+            .iter_mut()
+            .find(|c| c.key == key)
+            .unwrap()
+            .tab_id = None;
+        // A feed card with no list for it, or one its backend couldn't read: left out.
+        shows(&mut app, ("w7", None), None);
+        assert_eq!(asked(&mut app), plain, "no list");
+        shows(&mut app, ("w7", None), Some(&["c-alpha", "c\u{7}bell"]));
+        assert_eq!(asked(&mut app), plain, "a control character");
+        // None running there is said as none.
+        shows(&mut app, ("w7", None), Some(&[]));
+        let mut none = plain.clone();
+        none["conversations"] = serde_json::json!([]);
+        assert_eq!(asked(&mut app), none, "none running");
+        // A backend that does the step first: X on done work with a workspace open is still
+        // Kerdr's question, and names them; X on work an agent is at goes unanswered, as it was.
+        steps_everywhere(&mut app);
+        token(&mut app, true);
+        shows(&mut app, ("w7", None), Some(&["c-zed", "c-alpha"]));
+        app.mode = Mode::Board;
+        app.busy = false;
+        let Action::Mutate { request, .. } = press(&mut app, 'X') else {
+            panic!("X on work an agent is at sent nothing: {:?}", app.message())
+        };
+        assert_eq!(request, serde_json::json!({"action": "cancel", "id": id}));
+        let card = app.board.cards.iter_mut().find(|c| c.key == key).unwrap();
+        card.stage = Stage::Maintain;
+        card.attention = Attention::Done;
+        app.sel = Selection {
+            col: Stage::Maintain.index(),
+            key: Some(key.clone()),
+        };
+        let asked_done = asked(&mut app);
+        assert_eq!(asked_done, with, "X on done work");
+    }
+
+    #[test]
     fn x_upper_on_done_work_asks_the_backend_where_its_workspace_runs_about_steps() {
         // Codex's review: X's request goes to the machine its workspace runs on, so that
         // machine's backend, not its home's, decides whether it does the step.

@@ -1643,6 +1643,14 @@ impl App {
         if let Some(tab) = &card.tab_id {
             request["tab"] = json!(tab);
         }
+        // What its feed showed running there when X was pressed, so its yes, held or late, never
+        // stops a workspace remade under the same id before the board caught up (r4-a's point 13).
+        // Its yes, and any resend, carry this list, never a fresh one.
+        if let Some(conversations) =
+            self.card_conversations(&card, machine, &session, &workspace, card.tab_id.as_deref())
+        {
+            request["conversations"] = json!(conversations);
+        }
         let place = card
             .workspace_label
             .clone()

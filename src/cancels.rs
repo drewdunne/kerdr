@@ -20,8 +20,8 @@ pub const CANCEL_BACKLOG: &str = "cancel-backlog";
 /// intent is behind.
 pub const CANCEL_WORKSPACE: &str = "cancel-workspace";
 
-/// What a backend's feed lists in `supports` when it checks `conversations` on the cancel of a
-/// workspace no intent is behind (r4-a's point 13).
+/// What a backend's feed lists in `supports` when it checks `conversations` on a cancel that names
+/// a workspace (r4-a's point 13).
 pub const CANCEL_CONVERSATIONS: &str = "cancel-conversations";
 
 /// The action of Kerdr's own question whether to stop a start Esc came too late for: never sent
@@ -34,6 +34,16 @@ pub(crate) const NO_INTENT: &str = "This workspace has no intent, so X has no wo
 /// Whether a request is X's on a workspace with no intent.
 pub(crate) fn is_bare_cancel(request: &Value) -> bool {
     request["action"] == "cancel" && request.get("id").is_none()
+}
+
+/// Conversation ids as a cancel names them: each non-empty one once, sorted. More than 64, or one
+/// with a control character its backend couldn't read, and None: the list is left out, and that
+/// backend checks the place by its id alone, as it did before.
+fn named_conversations(mut ids: Vec<String>) -> Option<Vec<String>> {
+    ids.retain(|c| !c.is_empty());
+    ids.sort();
+    ids.dedup();
+    (ids.len() <= 64 && ids.iter().all(|c| !c.chars().any(char::is_control))).then_some(ids)
 }
 
 /// Whether a request is Esc's stop of a start, back to the backlog.
@@ -201,37 +211,65 @@ impl App {
         Action::None
     }
 
+    /// Whether a machine's backend checks `conversations` on a cancel that names a workspace (r4-a's
+    /// point 13): its feed lists "cancel-conversations" in `supports`, or carries
+    /// `workspace.conversations` on its cards. A backend that doesn't know them never gets them.
+    fn conversations_announced(&self, machine: usize) -> bool {
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .is_some_and(|f| {
+                f.supports(CANCEL_CONVERSATIONS)
+                    || f.cards.iter().any(|c| {
+                        c.workspace
+                            .as_ref()
+                            .is_some_and(|w| w.conversations.is_some())
+                    })
+            })
+    }
+
+    /// The conversations a card's feed showed running where its cancel stops (r4-a's point 13): its
+    /// `workspace.conversations` as the board had it when the key was pressed, only when that
+    /// workspace is the place the cancel names (its session, id and tab), and only to a machine
+    /// whose feed announces them. None otherwise: its backend then checks the place by its id alone,
+    /// as it did before.
+    pub(super) fn card_conversations(
+        &self,
+        card: &Card,
+        machine: usize,
+        session: &str,
+        workspace: &str,
+        tab: Option<&str>,
+    ) -> Option<Vec<String>> {
+        if !self.conversations_announced(machine) {
+            return None;
+        }
+        let w = card.detail.as_ref()?.workspace.as_ref()?;
+        let same = w.session.as_deref() == Some(session)
+            && w.id.as_deref() == Some(workspace)
+            && w.tab.as_deref() == tab;
+        named_conversations(w.conversations.clone().filter(|_| same)?)
+    }
+
     /// The conversations herdr's agent list shows running in a workspace, sorted, for the cancel of
-    /// a workspace with no intent (r4-a's point 13). Only for a machine whose feed lists
-    /// "cancel-conversations" in `supports`, or carries `workspace.conversations` on its cards, so
-    /// a backend that doesn't know them never gets them.
-    /// More than 64, or one its backend couldn't read, and it's left out: that backend then checks
-    /// the workspace by its id alone, as it did before.
+    /// a workspace with no intent (r4-a's point 13), to a machine whose feed announces them.
     fn workspace_conversations(
         &self,
         card: &Card,
         session: &str,
         workspace: &str,
     ) -> Option<Vec<String>> {
-        let m = self.machines.get(card.machine_index)?;
-        let announced = m.feed.as_ref().is_some_and(|f| {
-            f.supports(CANCEL_CONVERSATIONS)
-                || f.cards.iter().any(|c| {
-                    c.workspace
-                        .as_ref()
-                        .is_some_and(|w| w.conversations.is_some())
-                })
-        });
-        if !announced {
+        if !self.conversations_announced(card.machine_index) {
             return None;
         }
+        let m = self.machines.get(card.machine_index)?;
         let snapshot = m.data.as_ref().and_then(|d| {
             d.snapshots
                 .get(session)
                 .and_then(|s| s.as_ref().ok())
                 .or_else(|| d.kept_snapshots.get(session))
         });
-        let mut ids: Vec<String> = match snapshot {
+        let ids: Vec<String> = match snapshot {
             Some(s) => s
                 .agents_in(workspace)
                 .filter_map(|a| a.agent_session.as_ref()?.value.clone())
@@ -242,10 +280,7 @@ impl App {
                 .filter_map(|a| a.conversation.clone())
                 .collect(),
         };
-        ids.retain(|c| !c.is_empty());
-        ids.sort();
-        ids.dedup();
-        (ids.len() <= 64 && ids.iter().all(|c| !c.chars().any(char::is_control))).then_some(ids)
+        named_conversations(ids)
     }
 
     /// The workspace a bare cancel's yes was for, as the board shows it now: still there, on the
