@@ -3353,7 +3353,21 @@ impl App {
         self.answer_by_enter = by_enter;
         self.answer_job = Some(n);
         self.answer_key = job_key;
+        // Sent again after a part-done followed end: what stood then is said again if this
+        // didn't happen either (intent 0591).
+        let stood = refused
+            .as_ref()
+            .and_then(|j| j.again.as_ref())
+            .and_then(|a| a.partial.clone())
+            .filter(|_| match &result {
+                Ok(r) => !r.confirmation && r.questions.is_empty() && !redirected,
+                Err(_) => true,
+            });
+        let since = Instant::now();
         self.finish_action(machine, request, result);
+        if let Some(stood) = stood {
+            self.say_what_stood(&stood, since);
+        }
         self.answer_job = None;
         self.answer_key = None;
         self.answer_by_enter = false;
@@ -3893,6 +3907,33 @@ impl App {
         ))
     }
 
+    /// A part-done answer's line: its words, the card named in front when they don't name it.
+    pub(super) fn partly_line(&self, request: &Value, message: &str) -> String {
+        match request["id"].as_str() {
+            Some(id) if !names(message, &self.reference_for(id)) => {
+                format!("{}: {message}", self.reference_for(id))
+            }
+            _ => message.to_string(),
+        }
+    }
+
+    /// What stood before a change was sent again by itself (Again::partial), said again with its
+    /// last answer when that didn't happen either, so it's never lost (intent 0591): just above
+    /// the line that answer put up since `since`, or after whatever is up when that line waits.
+    pub(super) fn say_what_stood(&mut self, stood: &str, since: Instant) {
+        match &self.message {
+            Some((text, _, _)) if text.contains(stood) => {}
+            Some((text, tone, at)) if *at >= since => {
+                let text = match text.rsplit_once('\n') {
+                    Some((older, newest)) => format!("{older}\n{stood}\n{newest}"),
+                    None => format!("{stood}\n{text}"),
+                };
+                self.message = Some((text, *tone, Instant::now()));
+            }
+            _ => self.show(stood.to_string(), Tone::Warn),
+        }
+    }
+
     /// How the board names a request's card, "#41"; empty for one with no record.
     fn reference_of(&self, request: &Value) -> String {
         request["id"]
@@ -4422,12 +4463,7 @@ impl App {
                     // Part of it happened, and the backend's words say which: not a change that
                     // didn't happen, so no "didn't" (intent 0591). The feed is read at once.
                     let kept = self.kickoff_kept_note(&request, held.as_deref());
-                    let text = match request["id"].as_str() {
-                        Some(id) if !names(&message, &self.reference_for(id)) => {
-                            format!("{}: {message}{kept}", self.reference_for(id))
-                        }
-                        _ => format!("{message}{kept}"),
-                    };
+                    let text = format!("{}{kept}", self.partly_line(&request, &message));
                     self.say(short(text), Tone::Warn);
                 } else if !response.ok {
                     // The card is back as it really is; say what didn't happen, and why, naming

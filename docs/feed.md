@@ -440,6 +440,11 @@ Kerdr shows `say`, and asks the same machine, over the same connection, how it s
   shown as it is. The wait, and anything sent again after it, fit in two minutes from that end, as
   in [Asking again](#asking-again-op-and-retry): a wait that doesn't, or one the computer slept
   through, sends nothing and shows the `message`. Later changes to the same card wait behind it.
+  A part-done end with `retry` (`partial: true`, when the only step that stood was starting its
+  herdr session) goes again the same way. Its `message` is said at once, in yellow, as any part-done
+  answer is, so what stood is never lost. If the next answer doesn't start it either, its line says
+  that `message` again just above why: "Started herdr session web, but then: #41 didn't start yet
+  (…)", then "#41 didn't start yet (…)".
   For that resend to do the step again, the backend's record of its `op` must no longer give back
   the follow: when followed work ends with `retry`, mark its `op` safe to send again, as a direct
   `retry` answer is.
@@ -567,7 +572,8 @@ every step that changes something, in the order it says, in one request with one
 `message` says each step: "Brought #41 back from won't do and started it." When a later step fails
 after an earlier one stood, answer `ok: false` with `partial: true`, saying which step stood ("#41 is
 back in the backlog, but it didn't start: …"), never a plain failure, and never `retry` once anything
-has changed.
+has changed, except at the end of a followed start where only its herdr session's start stood (see
+[Following work](#following-work-that-goes-on-after-its-answer)).
 
 A step done first never overrides a choice of yours: an account picked, a no, or a card set aside.
 The one exception is a key that means starting or finishing that same card: `d`, `Enter`, `C` and

@@ -344,6 +344,12 @@ impl App {
             return;
         }
         let f = self.follows.remove(i);
+        // Sent again after a part-done end: what stood then is said again if this didn't happen.
+        let stood = self
+            .resolver
+            .what_stood(f.job)
+            .filter(|_| !done && !response.confirmation && response.questions.is_empty());
+        let since = Instant::now();
         if self.resolver.end_follow(f.job, done) {
             self.rebuild();
         }
@@ -381,6 +387,9 @@ impl App {
         self.answer_job = Some(f.job);
         self.answer_key = f.key.clone();
         self.finish_action(f.machine, f.request.clone(), Ok(response));
+        if let Some(stood) = stood {
+            self.say_what_stood(&stood, since);
+        }
         self.answer_job = None;
         self.answer_key = None;
         self.answer_by_enter = false;
@@ -394,7 +403,10 @@ impl App {
     /// same op, after that wait, as a refusal answered at once is (intent 0591): only to a backend
     /// that keeps ops, and only when the wait leaves room for its answer within RETRY_MOST. Its card
     /// says it's trying again meanwhile, nothing is said in red, and its next answer is taken as
-    /// its answer, a follow's end too; a second `retry` is said as it is. Whether it's sent again.
+    /// its answer, a follow's end too; a second `retry` is said as it is. A part-done end (only
+    /// its session's start stood, say) goes again too: what stood is said now, in yellow, as any
+    /// part-done answer is, and again with the next answer if that doesn't happen either, so it's
+    /// never lost. Whether it's sent again.
     fn follow_again(&mut self, i: usize, response: &Response) -> bool {
         let Some(f) = self.follows.get(i) else {
             return false;
@@ -412,15 +424,26 @@ impl App {
             return false;
         }
         let (n, from, entered, away) = (f.job, f.from.clone(), f.entered, f.away);
-        if !self
-            .resolver
-            .send_again_after(n, wait, response.clone(), from, entered, away)
-        {
+        let stood = response
+            .partial
+            .then(|| super::controls::short(self.partly_line(&f.request, &response.message)));
+        if !self.resolver.send_again_after(
+            n,
+            wait,
+            response.clone(),
+            from,
+            entered,
+            away,
+            stood.clone(),
+        ) {
             return false;
         }
         let f = self.follows.remove(i);
         self.unsay(&f.say);
         self.rebuild();
+        if let Some(stood) = stood {
+            self.say(stood, Tone::Warn);
+        }
         true
     }
 
@@ -1800,6 +1823,72 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    #[test]
+    fn a_followed_start_whose_session_started_then_refused_for_a_moment_keeps_saying_so() {
+        // Piece A: a followed start whose only step that stood is its session's start ends
+        // `ok: false, partial: true` with `retry`. It goes again by itself, once, with the same op
+        // and the card's rev; what stood is said while it waits, and again with a resend that
+        // doesn't start it either, whether that resend answers at once or after a follow.
+        for followed in [false, true] {
+            let (mut app, key, id) = on_waiting_card(true);
+            for feed in app.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+                feed.supports.push("hold".into());
+            }
+            for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+                c.detail.as_mut().unwrap().rev = Some("r-1a2b".into());
+            }
+            let reference = app.reference_for(&id);
+            let stood = format!(
+                "Started herdr session web, but then: {reference} didn't start yet (Claude Code's first-run answers here were still being written); ⏎ again in a moment. What was opened for it is closed again."
+            );
+            let partial = json!({"ok": false, "partial": true, "state": "failed", "id": id,
+                                 "session": "web", "retry": 10, "message": stood});
+            let (n, first, machine, request) = followed_start_ends(&mut app, &id, false, partial);
+            let again = app.resolver.ready();
+            assert_eq!(again.len(), 1, "sent again by itself: {:?}", app.message());
+            assert_eq!(again[0].0, n);
+            assert_eq!(again[0].2["op"], first["op"], "the same op");
+            assert_eq!(
+                app.resolver.rev_of(n).as_deref(),
+                Some("r-1a2b"),
+                "its resend carries the card's rev"
+            );
+            let (wait, _) = app.resolver.take_again(n).unwrap();
+            assert_eq!(wait, Duration::from_secs(10));
+            assert_eq!(
+                status_shown(&app, &key).as_deref(),
+                Some(crate::resolve::RETRYING)
+            );
+            // While it waits: what stood is said, in yellow, not lost.
+            assert_eq!(app.message(), Some((stood.as_str(), Tone::Warn)));
+            // The resend doesn't start it either: the session is up now, so only the refusal.
+            let busy = launch_busy(&id, 10);
+            if followed {
+                answer(
+                    &mut app,
+                    machine,
+                    &request,
+                    follow_reply(&id, "start", "Starting web, then the work…"),
+                );
+                poll(&mut app);
+                progress(&mut app, busy.clone());
+            } else {
+                let mut direct = busy.clone();
+                direct.as_object_mut().unwrap().remove("state");
+                answer(&mut app, machine, &request, direct);
+            }
+            assert!(app.resolver.ready().is_empty(), "once only");
+            let (said, tone) = app.message().unwrap();
+            assert_eq!(tone, Tone::Fail);
+            let refusal = busy["message"].as_str().unwrap();
+            assert_eq!(
+                said,
+                format!("{stood}\n{refusal}"),
+                "what stood, then why it still didn't start"
+            );
         }
     }
 
