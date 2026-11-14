@@ -1218,7 +1218,7 @@ impl App {
     /// Whether you're still on this work, in the view you're looking at (the board, a peek, the
     /// backlog or Misc), and it hasn't changed since the action started: where a late answer may
     /// ask you something or take you in. Typing a search, a filter or a new intent isn't.
-    pub(super) fn still_on(&self, from: &CardSnapshot, made: Option<&str>) -> bool {
+    pub(super) fn still_on(&self, from: &CardSnapshot, made: Option<(&str, &str)>) -> bool {
         matches!(
             self.mode,
             Mode::Board
@@ -4405,7 +4405,7 @@ impl App {
                 {
                     // The board may already show the workspace it just made: that's still the card.
                     match from
-                        .filter(|f| self.still_on(f, Some(&workspace)))
+                        .filter(|f| self.still_on(f, Some((&session, &workspace))))
                         .map(|f| f.key)
                     {
                         Some(from) => {

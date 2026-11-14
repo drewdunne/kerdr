@@ -734,24 +734,37 @@ pub fn run_resending_rev(
     )
 }
 
-/// As run_resending_rev, for a change whose followed work ended refused with `retry` (intent
-/// 0591): `after` is that wait and that answer. Nothing goes until the wait is over; then the
-/// request is sent again, with its op and the card's `rev`, as a resend is, and sent again as any
-/// is within RETRY_MOST of that answer. When the wait leaves less than RESEND_ROOM (a computer
-/// asleep through it), nothing is sent and that answer stands. Without `after`, run_resending_rev.
+/// A change whose followed work ended refused with `retry`, to be sent again once (intent 0591):
+/// the wait that `retry` asked for, the answer that stands if it can't go, and when Kerdr had that
+/// answer, from which the wait and the two minutes count, however long it then waited for its
+/// runner's turn, the computer asleep or not (Codex's review 75, 3).
+#[derive(Clone, Debug)]
+pub struct After {
+    pub wait: Duration,
+    pub last: Response,
+    pub since: Clocks,
+}
+
+/// As run_resending_rev, for a change whose followed work ended refused with `retry` (`after`,
+/// intent 0591). Nothing goes until what's left of its wait is over; then the request is sent
+/// once more, with its op and the card's `rev`, as a resend is. A `retry` answer to that is said as
+/// it is, never sent again (Codex's review 75, 2); an answer lost on the way is asked for again
+/// with the same op, as every send's is, within RETRY_MOST of `after`'s answer. When what's left of
+/// those two minutes, before the wait or after it, leaves less than RESEND_ROOM, nothing is sent
+/// and that answer stands. Without `after`, run_resending_rev.
 #[allow(clippy::too_many_arguments)]
 pub fn run_resending_after(
     machine: &Machine,
     command: &str,
     request: &Value,
     rev: Option<&str>,
-    after: Option<(Duration, Response)>,
+    after: Option<After>,
     handed: Option<transport::Handed>,
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
 ) -> Answered {
-    let Some((wait, last)) = after else {
+    let Some(after) = after else {
         return run_resending_rev(machine, command, request, rev, handed, resends, tell, pause);
     };
     resend_after(
@@ -759,7 +772,7 @@ pub fn run_resending_after(
         command,
         request,
         rev,
-        (wait, last),
+        after,
         handed,
         resends,
         tell,
@@ -776,36 +789,45 @@ fn resend_after(
     command: &str,
     request: &Value,
     rev: Option<&str>,
-    (wait, last): (Duration, Response),
+    After { wait, last, since }: After,
     handed: Option<transport::Handed>,
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
     clock: &dyn Fn() -> Clocks,
 ) -> Answered {
-    let start = clock();
     let stands = |last: Response| Answered {
         result: Ok(last),
         stderr: String::new(),
         unreached: None,
     };
-    let fits = wait <= RETRY_MOST && RETRY_MOST - wait >= RESEND_ROOM;
-    if !resends || request.get("op").is_none() || !fits {
+    if !resends || request.get("op").is_none() {
+        return stands(last);
+    }
+    // What's left of its wait and of its two minutes, both counted from that answer: a turn that
+    // came late, or a computer asleep before it came, has used them (Codex's review 75, 3).
+    let now = clock();
+    let left = Clocks::left_of_retrying(since, now);
+    let rest = wait.saturating_sub(now.steady.saturating_duration_since(since.steady));
+    if rest > left || left - rest < RESEND_ROOM {
         return stands(last);
     }
     tell(&Resend::Retry {
-        wait,
+        wait: rest,
         message: last.message.clone(),
         partial: last.partial,
     });
-    pause(wait);
-    let left = Clocks::left_of_retrying(start, clock());
+    if !rest.is_zero() {
+        pause(rest);
+    }
+    let left = Clocks::left_of_retrying(since, clock());
     if left < RESEND_ROOM {
         return stands(last);
     }
     let again = with_rev(request, rev).unwrap_or_else(|| request.clone());
     resending_from(
-        Some(start),
+        Some(since),
+        false,
         &again,
         handed,
         resends,
@@ -901,15 +923,17 @@ fn resending(
     send: &mut dyn FnMut(Option<transport::Handed>, Duration) -> Sent,
 ) -> Answered {
     resending_from(
-        None, request, handed, resends, tell, pause, clock, deadline, send,
+        None, true, request, handed, resends, tell, pause, clock, deadline, send,
     )
 }
 
 /// As resending, retrying having started at `began` when given (an earlier answer's, which a
-/// followed step's end with `retry` is: resend_after), not at the first answer here.
+/// followed step's end with `retry` is: resend_after), not at the first answer here. Without
+/// `retries`, a `retry` answer is the answer, never sent again: only a lost one is asked again.
 #[allow(clippy::too_many_arguments)]
 fn resending_from(
     began: Option<Clocks>,
+    retries: bool,
     request: &Value,
     handed: Option<transport::Handed>,
     resends: bool,
@@ -939,7 +963,7 @@ fn resending_from(
         }
         let start = *start.get_or_insert_with(clock);
         let why = match &sent.answered.result {
-            Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
+            Ok(r) if retries && !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
                 // As long as it asked, never less; at least a second.
                 wait: Duration::from_secs(r.retry.unwrap_or(1).max(1)),
                 message: r.message.clone(),
@@ -1698,18 +1722,23 @@ printf '%s' "$answer"
     #[test]
     fn a_followed_end_with_retry_goes_again_once_its_wait_is_over_never_after_a_sleep() {
         // Intent 0591: a start whose followed work ended refused with `retry` 10 (piece A's
-        // `launch_busy`). Its runner waits that long, then sends it with the same op and its
-        // card's rev. A computer asleep through the wait, so that it leaves no room for an answer
-        // within two minutes, or a backend that keeps no ops, sends nothing: the refusal stands.
+        // `launch_busy`). Its runner waits what's left of that, then sends it with the same op and
+        // its card's rev. Time before its runner began counts (Codex's review 75, 3): 3 s of it
+        // leaves a 7 s wait, and 115 s, as a computer asleep before its turn came, leaves no room
+        // for an answer within two minutes. That, a computer asleep through the wait, or a backend
+        // that keeps no ops, sends nothing: the refusal stands.
         let last = parse_response(
             r##"{"ok":false,"retry":10,"message":"#41 didn't start yet; ⏎ again in a moment."}"##,
         )
         .unwrap();
         let request = with_op(json!({"action":"dispatch","id":"0041"}));
-        for (asleep, resends, goes) in [
-            (Duration::ZERO, true, true),
-            (Duration::from_secs(105), true, false),
-            (Duration::ZERO, false, false),
+        let secs = Duration::from_secs;
+        for (before, asleep, resends, goes) in [
+            (Duration::ZERO, Duration::ZERO, true, Some(secs(10))),
+            (secs(3), Duration::ZERO, true, Some(secs(7))),
+            (secs(115), Duration::ZERO, true, None),
+            (Duration::ZERO, secs(105), true, None),
+            (Duration::ZERO, Duration::ZERO, false, None),
         ] {
             let dir = tempfile::tempdir().unwrap();
             let d = quote(dir.path().to_str().unwrap());
@@ -1722,13 +1751,18 @@ printf '%s' "$answer"
             );
             let mut told = vec![];
             let waits = std::cell::RefCell::new(vec![]);
-            let waited = std::cell::Cell::new(Duration::ZERO);
+            let waited = std::cell::Cell::new(before);
+            let since = Clocks::now();
             let answered = resend_after(
                 &machine(),
                 &command,
                 &request,
                 Some("r-1a2b"),
-                (Duration::from_secs(10), last.clone()),
+                After {
+                    wait: Duration::from_secs(10),
+                    last: last.clone(),
+                    since,
+                },
                 None,
                 resends,
                 &mut |r| told.push(r.clone()),
@@ -1736,21 +1770,21 @@ printf '%s' "$answer"
                     waits.borrow_mut().push(d);
                     waited.set(waited.get() + d + asleep);
                 },
-                &|| later(Clocks::now(), waited.get()),
+                &|| later(since, waited.get()),
             );
             let sent: Vec<Value> = lines(dir.path(), "requests.log")
                 .iter()
                 .map(|l| serde_json::from_str(l).unwrap())
                 .collect();
             let r = answered.result.unwrap();
-            if goes {
+            if let Some(rest) = goes {
                 assert!(r.ok, "{r:?}");
                 assert_eq!(sent.len(), 1, "sent once: {sent:?}");
                 assert_eq!(sent[0]["op"], request["op"], "with the same op");
                 assert_eq!(sent[0]["rev"], "r-1a2b");
-                assert_eq!(waits.into_inner(), [Duration::from_secs(10)]);
+                assert_eq!(waits.into_inner(), [rest], "before {before:?}");
                 assert!(
-                    matches!(&told[..], [Resend::Retry { wait, .. }] if *wait == Duration::from_secs(10)),
+                    matches!(&told[..], [Resend::Retry { wait, .. }] if *wait == rest),
                     "{told:?}"
                 );
             } else {

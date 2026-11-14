@@ -5245,7 +5245,7 @@ impl App {
             && let (Some(session), Some(workspace)) =
                 (response.session.clone(), response.workspace.clone())
         {
-            match start_from.filter(|f| self.still_on(f, Some(&workspace))) {
+            match start_from.filter(|f| self.still_on(f, Some((&session, &workspace)))) {
                 Some(from) => {
                     self.open_after = Some(crate::app::OpenAfter {
                         machine,

@@ -436,10 +436,13 @@ Kerdr shows `say`, and asks the same machine, over the same connection, how it s
   that's passing, as on a direct answer: from a machine whose feed lists `"op"`, Kerdr waits that
   many seconds and sends the request again by itself, once, with the same `op` and the card's
   `rev`, saying "Trying again…" on the card and nothing on the message line meanwhile. Its next
-  answer is taken as the request's answer, a follow's end included, and a second `retry` there is
-  shown as it is. The wait, and anything sent again after it, fit in two minutes from that end, as
-  in [Asking again](#asking-again-op-and-retry): a wait that doesn't, or one the computer slept
-  through, sends nothing and shows the `message`. Later changes to the same card wait behind it.
+  answer is taken as the request's answer, a follow's end included. A `retry` in that answer, at
+  once or at a follow's end, is shown as it is, never sent again; an answer lost on the way is
+  asked for again with the same `op`, as any is. The wait and that resend both count from when
+  Kerdr had the end, however long the resend then waited for its turn: they fit in two minutes from
+  then, as in [Asking again](#asking-again-op-and-retry), checked before the wait and again before
+  the send, so a wait that doesn't fit, or a computer that slept before or during it, sends nothing
+  and shows the `message`. Later changes to the same card wait behind it.
   A part-done end with `retry` (`partial: true`, when the only step that stood was starting its
   herdr session) goes again the same way. Its `message` is said at once, in yellow, as any part-done
   answer is, so what stood is never lost. If the next answer doesn't start it either, its line says
@@ -1207,8 +1210,10 @@ moves. Kerdr goes in only while you're still on that card, and it's still the sa
 you've moved on, or pressed `Esc`, it says the work is open again instead. A feed read while the
 reopen ran may already show the card in the workspace the answer names, with no `resume` (which the
 feed gives only while there's no workspace): that's what the reopen did, so it's still the same work
-and Kerdr goes in. Another workspace, or `resume` naming another conversation, isn't. The same holds
-for a start `Enter` asked for, answered at once or once its followed work is done.
+and Kerdr goes in. That workspace is the one the answer names by both `session` and `workspace`:
+one with the same id in another session is another workspace. Another workspace, or `resume`
+naming another conversation, isn't. The same holds for a start `Enter` asked for, answered at once
+or once its followed work is done.
 
 To ask first (the session is at its usual limit, the conversation may still be open somewhere
 else), answer with `"confirmation": true`, a `message` that names every reason, and optionally

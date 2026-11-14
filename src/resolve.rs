@@ -414,9 +414,9 @@ pub struct Job {
 /// 0591, Resolver::send_again_after).
 #[derive(Clone, Debug)]
 pub struct Again {
-    /// How long its runner waits before it goes, and the answer that stands if it can't go in
-    /// time: taken when it's handed to the runner.
-    pub wait: Option<(Duration, crate::actions::Response)>,
+    /// How long its runner waits before it goes, the answer that stands if it can't go in time,
+    /// and when Kerdr had that answer: taken when it's handed to the runner.
+    pub wait: Option<crate::actions::After>,
     /// The board's `away` when it was first followed, which its next follow keeps: once you've
     /// been into herdr since, its end takes you in only if ⏎ asked again.
     pub away: u64,
@@ -1384,17 +1384,15 @@ impl Resolver {
     }
 
     /// A followed change that ended refused with `retry` (its launch lock held a moment, say) is
-    /// sent again by itself, with the same op, once `wait` is over (intent 0591): it stays in its
-    /// place, unanswered and not yet handed to the runner, its card saying it's trying again.
-    /// `last` is the answer that stands if it can't go in time; `from`, `entered` and `away` are
-    /// its follow's, which its next follow keeps; `partial`, what stood, as said (Job::stood).
-    /// False when it isn't followed, or has been sent again this way already: once only.
-    #[allow(clippy::too_many_arguments)]
+    /// sent again by itself, with the same op, once `after`'s wait is over (intent 0591): it stays
+    /// in its place, unanswered and not yet handed to the runner, its card saying it's trying
+    /// again. `from`, `entered` and `away` are its follow's, which its next follow keeps;
+    /// `partial`, what stood, as said (Job::stood). False when it isn't followed, or has been sent
+    /// again this way already: once only.
     pub fn send_again_after(
         &mut self,
         n: u64,
-        wait: Duration,
-        last: crate::actions::Response,
+        after: crate::actions::After,
         from: Option<CardSnapshot>,
         entered: bool,
         away: u64,
@@ -1417,7 +1415,7 @@ impl Resolver {
         job.from = from;
         job.entered = entered;
         job.again = Some(Again {
-            wait: Some((wait, last)),
+            wait: Some(after),
             away,
         });
         if partial.is_some() {
@@ -1443,9 +1441,10 @@ impl Resolver {
         }
     }
 
-    /// The wait before a change sent again after its follow ended goes, and the answer that stands
-    /// if it can't (Resolver::send_again_after): taken as it's handed to the runner.
-    pub fn take_again(&mut self, n: u64) -> Option<(Duration, crate::actions::Response)> {
+    /// The wait before a change sent again after its follow ended goes, the answer that stands if
+    /// it can't, and when Kerdr had it (Resolver::send_again_after): taken as it's handed to the
+    /// runner.
+    pub fn take_again(&mut self, n: u64) -> Option<crate::actions::After> {
         self.jobs
             .iter_mut()
             .find(|j| j.n == n)

@@ -801,7 +801,7 @@ enum ToRunner {
         /// Sent again after its followed work ended refused with `retry`: how long it waits
         /// first, holding its record's turn, and the answer that stands if it can't go in time
         /// (intent 0591).
-        after: Option<Box<(Duration, crate::actions::Response)>>,
+        after: Option<Box<crate::actions::After>>,
     },
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
@@ -828,7 +828,7 @@ type Waiting = (
     serde_json::Value,
     bool,
     Option<String>,
-    Option<Box<(Duration, crate::actions::Response)>>,
+    Option<Box<crate::actions::After>>,
 );
 
 /// Runs changes to cards in their turn on a thread of its own, which never touches App: a change
@@ -2213,7 +2213,11 @@ mod tests {
             .send(run(
                 1,
                 start,
-                Some(Box::new((Duration::from_secs(1), last))),
+                Some(Box::new(crate::actions::After {
+                    wait: Duration::from_secs(1),
+                    last,
+                    since: crate::actions::Clocks::now(),
+                })),
             ))
             .unwrap();
         runner
@@ -2245,6 +2249,107 @@ mod tests {
         assert_eq!(sent[0]["op"], "k-0123abcd");
         assert_eq!(sent[0]["rev"], "r-7", "as a resend goes");
         assert_eq!(sent[1]["action"], "close");
+    }
+
+    /// The runner's resend after a followed end refused with `retry` 1: `since`, when Kerdr had it.
+    fn after_follow(since: crate::actions::Clocks) -> Option<Box<crate::actions::After>> {
+        let last = crate::actions::parse_response(
+            r##"{"ok":false,"retry":1,"message":"#7 didn't start yet; ⏎ again in a moment."}"##,
+        )
+        .unwrap();
+        Some(Box::new(crate::actions::After {
+            wait: Duration::from_secs(1),
+            last,
+            since,
+        }))
+    }
+
+    /// A dispatch of #7 run with `after`, by a backend that answers `answer` and logs each request:
+    /// what the runner said of it, and the requests it was sent.
+    #[cfg(unix)]
+    fn followed_resend(
+        after: Option<Box<crate::actions::After>>,
+        answer: &str,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let command = format!(
+            "req=$(cat)\nprintf '%s\\n' \"$req\" >> '{}'\nprintf '%s' '{answer}'\n",
+            log.display()
+        );
+        runner
+            .tx
+            .send(ToRunner::Run {
+                n: 1,
+                machine: 0,
+                key: Some("here:7".into()),
+                target: machine,
+                command,
+                request: serde_json::json!({"action":"dispatch","id":"7","op":"k-0123abcd"}),
+                gated: false,
+                resends: true,
+                rev: Some("r-7".into()),
+                guard: None,
+                after,
+            })
+            .unwrap();
+        let mut seen = vec![];
+        while let Some(said) = next_heard(&rx, 10_000) {
+            let done = said.starts_with("done");
+            seen.push(said);
+            if done {
+                break;
+            }
+        }
+        // Nothing more comes after its answer.
+        assert_eq!(next_heard(&rx, 1_500), None, "{seen:?}");
+        let sent = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (seen, sent)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_followed_end_is_sent_again_once_and_a_retry_answer_to_that_is_said_as_it_is() {
+        // Codex's review 75, 2: after the one resend, a `retry` answer to it is the answer; the
+        // runner's ordinary retrying doesn't send it a third time.
+        let (seen, sent) = followed_resend(
+            after_follow(crate::actions::Clocks::now()),
+            r##"{"ok":false,"retry":1,"message":"#7 is not started yet; Enter again in a moment."}"##,
+        );
+        assert_eq!(seen, ["started 1", "resending 1 retry", "done 1 refused"]);
+        assert_eq!(sent.len(), 1, "sent once: {sent:?}");
+        assert_eq!(sent[0]["op"], "k-0123abcd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_followed_end_queued_before_a_sleep_isnt_sent_once_its_two_minutes_are_gone() {
+        // Codex's review 75, 3: Kerdr had the end three minutes ago by the wall clock, and the
+        // computer slept before the runner began (Linux's steady clock stops meanwhile). Its two
+        // minutes count from that end, so nothing is sent and the refusal stands.
+        let since = crate::actions::Clocks {
+            steady: Instant::now(),
+            wall: std::time::SystemTime::now() - Duration::from_secs(180),
+        };
+        let (seen, sent) = followed_resend(
+            after_follow(since),
+            r#"{"ok":true,"message":"Started #7."}"#,
+        );
+        assert_eq!(seen, ["started 1", "done 1 refused"]);
+        assert!(sent.is_empty(), "nothing sent: {sent:?}");
     }
 
     #[cfg(unix)]

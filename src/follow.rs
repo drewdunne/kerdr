@@ -427,15 +427,16 @@ impl App {
         let stood = response
             .partial
             .then(|| super::controls::short(self.partly_line(&f.request, &response.message)));
-        if !self.resolver.send_again_after(
-            n,
+        // Its two minutes count from now, however long it then waits for its turn.
+        let after = crate::actions::After {
             wait,
-            response.clone(),
-            from,
-            entered,
-            away,
-            stood.clone(),
-        ) {
+            last: response.clone(),
+            since: crate::actions::Clocks::now(),
+        };
+        if !self
+            .resolver
+            .send_again_after(n, after, from, entered, away, stood.clone())
+        {
             return false;
         }
         let f = self.follows.remove(i);
@@ -882,6 +883,26 @@ mod tests {
                 app.message()
             );
         }
+    }
+
+    #[test]
+    fn an_answer_naming_the_same_workspace_id_in_another_session_isnt_gone_into() {
+        // Codex's review 75, 1: the card shows api's w7, and the reopen's answer names web's w7.
+        // Those are different workspaces, so the card isn't what the reopen made: no go-in.
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        read_shows_it_open(&mut app, "w7", None);
+        let mut elsewhere = reopened(&id, "w7");
+        elsewhere["session"] = json!("web");
+        answer(&mut app, machine, &request, elsewhere);
+        assert_eq!(app.open_after, None);
+        assert!(
+            app.message().unwrap().0.ends_with("⏎ on its card goes in."),
+            "{:?}",
+            app.message()
+        );
     }
 
     #[test]
@@ -1768,12 +1789,14 @@ mod tests {
                 assert_eq!(again[0].0, n, "the same change, in its place");
                 assert_eq!(again[0].2["op"].as_str(), Some(op.as_str()), "the same op");
                 assert_eq!(again[0].2["action"], first["action"]);
-                let (wait, stands) = app
+                let after = app
                     .resolver
                     .take_again(n)
                     .expect("its runner waits what the refusal asked first");
-                assert_eq!(wait, Duration::from_secs(10));
-                assert!(stands.message.contains("didn't start yet"), "{stands:?}");
+                assert_eq!(after.wait, Duration::from_secs(10));
+                assert!(after.last.message.contains("didn't start yet"), "{after:?}");
+                // Its two minutes count from that end, not from when its runner begins.
+                assert!(after.since.steady.elapsed() < Duration::from_secs(5));
                 assert!(app.follows.is_empty());
                 assert_eq!(
                     status_shown(&app, &key).as_deref(),
@@ -1856,8 +1879,8 @@ mod tests {
                 Some("r-1a2b"),
                 "its resend carries the card's rev"
             );
-            let (wait, _) = app.resolver.take_again(n).unwrap();
-            assert_eq!(wait, Duration::from_secs(10));
+            let after = app.resolver.take_again(n).unwrap();
+            assert_eq!(after.wait, Duration::from_secs(10));
             assert_eq!(
                 status_shown(&app, &key).as_deref(),
                 Some(crate::resolve::RETRYING)
