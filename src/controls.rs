@@ -3168,7 +3168,8 @@ impl App {
     pub fn finish_job(&mut self, n: u64, request: Value, result: Result<Response, String>) {
         // Sent from the hold file, through another machine, or held by its backend (intent 0591,
         // release 4).
-        if self.held_answer(n, &result) {
+        let unreached = self.answer_unreached.take();
+        if self.held_answer(n, &result, unreached) {
             self.keep_words_now();
             return;
         }

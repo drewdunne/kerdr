@@ -42,6 +42,10 @@ pub struct Output {
     pub stderr: String,
     pub timed_out: bool,
     pub took: Duration,
+    /// For an adapter run with its request on stdin: whether the shell that runs its command said
+    /// it had started (STARTED), before anything else, taken out of `stderr`. None where Kerdr
+    /// didn't arrange that (a read, a local command on Windows).
+    pub started: Option<bool>,
 }
 
 impl Output {
@@ -199,6 +203,34 @@ pub fn run_herdr(target: &Target, herdr: &str, args: &[&str], deadline: Duration
     run_script(target, &script, deadline)
 }
 
+/// What the shell that runs an adapter's command prints on standard error before anything else,
+/// so Kerdr knows for certain whether the command started: a request whose command never started
+/// was never sent (Codex's review 74, 2). Kerdr takes it out of what the command printed.
+pub const STARTED: &str = "kerdr: its command started";
+
+/// The shell source an adapter with its request on stdin runs: the start mark first, so nothing
+/// the command does comes before it, then its PATH, herdr's variables dropped, and the command.
+fn adapter_script(command: &str) -> String {
+    format!(
+        "printf '%s\\n' {} >&2\n{PATH_PREFIX}\nunset {}\n{command}\n",
+        quote(STARTED),
+        HERDR_VARS.join(" ")
+    )
+}
+
+/// Takes the start mark out of what a command printed on standard error: whether it was there.
+fn take_started(stderr: &mut String) -> bool {
+    let mut at = 0;
+    for line in stderr.split_inclusive('\n') {
+        if line.trim_end_matches(['\n', '\r']) == STARTED {
+            stderr.replace_range(at..at + line.len(), "");
+            return true;
+        }
+        at += line.len();
+    }
+    false
+}
+
 /// Runs a configured adapter with optional JSON on stdin.
 pub fn run_adapter(
     target: &Target,
@@ -239,10 +271,11 @@ pub fn run_adapter_handing(
         );
     }
     // JSON stays on stdin, separate from shell source and process arguments, including tokens.
-    let script = format!("{PATH_PREFIX}\nunset {}\n{command}\n", HERDR_VARS.join(" "));
     if input.is_none() {
+        let script = format!("{PATH_PREFIX}\nunset {}\n{command}\n", HERDR_VARS.join(" "));
         return run_script(target, &script, deadline);
     }
+    let script = adapter_script(command);
     let mut cmd = match target {
         Target::Local => {
             let mut c = Command::new("sh");
@@ -259,13 +292,15 @@ pub fn run_adapter_handing(
             c
         }
     };
-    run(
+    let mut out = run(
         &mut cmd,
         input.map(str::as_bytes),
         deadline,
         input.is_none(),
         handed,
-    )
+    );
+    out.started = Some(take_started(&mut out.stderr));
+    out
 }
 
 fn remote_adapter_command(script: &str) -> String {
@@ -476,6 +511,7 @@ fn run(
         stderr: String::from_utf8_lossy(&stderr).into_owned(),
         timed_out,
         took: started.elapsed(),
+        started: None,
     }
 }
 
@@ -541,8 +577,19 @@ pub fn never_reached(stderr: &str) -> bool {
     })
 }
 
+/// The line of ssh's that says it never reached the machine, as shown: a refused host key or
+/// sign-in first, wherever it is among ssh's lines, since a jump host's refusal may be followed by
+/// another ("Connection closed by UNKNOWN port 65535").
+pub fn unreached_line(stderr: &str) -> Option<&str> {
+    let lines = || stderr.lines().map(str::trim).filter(|l| !l.is_empty());
+    lines()
+        .find(|l| trust_refused_line(&l.to_lowercase()))
+        .or_else(|| lines().find(|l| never_reached(l)))
+}
+
 /// Whether ssh's own words say it refused the machine's host key, or the machine refused the
-/// sign-in: a machine Kerdr can't trust or sign in to is never gone around through another one.
+/// sign-in, on any line: a machine Kerdr can't trust or sign in to is never gone around through
+/// another one.
 pub fn trust_refused(stderr: &str) -> bool {
     stderr
         .lines()

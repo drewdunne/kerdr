@@ -264,7 +264,10 @@ Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `p
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
 exactly one JSON response to standard output. Send diagnostic output to standard error: Kerdr keeps it
-with any failure it shows, in the log the README's "Errors are kept" describes.
+with any failure it shows, in the log the README's "Errors are kept" describes. The shell Kerdr runs
+the command in first prints a line of its own on standard error, `kerdr: its command started`, before
+anything of the command's; Kerdr takes it out again, and only its absence lets Kerdr count a request
+as never sent (see "A lost answer" below). A backend never needs to print it.
 
 ```json
 {"ok":true,"message":"Work started","id":"0041","session":"web"}
@@ -491,15 +494,19 @@ exit, 255), nobody can tell whether the request happened. To a machine whose fee
 sends it again with the same `op`, after 5, 10 and 15 seconds, within the same two minutes as
 `retry`, and the record answers if it did. To
 any other machine, Kerdr never sends it again: it says plainly that it can't tell whether it
-happened, and that the card shows how it stands. ssh's exit 255 with nothing printed, whose message
-says it never reached the machine (it couldn't connect, find the name, or check its host key, or the
-machine refused the sign-in), isn't a lost answer: nothing was sent, so the machine is away, and the
-change is held for it, or sent through a machine that forwards, as one asked while its machine isn't
-answering is (see [Holding and sending on a request](#holding-and-sending-on-a-request)), though
-never through another machine when it was the host key or the sign-in that was refused; a backend
-that holds nothing refuses it as before ("X couldn't be reached (…), so nothing was sent"). After a
-try that may have reached it, one that didn't is still a lost answer, since the first may have
-landed. A backend that crashed or printed something that
+happened, and that the card shows how it stands. ssh's exit 255 with nothing printed isn't a lost
+answer only when both say the command never started: the shell's start line never came, and ssh's
+own words say it never reached the machine (it couldn't connect, find the name, or check its host
+key, or the machine refused the sign-in, on any of its lines, so a jump host's refusal followed by
+"Connection closed…" counts). Then nothing was sent, so the machine is away, and the change is held
+for it, or sent through a machine that forwards, as one asked while its machine isn't answering is
+(see [Holding and sending on a request](#holding-and-sending-on-a-request)), though never through
+another machine when it was the host key or the sign-in that was refused; a backend that holds
+nothing refuses it as before ("X couldn't be reached (…), so nothing was sent"). A command that
+started and then printed ssh's words itself, from a helper of its own, may have changed something
+first, so that's still a lost answer. After a try whose answer was lost, one that didn't reach the
+machine is still a lost answer, since the first may have landed; after a `retry` refusal, which says
+nothing changed, it's nothing sent. A backend that crashed or printed something that
 isn't JSON isn't a lost answer, since sending it again would most likely do the same: what it printed
 goes to Kerdr's error log, never the board.
 

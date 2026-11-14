@@ -449,22 +449,46 @@ pub const NOT_SENT: &str = "so nothing was sent";
 /// machine is away, though the board may not have seen it yet (the end-to-end check's P1).
 pub const UNREACHED: &str = "couldn't be reached";
 
-/// Whether an error says the request's machine couldn't be reached, so nothing was sent: a
-/// change to a card is then held for it, or sent through a machine that forwards, as one pressed
-/// while it's away is.
-pub fn unreached(error: &str) -> bool {
-    error.contains(UNREACHED) && !result_unknown(error)
+/// How a request's machine wasn't reached, so its command never started there and nothing was
+/// sent: known from the whole of what ssh returned, and kept apart from the words shown (Codex's
+/// review 74, 1). A change to a card is then held for its machine, or sent through one that
+/// forwards, as one pressed while it's away is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreached {
+    /// ssh couldn't connect to it, or find it: it's away.
+    Away,
+    /// ssh refused its host key, or it refused the sign-in: never gone around through another
+    /// machine, so a change for it is held when its backend holds, and refused otherwise.
+    Refused,
 }
 
-/// Whether such an error says ssh refused its machine's host key or the sign-in: that machine is
-/// never gone around through another, so a change for it is held when its backend holds, and
-/// refused otherwise, as when the board already knows it.
-pub fn trust_refused(error: &str) -> bool {
-    let Some((_, why)) = error.split_once(&format!("{UNREACHED} (")) else {
-        return false;
-    };
-    why.strip_suffix(&format!("), {NOT_SENT}"))
-        .is_some_and(transport::trust_refused)
+/// For tests elsewhere: what a command's output over ssh answers, and how it says its machine
+/// wasn't reached, as the runner would hand them to the board.
+#[cfg(test)]
+pub(crate) fn over_ssh_answer(
+    output: &transport::Output,
+    request: &Value,
+    machine: &str,
+) -> (Result<Response, String>, Option<Unreached>) {
+    let result = answer_of(output, request, deadline_for(request), machine, true);
+    let unreached = unreached_of(output, &result, true);
+    (result, unreached)
+}
+
+/// Whether, and how, a command's output says its request never reached its machine: over ssh,
+/// no answer, and ssh's own exit with its start mark missing and its words saying so.
+fn unreached_of(
+    output: &transport::Output,
+    result: &Result<Response, String>,
+    ssh: bool,
+) -> Option<Unreached> {
+    (ssh && result.is_err() && never_reached(output)).then(|| {
+        if transport::trust_refused(&output.stderr) {
+            Unreached::Refused
+        } else {
+            Unreached::Away
+        }
+    })
 }
 
 /// What a request says when Kerdr has no action backend to send it to.
@@ -789,12 +813,13 @@ fn resending(
     // When retrying started: at the first answer, fixed then. It ends RETRY_MOST later.
     let mut start: Option<Clocks> = None;
     let mut lost = 0;
-    // Whether an earlier send may have reached its machine: one that didn't reach it now says
+    // Whether an earlier send's answer was lost: one that didn't reach its machine now says
     // nothing of that one, so the result stays unknown, and it's sent again while there's time.
-    let mut reached = false;
+    // An answer that came, a `retry` refusal say, says nothing changed (Codex's review 74, 3).
+    let mut lost_before = false;
     loop {
         let sent = send(handed.take(), this_deadline);
-        let missed = matches!(&sent.answered.result, Err(e) if unreached(e));
+        let missed = sent.answered.unreached.is_some();
         if !may {
             return sent.answered;
         }
@@ -805,16 +830,16 @@ fn resending(
                 wait: Duration::from_secs(r.retry.unwrap_or(1).max(1)),
                 message: r.message.clone(),
             },
-            Err(error) if (sent.lost || (missed && reached)) && lost < LOST_WAITS.len() => {
+            Err(error) if (sent.lost || (missed && lost_before)) && lost < LOST_WAITS.len() => {
                 Resend::Lost {
                     wait: LOST_WAITS[lost],
                     error: error.clone(),
                     attempt: lost + 1,
                 }
             }
-            _ => return after_reaching(sent.answered, missed && reached),
+            _ => return after_reaching(sent.answered, missed && lost_before),
         };
-        reached |= !missed;
+        lost_before |= sent.lost;
         let wait = match &why {
             Resend::Retry { wait, .. } | Resend::Lost { wait, .. } => *wait,
         };
@@ -822,7 +847,7 @@ fn resending(
         // for, however long, can overflow.
         let left = Clocks::left_of_retrying(start, clock());
         if wait > left || left - wait < RESEND_ROOM {
-            return after_reaching(sent.answered, missed && reached);
+            return after_reaching(sent.answered, missed && lost_before);
         }
         if matches!(why, Resend::Lost { .. }) {
             lost += 1;
@@ -831,7 +856,7 @@ fn resending(
         pause(wait);
         let left = Clocks::left_of_retrying(start, clock());
         if left < RESEND_ROOM {
-            return after_reaching(sent.answered, missed && reached);
+            return after_reaching(sent.answered, missed && lost_before);
         }
         this_deadline = deadline.min(left);
     }
@@ -842,6 +867,7 @@ fn resending(
 /// result is unknown, as that earlier send's was.
 fn after_reaching(mut answered: Answered, earlier_may_have: bool) -> Answered {
     if earlier_may_have && let Err(error) = &answered.result {
+        answered.unreached = None;
         let missed = error.replace(&format!(", {NOT_SENT}"), "");
         answered.result = Err(format!(
             "{missed} after an earlier try whose answer was lost; {UNKNOWN}, and its card shows how it stands."
@@ -909,6 +935,8 @@ fn reference(request: &Value) -> String {
 pub struct Answered {
     pub result: Result<Response, String>,
     pub stderr: String,
+    /// When nothing was sent because its machine wasn't reached, how.
+    pub unreached: Option<Unreached>,
 }
 
 fn answer_with_stderr(
@@ -953,6 +981,7 @@ fn keep_stderr(ran: Ran, request: &Value) -> Answered {
     Answered {
         result: ran.result,
         stderr,
+        unreached: ran.unreached,
     }
 }
 
@@ -997,6 +1026,8 @@ struct Ran {
     /// Whether its answer was lost (none in time, or the connection dropped): the request may or
     /// may not have happened.
     lost: bool,
+    /// When its machine wasn't reached, so nothing was sent, how.
+    unreached: Option<Unreached>,
 }
 
 impl Ran {
@@ -1007,6 +1038,7 @@ impl Ran {
             stderr: String::new(),
             printed: None,
             lost: false,
+            unreached: None,
         }
     }
 }
@@ -1054,6 +1086,7 @@ fn run_with_deadline(
         machine.ssh.is_some(),
     );
     let lost = result.is_err() && lost(&output, machine.ssh.is_some());
+    let unreached = unreached_of(&output, &result, machine.ssh.is_some());
     // An answer it couldn't read, or one far too long: what it printed goes to the error log, as
     // its error says (intent 0591). A lost answer's error promises nothing of the kind.
     let printed = (result.is_err() && !lost && !output.stdout.trim().is_empty())
@@ -1063,6 +1096,7 @@ fn run_with_deadline(
         stderr: output.stderr,
         printed,
         lost,
+        unreached,
     }
 }
 
@@ -1075,10 +1109,13 @@ fn lost(output: &transport::Output, ssh: bool) -> bool {
 }
 
 /// Whether ssh's own exit says it never reached the machine, so the request never left Kerdr's
-/// side: ssh's words alone, with nothing printed that a backend could have (the end-to-end check's
-/// P1).
+/// side (the end-to-end check's P1). Known for certain only when the command's shell never said
+/// it had started (Codex's review 74, 2): a command that did start may itself print ssh's words,
+/// from a helper of its own, after changing something. And ssh's own words must say it never
+/// connected, since a connection that dropped may have lost the start mark on its way.
 fn never_reached(output: &transport::Output) -> bool {
-    output.status == Some(255)
+    output.started == Some(false)
+        && output.status == Some(255)
         && output.stdout.trim().is_empty()
         && transport::never_reached(&output.stderr)
 }
@@ -1172,13 +1209,9 @@ fn answer_of(
         response
     }).map_err(|_| {
         // ssh never reached the machine: nothing was sent, so it's away (the end-to-end check's
-        // P1). Said with ssh's own last line, scrubbed.
+        // P1). Said with ssh's own line that says so, scrubbed.
         if ssh && never_reached(output) {
-            let why = output
-                .stderr
-                .lines()
-                .map(str::trim)
-                .rfind(|l| !l.is_empty())
+            let why = transport::unreached_line(&output.stderr)
                 .map(|l| redact(&l.chars().filter(|c| !c.is_control()).collect::<String>()))
                 .unwrap_or_default();
             return format!("{machine} {UNREACHED} ({why}), {NOT_SENT}");
@@ -1232,6 +1265,7 @@ mod tests {
             status: Some(0),
             timed_out: false,
             took: Duration::from_millis(5),
+            started: Some(true),
         };
         answer_of(&output, request, deadline_for(request), "arknet-one", true)
     }
@@ -1647,10 +1681,12 @@ printf '%s' "$answer"
                 }
                 let result = answer_of(&out, request, deadline, "arknet-one", true);
                 let lost = result.is_err() && lost(&out, true);
+                let unreached = unreached_of(&out, &result, true);
                 Sent {
                     answered: Answered {
                         result,
                         stderr: out.stderr.clone(),
+                        unreached,
                     },
                     lost,
                 }
@@ -1675,6 +1711,7 @@ printf '%s' "$answer"
             stderr: String::new(),
             timed_out: true,
             took: Duration::ZERO,
+            started: Some(true),
         }
     }
 
@@ -1814,6 +1851,7 @@ printf '%s' "$answer"
                 ..Default::default()
             }),
             stderr: String::new(),
+            unreached: None,
         };
         let mut answers = vec![refusal(5), refusal(u64::MAX)].into_iter();
         let now = std::cell::Cell::new(Clocks::now());
@@ -1858,6 +1896,7 @@ printf '%s' "$answer"
                 ..Default::default()
             }),
             stderr: String::new(),
+            unreached: None,
         };
         let run = |asleep: Duration, wall_set: Duration| {
             let now = std::cell::Cell::new(Clocks::now());
@@ -1889,6 +1928,7 @@ printf '%s' "$answer"
                                 ..Default::default()
                             }),
                             stderr: String::new(),
+                            unreached: None,
                         }
                     };
                     Sent {
@@ -1945,6 +1985,7 @@ printf '%s' "$answer"
         assert_eq!(r.state.as_deref(), Some("unknown"));
     }
 
+    /// What a command whose shell started printed, and how it ended.
     fn output(status: i32, stdout: &str, stderr: &str) -> transport::Output {
         transport::Output {
             status: Some(status),
@@ -1952,7 +1993,24 @@ printf '%s' "$answer"
             stderr: stderr.into(),
             timed_out: false,
             took: Duration::from_millis(5),
+            started: Some(true),
         }
+    }
+
+    /// ssh's own exit, 255, its words `stderr`, with no start mark: the command never started.
+    fn unstarted(stderr: &str) -> transport::Output {
+        transport::Output {
+            status: Some(255),
+            stderr: stderr.into(),
+            took: Duration::from_millis(5),
+            started: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// How the answer says its machine wasn't reached.
+    fn how_unreached(answered: &Answered) -> Option<Unreached> {
+        answered.unreached
     }
 
     #[test]
@@ -2020,25 +2078,37 @@ printf '%s' "$answer"
         let request = with_op(
             json!({"action":"edit","id":"0927","text":"New words.","was":"sha256:aa","from":"here"}),
         );
-        for stderr in [
-            "ssh: connect to host zznew port 22: No route to host\n",
-            "ssh: connect to host 10.0.0.9 port 22: Connection timed out\n",
-            "ssh: Could not resolve hostname zznew: Name or service not known\n",
-            "Host key verification failed.\n",
-            "drew@zznew: Permission denied (publickey).\n",
+        for (stderr, how) in [
+            (
+                "ssh: connect to host zznew port 22: No route to host\n",
+                Unreached::Away,
+            ),
+            (
+                "ssh: connect to host 10.0.0.9 port 22: Connection timed out\n",
+                Unreached::Away,
+            ),
+            (
+                "ssh: Could not resolve hostname zznew: Name or service not known\n",
+                Unreached::Away,
+            ),
+            ("Host key verification failed.\n", Unreached::Refused),
+            (
+                "drew@zznew: Permission denied (publickey).\n",
+                Unreached::Refused,
+            ),
         ] {
-            let (answered, told, sends) = over_ssh(&request, true, vec![output(255, "", stderr)]);
+            let (answered, told, sends) = over_ssh(&request, true, vec![unstarted(stderr)]);
             assert_eq!(sends, 1, "{stderr}");
             assert!(told.is_empty(), "{stderr}");
+            assert_eq!(how_unreached(&answered), Some(how), "{stderr}");
             let error = answered.result.unwrap_err();
             assert!(!result_unknown(&error), "{error}");
-            // A host key or a sign-in refused is never gone around through another machine.
-            let trust = stderr.starts_with("Host key") || stderr.contains("Permission denied");
-            assert_eq!(trust_refused(&error), trust, "{error}");
-            assert!(
-                error.starts_with("arknet-one couldn't be reached (")
-                    && error.ends_with("), so nothing was sent"),
-                "{error}"
+            assert_eq!(
+                error,
+                format!(
+                    "arknet-one couldn't be reached ({}), so nothing was sent",
+                    stderr.trim()
+                )
             );
         }
         // A connection that dropped once made, or anything printed, may have reached it: as
@@ -2055,18 +2125,15 @@ printf '%s' "$answer"
                 "ssh: connect to host zznew port 22: No route to host\n",
             ),
         ] {
-            let (answered, ..) = over_ssh(&request, false, vec![output(255, stdout, stderr)]);
+            let mut out = unstarted(stderr);
+            out.stdout = stdout.into();
+            let (answered, ..) = over_ssh(&request, false, vec![out]);
+            assert_eq!(how_unreached(&answered), None, "{stderr}");
             assert!(result_unknown(&answered.result.unwrap_err()), "{stderr}");
         }
         // After a send whose answer was lost, one that never reached its machine says nothing of
         // that first one: still unknown, and sent again while there's time.
-        let refused = || {
-            output(
-                255,
-                "",
-                "ssh: connect to host zznew port 22: No route to host\n",
-            )
-        };
+        let refused = || unstarted("ssh: connect to host zznew port 22: No route to host\n");
         let (answered, told, sends) = over_ssh(
             &request,
             true,
@@ -2078,6 +2145,7 @@ printf '%s' "$answer"
             ],
         );
         assert_eq!((sends, told.len()), (4, 3));
+        assert_eq!(how_unreached(&answered), None);
         let error = answered.result.unwrap_err();
         assert!(result_unknown(&error), "{error}");
         assert!(
@@ -2085,6 +2153,130 @@ printf '%s' "$answer"
                 && error.contains("after an earlier try whose answer was lost"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_host_key_or_sign_in_refused_then_another_line_is_still_refused() {
+        // Codex's review 74, 1: a jump host's refusal followed by another line of ssh's. Taken
+        // from ssh's last line alone, it read as a machine that's away, so it was forwarded.
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        for (stderr, said) in [
+            (
+                "Host key verification failed.\nConnection closed by UNKNOWN port 65535\n",
+                "Host key verification failed.",
+            ),
+            (
+                "drew@zznew: Permission denied (publickey,password).\nConnection closed by 10.0.0.9 port 22\n",
+                "drew@zznew: Permission denied (publickey,password).",
+            ),
+        ] {
+            let (answered, told, sends) = over_ssh(&request, true, vec![unstarted(stderr)]);
+            assert_eq!((sends, told.len()), (1, 0), "{stderr}");
+            assert_eq!(
+                how_unreached(&answered),
+                Some(Unreached::Refused),
+                "{stderr}"
+            );
+            assert_eq!(
+                answered.result.unwrap_err(),
+                format!("arknet-one couldn't be reached ({said}), so nothing was sent")
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_words_from_a_command_that_started_never_mean_nothing_was_sent() {
+        // Codex's review 74, 2: the command started (its shell said so first), changed something,
+        // then a helper of its own printed ssh's words and it ended with 255. That may have
+        // happened, so it's a lost answer, sent again with its op, never "nothing was sent".
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let changed_then_failed = output(
+            255,
+            "",
+            "ssh: connect to host other port 22: No route to host\n",
+        );
+        let (answered, told, sends) = over_ssh(
+            &request,
+            true,
+            vec![
+                changed_then_failed,
+                output(0, r#"{"ok":true,"message":"Closed #41."}"#, ""),
+            ],
+        );
+        assert_eq!((sends, told.len()), (2, 1));
+        assert!(matches!(told[0], Resend::Lost { .. }));
+        assert!(answered.result.unwrap().ok);
+        // Without resends, said as unknown.
+        let (answered, ..) = over_ssh(
+            &request,
+            false,
+            vec![output(
+                255,
+                "",
+                "ssh: connect to host other port 22: No route to host\n",
+            )],
+        );
+        assert_eq!(how_unreached(&answered), None);
+        assert!(result_unknown(&answered.result.unwrap_err()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_command_that_changed_something_then_printed_ssh_words_isnt_unsent() {
+        // The same through the adapter's real shell: its start mark comes first, so a command that
+        // changes something and then prints ssh's words is known to have started.
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("changed");
+        let command = format!(
+            "cat >/dev/null; touch {}; echo 'ssh: connect to host other port 22: No route to host' >&2; exit 255",
+            quote(&changed.display().to_string())
+        );
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let out = transport::run_adapter_handing(
+            &Target::Local,
+            &command,
+            Some(&request.to_string()),
+            Duration::from_secs(20),
+            None,
+        );
+        assert!(changed.exists());
+        assert_eq!(out.status, Some(255));
+        assert_eq!(
+            out.stderr.trim(),
+            "ssh: connect to host other port 22: No route to host"
+        );
+        let result = answer_of(&out, &request, deadline_for(&request), "arknet-one", true);
+        assert_eq!(unreached_of(&out, &result, true), None);
+        assert!(result_unknown(&result.unwrap_err()));
+        assert!(lost(&out, true));
+    }
+
+    #[test]
+    fn a_retry_refusal_then_an_unreachable_machine_is_nothing_sent() {
+        // Codex's review 74, 3: a refusal asking to try again (its lock was held) says nothing
+        // changed; the try after it that couldn't connect sent nothing either. So nothing was
+        // sent, and the save is held, never "Kerdr can't tell".
+        let request = with_op(
+            json!({"action":"edit","id":"0927","text":"New words.","was":"sha256:aa","from":"here"}),
+        );
+        let (answered, told, sends) = over_ssh(
+            &request,
+            true,
+            vec![
+                output(
+                    1,
+                    r##"{"ok":false,"message":"#927 is locked by another request.","retry":1}"##,
+                    "",
+                ),
+                unstarted("ssh: connect to host zznew port 22: No route to host\n"),
+            ],
+        );
+        assert_eq!((sends, told.len()), (2, 1));
+        assert!(matches!(told[0], Resend::Retry { .. }));
+        assert_eq!(how_unreached(&answered), Some(Unreached::Away));
+        let error = answered.result.unwrap_err();
+        assert!(!result_unknown(&error), "{error}");
+        assert!(error.ends_with("so nothing was sent"), "{error}");
     }
 
     #[test]

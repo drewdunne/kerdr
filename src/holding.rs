@@ -249,7 +249,7 @@ impl App {
     /// It goes as one pressed while it's away does (route): through a machine that forwards, else
     /// into the hold file when its backend holds, with its op and the card's `rev` from when the
     /// key was pressed. Whether it was taken; otherwise its failure is said as before.
-    fn away_after_all(&mut self, n: u64, error: &str) -> bool {
+    fn away_after_all(&mut self, n: u64, how: crate::actions::Unreached) -> bool {
         let Some(job) = self.resolver.job(n) else {
             return false;
         };
@@ -266,7 +266,7 @@ impl App {
             return false;
         }
         // A host key or a sign-in its ssh refused is never gone around: held, or refused.
-        let via = (!crate::actions::trust_refused(error))
+        let via = (how == crate::actions::Unreached::Away)
             .then(|| self.forwarder_for(Some(&name)))
             .flatten();
         if via.is_none() && !self.holds_on(machine) {
@@ -852,7 +852,12 @@ impl App {
     /// Before a change's answer is taken: one sent from the hold file leaves it once answered;
     /// one a forwarding machine couldn't get through is held for the machine it was for; and one
     /// its backend holds says so on its card. Whether the answer is dealt with here.
-    pub(crate) fn held_answer(&mut self, n: u64, result: &Result<Response, String>) -> bool {
+    pub(crate) fn held_answer(
+        &mut self,
+        n: u64,
+        result: &Result<Response, String>,
+        unreached: Option<crate::actions::Unreached>,
+    ) -> bool {
         let from_file = self.held_sending.remove(&n);
         let response = result.as_ref().ok();
         if let Some(op) = &from_file {
@@ -892,15 +897,13 @@ impl App {
         // away, though the board hadn't seen it yet, its loop standing still while an editor was
         // open, say. One from the file waits there again, as itself; any other goes as a change
         // pressed while its machine is away does (away_after_all).
-        if let Err(error) = result
-            && crate::actions::unreached(error)
-        {
+        if let Some(how) = unreached.filter(|_| result.is_err()) {
             if from_file.is_some() {
                 self.resolver.take(n);
                 self.rebuild();
                 return true;
             }
-            if self.away_after_all(n, error) {
+            if self.away_after_all(n, how) {
                 return true;
             }
         }
@@ -2318,11 +2321,30 @@ mod tests {
         assert!(app.kept.held.is_empty());
     }
 
-    /// What ssh says when it couldn't connect, as the runner gives it: nothing was sent.
-    fn unreached(name: &str) -> Result<Response, String> {
-        Err(format!(
-            "{name} couldn't be reached (ssh: connect to host {name} port 22: No route to host), so nothing was sent"
-        ))
+    /// The answer to change `n` when ssh's own words, with its command never started, are
+    /// `stderr`: as the runner hands the board that answer, and how its machine wasn't reached.
+    fn ssh_said(app: &mut App, n: u64, request: Value, stderr: &str) {
+        let output = crate::transport::Output {
+            status: Some(255),
+            stderr: stderr.into(),
+            started: Some(false),
+            ..Default::default()
+        };
+        let name = app.machines[app.resolver.job(n).unwrap().machine].name();
+        let (result, unreached) = crate::actions::over_ssh_answer(&output, &request, &name);
+        app.answer_unreached = unreached;
+        app.finish_job(n, request, result);
+    }
+
+    /// The same, when ssh couldn't connect: nothing was sent.
+    fn unreached(app: &mut App, n: u64, request: Value) {
+        let name = app.machines[app.resolver.job(n).unwrap().machine].name();
+        ssh_said(
+            app,
+            n,
+            request,
+            &format!("ssh: connect to host {name} port 22: No route to host\n"),
+        );
     }
 
     #[test]
@@ -2342,7 +2364,7 @@ mod tests {
             panic!("d didn't go once: {ready:?}")
         };
         assert_eq!(*machine, m);
-        app.finish_job(*n, request.clone(), unreached(&name));
+        unreached(&mut app, *n, request.clone());
         assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
         let held = app.kept.held[0].clone();
         assert_eq!(held.op(), request["op"].as_str().unwrap());
@@ -2372,7 +2394,7 @@ mod tests {
         supports(&mut app, via, FORWARD);
         d(&mut app);
         let (n, _, request, _) = app.resolver.ready()[0].clone();
-        app.finish_job(n, request.clone(), unreached(&name));
+        unreached(&mut app, n, request.clone());
         assert!(app.kept.held.is_empty());
         let Action::Mutate {
             machine,
@@ -2391,24 +2413,38 @@ mod tests {
             (&sent["action"], &sent["forward_to"], &sent["id"]),
             (&request["action"], &json!(name), &request["id"])
         );
-        // A host key its ssh refused is never gone around: held for it, not forwarded.
-        let mut app = self::app();
-        let (_, _, _, m) = waiting(&mut app);
-        supports(&mut app, m, HOLD);
-        supports(&mut app, via, FORWARD);
-        d(&mut app);
-        let (n, _, request, _) = app.resolver.ready()[0].clone();
-        app.finish_job(
-            n,
-            request.clone(),
-            Err(format!(
-                "{name} couldn't be reached (Host key verification failed.), so nothing was sent"
-            )),
-        );
-        assert_eq!(app.next_owed(), Action::None);
-        assert!(app.resolver.ready().is_empty());
-        assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
-        assert_eq!(app.kept.held[0].op(), request["op"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_host_key_or_sign_in_refused_is_never_forwarded_whatever_ssh_said_after_it() {
+        // A host key or a sign-in its ssh refused is never gone around: held for it, not
+        // forwarded. Codex's review 74, 1: also when another line of ssh's follows the refusal,
+        // a jump host's say, which made it read as a machine that's merely away.
+        for stderr in [
+            "Host key verification failed.\n",
+            "Host key verification failed.\nConnection closed by UNKNOWN port 65535\n",
+            "drew@zznew: Permission denied (publickey,password).\nConnection closed by 10.0.0.9 port 22\n",
+        ] {
+            let mut app = app();
+            let (_, _, reference, m) = waiting(&mut app);
+            let via = (0..app.machines.len())
+                .find(|&i| i != m && app.machines[i].feed.is_some())
+                .unwrap();
+            supports(&mut app, m, HOLD);
+            supports(&mut app, via, FORWARD);
+            let name = app.machines[m].name();
+            d(&mut app);
+            let (n, _, request, _) = app.resolver.ready()[0].clone();
+            ssh_said(&mut app, n, request.clone(), stderr);
+            assert_eq!(app.next_owed(), Action::None, "{stderr}");
+            assert!(app.resolver.ready().is_empty(), "{stderr}");
+            assert_eq!(app.kept.held.len(), 1, "{stderr}: {}", said(&app));
+            assert_eq!(app.kept.held[0].op(), request["op"].as_str().unwrap());
+            assert_eq!(
+                said(&app),
+                format!("Held: d on {reference} goes when {name} answers.")
+            );
+        }
     }
 
     #[test]
@@ -2425,8 +2461,7 @@ mod tests {
         let (n, _, request, _) = app.resolver.ready()[0].clone();
         assert_eq!(request["held"], true);
         app.message = None;
-        let name = app.machines[m].name();
-        app.finish_job(n, request, unreached(&name));
+        unreached(&mut app, n, request);
         assert_eq!(app.kept.held.len(), 1);
         let held = app.kept.held[0].clone();
         assert_eq!(held.op(), op);

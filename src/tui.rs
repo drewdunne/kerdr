@@ -233,7 +233,7 @@ fn event_loop(
         theme.check(false);
         send_loaded_images(app, &bg, None);
         while let Ok(answer) = action_rx.try_recv() {
-            let (job, machine, request, result, stderr) = match answer {
+            let (job, machine, request, result, stderr, unreached) = match answer {
                 Answer::Started(n) => {
                     // A start that waited for its write-up shows from now.
                     app.job_started(n);
@@ -289,12 +289,14 @@ fn event_loop(
             app.answer_stderr = stderr;
             // Its machine couldn't be reached, so nothing was sent: read it now, so the board
             // shows it away and what comes next for it is held (the end-to-end check's P1).
-            let unreached = result.as_ref().is_err_and(|e| crate::actions::unreached(e));
-            if unreached && let Some(l) = live.as_deref() {
+            if unreached.is_some()
+                && let Some(l) = live.as_deref()
+            {
                 l.wake(machine);
             }
             match job {
                 Some(n) => {
+                    app.answer_unreached = unreached;
                     app.finish_job(n, request, result);
                     // Finished with: its record's next change may start. One sent on to another
                     // machine keeps its place in the runner's queue, and runs again from there.
@@ -752,6 +754,7 @@ type ActionResult = (
     serde_json::Value,
     Result<crate::actions::Response, String>,
     String,
+    Option<crate::actions::Unreached>,
 );
 
 /// What comes back to the board's thread: a change's command has started, its command has the
@@ -983,6 +986,7 @@ impl Runner {
                             metadata,
                             answered.result,
                             answered.stderr,
+                            answered.unreached,
                         ))));
                         if !held {
                             let _ = back.send(ToRunner::Done(n));
@@ -1099,6 +1103,7 @@ fn start_action(
             metadata,
             answered.result,
             answered.stderr,
+            answered.unreached,
         ))));
     });
 }

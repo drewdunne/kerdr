@@ -2981,6 +2981,7 @@ mod tests {
             format!("Quitting once {reference}'s new text is saved or held… Esc stays.")
         );
         assert!(!app.quit_due());
+        app.answer_unreached = Some(crate::actions::Unreached::Away);
         answer(
             &mut app,
             &sent,

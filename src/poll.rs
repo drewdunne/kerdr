@@ -1578,6 +1578,7 @@ esac
             status: Some(0),
             timed_out: false,
             took: Duration::from_millis(5),
+            started: None,
         };
         let Ok(data) = read(&Target::Local, &out, true) else {
             panic!("a read herdr answered is a read");

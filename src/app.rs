@@ -797,6 +797,9 @@ pub struct App {
     pub error_log: crate::errlog::ErrorLog,
     /// What the command behind the answer about to arrive printed on standard error.
     pub answer_stderr: String,
+    /// When the answer about to arrive says its machine wasn't reached, so nothing was sent, how:
+    /// known from ssh's whole result, never from the words shown (Codex's review 74, 1).
+    pub answer_unreached: Option<crate::actions::Unreached>,
     pub(crate) answering: Option<errors::Answering>,
     pub(crate) signin_kept: Option<String>,
     pub(crate) machine_problems: std::collections::HashMap<(usize, String), String>,
@@ -1001,6 +1004,7 @@ impl App {
             edit_open_when: None,
             error_log: crate::errlog::ErrorLog::on_this_machine(),
             answer_stderr: String::new(),
+            answer_unreached: None,
             answering: None,
             signin_kept: None,
             machine_problems: Default::default(),
