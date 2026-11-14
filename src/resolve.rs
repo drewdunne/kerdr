@@ -404,6 +404,10 @@ pub struct Job {
     /// Followed, it ended refused with `retry`, and it's being sent again by itself (Again): once
     /// only, whatever its next answer says (intent 0591).
     pub again: Option<Again>,
+    /// It's being sent again by itself after a part-done answer with `retry` (only its session's
+    /// start stood, say), at once or at a follow's end: that answer's line, as it was said, said
+    /// again with its last answer if that doesn't happen either (intent 0591).
+    pub stood: Option<String>,
 }
 
 /// A followed change that ended refused for something passing, sent again by itself once (intent
@@ -416,9 +420,6 @@ pub struct Again {
     /// The board's `away` when it was first followed, which its next follow keeps: once you've
     /// been into herdr since, its end takes you in only if ⏎ asked again.
     pub away: u64,
-    /// What stood before it ended (a part-done end, "Started herdr session web, but then: …"), as
-    /// it was said: said again with its next answer if that doesn't happen either.
-    pub partial: Option<String>,
 }
 
 impl Job {
@@ -877,6 +878,7 @@ impl Resolver {
             behind: None,
             unkept: false,
             again: None,
+            stood: None,
         });
         self.next
     }
@@ -1385,8 +1387,8 @@ impl Resolver {
     /// sent again by itself, with the same op, once `wait` is over (intent 0591): it stays in its
     /// place, unanswered and not yet handed to the runner, its card saying it's trying again.
     /// `last` is the answer that stands if it can't go in time; `from`, `entered` and `away` are
-    /// its follow's, which its next follow keeps; `partial`, what stood, as said. False when it
-    /// isn't followed, or has been sent again this way already: once only.
+    /// its follow's, which its next follow keeps; `partial`, what stood, as said (Job::stood).
+    /// False when it isn't followed, or has been sent again this way already: once only.
     #[allow(clippy::too_many_arguments)]
     pub fn send_again_after(
         &mut self,
@@ -1417,16 +1419,28 @@ impl Resolver {
         job.again = Some(Again {
             wait: Some((wait, last)),
             away,
-            partial,
         });
+        if partial.is_some() {
+            job.stood = partial;
+        }
         true
     }
 
-    /// What stood before this change was sent again by itself, as it was said (Again::partial).
+    /// What stood before this change was sent again by itself, as it was said (Job::stood).
     pub fn what_stood(&self, n: u64) -> Option<String> {
-        self.job(n)
-            .and_then(|j| j.again.as_ref())
-            .and_then(|a| a.partial.clone())
+        self.job(n).and_then(|j| j.stood.clone())
+    }
+
+    /// Keeps what stood before this change is sent again by itself (Job::stood). Whether it's new
+    /// for it, and so to be said.
+    pub fn keep_stood(&mut self, n: u64, line: String) -> bool {
+        match self.jobs.iter_mut().find(|j| j.n == n) {
+            Some(job) if job.stood.as_deref() != Some(line.as_str()) => {
+                job.stood = Some(line);
+                true
+            }
+            _ => false,
+        }
     }
 
     /// The wait before a change sent again after its follow ended goes, and the answer that stands

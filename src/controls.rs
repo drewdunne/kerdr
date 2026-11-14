@@ -3135,11 +3135,26 @@ impl App {
     /// A request is being sent again by itself, with the same op (intent 0591): a change's card,
     /// or the busy line of an account request, says so quietly. Nothing red, and nothing in the
     /// error log: only its last answer counts, and that's said as any answer is.
-    pub fn resending(&mut self, job: Option<u64>, _machine: usize, _why: &crate::actions::Resend) {
+    /// A part-done answer with `retry` is no plain refusal: what stood is said at once, in
+    /// yellow, as any part-done answer is, and again with its last answer if that doesn't happen
+    /// either, as at a follow's end (follow_again).
+    pub fn resending(&mut self, job: Option<u64>, _machine: usize, why: &crate::actions::Resend) {
         match job {
             Some(n) => {
                 if self.resolver.note_retrying(n, true) {
                     self.rebuild();
+                }
+                if let crate::actions::Resend::Retry {
+                    message,
+                    partial: true,
+                    ..
+                } = why
+                    && let Some(request) = self.resolver.job_request(n).cloned()
+                {
+                    let line = short(self.partly_line(&request, message));
+                    if self.resolver.keep_stood(n, line.clone()) {
+                        self.say(line, Tone::Warn);
+                    }
                 }
             }
             None if self.busy => {
@@ -3353,12 +3368,11 @@ impl App {
         self.answer_by_enter = by_enter;
         self.answer_job = Some(n);
         self.answer_key = job_key;
-        // Sent again after a part-done followed end: what stood then is said again if this
-        // didn't happen either (intent 0591).
+        // Sent again after a part-done answer, at once or at a follow's end: what stood then is
+        // said again if this didn't happen either (intent 0591).
         let stood = refused
             .as_ref()
-            .and_then(|j| j.again.as_ref())
-            .and_then(|a| a.partial.clone())
+            .and_then(|j| j.stood.clone())
             .filter(|_| match &result {
                 Ok(r) => !r.confirmation && r.questions.is_empty() && !redirected,
                 Err(_) => true,
@@ -3917,7 +3931,7 @@ impl App {
         }
     }
 
-    /// What stood before a change was sent again by itself (Again::partial), said again with its
+    /// What stood before a change was sent again by itself (Job::stood), said again with its
     /// last answer when that didn't happen either, so it's never lost (intent 0591): just above
     /// the line that answer put up since `since`, or after whatever is up when that line waits.
     pub(super) fn say_what_stood(&mut self, stood: &str, since: Instant) {

@@ -503,6 +503,10 @@ come out of those two minutes, and a resend
 is given only what's left of them to answer in. A wait is never cut short: when N seconds, and at
 least 10 more for the resend to answer in, don't fit in what's left, or a wait ends with less than 10
 left, Kerdr sends nothing more and shows the last message as it is.
+A part-done answer with `retry` (`partial: true`) is sent again the same way, whether it comes at
+once or at the end of followed work: its `message` says what stood, so Kerdr says it at once, in
+yellow, as any part-done answer is, and again just above its last answer's line when that doesn't
+happen either; a plain `retry` refusal after it keeps it.
 Decide everything again at each send: a request whose card has changed meanwhile is decided for the
 card as it is now, and one that would now need a question asks it. Kerdr follows `retry` only from a
 machine whose feed lists `"op"`: there a change is followed with its `op`, and a read (an `edit` with

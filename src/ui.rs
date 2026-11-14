@@ -7789,6 +7789,7 @@ mod tests {
         let again = crate::actions::Resend::Retry {
             wait: std::time::Duration::from_secs(5),
             message: "#4's record is locked by a pull under way.".into(),
+            partial: false,
         };
         let backlog: Vec<Card> = a
             .board

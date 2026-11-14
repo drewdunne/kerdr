@@ -506,7 +506,12 @@ pub fn result_unknown(error: &str) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Resend {
     /// Refused for something passing: sent again after `wait`, the backend's words meanwhile.
-    Retry { wait: Duration, message: String },
+    /// `partial`: part of it stood, and those words say what, so they're kept (intent 0591).
+    Retry {
+        wait: Duration,
+        message: String,
+        partial: bool,
+    },
     /// Its answer was lost: sent again after `wait`, the `attempt`th time.
     Lost {
         wait: Duration,
@@ -791,6 +796,7 @@ fn resend_after(
     tell(&Resend::Retry {
         wait,
         message: last.message.clone(),
+        partial: last.partial,
     });
     pause(wait);
     let left = Clocks::left_of_retrying(start, clock());
@@ -937,6 +943,7 @@ fn resending_from(
                 // As long as it asked, never less; at least a second.
                 wait: Duration::from_secs(r.retry.unwrap_or(1).max(1)),
                 message: r.message.clone(),
+                partial: r.partial,
             },
             Err(error) if (sent.lost || (missed && lost_before)) && lost < LOST_WAITS.len() => {
                 Resend::Lost {
@@ -2009,6 +2016,59 @@ printf '%s' "$answer"
             over_ssh_late(&reopen, true, vec![retry(5)], &[Duration::from_secs(107)]);
         assert_eq!(deadlines.len(), 1);
         assert_eq!(answered.result.unwrap().retry, Some(5));
+    }
+
+    #[test]
+    fn a_part_done_refusal_with_retry_is_told_as_part_done() {
+        // Intent 0591: the board keeps what stood (App::resending), so the runner says so.
+        let close = with_op(json!({"action":"close","id":"0041"}));
+        let answer = |partial: bool| Answered {
+            result: Ok(Response {
+                ok: false,
+                partial,
+                retry: Some(5),
+                message: "Brought #41 back, but then: #41 is locked by another request.".into(),
+                ..Default::default()
+            }),
+            stderr: String::new(),
+            unreached: None,
+        };
+        let done = Answered {
+            result: Ok(Response {
+                ok: true,
+                message: "Marked #41 done.".into(),
+                ..Default::default()
+            }),
+            stderr: String::new(),
+            unreached: None,
+        };
+        let mut answers = vec![answer(true), answer(false), done].into_iter();
+        let now = std::cell::Cell::new(Clocks::now());
+        let mut told = vec![];
+        let answered = resending(
+            &close,
+            None,
+            true,
+            &mut |r| told.push(r.clone()),
+            &|d| now.set(later(now.get(), d)),
+            &|| now.get(),
+            deadline_for(&close),
+            &mut |_, _| Sent {
+                answered: answers.next().expect("sent more often than expected"),
+                lost: false,
+            },
+        );
+        assert!(answered.result.unwrap().ok);
+        assert!(
+            matches!(
+                &told[..],
+                [
+                    Resend::Retry { partial: true, .. },
+                    Resend::Retry { partial: false, .. }
+                ]
+            ),
+            "{told:?}"
+        );
     }
 
     #[test]

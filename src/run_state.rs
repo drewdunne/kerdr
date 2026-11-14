@@ -2434,6 +2434,7 @@ mod tests {
             &crate::actions::Resend::Retry {
                 wait: Duration::from_secs(3),
                 message: "herdr in web isn't answering yet; Kerdr asks again shortly.".into(),
+                partial: false,
             },
         );
         assert_eq!(a.busy_label, "Starting a fresh agent… trying again…");

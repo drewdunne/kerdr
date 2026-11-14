@@ -9377,6 +9377,7 @@ pub(crate) mod tests {
             &crate::actions::Resend::Retry {
                 wait: Duration::from_secs(5),
                 message: "#1's record is locked by a pull under way.".into(),
+                partial: false,
             },
         );
         assert_eq!(
@@ -9391,6 +9392,52 @@ pub(crate) mod tests {
             Some(crate::resolve::RETRYING)
         );
         assert_eq!(app.message(), None);
+    }
+
+    /// The runner's word that a change is being sent again after a refusal with `retry`.
+    fn retry_told(message: &str, partial: bool) -> crate::actions::Resend {
+        crate::actions::Resend::Retry {
+            wait: Duration::from_secs(10),
+            message: message.into(),
+            partial,
+        }
+    }
+
+    #[test]
+    fn a_part_done_answer_sent_again_at_once_keeps_saying_what_stood() {
+        // One rule for both paths (intent 0591): a part-done answer with `retry` that comes at
+        // once, not at a follow's end, is sent again by itself with what stood said while it
+        // waits, in yellow, and again above the last answer's line when that doesn't start it
+        // either. A later plain refusal with `retry` meanwhile keeps it.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        app.queue_action(machine, serde_json::json!({"action": "dispatch", "id": id}));
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.message = None;
+        let stood = format!(
+            "Started herdr session web, but then: {reference} didn't start yet (Claude Code's first-run answers here were still being written); ⏎ again in a moment. What was opened for it is closed again."
+        );
+        let busy = format!(
+            "{reference} didn't start yet (Claude Code's first-run answers here were still being written); ⏎ again in a moment. What was opened for it is closed again; nothing changed."
+        );
+        app.resending(Some(n), machine, &retry_told(&stood, true));
+        assert!(app.resolver.job(n).unwrap().retrying, "trying again");
+        assert_eq!(app.message(), Some((stood.as_str(), Tone::Warn)));
+        app.message = None;
+        app.resending(Some(n), machine, &retry_told(&busy, false));
+        assert_eq!(
+            app.message(),
+            None,
+            "a plain refusal says nothing meanwhile"
+        );
+        app.finish_job(n, request, refused(&busy));
+        assert_eq!(
+            app.message(),
+            Some((format!("{stood}\n{busy}").as_str(), Tone::Fail)),
+            "what stood, then why it still didn't start"
+        );
     }
 
     #[test]
