@@ -720,8 +720,8 @@ backend's after.
   false` with no question, or no answer back), that never went, or whose next question he leaves
   with Esc, is forgotten: its card asks again while the feed still carries the question, and s opens
   it again. An older Kerdr ignores `asks` and shows
-  `pending`, so `pending` should name the key that asks again ("waits for your answer: it started a
-  background job since you asked; s asks again").
+  `pending`, so `pending` should name the key that asks again ("moves to ARK_C once you answer: it
+  started background work since you asked; s on its card asks again").
 - **A save finishing in the background**: a `create` answered `ok` with `pending` and no `id`
   (`{"ok": true, "pending": "saving: its number comes once the central copy answers", "message": "…",
   "submission": "…"}`). Its card stays in the backlog, saying "✎ saving: its number comes once the

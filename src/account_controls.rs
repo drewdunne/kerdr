@@ -7346,7 +7346,7 @@ mod tests {
         let held: crate::feed::Held = serde_json::from_value(json!({
             "op": op,
             "action": "account-move",
-            "pending": "waits for your answer: it started a background job since you asked; s asks again",
+            "pending": "moves to ARK_C once you answer: it started background work since you asked; s on its card asks again",
             "since": 1_700_000_000,
             "asks": {
                 "message": format!("{reference} started a background job since you asked to move it, and moving it now ends that job. Move it now?"),
