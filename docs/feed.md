@@ -1210,10 +1210,11 @@ moves. Kerdr goes in only while you're still on that card, and it's still the sa
 you've moved on, or pressed `Esc`, it says the work is open again instead. A feed read while the
 reopen ran may already show the card in the workspace the answer names, with no `resume` (which the
 feed gives only while there's no workspace): that's what the reopen did, so it's still the same work
-and Kerdr goes in. That workspace is the one the answer names by both `session` and `workspace`:
-one with the same id in another session is another workspace. Another workspace, or `resume`
-naming another conversation, isn't. The same holds for a start `Enter` asked for, answered at once
-or once its followed work is done.
+and Kerdr goes in. That workspace is the one the answer names by both `session` and `workspace`,
+and a workspace the card already showed when you pressed `Enter` is still its own only in the same
+session: one with the same id in another session is another workspace. Another workspace, or
+`resume` naming another conversation, isn't. The same holds for a start `Enter` asked for,
+answered at once or once its followed work is done.
 
 To ask first (the session is at its usual limit, the conversation may still be open somewhere
 else), answer with `"confirmation": true`, a `message` that names every reason, and optionally

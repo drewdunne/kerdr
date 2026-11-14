@@ -765,17 +765,18 @@ mod tests {
     /// answer will name, and the feed card has it too, so it names no conversation to resume any
     /// more (it gives one only while there's no workspace), or names `resume` instead.
     fn read_shows_it_open(app: &mut App, ws: &str, resume: Option<&str>) {
+        read_shows_it_in(app, "api", ws, resume);
+    }
+
+    /// The same read, with the workspace in herdr session `session`, and in that one only.
+    fn read_shows_it_in(app: &mut App, session: &str, ws: &str, resume: Option<&str>) {
         let mi = app.machine_index("build-box").unwrap();
         let label = "39-flaky-login-test";
-        let snap = app.machines[mi]
-            .data
-            .as_mut()
-            .unwrap()
-            .snapshots
-            .get_mut("api")
-            .unwrap()
-            .as_mut()
-            .unwrap();
+        let data = app.machines[mi].data.as_mut().unwrap();
+        for snap in data.snapshots.values_mut().flatten() {
+            snap.workspaces.retain(|w| w.label != label);
+        }
+        let snap = data.snapshots.get_mut(session).unwrap().as_mut().unwrap();
         snap.workspaces.push(crate::herdr::Workspace {
             workspace_id: ws.into(),
             label: label.into(),
@@ -790,7 +791,7 @@ mod tests {
             .find(|c| c.id == "39")
             .unwrap();
         fc.workspace = Some(crate::feed::FeedWorkspace {
-            session: Some("api".into()),
+            session: Some(session.into()),
             id: Some(ws.into()),
             label: Some(label.into()),
             ..Default::default()
@@ -801,7 +802,10 @@ mod tests {
         });
         app.rebuild();
         let card = app.card("demo:39").unwrap();
-        assert_eq!(card.workspace_id.as_deref(), Some(ws));
+        assert_eq!(
+            (card.session.as_deref(), card.workspace_id.as_deref()),
+            (Some(session), Some(ws))
+        );
         assert_eq!(
             card.detail.as_ref().unwrap().resume.is_some(),
             resume.is_some()
@@ -903,6 +907,49 @@ mod tests {
             "{:?}",
             app.message()
         );
+        // Codex's review 76: a card that already showed api's w7 when the reopen went out (the
+        // board hadn't caught up with herdr saying it closed), and that a read shows in another
+        // session's w7 by the answer, with the same home and no conversation named either time.
+        // That's another workspace, so the answer naming api's w7 doesn't take him in. A read
+        // still showing api's w7 does.
+        for (now_in, goes_in) in [("api", true), ("background", false)] {
+            let mut app = demo_app();
+            let (key, id) = closed_card(&mut app);
+            read_shows_it_open(&mut app, "w7", None);
+            assert!(app.closed_under_you(&key, Some("w7")));
+            let reopen = app.next_owed();
+            let from = app
+                .action_from
+                .as_ref()
+                .expect("the reopen's card, as it was");
+            assert_eq!(
+                (
+                    from.workspace.as_deref(),
+                    from.resume_conversation.as_deref()
+                ),
+                (Some("w7"), None)
+            );
+            let (machine, request) = sent(&mut app, reopen);
+            assert_eq!(request["action"], "reopen");
+            read_shows_it_in(&mut app, now_in, "w7", None);
+            answer(&mut app, machine, &request, reopened(&id, "w7"));
+            match app.open_after.take() {
+                Some(open) if goes_in => assert_eq!(
+                    (
+                        open.session.as_str(),
+                        open.workspace.as_str(),
+                        open.from.as_str()
+                    ),
+                    ("api", "w7", key.as_str())
+                ),
+                None if !goes_in => assert!(
+                    app.message().unwrap().0.ends_with("⏎ on its card goes in."),
+                    "{:?}",
+                    app.message()
+                ),
+                open => panic!("now in {now_in}: {open:?}, {:?}", app.message()),
+            }
+        }
     }
 
     #[test]

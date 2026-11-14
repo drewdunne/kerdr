@@ -157,6 +157,7 @@ impl App {
             resume_agent: None,
             resume_conversation: Some(resume.conversation.clone()),
             workspace: None,
+            workspace_session: None,
             waiting: false,
             done: false,
             dismissed: false,
