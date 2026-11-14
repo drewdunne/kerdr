@@ -698,6 +698,130 @@ mod tests {
             .and_then(|c| c.status.clone())
     }
 
+    /// A read of build-box between ⏎ on #39 and its answer: herdr shows the workspace `ws` the
+    /// answer will name, and the feed card has it too, so it names no conversation to resume any
+    /// more (it gives one only while there's no workspace), or names `resume` instead.
+    fn read_shows_it_open(app: &mut App, ws: &str, resume: Option<&str>) {
+        let mi = app.machine_index("build-box").unwrap();
+        let label = "39-flaky-login-test";
+        let snap = app.machines[mi]
+            .data
+            .as_mut()
+            .unwrap()
+            .snapshots
+            .get_mut("api")
+            .unwrap()
+            .as_mut()
+            .unwrap();
+        snap.workspaces.push(crate::herdr::Workspace {
+            workspace_id: ws.into(),
+            label: label.into(),
+            ..Default::default()
+        });
+        let fc = app.machines[mi]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+            .find(|c| c.id == "39")
+            .unwrap();
+        fc.workspace = Some(crate::feed::FeedWorkspace {
+            session: Some("api".into()),
+            id: Some(ws.into()),
+            label: Some(label.into()),
+            ..Default::default()
+        });
+        fc.resume = resume.map(|conversation| crate::feed::Resume {
+            agent: Some("codex".into()),
+            conversation: Some(conversation.into()),
+        });
+        app.rebuild();
+        let card = app.card("demo:39").unwrap();
+        assert_eq!(card.workspace_id.as_deref(), Some(ws));
+        assert_eq!(
+            card.detail.as_ref().unwrap().resume.is_some(),
+            resume.is_some()
+        );
+    }
+
+    fn reopened(id: &str, ws: &str) -> Value {
+        json!({"ok": true, "message": "Reopened #39 in api, resuming its Codex conversation.",
+               "id": id, "session": "api", "workspace": ws, "label": "39-flaky-login-test"})
+    }
+
+    #[test]
+    fn a_read_between_enter_and_its_answer_that_shows_the_workspace_still_goes_in() {
+        // The end-to-end check's F1: the feed was read while the reopen ran, so by its answer the
+        // card showed the workspace the answer names and its feed no longer named a conversation
+        // to resume. That's what the reopen itself did: still the same work, so Kerdr goes in.
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        assert_eq!(request["action"], "reopen");
+        read_shows_it_open(&mut app, "w7", None);
+        answer(&mut app, machine, &request, reopened(&id, "w7"));
+        let open = app
+            .open_after
+            .clone()
+            .unwrap_or_else(|| panic!("it didn't go in: {:?}", app.message()));
+        assert_eq!(
+            (open.workspace.as_str(), open.from.as_str()),
+            ("w7", key.as_str())
+        );
+        // Followed, the read coming before even the answer that it's being followed: in once it's
+        // done.
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        read_shows_it_open(&mut app, "w7", None);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(
+                &id,
+                "recover",
+                "Bringing api back on its machine, then the work…",
+            ),
+        );
+        poll(&mut app);
+        assert!(progress(&mut app, {
+            let mut done = reopened(&id, "w7");
+            done["state"] = json!("done");
+            done
+        }));
+        let open = app
+            .open_after
+            .clone()
+            .unwrap_or_else(|| panic!("it didn't go in when done: {:?}", app.message()));
+        assert_eq!(
+            (open.workspace.as_str(), open.from.as_str()),
+            ("w7", key.as_str())
+        );
+        // A workspace other than the one the answer names, or another conversation to resume,
+        // isn't what the reopen did: it says where it is instead of taking him in.
+        for (ws, resume) in [
+            ("w8", None),
+            ("w7", Some("9d1e2f3a-0b4c-4d5e-8f6a-7b8c9d0e1f2a")),
+        ] {
+            let mut app = demo_app();
+            let (_, id) = closed_card(&mut app);
+            let enter = key_enter(&mut app);
+            let (machine, request) = sent(&mut app, enter);
+            read_shows_it_open(&mut app, ws, resume);
+            answer(&mut app, machine, &request, reopened(&id, "w7"));
+            assert_eq!(app.open_after, None, "{ws} {resume:?}");
+            assert!(
+                app.message().unwrap().0.ends_with("⏎ on its card goes in."),
+                "{:?}",
+                app.message()
+            );
+        }
+    }
+
     #[test]
     fn a_followed_reopen_shows_its_words_and_goes_in_when_done() {
         let mut app = demo_app();

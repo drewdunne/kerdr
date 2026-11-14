@@ -548,25 +548,37 @@ impl CardSnapshot {
         self.same_work_or(card, None)
     }
 
-    /// The same, also allowing for it to have the workspace `made` (the one a reopen just made).
+    /// The same, also allowing for what the answer that named the workspace `made` (a reopen's, or
+    /// a start's) brought about by itself. The card may have that workspace, and once it does, by
+    /// herdr's view or its feed's, its feed names no conversation to resume, since it gives one
+    /// only while there's no workspace: a feed read between the question and the answer shows both
+    /// (the end-to-end check's F1). It's still the same card on the same machine with the same
+    /// home, and a conversation it does name must be the one it had.
     pub fn same_work_or(&self, card: &Card, made: Option<&str>) -> bool {
         let now = CardSnapshot::of(card);
+        let gained = made.is_some_and(|made| {
+            now.workspace.as_deref() == Some(made)
+                || card
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.workspace.as_ref())
+                    .and_then(|w| w.id.as_deref())
+                    == Some(made)
+        });
+        let resume_gone = gained && now.resume_agent.is_none() && now.resume_conversation.is_none();
+        let bare = |s: &CardSnapshot| CardSnapshot {
+            workspace: None,
+            waiting: false,
+            done: false,
+            dismissed: false,
+            resume_agent: s.resume_agent.clone().filter(|_| !resume_gone),
+            resume_conversation: s.resume_conversation.clone().filter(|_| !resume_gone),
+            ..s.clone()
+        };
         now.workspace
             .as_deref()
             .is_none_or(|w| self.workspace.as_deref() == Some(w) || made == Some(w))
-            && CardSnapshot {
-                workspace: None,
-                waiting: false,
-                done: false,
-                dismissed: false,
-                ..now
-            } == CardSnapshot {
-                workspace: None,
-                waiting: false,
-                done: false,
-                dismissed: false,
-                ..self.clone()
-            }
+            && bare(&now) == bare(self)
     }
 }
 

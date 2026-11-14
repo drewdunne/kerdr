@@ -1178,8 +1178,12 @@ conversation running in another pane, say), it answers with it, and Kerdr goes s
 opened a new tab in a workspace already open (beside its parent's agent, or beside a tab still
 open there), add `tab`, that tab's id: herdr leaves a workspace's active tab as it was, so Kerdr
 goes onto that tab, and only that tab. Create the tab without focusing it, so nobody else's screen
-moves. Kerdr goes in only while you're still on that card; if you've moved on, or pressed `Esc`,
-it says the work is open again instead.
+moves. Kerdr goes in only while you're still on that card, and it's still the same work; if
+you've moved on, or pressed `Esc`, it says the work is open again instead. A feed read while the
+reopen ran may already show the card in the workspace the answer names, with no `resume` (which the
+feed gives only while there's no workspace): that's what the reopen did, so it's still the same work
+and Kerdr goes in. Another workspace, or `resume` naming another conversation, isn't. The same holds
+for a start `Enter` asked for, answered at once or once its followed work is done.
 
 To ask first (the session is at its usual limit, the conversation may still be open somewhere
 else), answer with `"confirmation": true`, a `message` that names every reason, and optionally
