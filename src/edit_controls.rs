@@ -13,7 +13,7 @@
 //! says so in the red box that stays until it's read: a save that works says nothing, so one that
 //! doesn't can't be missed.
 
-use super::controls::short;
+use super::controls::{short, what_and_why};
 use super::*;
 use crate::actions::Response;
 use crate::edit::{self, Ended, Run};
@@ -970,7 +970,11 @@ impl App {
             if reads {
                 self.say(problem, Tone::Warn);
             } else {
-                self.fail(format!("{reference}'s text wasn't saved: {problem}"));
+                self.fail(what_and_why(
+                    &format!("{reference}'s text wasn't saved"),
+                    &reference,
+                    &problem,
+                ));
             }
             return;
         };
@@ -1148,20 +1152,23 @@ impl App {
                     held.machine = machine;
                     held.check_first = true;
                 }
+                let words = what_and_why(
+                    &format!("{reference}'s save happened only in part"),
+                    reference,
+                    &short(r.message),
+                );
                 self.say(
-                    format!(
-                        "{reference}'s save happened only in part: {} e checks the text, and opens your version if it isn't there.",
-                        short(r.message)
-                    ),
+                    format!("{words} e checks the text, and opens your version if it isn't there."),
                     Tone::Warn,
                 );
             }
             Ok(r) => {
                 let stale = r.status.as_deref() == Some("stale");
                 let Some(held) = self.edits.get_mut(key) else {
-                    return self.fail(format!(
-                        "{reference}'s text wasn't saved: {}",
-                        short(r.message)
+                    return self.fail(what_and_why(
+                        &format!("{reference}'s text wasn't saved"),
+                        reference,
+                        &short(r.message),
                     ));
                 };
                 held.machine = machine;
@@ -1184,10 +1191,12 @@ impl App {
                     held.check_first = false;
                     "Your version is kept: e opens it."
                 };
-                self.fail(format!(
-                    "{reference}'s text wasn't saved: {} {next}",
-                    short(r.message)
-                ));
+                let words = what_and_why(
+                    &format!("{reference}'s text wasn't saved"),
+                    reference,
+                    &short(r.message),
+                );
+                self.fail(format!("{words} {next}"));
             }
             Err(error) => {
                 if let Some(held) = self.edits.get_mut(key) {
@@ -2785,11 +2794,10 @@ mod tests {
             })
         };
         answer(&mut app, &sent, stale());
+        // Its words name the card already, so it isn't named twice.
         assert_eq!(
             said(&app),
-            format!(
-                "{reference}'s text wasn't saved: {changed} Your version is kept: e opens it, with the newer text below it."
-            )
+            format!("{changed} Your version is kept: e opens it, with the newer text below it.")
         );
         seen(&mut app);
         assert_eq!(press(&mut app, 'e'), Action::None);

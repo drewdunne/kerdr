@@ -91,6 +91,32 @@ pub(super) fn short(text: String) -> String {
     }
 }
 
+/// Whether a backend's words already name the card by `reference` ("#21", or a workspace's
+/// name): as a whole word, so "#2" isn't found in "#21", and "#21's" counts.
+pub(super) fn names(words: &str, reference: &str) -> bool {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return false;
+    }
+    words.match_indices(reference).any(|(at, _)| {
+        let before = words[..at].chars().next_back();
+        let after = words[at + reference.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '#')
+            && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// What didn't happen and the backend's words why, as one line: "#41 wasn't marked done: it's
+/// locked." Words that already name the card are said alone, so a line never names it twice,
+/// as "#21 didn't start: #21 didn't start yet (…)" did.
+pub(super) fn what_and_why(what: &str, reference: &str, why: &str) -> String {
+    if names(why, reference) {
+        why.to_string()
+    } else {
+        format!("{what}: {why}")
+    }
+}
+
 /// Work waiting to start: the only cards d, y, x, J, K, t and B change, so the bottom line, the
 /// menu and the keys themselves agree.
 pub(crate) fn waiting_work(card: &Card) -> bool {
@@ -3867,6 +3893,14 @@ impl App {
         ))
     }
 
+    /// How the board names a request's card, "#41"; empty for one with no record.
+    fn reference_of(&self, request: &Value) -> String {
+        request["id"]
+            .as_str()
+            .map(|id| self.reference_for(id))
+            .unwrap_or_default()
+    }
+
     /// How a failure names the change that didn't happen: "#41 wasn't marked done".
     fn what_failed(&self, request: &Value) -> Option<String> {
         let id = request["id"].as_str()?;
@@ -4389,18 +4423,22 @@ impl App {
                     // didn't happen, so no "didn't" (intent 0591). The feed is read at once.
                     let kept = self.kickoff_kept_note(&request, held.as_deref());
                     let text = match request["id"].as_str() {
-                        Some(id) if !message.contains(&self.reference_for(id)) => {
+                        Some(id) if !names(&message, &self.reference_for(id)) => {
                             format!("{}: {message}{kept}", self.reference_for(id))
                         }
                         _ => format!("{message}{kept}"),
                     };
                     self.say(short(text), Tone::Warn);
                 } else if !response.ok {
-                    // The card is back as it really is; say what didn't happen, and why.
+                    // The card is back as it really is; say what didn't happen, and why, naming
+                    // the card once: words that already name it are said alone.
                     let what = self.what_failed(&request);
+                    let reference = self.reference_of(&request);
                     let kept = self.kickoff_kept_note(&request, held.as_deref());
                     self.fail(short(match what {
-                        Some(what) => format!("{what}: {message}{kept}"),
+                        Some(what) => {
+                            format!("{}{kept}", what_and_why(&what, &reference, &message))
+                        }
                         None => format!("{message}{kept}"),
                     }));
                 } else if let Some(note) = note {
@@ -4418,10 +4456,12 @@ impl App {
                 } else {
                     self.what_failed(&request)
                 };
+                let reference = self.reference_of(&request);
                 match what {
-                    Some(what) if !error.starts_with(&what) => {
-                        self.fail(short(format!("{what}: {error}{kept}")))
-                    }
+                    Some(what) if !error.starts_with(&what) => self.fail(short(format!(
+                        "{}{kept}",
+                        what_and_why(&what, &reference, &error)
+                    ))),
                     _ => self.fail(short(format!("{error}{kept}"))),
                 }
             }

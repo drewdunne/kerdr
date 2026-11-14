@@ -7,7 +7,7 @@
 //! - X on a workspace with no intent (K1-27): Kerdr asks, naming what stops, then sends `cancel`
 //!   with no `id`, only the workspace the yes was for; everything there is stopped and it's closed.
 
-use super::controls::short;
+use super::controls::{short, what_and_why};
 use super::*;
 use crate::actions::Response;
 use crate::model::{CardSnapshot, Source};
@@ -344,7 +344,10 @@ impl App {
                 request["confirm"] = json!(r.confirm);
                 if !from.as_ref().is_some_and(|f| self.still_on(f, None)) {
                     self.say(
-                        short(format!("{name} wasn't closed: {} X asks again.", r.message)),
+                        short(format!(
+                            "{} X asks again.",
+                            what_and_why(&format!("{name} wasn't closed"), &name, &r.message)
+                        )),
                         Tone::Warn,
                     );
                     return;
@@ -375,7 +378,11 @@ impl App {
                 self.say(short(said), Tone::Info);
             }
             Ok(r) if r.partial => self.say(short(r.message), Tone::Warn),
-            Ok(r) => self.fail(short(format!("{name} wasn't closed: {}", r.message))),
+            Ok(r) => self.fail(short(what_and_why(
+                &format!("{name} wasn't closed"),
+                &name,
+                &r.message,
+            ))),
             Err(e) if crate::actions::result_unknown(&e) => {
                 self.fail(short(format!("Closing {name}: {e}")))
             }
@@ -1170,6 +1177,23 @@ mod tests {
             "{}",
             said(&a)
         );
+        // Words that name the workspace already are said alone, never naming it twice.
+        let naming = format!(
+            "{} has an agent at work as another account, so nothing was stopped.",
+            card.workspace_name()
+        );
+        a.message = None;
+        a.action_from = Some(CardSnapshot::of(&card));
+        a.finish_action(
+            machine,
+            request.clone(),
+            Ok(crate::actions::Response {
+                ok: false,
+                message: naming.clone(),
+                ..Default::default()
+            }),
+        );
+        assert_eq!(said(&a), naming);
         // A question it asks goes back with its token, and the yes with override.
         let mut a = demo_app();
         let card = bare(&mut a, true);

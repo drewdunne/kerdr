@@ -7503,7 +7503,8 @@ pub(crate) mod tests {
             );
             assert!(matches!(app.mode, Mode::Board), "a refusal asked something");
             let (said, tone) = last_said(&app).unwrap();
-            assert_eq!(said, format!("{reference} didn't reopen: {refusal}"));
+            // Its words name the card already, so it isn't named twice.
+            assert_eq!(said, refusal);
             assert_eq!(tone, Tone::Fail);
             assert_eq!(app.open_after, None);
         }
@@ -9539,6 +9540,45 @@ pub(crate) mod tests {
             message: message.into(),
             ..Default::default()
         })
+    }
+
+    #[test]
+    fn a_refusal_that_already_names_its_card_is_said_without_naming_it_again() {
+        // "#21 didn't start: #21 didn't start yet (…)" named the card twice: piece A's launch_busy
+        // names it, as many refusals do. Words that name the card are said alone; others still
+        // have what didn't happen in front, and "#210" isn't "#21". An error naming it likewise.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        let (_, id, machine) = waiting_card(&app);
+        let reference = app.reference_for(&id);
+        let busy = format!(
+            "{reference} didn't start yet (Claude Code's first-run answers here were still being written); ⏎ again in a moment. What was opened for it is closed again; nothing changed."
+        );
+        let held = format!("Another request holds {reference}'s record just now.");
+        let other = format!("{reference}0 holds the lock.");
+        for (action, answer, said) in [
+            ("dispatch", refused(&busy), busy.clone()),
+            ("close", refused(&held), held.clone()),
+            (
+                "close",
+                refused("The store is locked."),
+                format!("{reference} wasn't marked done: The store is locked."),
+            ),
+            (
+                "close",
+                refused(&other),
+                format!("{reference} wasn't marked done: {other}"),
+            ),
+            ("close", Err(held.clone()), held.clone()),
+        ] {
+            let request = serde_json::json!({"action": action, "id": id});
+            app.queue_action(machine, request.clone());
+            let ready = app.resolver.ready();
+            assert_eq!(ready.len(), 1);
+            app.finish_job(ready[0].0, request, answer);
+            assert_eq!(app.message(), Some((said.as_str(), Tone::Fail)), "{action}");
+            app.message = None;
+        }
     }
 
     #[test]

@@ -354,6 +354,9 @@ A success shows from the feed itself once a read has it (or
 after two reads, or a minute). Anything else (`ok: false`, a confirmation, a timeout, an invalid
 response) takes the change off the board at once, so the card is as the feed last said, and Kerdr
 says what didn't happen in a red box that stays until a key is pressed, or asks the question.
+It puts what didn't happen in front of your `message` ("#41 wasn't marked done: the store is
+locked."), unless the `message` already names the card, as "#41 didn't start yet (…)" does: then
+it's said alone, so the card is never named twice.
 While a `dispatch` or `reopen` is unanswered, or answered but not yet in the feed, Kerdr sends
 nothing else for that record. A later change the feed shows retires the earlier ones to the same
 record, and a failed `move` takes the later moves' shown orders with it. Account
