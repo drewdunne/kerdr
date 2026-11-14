@@ -1208,6 +1208,22 @@ impl Resolver {
             .collect()
     }
 
+    /// Saves of an item's text whose commands have the whole request but haven't answered: one
+    /// whose machine turned out to be away is held only once its answer says so, so q waits for
+    /// it (the end-to-end check's P1).
+    pub fn saving_text(&self) -> Vec<&Job> {
+        self.jobs
+            .iter()
+            .filter(|j| {
+                j.settled.is_none()
+                    && j.handed
+                    && j.behind.is_none()
+                    && j.request["action"] == "edit"
+                    && !j.reads()
+            })
+            .collect()
+    }
+
     /// Unanswered changes whose commands have their whole request and carry on without Kerdr. A
     /// read isn't one: quitting loses nothing but its answer.
     pub fn running(&self) -> Vec<&Job> {

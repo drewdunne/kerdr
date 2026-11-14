@@ -27,6 +27,12 @@ use crate::state::State;
 /// lands well inside it, and giving up only chooses from a read a few seconds old (intent 0491).
 const FRESH_WAIT: Duration = Duration::from_millis(250);
 
+/// How long a save from a closed editor waits for its machine to be read afresh. The board takes
+/// no reads while your editor is open, so how a machine stood when it opened says nothing about
+/// now; a machine that can't be reached takes seconds to say so, and past this the save goes and
+/// its answer says it (the end-to-end check's P1).
+const EDIT_CHECK_WAIT: Duration = Duration::from_secs(3);
+
 /// How long after coming back to the board its turn stays quick for the read asked for then.
 const READ_LANDS: Duration = Duration::from_secs(1);
 
@@ -281,6 +287,12 @@ fn event_loop(
             });
             // For the error log, should it be a failure.
             app.answer_stderr = stderr;
+            // Its machine couldn't be reached, so nothing was sent: read it now, so the board
+            // shows it away and what comes next for it is held (the end-to-end check's P1).
+            let unreached = result.as_ref().is_err_and(|e| crate::actions::unreached(e));
+            if unreached && let Some(l) = live.as_deref() {
+                l.wake(machine);
+            }
             match job {
                 Some(n) => {
                     app.finish_job(n, request, result);
@@ -357,7 +369,7 @@ fn event_loop(
         }
         // A backlog item's text you just asked for with e: your editor, full screen (intent 0414).
         if let Some(key) = app.editor_due() {
-            edit_text(terminal, flags, app, &bg, &key)?;
+            edit_text(terminal, flags, app, live.as_deref(), &bg, &key)?;
         }
         // A resend to a record's real home, or a card whose workspace closed as you went in
         // reopening (intent 0411), whatever account action runs (intent 0445).
@@ -1184,6 +1196,7 @@ fn edit_text(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
     app: &mut App,
+    live: Option<&Live>,
     bg: &Bg,
     key: &str,
 ) -> anyhow::Result<()> {
@@ -1233,10 +1246,54 @@ fn edit_text(
         );
     }
     drop(stops);
+    // A changed text: its machine is read afresh first, so one that stopped answering while the
+    // editor was open has the save held, as any change for it is (the end-to-end check's P1).
+    if matches!(ended, crate::edit::Ended::Wrote { touched: true, .. })
+        && let Some((machine, reference)) = app.saved_to(key)
+    {
+        let checking = format!(
+            "Checking {} is answering before {reference}'s new text goes…",
+            app.machines[machine].name()
+        );
+        read_before_saving(app, live, bg.inbox, machine, EDIT_CHECK_WAIT, &mut |app| {
+            app.say(checking.clone(), Tone::Info);
+            let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        });
+        app.unsay(&checking);
+    }
     if let Action::Mutate { machine, request } = app.edit_ended(key, ended) {
         start_action(app, bg.answers, bg.runner, machine, request);
     }
     Ok(())
+}
+
+/// Before a save from a closed editor goes: what the machines said while the editor was open,
+/// which nobody applied, is applied now, and the save's machine, if it still reads as live, is read
+/// again, `wait` at most, with `waiting` told first. The save then goes to a machine that answered
+/// a moment ago, or is held for one that didn't (the end-to-end check's P1).
+fn read_before_saving(
+    app: &mut App,
+    live: Option<&Live>,
+    inbox: &Inbox,
+    machine: usize,
+    wait: Duration,
+    waiting: &mut dyn FnMut(&mut App),
+) {
+    for ev in inbox.take() {
+        app.apply(ev);
+    }
+    let Some(l) = live else { return };
+    let polled = l.pollers.get(machine).is_some_and(Option::is_some);
+    if !polled || !app.machines.get(machine).is_some_and(|m| m.conn.is_live()) {
+        return;
+    }
+    waiting(app);
+    let since = Instant::now();
+    l.wake(machine);
+    inbox.wait_since(&[machine], since, wait);
+    for ev in inbox.take() {
+        app.apply(ev);
+    }
 }
 
 /// Before the board hands the terminal over (into herdr, or to your editor): a new intent Enter
@@ -1794,6 +1851,65 @@ fn open_signin(app: &mut App, url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_save_from_a_closed_editor_goes_by_what_its_machine_said_while_the_editor_was_open() {
+        // The end-to-end check's P1: the board takes no reads while the editor is open, so the
+        // reads that came meanwhile wait in the inbox. Before the save goes they're applied: a
+        // machine that stopped answering meanwhile has the save held, never sent into the dark.
+        let mut app = App::new(
+            crate::config::Config::default(),
+            crate::demo::machines(false),
+        );
+        app.cfg.actions.command = Some("test-adapter".into());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| crate::app::waiting_work(c) && c.intake().is_none() && !c.dismissed())
+            .expect("a waiting backlog card in the demo")
+            .clone();
+        let m = card.machine_index;
+        app.machines[m]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        assert!(app.machines[m].conn.is_live());
+        let inbox = Inbox::default();
+        let reader = inbox.next_reader(m);
+        let since = app.now() - chrono::Duration::seconds(20);
+        inbox.put(
+            poll::Event {
+                machine: m,
+                conn: Conn::Reconnecting {
+                    since,
+                    attempt: 1,
+                    retry_at: since,
+                    detail: "ssh: connect to host: No route to host".into(),
+                },
+                data: None,
+                at: since,
+            },
+            Instant::now(),
+            reader,
+        );
+        // Known away from what came meanwhile: not read again, nothing waited for.
+        read_before_saving(&mut app, None, &inbox, m, Duration::ZERO, &mut |_| {
+            panic!("waited for a machine already known away")
+        });
+        assert!(!app.machines[m].conn.is_live());
+        let id = card.detail.as_ref().unwrap().id.clone();
+        app.action_key = Some(card.key.clone());
+        app.queue_action(
+            m,
+            serde_json::json!({"action":"edit","id":id,"text":"Mine.","was":"sha256:aa","from":"here"}),
+        );
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].request["text"], "Mine.");
+    }
 
     #[test]
     fn a_reopen_that_opened_a_tab_lands_on_that_tab_only() {

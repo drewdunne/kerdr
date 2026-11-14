@@ -527,6 +527,49 @@ impl Problem {
     }
 }
 
+/// Whether ssh's own words say it never reached the machine, so nothing it was to run started
+/// there: it couldn't connect, find the host, agree on its key, or sign in (the end-to-end check's
+/// P1). A connection that dropped after it was made says something else ("closed by remote host",
+/// "broken pipe"), and isn't this: what it ran may have started.
+pub fn never_reached(stderr: &str) -> bool {
+    stderr.lines().map(|l| l.trim().to_lowercase()).any(|l| {
+        l.starts_with("ssh: connect to host ")
+            || l.starts_with("ssh: could not resolve hostname ")
+            || l.starts_with("kex_exchange_identification:")
+            || l.contains("connection timed out during banner exchange")
+            || trust_refused_line(&l)
+    })
+}
+
+/// Whether ssh's own words say it refused the machine's host key, or the machine refused the
+/// sign-in: a machine Kerdr can't trust or sign in to is never gone around through another one.
+pub fn trust_refused(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .map(|l| l.trim().to_lowercase())
+        .any(|l| trust_refused_line(&l))
+}
+
+/// One line of ssh's, trimmed and in lower case: a host key refused, or a sign-in refused, which
+/// ssh says with the ways it tried ("Permission denied (publickey,password)."), never with a
+/// program's own error ("Permission denied (os error 13)").
+fn trust_refused_line(l: &str) -> bool {
+    l.starts_with("host key verification failed")
+        || l.contains("remote host identification has changed")
+        || l.starts_with("no ed25519 host key is known")
+        || l.split_once("permission denied (")
+            .is_some_and(|(_, rest)| {
+                rest.trim_end_matches('.')
+                    .strip_suffix(')')
+                    .is_some_and(|ways| {
+                        !ways.is_empty()
+                            && ways
+                                .chars()
+                                .all(|c| c.is_ascii_lowercase() || c == '-' || c == ',')
+                    })
+            })
+}
+
 /// Reads an SSH failure. Returns None when SSH itself worked.
 pub fn classify(target: &Target, out: &Output) -> Option<Problem> {
     if out.timed_out {

@@ -605,6 +605,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let message = app.message();
     // What was said takes the line first; this lasts as long as the ⏎ does (intent 0491).
     let remembered = remembered_line(app);
+    // Then what's held for the list row selected, which its row has no room for.
+    let held_row = held_row_line(app);
     let filter_line = filtered(app);
     let accounts = app
         .machines
@@ -616,7 +618,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(if accounts { 1 } else { 3 }),
         Constraint::Min(4),
         Constraint::Length(u16::from(
-            pending.is_some() || message.is_some() || remembered.is_some(),
+            pending.is_some() || message.is_some() || remembered.is_some() || held_row.is_some(),
         )),
         Constraint::Length(1),
     ])
@@ -714,6 +716,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             vec![Span::styled(text.to_string(), fg(color))],
         );
     } else if let Some(line) = remembered {
+        put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
+    } else if let Some(line) = held_row {
         put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
     }
     let backlog_hints = card_hints(app);
@@ -1409,6 +1413,18 @@ fn remembered_line(app: &App) -> Option<Vec<Span<'static>>> {
     ])
 }
 
+/// What's held for the selected card when it shows as a one-line row (the backlog, done work):
+/// "#41 ⧗ d waits for LAB-Server", in full, since its row shows only ⧗ (the end-to-end check's
+/// P2). A card box shows its own line.
+fn held_row_line(app: &App) -> Option<Vec<Span<'static>>> {
+    let card = app.selected().filter(|c| c.stage.is_list())?;
+    let line = app.held_line_for(card)?;
+    Some(vec![
+        Span::styled(format!("{} ", card.reference), bold(CYAN)),
+        Span::styled(line, fg(CYAN)),
+    ])
+}
+
 fn strip(f: &mut Frame, rect: Rect, app: &App) {
     let s = app.summary();
     panel(f, rect, BORDER, PANEL, BorderType::Rounded);
@@ -1755,6 +1771,12 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
         if let Some(r) = app.held_elsewhere(i) {
             meta = format!("in {r}");
             mcolor = CYAN;
+        }
+        // A change held for it, Kerdr's or its backend's (intent 0591, release 4): ⧗ in its
+        // glyph's place, so its row stays one line, and its words on the message line while it's
+        // selected (the end-to-end check's P2).
+        if app.held_line_for(c).is_some_and(|l| l.starts_with('⧗')) {
+            (glyph, gcolor) = ("⧗", CYAN);
         }
         // A question waits on it for you (intent 0591).
         if let Some(line) = app.waiting_line_for(&c.key) {

@@ -399,16 +399,24 @@ pub struct FeedCard {
 
 /// One request a backend holds for a card (intent 0591, release 4): its `op`, the action it is,
 /// what the card says meanwhile, when it was taken, and, for one that runs at a set time, when.
-/// Both times are epoch seconds.
+/// Both times are epoch seconds, whole or with a fraction (epoch_seconds).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct Held {
     pub op: String,
     #[serde(default)]
     pub action: String,
     pub pending: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "epoch_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub since: Option<i64>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "epoch_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub until: Option<i64>,
     /// The new intent a save held at the feed's top level is for, by its submission id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -459,6 +467,20 @@ fn held_asks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<HeldAsks>,
             && a.request["action"]
                 .as_str()
                 .is_some_and(|action| action.starts_with("account-"))
+    }))
+}
+
+/// An epoch time in seconds: a whole number, or one with a fraction, cut to the second, since a
+/// backend may write either (the end-to-end check's P4). Anything else reads as none, so an entry
+/// is never lost over its time.
+fn epoch_seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.and_then(|v| {
+        v.as_i64().or_else(|| {
+            v.as_f64()
+                .filter(|f| f.is_finite() && (i64::MIN as f64..=i64::MAX as f64).contains(f))
+                .map(|f| f.floor() as i64)
+        })
     }))
 }
 
@@ -787,6 +809,34 @@ mod tests {
         assert_eq!(asks.choices.len(), 1);
         assert_eq!(asks.request["to"], "ARK_C");
         assert!(held[1..].iter().all(|h| h.asks.is_none()), "{held:?}");
+    }
+
+    #[test]
+    fn a_held_entry_whose_times_have_a_fraction_is_read_never_dropped() {
+        // The end-to-end check's P4: the accounts backend wrote `since` and `until` with a
+        // fraction, and Kerdr dropped every such entry, its question too. Cut to the second; a
+        // time it can't read at all is none, and the entry stays.
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[],
+              "agents":[{"pane":"w1:p1","session":"web","conversation":"c1","account":"KBZ_C",
+                 "held":[
+                  {"op":"k-5234ac48661e6ebb","action":"account-move","pending":"moves to ZZB_C at 05:53","since":1794657061.9556377,"until":1794657211.0},
+                  {"op":"k-c1abb6e1ac6cb5c8","action":"account-move","pending":"moves to ZZN_C once the move under way finishes","since":1794657243.6067748},
+                  {"op":"k-9ec7fba147ea3f72","action":"account-move","pending":"moves to ZZB_C once you answer","since":1794657300.5,
+                   "asks":{"message":"Move it now?","confirm":"t-1","request":{"action":"account-move","pane":"w1:p1","to":"ZZB_C"}}},
+                  {"op":"k-0000000000000004","action":"account-move","pending":"a time it can't read","since":"soon","until":[1]}]}]}"#,
+        )
+        .unwrap();
+        let held = &feed.agents[0].held;
+        assert_eq!(held.len(), 4, "{held:?}");
+        assert_eq!(
+            (held[0].since, held[0].until),
+            (Some(1794657061), Some(1794657211))
+        );
+        assert_eq!((held[1].since, held[1].until), (Some(1794657243), None));
+        assert_eq!(held[2].since, Some(1794657300));
+        assert!(held[2].asks.is_some(), "its question is kept");
+        assert_eq!((held[3].since, held[3].until), (None, None));
     }
 
     #[test]

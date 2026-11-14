@@ -88,6 +88,19 @@ pub fn held_what(request: &Value) -> String {
     .to_string()
 }
 
+/// What a drop that can't get through says: nothing was dropped, why, and how to drop it once its
+/// machine answers. Never 0.34.0's refusal (the end-to-end check's P3).
+pub(crate) fn not_dropped(reference: &str, words: Option<&str>, machine: &str) -> String {
+    match words.filter(|w| !w.trim().is_empty()) {
+        Some(words) => format!(
+            "{reference}: \"{words}\" wasn't dropped: {machine} can't be reached from here. Once it answers, m then D drops it."
+        ),
+        None => format!(
+            "Nothing held for {reference} was dropped: {machine} can't be reached from here. Once it answers, m then D drops it."
+        ),
+    }
+}
+
 /// A short span of time: "40 s", "3 min", "2 h".
 pub fn span(secs: i64) -> String {
     let secs = secs.max(0);
@@ -231,6 +244,49 @@ impl App {
         Some((machine, request))
     }
 
+    /// A change to a card whose machine ssh couldn't reach, so nothing was sent: that machine is
+    /// away after all, though the board still read it as answering (the end-to-end check's P1).
+    /// It goes as one pressed while it's away does (route): through a machine that forwards, else
+    /// into the hold file when its backend holds, with its op and the card's `rev` from when the
+    /// key was pressed. Whether it was taken; otherwise its failure is said as before.
+    fn away_after_all(&mut self, n: u64, error: &str) -> bool {
+        let Some(job) = self.resolver.job(n) else {
+            return false;
+        };
+        let machine = job.machine;
+        let card_change = job.request["action"]
+            .as_str()
+            .is_some_and(|a| a != "create" && !a.starts_with("account-"))
+            && !crate::resolve::reads(&job.request)
+            && job.request.get("forward_to").is_none();
+        let Some(name) = self.machines.get(machine).map(|m| m.name()) else {
+            return false;
+        };
+        if !card_change || !self.actions_on() {
+            return false;
+        }
+        // A host key or a sign-in its ssh refused is never gone around: held, or refused.
+        let via = (!crate::actions::trust_refused(error))
+            .then(|| self.forwarder_for(Some(&name)))
+            .flatten();
+        if via.is_none() && !self.holds_on(machine) {
+            return false;
+        }
+        let Some(job) = self.resolver.take(n) else {
+            return false;
+        };
+        let mut request = job.request.clone();
+        match via {
+            Some(via) => {
+                request["forward_to"] = Value::String(name);
+                self.resend
+                    .push_back((via, request, job.from.clone(), job.key.clone()));
+            }
+            None => self.hold_request(name, request, job.key.clone(), job.rev.clone(), None),
+        }
+        true
+    }
+
     /// A key pressed again on a card whose same change is in the file, kept there because its
     /// machine's backend doesn't check one (`stays`), or on its way from a Kerdr already. Kept
     /// held, it goes as that record, claimed, with its op, and its answer takes it out of the
@@ -335,16 +391,16 @@ impl App {
                 .and_then(|c| c.detail.as_ref())
                 .and_then(|d| d.held.iter().find(|h| h.op == target))
                 .map(|h| h.pending.clone())
-                .filter(|w| !w.is_empty());
-            let said = match words {
-                Some(words) => format!(
-                    "{reference}: \"{words}\" wasn't dropped: {machine} can't be reached from here. Once it answers, m then D drops it."
-                ),
-                None => format!(
-                    "Nothing held for {reference} was dropped: {machine} can't be reached from here. Once it answers, m then D drops it."
-                ),
-            };
-            self.say(said, Tone::Warn);
+                .or_else(|| {
+                    self.pendings
+                        .iter()
+                        .find(|p| p.op == target)
+                        .map(|p| p.words.clone())
+                });
+            self.say(
+                not_dropped(&reference, words.as_deref(), &machine),
+                Tone::Warn,
+            );
             self.rebuild();
             return;
         }
@@ -830,6 +886,22 @@ impl App {
                     }
                     self.kept.unclaim(op);
                 }
+            }
+        }
+        // Its machine couldn't be reached, so nothing was sent (the end-to-end check's P1): it's
+        // away, though the board hadn't seen it yet, its loop standing still while an editor was
+        // open, say. One from the file waits there again, as itself; any other goes as a change
+        // pressed while its machine is away does (away_after_all).
+        if let Err(error) = result
+            && crate::actions::unreached(error)
+        {
+            if from_file.is_some() {
+                self.resolver.take(n);
+                self.rebuild();
+                return true;
+            }
+            if self.away_after_all(n, error) {
+                return true;
             }
         }
         if let Some(to) = response.and_then(|r| r.unreachable.clone()) {
@@ -1381,7 +1453,10 @@ impl App {
             );
             return super::Action::None;
         }
-        if !self.can_write(machine) {
+        // A change to a card: for a machine that isn't answering it goes through one that
+        // forwards, or is said as not dropped (hold_request), never refused as 0.34.0 refused it
+        // (the end-to-end check's P3).
+        if !self.can_change(machine) {
             return super::Action::None;
         }
         let mut request = json!({"action": "drop", "held": op});
@@ -1417,6 +1492,17 @@ impl App {
                 ),
                 Tone::Info,
             );
+            return super::Action::None;
+        }
+        // Its machine isn't answering: an account request is never held or sent on, so it's said
+        // as not dropped, as a card's drop is (the end-to-end check's P3).
+        if self.actions_on() && !self.machines[machine].conn.is_live() {
+            let reference = self
+                .card(key)
+                .map(|c| c.reference.clone())
+                .unwrap_or_else(|| "its card".into());
+            let name = self.machines[machine].name();
+            self.say(not_dropped(&reference, Some(words), &name), Tone::Warn);
             return super::Action::None;
         }
         if !self.can_write(machine) {
@@ -1567,6 +1653,16 @@ impl App {
                 .unwrap_or_else(|| "a card".into());
             return Some(format!("{reference}'s change is handed over"));
         }
+        // A save of an item's text not answered yet: one whose machine turned out to be away is
+        // held only once its answer says so, so q waits the moment that takes (the end-to-end
+        // check's P1).
+        if let Some(first) = self.resolver.saving_text().first() {
+            let reference = first
+                .id()
+                .map(|id| self.reference_for(id))
+                .unwrap_or_else(|| "a card".into());
+            return Some(format!("{reference}'s new text is saved or held"));
+        }
         // A change whose copies disagreed, sent once more when they agree (K1-53): within two
         // minutes, it goes or is said (Codex's review 60).
         if let Some(d) = self.catch_up.disagreed.first() {
@@ -1603,8 +1699,15 @@ impl App {
         };
         if self.quitting.is_some() {
             self.hold_unsent();
+            // Only saves of an item's text left, for backends that don't hold: their words are kept
+            // as your version, which e opens, so quitting loses nothing.
+            let texts_only = self.resolver.holding_quit().is_empty()
+                && self.send_after_load.is_none()
+                && self.catch_up.disagreed.is_empty()
+                && !self.resolver.saving_text().is_empty();
             match self.quit_waits_for() {
                 None => return self.quit_now(),
+                Some(_) if texts_only => return self.quit_now(),
                 Some(w)
                     if w == "the account change answers"
                         || self.account_away_wait().as_deref() == Some(w.as_str()) =>
@@ -1692,15 +1795,20 @@ impl App {
                 unanswered: false,
             });
         }
+        // With saves of an item's text not answered yet (the end-to-end check's P1): held with
+        // their op, so if one did land, its backend answers the next send from its record.
         let unsent: Vec<u64> = self
             .resolver
             .holding_quit()
-            .iter()
+            .into_iter()
+            .chain(self.resolver.saving_text())
             .filter(|j| j.request["action"] != "create" && self.holds_on(j.machine))
             .map(|j| j.n)
             .collect();
         for n in unsent {
             if let Some(job) = self.resolver.take(n) {
+                // Its command had all of it: it may have gone ahead.
+                let unanswered = job.handed;
                 // One from the hold file is there already, as itself (Codex's review 60).
                 if let Some(op) = self.held_sending.remove(&n)
                     && self.kept.find(&op).is_some()
@@ -1722,7 +1830,7 @@ impl App {
                     after: None,
                     by: Some(me.clone()),
                     stays: None,
-                    unanswered: false,
+                    unanswered,
                 });
             }
         }
@@ -2208,6 +2316,127 @@ mod tests {
         assert_eq!(app.kept.held.len(), 1);
         app.finish_job(n, request, ok(json!({})));
         assert!(app.kept.held.is_empty());
+    }
+
+    /// What ssh says when it couldn't connect, as the runner gives it: nothing was sent.
+    fn unreached(name: &str) -> Result<Response, String> {
+        Err(format!(
+            "{name} couldn't be reached (ssh: connect to host {name} port 22: No route to host), so nothing was sent"
+        ))
+    }
+
+    #[test]
+    fn a_change_whose_machine_couldnt_be_reached_after_all_is_held_or_forwarded() {
+        // The end-to-end check's P1: the board still read the machine as answering (its loop
+        // stood still while an editor was open), so the change went, and ssh couldn't connect.
+        // Nothing reached it, so the machine is away: the change is held as any change for an away
+        // machine is, with its op, or goes through a machine that forwards. Never "can't tell".
+        let mut app = app();
+        let (key, _, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        let name = app.machines[m].name();
+        assert!(app.machines[m].conn.is_live());
+        d(&mut app);
+        let ready = app.resolver.ready();
+        let [(n, machine, request, _)] = &ready[..] else {
+            panic!("d didn't go once: {ready:?}")
+        };
+        assert_eq!(*machine, m);
+        app.finish_job(*n, request.clone(), unreached(&name));
+        assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
+        let held = app.kept.held[0].clone();
+        assert_eq!(held.op(), request["op"].as_str().unwrap());
+        assert_eq!(
+            (held.machine.as_str(), held.unanswered),
+            (name.as_str(), false)
+        );
+        assert_eq!(held.rev.as_deref(), Some("r1"));
+        assert_eq!(
+            said(&app),
+            format!("Held: d on {reference} goes when {name} answers.")
+        );
+        assert!(!app.failing());
+        assert_eq!(app.resolver.unanswered(), 0);
+        let card = app.card(&key).unwrap().clone();
+        assert_eq!(
+            app.held_line_for(&card).as_deref(),
+            Some(format!("⧗ d waits for {name}").as_str())
+        );
+        // A machine that forwards: through it, once.
+        let mut app = self::app();
+        let (_, _, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        let via = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(&mut app, via, FORWARD);
+        d(&mut app);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(n, request.clone(), unreached(&name));
+        assert!(app.kept.held.is_empty());
+        let Action::Mutate {
+            machine,
+            request: again,
+        } = app.next_owed()
+        else {
+            panic!("not sent on: {}", said(&app))
+        };
+        app.queue_action(machine, again);
+        let ready = app.resolver.ready();
+        let [(_, to, sent, _)] = &ready[..] else {
+            panic!("not sent once: {ready:?}")
+        };
+        assert_eq!(*to, via);
+        assert_eq!(
+            (&sent["action"], &sent["forward_to"], &sent["id"]),
+            (&request["action"], &json!(name), &request["id"])
+        );
+        // A host key its ssh refused is never gone around: held for it, not forwarded.
+        let mut app = self::app();
+        let (_, _, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        supports(&mut app, via, FORWARD);
+        d(&mut app);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        app.finish_job(
+            n,
+            request.clone(),
+            Err(format!(
+                "{name} couldn't be reached (Host key verification failed.), so nothing was sent"
+            )),
+        );
+        assert_eq!(app.next_owed(), Action::None);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
+        assert_eq!(app.kept.held[0].op(), request["op"].as_str().unwrap());
+    }
+
+    #[test]
+    fn a_change_from_the_hold_file_whose_machine_couldnt_be_reached_waits_there_unsaid() {
+        // The same from the hold file: it waits there again as itself, unclaimed, and goes when
+        // its machine answers. Nothing reached the machine, so it's not one that may have gone.
+        let mut app = app();
+        let (_, _, _, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        away(&mut app, m, 40);
+        d(&mut app);
+        let op = app.kept.held[0].op().to_string();
+        back(&mut app, m);
+        let (n, _, request, _) = app.resolver.ready()[0].clone();
+        assert_eq!(request["held"], true);
+        app.message = None;
+        let name = app.machines[m].name();
+        app.finish_job(n, request, unreached(&name));
+        assert_eq!(app.kept.held.len(), 1);
+        let held = app.kept.held[0].clone();
+        assert_eq!(held.op(), op);
+        assert_eq!((held.by.as_deref(), held.unanswered), (None, false));
+        assert_eq!(app.message(), None);
+        assert_eq!(app.resolver.unanswered(), 0);
+        back(&mut app, m);
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "{ready:?}");
+        assert_eq!(ready[0].2["op"], op.as_str());
     }
 
     #[test]
@@ -2806,6 +3035,114 @@ mod tests {
             said(&app),
             format!(
                 "Nothing held for {reference} was dropped: {name} can't be reached from here. Once it answers, m then D drops it."
+            )
+        );
+    }
+
+    #[test]
+    fn a_backlog_row_shows_what_is_held_for_it_and_says_it_in_full_when_selected() {
+        // The end-to-end check's P2: card boxes showed "⧗ d waits for X", but backlog rows, where
+        // most d and x presses are, didn't. The row shows ⧗ in its glyph's place, staying one
+        // line, and the message line says it in full while the row is selected.
+        let mut app = app();
+        let (key, _, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        away(&mut app, m, 40);
+        let name = app.machines[m].name();
+        assert!(
+            matches!(d(&mut app), Action::Mutate { .. }),
+            "{}",
+            said(&app)
+        );
+        assert_eq!(app.kept.held.len(), 1);
+        app.message = None;
+        let screen = crate::ui::tests_render(&app, 160, 40);
+        assert!(
+            screen.contains(&format!("⧗ {reference} ")),
+            "no ⧗ on its row: {screen}"
+        );
+        assert!(
+            screen.contains(&format!("{reference} ⧗ d waits for {name}")),
+            "not on the message line: {screen}"
+        );
+        // Another row selected: its own row still shows it, the message line doesn't.
+        let other = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.key != key && c.stage == crate::model::Stage::Backlog)
+            .expect("another backlog card")
+            .key
+            .clone();
+        select(&mut app, &other);
+        let screen = crate::ui::tests_render(&app, 160, 40);
+        assert!(screen.contains(&format!("⧗ {reference} ")), "{screen}");
+        assert!(!screen.contains("⧗ d waits for"), "{screen}");
+    }
+
+    #[test]
+    fn d_for_a_machine_that_isnt_answering_says_it_wasnt_dropped_not_the_old_refusal() {
+        // The end-to-end check's P3: D on what a backend holds, its machine away, said 0.34.0's
+        // "That machine is not answering. Reconnect before changing its intents." It's a change to
+        // a card: through a machine that forwards when there is one, else not dropped, said so,
+        // with what to do once it answers. An account request's drop says the same.
+        let mut app = app();
+        let (key, id, reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        let held: crate::feed::Held = serde_json::from_value(json!({
+            "op": "k-target",
+            "action": "dispatch",
+            "pending": "starts once a workspace in ARK frees up",
+        }))
+        .unwrap();
+        for c in app.machines[m].feed.as_mut().unwrap().cards.iter_mut() {
+            if c.id == id {
+                c.held = vec![held.clone()];
+            }
+        }
+        app.rebuild();
+        select(&mut app, &key);
+        away(&mut app, m, 30);
+        let name = app.machines[m].name();
+        if let Action::Mutate { machine, request } = app.drop_held(None) {
+            app.queue_action(machine, request);
+        }
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference}: \"starts once a workspace in ARK frees up\" wasn't dropped: {name} can't be reached from here. Once it answers, m then D drops it."
+            )
+        );
+        assert!(app.kept.held.is_empty(), "kept: {:?}", app.kept.held);
+        assert!(app.resolver.ready().is_empty());
+        // A machine that forwards: sent through it.
+        let other = (0..app.machines.len())
+            .find(|&i| i != m && app.machines[i].feed.is_some())
+            .unwrap();
+        supports(&mut app, other, FORWARD);
+        let Action::Mutate { machine, request } = app.drop_held(None) else {
+            panic!("not sent through the forwarder: {}", said(&app))
+        };
+        app.queue_action(machine, request);
+        let ready = app.resolver.ready();
+        let [(_, via, sent, _)] = &ready[..] else {
+            panic!("not sent once: {ready:?}")
+        };
+        assert_eq!(*via, other);
+        assert_eq!(
+            (&sent["action"], &sent["held"], &sent["forward_to"]),
+            (&json!("drop"), &json!("k-target"), &json!(name))
+        );
+        // An account request's drop, its machine away.
+        app.message = None;
+        assert_eq!(
+            app.drop_account_backend(m, &key, "k-move", "moves to ARK_C at 02:00"),
+            Action::None
+        );
+        assert_eq!(
+            said(&app),
+            format!(
+                "{reference}: \"moves to ARK_C at 02:00\" wasn't dropped: {name} can't be reached from here. Once it answers, m then D drops it."
             )
         );
     }

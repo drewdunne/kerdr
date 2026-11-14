@@ -107,7 +107,7 @@ know rather than guessing.
 | `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"`, `"steps"`, `"cancel-backlog"`, `"cancel-workspace"`, `"cancel-conversations"`, `"hold"` and `"forward"`. See [Asking again](#asking-again-op-and-retry), [Each key's step first](#each-keys-step-first-and-questions-with-choices), [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace) and [Holding and sending on a request](#holding-and-sending-on-a-request). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
 | `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)); until they're gone, and from the first read that names them, that session's workspaces are marked out of date, dim on the board, and a card with no workspace says "workspace not known" instead of "no workspace open". Entries of any other shape are ignored: a `session` on a `feed` or `herdr` entry, a `session` entry with none, or a `part` Kerdr doesn't know. An entry whose `why` is empty gets Kerdr's own words. |
 | `rev` | Optional, for a backend that lists `"hold"`: a short hash of what a decision about the card rests on (its state, disposition, status, home, workspace, conversation and text fingerprint), computed from the record alone, so every machine's copy gives the same one. A request that waited before it was sent carries the `rev` the card had when the key was pressed. See [Holding and sending on a request](#holding-and-sending-on-a-request). |
-| `held` | Optional, for a backend that lists `"hold"`: what it holds for this card, `[{"op": "<the request's op>", "action": "dispatch", "pending": "queued in ARK: starts when a place frees", "since": <epoch seconds>, "until": <epoch seconds>}]`, `until` only for one that runs at a set time. Kerdr shows the first on the card ("⧗ queued in ARK: …") and lists them all in its peek (`m`), each with a key to drop it. An entry with no `op` or no `pending` is left out. One whose `action` starts with `account-` (an `account-move` for later) is dropped with `account-drop`. An account one may carry `asks`, a question it waits on (see `pending` under the requests). |
+| `held` | Optional, for a backend that lists `"hold"`: what it holds for this card, `[{"op": "<the request's op>", "action": "dispatch", "pending": "queued in ARK: starts when a place frees", "since": <epoch seconds>, "until": <epoch seconds>}]`, `until` only for one that runs at a set time. Write whole seconds; Kerdr also reads a time with a fraction (`1762873200.5`), as its whole second, and an entry whose time it can't read at all is kept, without that time, never left out for it. Kerdr shows the first on the card ("⧗ queued in ARK: …") and lists them all in its peek (`m`), each with a key to drop it. An entry with no `op` or no `pending` is left out. One whose `action` starts with `account-` (an `account-move` for later) is dropped with `account-drop`. An account one may carry `asks`, a question it waits on (see `pending` under the requests). |
 | `held` (top level) | Optional, for a backend that lists `"hold"`: what it holds that has no card yet, a new intent's save finishing in the background, `[{"op": "<the create's op>", "action": "create", "pending": "saving: its number comes once the central copy answers", "since": <epoch seconds>, "submission": "<its submission id>", "title": "<a title from his words>"}]`. While it lists a save, that save's card stays saying so, and a Kerdr opened after it was sent shows a card for it, titled `title` ("Your new intent" without one), until a card with its `submission` is read. See [Holding and sending on a request](#holding-and-sending-on-a-request). |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
@@ -491,7 +491,15 @@ exit, 255), nobody can tell whether the request happened. To a machine whose fee
 sends it again with the same `op`, after 5, 10 and 15 seconds, within the same two minutes as
 `retry`, and the record answers if it did. To
 any other machine, Kerdr never sends it again: it says plainly that it can't tell whether it
-happened, and that the card shows how it stands. A backend that crashed or printed something that
+happened, and that the card shows how it stands. ssh's exit 255 with nothing printed, whose message
+says it never reached the machine (it couldn't connect, find the name, or check its host key, or the
+machine refused the sign-in), isn't a lost answer: nothing was sent, so the machine is away, and the
+change is held for it, or sent through a machine that forwards, as one asked while its machine isn't
+answering is (see [Holding and sending on a request](#holding-and-sending-on-a-request)), though
+never through another machine when it was the host key or the sign-in that was refused; a backend
+that holds nothing refuses it as before ("X couldn't be reached (…), so nothing was sent"). After a
+try that may have reached it, one that didn't is still a lost answer, since the first may have
+landed. A backend that crashed or printed something that
 isn't JSON isn't a lost answer, since sending it again would most likely do the same: what it printed
 goes to Kerdr's error log, never the board.
 
@@ -723,7 +731,9 @@ backend's after.
   `held` names what it drops and a change sent from the file is marked `held: true`: when it can't
   get through (a forwarder answers `unreachable`, or its machine isn't answering), nothing is
   dropped, and Kerdr says so: "#41: "queued in ARK: starts when a place frees" wasn't dropped:
-  build-box can't be reached from here. Once it answers, m then D drops it." A drop sent to a
+  build-box can't be reached from here. Once it answers, m then D drops it." A held request with no
+  `pending` words says "Nothing held for #41 was dropped: …" in the same shape, and an account
+  request's drop (`account-drop`) says the same when its machine isn't answering. A drop sent to a
   machine that doesn't hold what it drops (the one that queued a start on another, say) may answer
   `ok: false` with `home`, naming the machine that holds it: Kerdr sends the same drop there once,
   with its `op` and `held`, as for any `home` refusal, but never takes it as the card's record having
@@ -796,7 +806,9 @@ backend's after.
 `"hold"` when Kerdr last read it, goes into `held.json` in Kerdr's state folder (readable by you
 alone): the request with its `op`, the machine, the card's `rev`, and when the key was pressed. The
 card says "⧗ d waits for LAB-Server", and the message line "Held: d on #582 goes when LAB-Server
-answers (it dropped 40 s ago)." Once that machine answers, and its feed has been read since, the next
+answers (it dropped 40 s ago)." A backlog card's row on the board stays one line: a cyan ⧗ takes the
+place of its glyph, and while it's selected the message line under the board says it in full ("#582
+⧗ d waits for LAB-Server"), as for any held request the card shows. Once that machine answers, and its feed has been read since, the next
 read sends it as it was asked, with `held: true` and its `rev`; it leaves the file when it's answered,
 and the card says "⧗ d is on its way to LAB-Server" meanwhile. One sent that got no answer, or that a
 forwarder couldn't get through, waits in the file again, to go once more with the same `op`. One
@@ -841,7 +853,12 @@ can. A start that waited for its intent's write-up when you quit is kept the sam
 Kerdr starts it once it's written up, if its card still waits to start (Kerdr checks this itself,
 since an older backend checks no `rev`). The peek (`m`) lists Kerdr's held requests and the
 backend's, and `D` drops the first, `2D` the second. A save of an item's text (`edit`) whose machine
-stopped answering while your editor was open is held the same way, your version kept meanwhile. A
+stopped answering while your editor was open is held the same way, your version kept meanwhile. The
+board reads no machine while your editor is open, so when it closes on a changed text Kerdr first
+applies what the machines said meanwhile, and reads the save's machine again, waiting three seconds
+at most ("Checking LAB-Server is answering before #582's new text goes…"): a machine known to be
+away has the save held at once. One that turns out to be away only once the save is tried (ssh
+couldn't connect) has it held then, as above. A
 change still held after ten minutes is said once: "d on #582 still waits for LAB-Server (10 min so
 far): it goes when LAB-Server answers, and m then D on its card drops it." A machine that had stopped
 answering long enough to show it (past a drop's quiet first seconds, or unreachable) is said once it
@@ -914,11 +931,15 @@ for that home when its backend holds.
 
 **Quitting.** `q` quits at once unless something is still being handed over: a new intent until it's
 answered, words waiting for their image, a change whose command doesn't have the whole request yet,
-a change sent once more when its card's copies agree ("Quitting once #41's copies agree and it's
-sent again…"), or an account change, or one waiting its turn behind it. Then it says "Quitting once
+a save of an item's text not answered yet, which is held if its machine turns out to be away
+("Quitting once #41's new text is saved or held…"), a change sent once more when its card's copies
+agree ("Quitting once #41's copies agree and it's sent again…"), or an account change, or one
+waiting its turn behind it. Then it says "Quitting once
 #41's change is handed over… Esc stays." and quits by itself as soon as that's done; `Esc` stays. A
 second `q` quits at once when what's left can be kept: an account change, or a change to a backend
-that holds, which goes into the hold file with its `op`. What a quitting Kerdr puts in the hold file
+that holds, which goes into the hold file with its `op` (an unanswered save as one that may have gone
+ahead, so its backend answers from its record if it landed), or a save to a backend that doesn't
+hold, whose words are kept as your version (below). What a quitting Kerdr puts in the hold file
 stays marked as its own until it has really gone, when its `kerdr-<name>.lock` lets go: no other
 Kerdr sends any of it while this one may still, even when its words can't be written and it stays
 open. A new intent's words that come back from a failed save keep Kerdr open with them. Your words

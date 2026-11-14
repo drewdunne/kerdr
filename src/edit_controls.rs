@@ -527,6 +527,12 @@ impl App {
         }
     }
 
+    /// The machine a backlog item's text open in your editor is saved to, and the item's number.
+    pub fn saved_to(&self, key: &str) -> Option<(usize, String)> {
+        let held = self.edits.get(key)?;
+        Some((held.machine, self.reference_for(&held.id)))
+    }
+
     /// The editor has closed on this card's text. A changed text is sent as a save, which the
     /// card shows at once; closing with nothing changed, or with `:cq`, says nothing. What you
     /// wrote that can't be sent says so where it can't be missed, and your version is kept until a
@@ -2948,6 +2954,95 @@ mod tests {
         );
         // Your version stays yours until a save of it lands.
         assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
+    }
+
+    #[test]
+    fn a_save_whose_machine_left_while_the_editor_was_open_is_held_once_ssh_cant_connect() {
+        // The end-to-end check's P1: the board takes no reads while the editor is open, so its
+        // machine still reads as answering when it closes, and the save goes. ssh couldn't
+        // connect, so nothing was sent: the save is held as one made while its machine is away
+        // is, and q waits for its answer as for any change being handed over.
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        let name = app.machines[machine].name();
+        assert!(app.machines[machine].conn.is_live());
+        let sent = saves(&mut app, &key, wrote("Mine."));
+        app.resolver.handed(sent.n);
+        assert!(!app.quit_key());
+        assert_eq!(
+            said(&app),
+            format!("Quitting once {reference}'s new text is saved or held… Esc stays.")
+        );
+        assert!(!app.quit_due());
+        answer(
+            &mut app,
+            &sent,
+            Err(format!(
+                "{name} couldn't be reached (ssh: connect to host {name} port 22: No route to host), so nothing was sent"
+            )),
+        );
+        assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
+        let held = app.kept.held[0].clone();
+        assert_eq!(
+            (&held.request["text"], &held.request["op"], held.unanswered),
+            (&json!("Mine."), &sent.request["op"], false)
+        );
+        assert_eq!(
+            said(&app),
+            format!("Held: your new text on {reference} goes when {name} answers.")
+        );
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.resolver.unanswered(), 0);
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
+        // Held, so nothing is lost by quitting: q quits by itself.
+        assert!(app.quit_due());
+    }
+
+    #[test]
+    fn a_second_q_holds_a_save_still_waiting_for_its_answer() {
+        // q again while the save is unanswered: held with its op, as one that may have gone
+        // ahead, so the next Kerdr sends it and its backend answers from its record if it landed.
+        // A backend that doesn't hold: your version is in the words file, so q quits all the same.
+        for holds in [true, false] {
+            let mut app = app();
+            let (key, id, reference) = waiting(&mut app);
+            let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+            if holds {
+                app.machines[machine]
+                    .feed
+                    .as_mut()
+                    .unwrap()
+                    .supports
+                    .push("hold".into());
+            }
+            let sent = saves(&mut app, &key, wrote("Mine."));
+            app.resolver.handed(sent.n);
+            assert!(!app.quit_key());
+            assert!(
+                said(&app).contains(&format!("{reference}'s new text")),
+                "{}",
+                said(&app)
+            );
+            assert!(app.quit_key(), "{}", said(&app));
+            if holds {
+                assert_eq!(app.kept.held.len(), 1);
+                let held = &app.kept.held[0];
+                assert_eq!(
+                    (&held.request["op"], held.unanswered),
+                    (&sent.request["op"], true)
+                );
+            } else {
+                assert!(app.kept.held.is_empty());
+                assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
+            }
+        }
     }
 
     #[test]
