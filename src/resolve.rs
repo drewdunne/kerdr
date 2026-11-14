@@ -401,6 +401,21 @@ pub struct Job {
     /// A new intent that waits in Kerdr until it's in the words file as the send it is, so a
     /// crash after it went can never bring its words back as new ones (Codex's review 63, 2).
     pub unkept: bool,
+    /// Followed, it ended refused with `retry`, and it's being sent again by itself (Again): once
+    /// only, whatever its next answer says (intent 0591).
+    pub again: Option<Again>,
+}
+
+/// A followed change that ended refused for something passing, sent again by itself once (intent
+/// 0591, Resolver::send_again_after).
+#[derive(Clone, Debug)]
+pub struct Again {
+    /// How long its runner waits before it goes, and the answer that stands if it can't go in
+    /// time: taken when it's handed to the runner.
+    pub wait: Option<(Duration, crate::actions::Response)>,
+    /// The board's `away` when it was first followed, which its next follow keeps: once you've
+    /// been into herdr since, its end takes you in only if ⏎ asked again.
+    pub away: u64,
 }
 
 impl Job {
@@ -858,6 +873,7 @@ impl Resolver {
             rev: None,
             behind: None,
             unkept: false,
+            again: None,
         });
         self.next
     }
@@ -1360,6 +1376,55 @@ impl Resolver {
             job.effect = Some(Effect::Started);
         }
         true
+    }
+
+    /// A followed change that ended refused with `retry` (its launch lock held a moment, say) is
+    /// sent again by itself, with the same op, once `wait` is over (intent 0591): it stays in its
+    /// place, unanswered and not yet handed to the runner, its card saying it's trying again.
+    /// `last` is the answer that stands if it can't go in time; `from`, `entered` and `away` are
+    /// its follow's, which its next follow keeps. False when it isn't followed, or has been sent
+    /// again this way already: once only.
+    #[allow(clippy::too_many_arguments)]
+    pub fn send_again_after(
+        &mut self,
+        n: u64,
+        wait: Duration,
+        last: crate::actions::Response,
+        from: Option<CardSnapshot>,
+        entered: bool,
+        away: u64,
+    ) -> bool {
+        let Some(job) = self
+            .jobs
+            .iter_mut()
+            .find(|j| j.n == n && j.follow.is_some() && j.again.is_none())
+        else {
+            return false;
+        };
+        job.follow = None;
+        job.settled = None;
+        job.sent = false;
+        job.running = None;
+        job.handed = false;
+        job.gated = false;
+        job.retrying = true;
+        job.from = from;
+        job.entered = entered;
+        job.again = Some(Again {
+            wait: Some((wait, last)),
+            away,
+        });
+        true
+    }
+
+    /// The wait before a change sent again after its follow ended goes, and the answer that stands
+    /// if it can't (Resolver::send_again_after): taken as it's handed to the runner.
+    pub fn take_again(&mut self, n: u64) -> Option<(Duration, crate::actions::Response)> {
+        self.jobs
+            .iter_mut()
+            .find(|j| j.n == n)
+            .and_then(|j| j.again.as_mut())
+            .and_then(|a| a.wait.take())
     }
 
     /// A change refused where it was asked, sent on to the machine that refusal named: it goes

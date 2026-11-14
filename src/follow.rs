@@ -179,7 +179,8 @@ impl App {
             next: Instant::now() + POLL_FIRST,
             asking: false,
             misses: 0,
-            away: self.away,
+            // Sent again after an earlier follow ended (follow_again): as that one began.
+            away: job.again.as_ref().map_or(self.away, |a| a.away),
             entered: job.entered,
             follow,
         };
@@ -338,8 +339,11 @@ impl App {
     /// Followed work has finished, or needs a yes, or couldn't: its answer is taken as the answer to
     /// the request it followed would have been, had that waited.
     fn follow_ended(&mut self, i: usize, mut response: Response, done: bool) {
-        let f = self.follows.remove(i);
         let done = done && response.ok;
+        if !done && self.follow_again(i, &response) {
+            return;
+        }
+        let f = self.follows.remove(i);
         if self.resolver.end_follow(f.job, done) {
             self.rebuild();
         }
@@ -383,6 +387,41 @@ impl App {
         self.follow_end = None;
         self.action_from = None;
         self.answer_went_in = false;
+    }
+
+    /// Followed work that ended refused for something passing (its answer's `retry`: a start whose
+    /// launch lock a first run held past its wait, say) is sent again by itself, once, with the
+    /// same op, after that wait, as a refusal answered at once is (intent 0591): only to a backend
+    /// that keeps ops, and only when the wait leaves room for its answer within RETRY_MOST. Its card
+    /// says it's trying again meanwhile, nothing is said in red, and its next answer is taken as
+    /// its answer, a follow's end too; a second `retry` is said as it is. Whether it's sent again.
+    fn follow_again(&mut self, i: usize, response: &Response) -> bool {
+        let Some(f) = self.follows.get(i) else {
+            return false;
+        };
+        let Some(retry) = response
+            .retry
+            .filter(|_| !response.ok && !response.confirmation)
+        else {
+            return false;
+        };
+        // As long as it asked, never less; at least a second.
+        let wait = Duration::from_secs(retry.max(1));
+        let fits = wait <= crate::actions::RETRY_MOST.saturating_sub(crate::actions::RESEND_ROOM);
+        if !fits || f.request.get("op").is_none() || !self.resends_to(f.machine) {
+            return false;
+        }
+        let (n, from, entered, away) = (f.job, f.from.clone(), f.entered, f.away);
+        if !self
+            .resolver
+            .send_again_after(n, wait, response.clone(), from, entered, away)
+        {
+            return false;
+        }
+        let f = self.follows.remove(i);
+        self.unsay(&f.say);
+        self.rebuild();
+        true
     }
 
     /// Past its limit and the margin with no end heard: Kerdr stops following, and says the step is
@@ -1617,6 +1656,167 @@ mod tests {
                     "Started in web. ⏎ on its card goes in."
                 );
             }
+        }
+    }
+
+    /// The final answer of a followed start whose Claude launch a first run's write held past
+    /// ark-dispatch's wait (piece A's round 6, its outcome `launch_busy`).
+    fn launch_busy(id: &str, retry: u64) -> Value {
+        json!({"ok": false, "state": "failed", "id": id, "retry": retry,
+               "message": format!("#{id} didn't start yet (another start is setting up Claude's first run); ⏎ again in a moment. What was opened for it is closed again; nothing changed.")})
+    }
+
+    /// The board on a waiting card, selected, its backend keeping ops (`supports` "op") when
+    /// `ops`: its key and record.
+    fn on_waiting_card(ops: bool) -> (App, String, String) {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        if ops {
+            for feed in app.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+                feed.supports.push("op".into());
+            }
+        }
+        let (key, id) = {
+            let c = app
+                .board
+                .cards
+                .iter()
+                .find(|c| crate::app::waiting_work(c))
+                .unwrap();
+            (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+        };
+        for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.detail.as_mut().unwrap().kickoff = None;
+        }
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.sel = Selection {
+            col: app.board.cards[i].stage.index(),
+            key: Some(key.clone()),
+        };
+        (app, key, id)
+    }
+
+    /// d or ⏎ on the selected waiting card, answered with a follow, which ends `last`: the change,
+    /// its request as sent the first time, and as the key made it.
+    fn followed_start_ends(
+        app: &mut App,
+        id: &str,
+        by_enter: bool,
+        last: Value,
+    ) -> (u64, Value, usize, Value) {
+        let action = if by_enter {
+            key_enter(app)
+        } else {
+            press(app, 'd')
+        };
+        let Action::Mutate { machine, request } = action else {
+            panic!("nothing was sent: {:?}", app.message())
+        };
+        app.queue_action(machine, request.clone());
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1);
+        let (n, _, first, _) = ready.into_iter().next().unwrap();
+        answer(
+            app,
+            machine,
+            &request,
+            follow_reply(id, "start", "Starting web, then the work…"),
+        );
+        poll(app);
+        progress(app, last);
+        (n, first, machine, request)
+    }
+
+    #[test]
+    fn a_followed_start_refused_for_a_moment_goes_again_by_itself_once_with_the_same_op() {
+        // Piece A's round 6: a start Kerdr follows can end `failed` with `retry` 10, its Claude
+        // launch held a moment by a first run. As a refusal answered at once is, it's sent again
+        // by itself after that wait, with the same op, once: its card says it's trying again and
+        // nothing is said as failed. Its next end is taken as its answer; a second such end is
+        // said as it is.
+        for by_enter in [false, true] {
+            for second_busy in [false, true] {
+                let (mut app, key, id) = on_waiting_card(true);
+                let (n, first, machine, request) =
+                    followed_start_ends(&mut app, &id, by_enter, launch_busy(&id, 10));
+                let op = first["op"].as_str().expect("a start has an op").to_string();
+                let again = app.resolver.ready();
+                assert_eq!(again.len(), 1, "sent again by itself: {:?}", app.message());
+                assert_eq!(again[0].0, n, "the same change, in its place");
+                assert_eq!(again[0].2["op"].as_str(), Some(op.as_str()), "the same op");
+                assert_eq!(again[0].2["action"], first["action"]);
+                let (wait, stands) = app
+                    .resolver
+                    .take_again(n)
+                    .expect("its runner waits what the refusal asked first");
+                assert_eq!(wait, Duration::from_secs(10));
+                assert!(stands.message.contains("didn't start yet"), "{stands:?}");
+                assert!(app.follows.is_empty());
+                assert_eq!(
+                    status_shown(&app, &key).as_deref(),
+                    Some(crate::resolve::RETRYING),
+                    "its card says it's trying again"
+                );
+                assert!(
+                    !app.failing()
+                        && !app
+                            .message()
+                            .is_some_and(|m| m.0.contains("didn't start yet")),
+                    "{:?}",
+                    app.message()
+                );
+                // The resend is answered with a follow of its own.
+                answer(
+                    &mut app,
+                    machine,
+                    &request,
+                    follow_reply(&id, "start", "Starting web, then the work…"),
+                );
+                assert_eq!(app.follows.len(), 1);
+                poll(&mut app);
+                if second_busy {
+                    progress(&mut app, launch_busy(&id, 10));
+                    assert!(app.resolver.ready().is_empty(), "sent again once only");
+                    assert!(
+                        app.message()
+                            .is_some_and(|m| m.0.contains("didn't start yet")),
+                        "{:?}",
+                        app.message()
+                    );
+                    assert!(app.follows.is_empty());
+                } else {
+                    progress(
+                        &mut app,
+                        json!({"ok": true, "state": "done", "message": "Started in web.",
+                               "session": "web", "workspace": "w9", "label": "9-new"}),
+                    );
+                    if by_enter {
+                        assert!(app.open_after.is_some(), "⏎ goes in");
+                    } else {
+                        assert_eq!(
+                            app.message().unwrap().0,
+                            "Started in web. ⏎ on its card goes in."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_followed_end_with_retry_isnt_sent_again_without_ops_or_past_two_minutes() {
+        // A backend that doesn't keep ops could start it twice; a wait that leaves no room for an
+        // answer within two minutes isn't waited. Either way, the refusal is said as it is.
+        for (ops, retry) in [(false, 10), (true, 115)] {
+            let (mut app, _, id) = on_waiting_card(ops);
+            followed_start_ends(&mut app, &id, false, launch_busy(&id, retry));
+            assert!(app.resolver.ready().is_empty(), "ops {ops}, retry {retry}");
+            assert!(
+                app.message()
+                    .is_some_and(|m| m.0.contains("didn't start yet")),
+                "{:?}",
+                app.message()
+            );
         }
     }
 

@@ -429,7 +429,17 @@ Kerdr shows `say`, and asks the same machine, over the same connection, how it s
   workspaces its session has, Kerdr doesn't add its own count.
 - `failed`: shown as the request's failure, `message` and all. A worker that ended without
   finishing is `failed` too; say so, and that the card shows how it stands, since it may have done
-  part of the step.
+  part of the step. One with `retry` (a start whose launch was held a moment, say) is a refusal
+  that's passing, as on a direct answer: from a machine whose feed lists `"op"`, Kerdr waits that
+  many seconds and sends the request again by itself, once, with the same `op` and the card's
+  `rev`, saying "Trying again…" on the card and nothing on the message line meanwhile. Its next
+  answer is taken as the request's answer, a follow's end included, and a second `retry` there is
+  shown as it is. The wait, and anything sent again after it, fit in two minutes from that end, as
+  in [Asking again](#asking-again-op-and-retry): a wait that doesn't, or one the computer slept
+  through, sends nothing and shows the `message`. Later changes to the same card wait behind it.
+  For that resend to do the step again, the backend's record of its `op` must no longer give back
+  the follow: when followed work ends with `retry`, mark its `op` safe to send again, as a direct
+  `retry` answer is.
 - `unknown`: Kerdr says it lost track of the step and that the card shows how it stands. Any other
   `state` reads as `unknown`.
 
@@ -470,7 +480,9 @@ A backend that keeps ops lists `"op"` in its feed's `supports`, and does this, f
   `{"ok":false,"retry":5,"message":"…"}`.
 - A recorded answer is given again as it was, plus `"repeat": true`, and nothing is done. A recorded
   fingerprint that differs is refused: that id was used for another request. An answer with `follow`
-  is recorded with its token, so a repeat follows the same work; a question is recorded too, so a
+  is recorded with its token, so a repeat follows the same work, until that work ends with `retry`:
+  then it's a send that didn't happen yet, as below, and Kerdr sends it again (see
+  [Following work](#following-work-that-goes-on-after-its-answer)). A question is recorded too, so a
   repeat asks the same question with the same token. An answer with `retry` isn't recorded: it's a
   send that didn't happen yet.
 

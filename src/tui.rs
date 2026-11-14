@@ -798,6 +798,10 @@ enum ToRunner {
         /// For one waiting for its write-up, its card's footing when the key was pressed: it
         /// doesn't go once that has moved (Codex's review 60).
         guard: Option<crate::resolve::Footing>,
+        /// Sent again after its followed work ended refused with `retry`: how long it waits
+        /// first, holding its record's turn, and the answer that stands if it can't go in time
+        /// (intent 0591).
+        after: Option<Box<(Duration, crate::actions::Response)>>,
     },
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
@@ -815,7 +819,8 @@ enum ToRunner {
 }
 
 /// A change waiting its turn in the runner: its machine, where and how it's sent, its request,
-/// whether its backend keeps ops, and its card's `rev`.
+/// whether its backend keeps ops, its card's `rev`, and the wait before it's sent again after a
+/// followed end.
 type Waiting = (
     usize,
     Machine,
@@ -823,6 +828,7 @@ type Waiting = (
     serde_json::Value,
     bool,
     Option<String>,
+    Option<Box<(Duration, crate::actions::Response)>>,
 );
 
 /// Runs changes to cards in their turn on a thread of its own, which never touches App: a change
@@ -865,6 +871,7 @@ impl Runner {
                         resends,
                         rev,
                         guard,
+                        after,
                     } => {
                         if gated {
                             queue.push_gated(n, machine, key, &request);
@@ -882,7 +889,7 @@ impl Runner {
                         } else {
                             queue.push(n, machine, key, &request);
                         }
-                        waiting.insert(n, (machine, target, command, request, resends, rev));
+                        waiting.insert(n, (machine, target, command, request, resends, rev, after));
                     }
                     ToRunner::Done(n) => queue.done(n),
                     // Let go again, it's judged by its machine's newest read at once.
@@ -934,7 +941,7 @@ impl Runner {
                     let _ = answers.send(Answer::NotWrittenUp(n));
                 }
                 for n in queue.startable() {
-                    let Some((machine, target, command, mut request, resends, mut rev)) =
+                    let Some((machine, target, command, mut request, resends, mut rev, after)) =
                         waiting.remove(&n)
                     else {
                         continue;
@@ -957,12 +964,14 @@ impl Runner {
                         let handed = answers.clone();
                         let told = answers.clone();
                         // Sent again by itself, same op, while it holds its record's turn: what
-                        // comes after it for the same card waits (intent 0591).
-                        let answered = crate::actions::run_resending_rev(
+                        // comes after it for the same card waits (intent 0591). One sent again
+                        // after its followed work ended refused waits that refusal's `retry` first.
+                        let answered = crate::actions::run_resending_after(
                             &target,
                             &command,
                             &request,
                             rev.as_deref(),
+                            after.map(|a| *a),
                             Some(Box::new(move || {
                                 let _ = handed.send(Answer::Handed(n));
                             })),
@@ -1173,6 +1182,8 @@ fn run_ready(app: &mut App, runner: &Runner) {
         let rev = app.resolver.rev_of(n);
         // Its card's footing now, in the pass its key was taken in.
         let guard = gated.then(|| app.gate_footing(n)).flatten();
+        // Sent again after its followed work ended refused with `retry` (intent 0591).
+        let after = app.resolver.take_again(n).map(Box::new);
         let _ = runner.tx.send(ToRunner::Run {
             n,
             machine,
@@ -1184,6 +1195,7 @@ fn run_ready(app: &mut App, runner: &Runner) {
             resends,
             rev,
             guard,
+            after,
         });
     }
     // After the changes just handed over: a save of a text reaches the runner before the start it
@@ -2036,6 +2048,7 @@ mod tests {
                     resends: false,
                     rev: None,
                     guard: None,
+                    after: None,
                 })
                 .unwrap();
         }
@@ -2085,6 +2098,7 @@ mod tests {
                     resends: true,
                     rev: None,
                     guard: None,
+                    after: None,
                 })
                 .unwrap();
         }
@@ -2142,6 +2156,7 @@ mod tests {
             resends: false,
             rev: None,
             guard: None,
+            after: None,
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
@@ -2152,6 +2167,84 @@ mod tests {
         runner.tx.send(run(1, 1, &ok)).unwrap();
         let seen: Vec<String> = (0..4).filter_map(|_| next(10_000)).collect();
         assert_eq!(seen, ["started 1", "done 1 ok", "started 2", "done 2 ok"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_sent_again_after_its_follow_waits_first_holding_its_record_s_turn() {
+        // Intent 0591: a start whose followed work ended refused with `retry` goes again after
+        // that wait, with its op, and a change to the same card made meanwhile waits behind it.
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let command = format!(
+            "req=$(cat)\nprintf '%s\\n' \"$req\" >> '{}'\nprintf '%s' '{{\"ok\":true,\"message\":\"done\"}}'\n",
+            log.display()
+        );
+        let last = crate::actions::parse_response(
+            r##"{"ok":false,"retry":1,"message":"#7 didn't start yet; ⏎ again in a moment."}"##,
+        )
+        .unwrap();
+        let run = |n: u64, request: serde_json::Value, after| ToRunner::Run {
+            n,
+            machine: 0,
+            key: Some("here:7".into()),
+            target: machine.clone(),
+            command: command.clone(),
+            request,
+            gated: false,
+            resends: true,
+            rev: Some("r-7".into()),
+            guard: None,
+            after,
+        };
+        let began = Instant::now();
+        let start = serde_json::json!({"action":"dispatch","id":"7","op":"k-0123abcd"});
+        runner
+            .tx
+            .send(run(
+                1,
+                start,
+                Some(Box::new((Duration::from_secs(1), last))),
+            ))
+            .unwrap();
+        runner
+            .tx
+            .send(run(
+                2,
+                serde_json::json!({"action":"close","id":"7","op":"k-4567ef01"}),
+                None,
+            ))
+            .unwrap();
+        let seen: Vec<String> = (0..5).filter_map(|_| next_heard(&rx, 10_000)).collect();
+        assert_eq!(
+            seen,
+            [
+                "started 1",
+                "resending 1 retry",
+                "done 1 ok",
+                "started 2",
+                "done 2 ok"
+            ]
+        );
+        assert!(began.elapsed() >= Duration::from_secs(1), "it waited first");
+        let sent: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2, "each sent once: {sent:?}");
+        assert_eq!(sent[0]["op"], "k-0123abcd");
+        assert_eq!(sent[0]["rev"], "r-7", "as a resend goes");
+        assert_eq!(sent[1]["action"], "close");
     }
 
     #[cfg(unix)]
@@ -2180,6 +2273,7 @@ mod tests {
             resends: false,
             rev: None,
             guard: None,
+            after: None,
         };
         let next = || heard(rx.recv_timeout(Duration::from_secs(10)).unwrap());
         // Not yet written up: taken out before it started.
@@ -2308,6 +2402,7 @@ mod tests {
                     resends: false,
                     rev: None,
                     guard: None,
+                    after: None,
                 })
                 .unwrap();
         }
@@ -2374,6 +2469,7 @@ mod tests {
                     resends: false,
                     rev: None,
                     guard: Some(crate::resolve::Footing::default()),
+                    after: None,
                 })
                 .unwrap();
         }
@@ -2449,6 +2545,7 @@ mod tests {
                         resends: false,
                         rev: None,
                         guard: gated.then(crate::resolve::Footing::default),
+                        after: None,
                     })
                     .unwrap();
             };
