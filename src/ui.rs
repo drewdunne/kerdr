@@ -6166,6 +6166,35 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("build-box  – signed in, not checked yet"))
         );
+        // A machine listing only that copy shows it, rather than taking it for none.
+        ark(&mut a, 1).copies = serde_json::from_value(serde_json::json!([
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ]))
+        .unwrap();
+        assert!(
+            text_rows(&a, 176, 44)
+                .iter()
+                .any(|l| l.contains("build-box  ✕ not signed in"))
+        );
+        // In a narrow panel the states wrap rather than being cut off: at every width that shows
+        // the panel, both states are there whole, and at some the rows wrap as "name: state".
+        let live = a.machines[1].conn.clone();
+        a.machines[1].conn = crate::poll::Conn::Connecting;
+        let mut wrapped_at = vec![];
+        for w in 90..=176 {
+            let flat = flat_text(&a, w, 44, "ARK_C · Studio");
+            if !flat.contains("on each machine") {
+                continue;
+            }
+            assert!(flat.contains("✕ not signed in"), "{w}: {flat}");
+            assert!(flat.contains("✓ signed in and working"), "{w}: {flat}");
+            assert!(flat.contains("(cached)"), "{w}: {flat}");
+            if flat.contains("build-box: ✕ not signed in (cached)") {
+                wrapped_at.push(w);
+            }
+        }
+        assert!(!wrapped_at.is_empty(), "no width wrapped the rows");
+        a.machines[1].conn = live;
         // A machine whose account keeps no such copy says that, rather than nothing.
         ark(&mut a, 1).copies = vec![];
         assert!(
@@ -6173,6 +6202,29 @@ mod tests {
                 .iter()
                 .any(|l| l.contains("– no Remote Control copy there"))
         );
+        // The first copy selected shows its own state too: refused on build-box while the account
+        // still reads ready there.
+        ark(&mut a, 1).copies = serde_json::from_value(serde_json::json!([
+            {"id":"agents","label":"Your agents","stored":true,"works":false,"checked":null,"note":null},
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ]))
+        .unwrap();
+        let agents = rows
+            .iter()
+            .position(|r| *r == Row::Copy("ARK_C".into(), "agents".into()))
+            .unwrap();
+        if let Mode::Accounts {
+            screen: S::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = agents;
+        }
+        let lines = text_rows(&a, 176, 44);
+        let has = |words: &str| lines.iter().any(|l| l.contains(words));
+        assert!(has("Your agents on each machine"), "{lines:#?}");
+        assert!(has("build-box  ✕ signed in, but refused"), "{lines:#?}");
+        assert!(has("build-box  ready"), "{lines:#?}");
         // The account's own line and an account without copies keep one line per machine.
         let kbz = rows
             .iter()
@@ -6219,6 +6271,15 @@ mod tests {
         assert!(
             flat.contains("Remote Control on build-box isn't signed in yet, and this sign-in doesn't do it. Once this one is done, press esc, then tab to build-box and sign in there."),
             "{flat}"
+        );
+        // build-box listing only that copy is still warned about.
+        ark(&mut a, 1).copies = serde_json::from_value(serde_json::json!([
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ]))
+        .unwrap();
+        assert!(
+            flat_text(&a, 176, 44, "Sign ARK_C in on laptop")
+                .contains("Remote Control on build-box isn't signed in yet")
         );
         // Signed in on build-box too, it says nothing of it.
         ark(&mut a, 1).copies = copies(serde_json::json!(

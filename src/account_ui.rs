@@ -338,7 +338,9 @@ fn unsigned_elsewhere(app: &App, s: &crate::app::account_controls::Signin) -> Ve
                 .accounts
                 .iter()
                 .find(|a| a.code == s.code)?
-                .copy(id)?;
+                .copies
+                .iter()
+                .find(|c| &c.id == id)?;
             (!c.stored || c.works == Some(false)).then(|| {
                 let name = m.name();
                 wrapped(
@@ -404,28 +406,29 @@ fn machine_lines(
         .map(|(m, _)| width(&m.name()))
         .max()
         .unwrap_or(0);
-    let row = |m: &crate::board::MachineState, state: &str| {
+    // Lined up where it fits; in a narrow panel, wrapped as "name: state" so nothing is cut off.
+    let row = |m: &crate::board::MachineState, state: &str, color| {
         let name = m.name();
         let gap = " ".repeat(nw.saturating_sub(width(&name)));
-        format!("  {name}{gap}  {state}{}", cached(m))
-    };
-    let mut lines = vec![];
-    if !a.first_copy(c) {
-        lines.extend(wrapped(
-            &format!("{} on each machine", c.name()),
-            w,
-            bold(FG),
-            None,
-        ));
-        for (m, x) in &shown {
-            let (state, color) = match x.copy(&c.id) {
-                Some(mc) => (mc.state_label().to_string(), works_color_of(mc)),
-                None => (format!("– no {} copy there", c.name()), DIM),
-            };
-            lines.push(line(row(m, &state), color));
+        let lined = format!("  {name}{gap}  {state}{}", cached(m));
+        if width(&lined) <= w {
+            vec![line(lined, color)]
+        } else {
+            wrapped(&format!("{name}: {state}{}", cached(m)), w, fg(color), None)
         }
-        lines.push(Line::raw(""));
+    };
+    let mut lines = wrapped(&format!("{} on each machine", c.name()), w, bold(FG), None);
+    for (m, x) in &shown {
+        // Every copy the machine lists, by id: one listed alone is still that copy.
+        let (state, color) = match x.copies.iter().find(|mc| mc.id == c.id) {
+            Some(mc) => (mc.state_label().to_string(), works_color_of(mc)),
+            // An account listing no copies there signs in as its first copy.
+            None if a.first_copy(c) => (x.status_label(), account_color(x)),
+            None => (format!("– no {} copy there", c.name()), DIM),
+        };
+        lines.extend(row(m, &state, color));
     }
+    lines.push(Line::raw(""));
     let first = a.copies.first().map_or("the account", |f| f.name());
     lines.extend(wrapped(
         &format!(
@@ -442,7 +445,7 @@ fn machine_lines(
         None,
     ));
     for (m, x) in &shown {
-        lines.push(line(row(m, &x.status_label()), account_color(x)));
+        lines.extend(row(m, &x.status_label(), account_color(x)));
     }
     lines
 }
