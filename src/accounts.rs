@@ -189,6 +189,18 @@ impl AccountCopy {
         }
     }
 
+    /// This copy's own state in a few words, for the line per machine under a selected copy: a
+    /// stored sign-in reads as signed in only with that copy named, never as the account's
+    /// "ready", which is its first copy's (intent 0749).
+    pub fn state_label(&self) -> &'static str {
+        match (self.stored, self.works) {
+            (false, _) => "✕ not signed in",
+            (true, Some(true)) => "✓ signed in and working",
+            (true, Some(false)) => "✕ signed in, but refused",
+            (true, None) => "– signed in, not checked yet",
+        }
+    }
+
     pub fn works_label(&self) -> String {
         let when = self
             .checked

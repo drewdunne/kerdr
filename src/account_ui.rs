@@ -317,6 +317,144 @@ fn copy_line(c: &AccountCopy, yes: bool, cols: CopyColumns) -> Line<'static> {
     }
 }
 
+/// What the code box says about the two codes: the emailed one goes in the tab Kerdr opened,
+/// the long one comes back here.
+pub(super) const SIGNIN_STEPS: &str = "If the page emails you a short code, type it into the page in the browser tab Kerdr opened, the one asking for it; if you clicked the email's button instead, go back to that first tab. Then press Authorize, and paste the long code the page shows here.";
+
+/// For a copy's sign-in, one line for each other machine where that copy isn't signed in, since
+/// this one signs in only where it says (intent 0749).
+fn unsigned_elsewhere(app: &App, s: &crate::app::account_controls::Signin) -> Vec<Line<'static>> {
+    let Some((id, label)) = &s.copy else {
+        return vec![];
+    };
+    app.machines
+        .iter()
+        .enumerate()
+        .filter(|(mi, m)| m.is_shown() && !s.machines.contains(mi))
+        .filter_map(|(_, m)| {
+            let c = m
+                .feed
+                .as_ref()?
+                .accounts
+                .iter()
+                .find(|a| a.code == s.code)?
+                .copies
+                .iter()
+                .find(|c| &c.id == id)?;
+            (!c.stored || c.works == Some(false)).then(|| {
+                let name = m.name();
+                wrapped(
+                    &format!(
+                        "{label} on {name} isn't signed in yet, and this sign-in doesn't do it. Once this one is done, press esc, then tab to {name} and sign in there."
+                    ),
+                    68,
+                    fg(YELLOW),
+                    None,
+                )
+            })
+        })
+        .flatten()
+        .collect()
+}
+
+/// `Your agents'`, `Tenants'`, `Remote Control's`: a copy's name as an owner.
+fn possessive(name: &str) -> String {
+    if name.ends_with('s') {
+        format!("{name}'")
+    } else {
+        format!("{name}'s")
+    }
+}
+
+/// The details pane's lines for each machine. With a copy selected, they say that copy's own state
+/// on each machine first, then the account's readiness labelled as its first copy's, which new
+/// sessions start on: "LAB-Server: ready" under a Remote Control line read as Remote Control
+/// signed in there when it wasn't (intent 0749). An account without copies keeps one line each.
+fn machine_lines(
+    app: &App,
+    a: &Account,
+    copy: Option<&AccountCopy>,
+    w: usize,
+) -> Vec<Line<'static>> {
+    let shown: Vec<(&crate::board::MachineState, &Account)> = app
+        .machines
+        .iter()
+        .filter(|m| m.is_shown())
+        .filter_map(|m| {
+            m.feed
+                .as_ref()
+                .and_then(|f| f.accounts.iter().find(|x| x.code == a.code))
+                .map(|x| (m, x))
+        })
+        .collect();
+    let cached = |m: &crate::board::MachineState| if m.conn.is_live() { "" } else { " (cached)" };
+    let Some(c) = copy else {
+        return shown
+            .iter()
+            .flat_map(|(m, x)| {
+                wrapped(
+                    &format!("{}: {}{}", m.name(), x.status_label(), cached(m)),
+                    w,
+                    fg(account_color(x)),
+                    None,
+                )
+            })
+            .collect();
+    };
+    let nw = shown
+        .iter()
+        .map(|(m, _)| width(&m.name()))
+        .max()
+        .unwrap_or(0);
+    // Lined up where it fits; in a narrow panel, wrapped as "name: state" so nothing is cut off.
+    let row = |m: &crate::board::MachineState, state: &str, color| {
+        let name = m.name();
+        let gap = " ".repeat(nw.saturating_sub(width(&name)));
+        let lined = format!("  {name}{gap}  {state}{}", cached(m));
+        if width(&lined) <= w {
+            vec![line(lined, color)]
+        } else {
+            wrapped(&format!("{name}: {state}{}", cached(m)), w, fg(color), None)
+        }
+    };
+    let mut lines = wrapped(&format!("{} on each machine", c.name()), w, bold(FG), None);
+    for (m, x) in &shown {
+        // Every copy the machine lists, by id: one listed alone is still that copy.
+        let (state, color) = match x.copies.iter().find(|mc| mc.id == c.id) {
+            Some(mc) => (mc.state_label().to_string(), works_color_of(mc)),
+            // An account listing no copies there signs in as its first copy.
+            None if a.first_copy(c) => (x.status_label(), account_color(x)),
+            None => (format!("– no {} copy there", c.name()), DIM),
+        };
+        lines.extend(row(m, &state, color));
+    }
+    lines.push(Line::raw(""));
+    let first = a.copies.first().map_or("the account", |f| f.name());
+    lines.extend(wrapped(
+        &format!(
+            "{} {}, which new sessions start on",
+            possessive(first),
+            if a.kind == "token" {
+                "token"
+            } else {
+                "sign-in"
+            }
+        ),
+        w,
+        bold(FG),
+        None,
+    ));
+    for (m, x) in &shown {
+        lines.extend(row(m, &x.status_label(), account_color(x)));
+    }
+    lines
+}
+
+/// A copy's state colour: green signed in and working, red not signed in or refused.
+fn works_color_of(c: &AccountCopy) -> ratatui::style::Color {
+    if !c.stored { RED } else { works_color(c) }
+}
+
 fn copy_label(app: &App, machine: usize, code: &str, copy: &str) -> String {
     app.account(machine, code)
         .and_then(|a| a.copy(copy))
@@ -883,6 +1021,35 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 ),
                 None => vec![line("Each machine makes its own sign-in.", DIM)],
             };
+            // The machine it signs in on, where it can't be missed: a sign-in made on the laptop
+            // Kerdr runs on was taken for LAB-Server's (intent 0749).
+            let names: Vec<String> = s
+                .machines
+                .iter()
+                .map(|&mi| app.machines[mi].name())
+                .collect();
+            let what = s
+                .copy
+                .as_ref()
+                .map_or(s.code.clone(), |(_, label)| label.clone());
+            lines.splice(
+                0..0,
+                wrapped(
+                    &match (done, &s.copy, names.as_slice()) {
+                        (true, _, _) => format!("Signed in {what} on {}", names.join(", ")),
+                        (false, Some(_), [one]) => format!("Signs in {what} on {one} only"),
+                        _ => format!("Signing in {what} on {}", names.join(", then ")),
+                    },
+                    68,
+                    bold(CYAN),
+                    None,
+                ),
+            );
+            let elsewhere = unsigned_elsewhere(app, s);
+            if !elsewhere.is_empty() {
+                lines.push(Line::raw(""));
+                lines.extend(elsewhere);
+            }
             lines.push(Line::raw(""));
             let top = lines.len();
             let mut code_at: Option<usize> = None;
@@ -973,13 +1140,9 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 }
                 if s.needs_code {
                     lines.push(Line::raw(""));
-                    // Which code: a six-digit emailed one was once typed here and refused.
-                    lines.extend(wrapped(
-                        "Once you allow it, the page shows a code: paste that here. A short code emailed to you goes in the browser, not here.",
-                        68,
-                        fg(DIM),
-                        None,
-                    ));
+                    // Which code goes where: a six-digit emailed one was once typed here and refused,
+                    // and "in the browser" didn't say which tab (intents 0327 and 0749).
+                    lines.extend(wrapped(SIGNIN_STEPS, 68, fg(DIM), None));
                     lines.push(selected(
                         format!(
                             "code from the page   {}{}",
@@ -998,11 +1161,6 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 }
             }
             // Named every time: "on each machine" over a one-machine sign-in hid where it ran.
-            let names: Vec<String> = s
-                .machines
-                .iter()
-                .map(|&mi| app.machines[mi].name())
-                .collect();
             let title = match (&s.copy, names.as_slice()) {
                 (Some((_, label)), [first, ..]) => {
                     format!("Sign {} in on {first}: {label}", s.code)
@@ -1597,25 +1755,7 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
                         ));
                         detail.push(Line::raw(""));
                     }
-                    for m in app.machines.iter().filter(|m| m.is_shown()) {
-                        if let Some(a) = m
-                            .feed
-                            .as_ref()
-                            .and_then(|f| f.accounts.iter().find(|a| &a.code == code))
-                        {
-                            detail.extend(wrapped(
-                                &format!(
-                                    "{}: {}{}",
-                                    m.name(),
-                                    a.status_label(),
-                                    if m.conn.is_live() { "" } else { " (cached)" }
-                                ),
-                                w,
-                                fg(account_color(a)),
-                                None,
-                            ));
-                        }
-                    }
+                    detail.extend(machine_lines(app, a, copy, w));
                     detail.extend(usage_detail(app, a, w));
                     detail.extend(in_the_lists(feed, &a.code, w));
                     if !feed.knows_current() {

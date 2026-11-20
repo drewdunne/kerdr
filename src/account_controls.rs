@@ -327,7 +327,7 @@ pub struct WhereChoice {
 }
 
 /// What the code box says when it keeps back an emailed code, for a backend too old to say it.
-pub const EMAILED_CODE: &str = "That looks like the short code a sign-in page emails you: type it on the page in your browser. Here, paste the long code the page shows after you allow it.";
+pub const EMAILED_CODE: &str = "That looks like the short code a sign-in page emails you: type it into the page in the browser tab Kerdr opened, the one asking for it, not here. If you clicked the email's button instead, go back to that first tab. Then press Authorize, and paste the long code the page shows here.";
 
 /// An emailed sign-in code: a few digits, typed in the browser. The code an older backend wants
 /// is the long one the page shows after you allow it, so this is caught before it's sent to one
