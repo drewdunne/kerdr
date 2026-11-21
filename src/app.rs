@@ -2688,7 +2688,6 @@ impl App {
         let ctrl_c =
             key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
         if self.small_window() && !self.small_draws() && key.code != KeyCode::Esc && !ctrl_c {
-            self.say("This needs a bigger window: Esc goes back.", Tone::Info);
             return Action::None;
         }
         // Esc on the board lets a running action's answer go: it still finishes, but neither asks
@@ -4119,7 +4118,11 @@ pub(crate) mod tests {
         let before = box_words(&app);
         assert_eq!(press(&mut app, 'x'), Action::None);
         assert_eq!(box_words(&app), before);
-        assert!(app.message().unwrap().0.contains("needs a bigger window"));
+        let shown = crate::ui::tests_render(&app, 28, 6);
+        assert!(
+            shown.contains("needs a bigger") && shown.contains("Esc goes back."),
+            "{shown}"
+        );
         app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Board));
     }

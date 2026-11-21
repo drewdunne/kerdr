@@ -66,15 +66,24 @@ fn draw_screen(f: &mut Frame, app: &App) {
         if matches!(app.mode, Mode::Board) {
             return compact_board(f, area, app);
         }
-        let text = trunc("Kerdr needs a bigger window.", area.width as usize);
+        // Nothing but Esc acts here (App::on_key), and Esc goes back towards the board.
         let y = area.y + area.height / 2;
-        put(
-            f.buffer_mut(),
-            area.x,
-            y,
-            area.width,
-            vec![Span::styled(text, fg(FG2))],
-        );
+        for (i, line) in ["Kerdr needs a bigger window.", "Esc goes back."]
+            .into_iter()
+            .enumerate()
+        {
+            let y = y + i as u16;
+            if y < area.y + area.height {
+                let text = trunc(line, area.width as usize);
+                put(
+                    f.buffer_mut(),
+                    area.x,
+                    y,
+                    area.width,
+                    vec![Span::styled(text, fg(FG2))],
+                );
+            }
+        }
         return;
     }
     draw_mode(f, area, app, &app.mode);
