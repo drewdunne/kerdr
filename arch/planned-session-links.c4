@@ -1,34 +1,34 @@
-// Session links and a back stack (ark-sdlc intent 0770, a design waiting for approval): an agent
-// gives Drew a link to a card, kerdr://0591, which his terminal's link key opens in Kerdr, landing
-// on that card's workspace wherever it runs; inside herdr, two keys step back and forward through
-// the sessions he visited. Everything tagged #planned is planned until it's built.
+// Session links and a back stack (ark-sdlc intent 0770, a design approved by Andrew): an agent
+// writes a card's number in parentheses after its words, (0591), and Foot's card key opens it in
+// Kerdr, landing on that card's workspace wherever it runs; inside herdr, two keys step back and
+// forward through the sessions he visited. Everything tagged #planned is planned until it's built.
 model {
   agents = service "Agents in herdr panes" {
-    description "Coding agents Drew talks to. A rule of his own record system says when to give him a card's link: a card to look at, or a list of them."
+    description "Coding agents Drew talks to. They already write a card's number in parentheses after its words, under a rule of his own record system; a second rule says to give each card he should go to its own line."
   }
-  desktop = service "The desktop's link opener" {
+  cardkey = service "Foot's card key" {
     #planned
-    description "Foot's link key (Ctrl+Shift+O and a letter) runs xdg-open on a link, and so does a browser, after asking. A desktop file sends kerdr:// to kerdr open; Foot's link pattern gains kerdr:// beside the web's links."
+    description "A pattern of Foot's own, beside its web links: Ctrl+Shift+K puts a letter on each card number in parentheses on the screen, (0591), and runs kerdr open with the digits whose letter is pressed, as one argument and without a shell. Nothing registers a link type with the desktop, so browsers and other programs can't hand Kerdr anything."
   }
   open = app "kerdr open" {
     #planned
-    description "Runs for a kerdr:// link. Takes only a card's id, or a feed's name and an id, and refuses anything else; never runs what a link says or passes it to a shell. Hands the id to the Kerdr window used last, over a socket in the user's own runtime folder, waits for that Kerdr to say it took it, and brings its window to the front. With no Kerdr open, starts one window (one, however many links arrive at once) that lands on the card."
+    description "Runs with a card's number from Foot's card key. Takes only digits, and refuses anything else; never runs what it's given or passes it to a shell. Hands the number to the Kerdr window used last, over a socket in the user's own runtime folder, waits for that Kerdr to say it took it, and brings its window to the front. With no Kerdr open, starts one window (one, however many links arrive at once) that lands on the card."
   }
   trail = store "Kerdr's trail of places" {
     #planned
     description "Each Kerdr window's own list of places visited (machine, session, workspace, tab, and the card when there is one), up to 50, in memory. Back goes to the newest earlier place still open, forward undoes it. A closed workspace, or a card's own tab that has closed, is skipped and dropped; a machine not answering is skipped and kept. Going anywhere new drops the places ahead."
   }
   drew -> agents "asks"
-  agents -> drew "a card's link after its words: kerdr://0591" {
+  agents -> drew "a card's number in parentheses after its words: (0591)" {
     #planned
   }
-  drew -> desktop "Ctrl+Shift+O, then the link's letter" {
+  drew -> cardkey "Ctrl+Shift+K, then the number's letter" {
     #planned
   }
-  desktop -> open "runs it with the link" {
+  cardkey -> open "runs it with the number" {
     #planned
   }
-  open -> kerdr "the card's id; Kerdr says it took it" {
+  open -> kerdr "the card's number; Kerdr says it took it" {
     #planned
   }
   drew -> herdr "back and forward keys" {
@@ -45,17 +45,18 @@ views {
   view planned-session-links {
     title "Planned / Session links and a back stack"
     description """
-      ark-sdlc intent 0770, a design waiting for approval. An agent puts a card's link after its
-      words, kerdr://0591. Foot's link key hands it to the desktop's link opener, which runs kerdr
-      open: it sends the card's id to the Kerdr window used last and brings it to the front, or
-      opens a new Kerdr window on the card when none is open. Kerdr goes to the card's workspace
+      ark-sdlc intent 0770, a design Andrew approved (Foot's key for cards is still his to pick;
+      Ctrl+Shift+K is the recommendation). An agent writes a card's number in
+      parentheses after its words, (0591), as his rule on numbers already has it. Foot's card key
+      runs kerdr open with the number: it sends it to the Kerdr window used last and brings it to
+      the front, or opens a new Kerdr window on the card when none is open. Kerdr goes to the card's workspace
       wherever it runs, as Enter does, but a link only goes: it never starts or reopens work.
       Inside herdr, the back and forward keys leave herdr's usual token for Kerdr, which steps
       through its trail of places, skipping any that have closed.
     """
-    include drew, agents, desktop, open, kerdr, herdr, trail
+    include drew, agents, cardkey, open, kerdr, herdr, trail
     exclude * -> *
-    include agents -> drew, drew -> desktop, desktop -> open, open -> kerdr
+    include agents -> drew, drew -> cardkey, cardkey -> open, open -> kerdr
     include drew -> herdr, kerdr -> trail
     include kerdr -> herdr where tag is #planned
     style element.tag = #planned {
