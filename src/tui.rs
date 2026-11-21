@@ -2192,16 +2192,25 @@ mod tests {
                 .is_err_and(|e| e.to_string().contains("couldn't print your words")),
             "a quit that lost them ended as if it hadn't: {quit:?}"
         );
-        // Written: said so.
-        app.draft = "Words that reached him.".into();
-        app.open_terminal = || tempfile::tempfile().ok();
-        assert!(app.print_unkept());
-        let printed = print_recovery(&mut app);
-        let line = recovered(Err(anyhow::anyhow!("Stopped.")), printed)
+        // Written: said so. A file stands in for his terminal, which only works where words go
+        // to it as bytes: on Windows they go by the console's own call, which a file isn't (that
+        // call is tested through a stand-in, below).
+        #[cfg(not(windows))]
+        {
+            app.draft = "Words that reached him.".into();
+            app.open_terminal = || tempfile::tempfile().ok();
+            assert!(app.print_unkept());
+            let printed = print_recovery(&mut app);
+            let line = recovered(Err(anyhow::anyhow!("Stopped.")), printed)
+                .unwrap_err()
+                .to_string();
+            assert!(line.contains("printed on your terminal"), "{line}");
+            assert!(recovered(Ok(()), printed).is_ok());
+        }
+        let written = recovered(Err(anyhow::anyhow!("Stopped.")), Some(true))
             .unwrap_err()
             .to_string();
-        assert!(line.contains("printed on your terminal"), "{line}");
-        assert!(recovered(Ok(()), printed).is_ok());
+        assert!(written.contains("printed on your terminal"), "{written}");
     }
 
     #[test]
