@@ -111,8 +111,10 @@ impl Live {
 }
 
 pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
-    // A backlog item's text a killed Kerdr left in the temp folder (intent 0414).
-    crate::edit::sweep(&std::env::temp_dir());
+    // A backlog item's text a killed Kerdr left in a folder it edits in (intents 0414, 0591).
+    for folder in crate::edit::folders() {
+        crate::edit::sweep(&folder);
+    }
     // One read per machine at most, the newest: while you're inside herdr nobody applies them.
     let inbox = Arc::new(Inbox::default());
     let mut live = live.then(|| Live {
@@ -1220,11 +1222,10 @@ fn edit_text(
     let Some((id, file, intro, marker)) = app.edit_file(key) else {
         return Ok(());
     };
+    // One that opens a window of its own is told to wait for it, and that's said (K1-84).
     let candidates = crate::edit::candidates_here(app.cfg.editor.as_deref());
-    // One that opens a window of its own and isn't told to wait would be back at once.
-    if app.editor_wont_wait(key, &candidates) {
-        return Ok(());
-    }
+    let set = crate::edit::set_editor_here(app.cfg.editor.as_deref());
+    app.editor_note(key, set.as_deref());
     send_before_leaving(
         terminal,
         app,

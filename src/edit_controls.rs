@@ -468,35 +468,27 @@ impl App {
         Some((held.id.clone(), file, intro, marker))
     }
 
-    /// Before the editor starts: one that opens a window of its own and wouldn't be waited for
-    /// (`code` without `--wait`) isn't started, since Kerdr would never see what you write there.
-    /// Says which flag to add, keeps the text, and whether it stopped it.
-    pub fn editor_wont_wait(&mut self, key: &str, candidates: &[Vec<String>]) -> bool {
-        let Some(words) = candidates.first() else {
-            return false;
+    /// Before the editor starts: when the editor set (`set`, before Kerdr's flag) opens a window
+    /// of its own and lacks the flag that has it wait for that window, Kerdr adds it
+    /// (edit::candidates) and says so in one line, so it's no surprise (intent 0591, K1-84).
+    pub fn editor_note(&mut self, key: &str, set: Option<&[String]>) {
+        let Some(words) = set else {
+            return;
         };
         let Some(flag) = edit::missing_wait(words) else {
-            return false;
+            return;
         };
-        let Some(held) = self.edits.get_mut(key) else {
-            return false;
+        let Some(held) = self.edits.get(key) else {
+            return;
         };
-        held.read_only = None;
-        let (id, mine) = (held.id.clone(), held.mine.is_some());
-        let reference = self.reference_for(&id);
-        let named = words.join(" ");
-        let kept = if mine {
-            "Your version is kept: e opens it once that's set."
-        } else {
-            "Nothing changed; e opens it once that's set."
-        };
+        let reference = self.reference_for(&held.id);
         self.say(
             format!(
-                "Didn't open {reference}'s text: {named} opens a window of its own, and without {flag} Kerdr can't wait for you to close it. Add {flag} to editor in Kerdr's config (editor = \"{named} {flag}\"). {kept}"
+                "Kerdr opened {reference}'s text in {} with {flag}, so it waits for you to close its window.",
+                words.join(" ")
             ),
-            Tone::Warn,
+            Tone::Info,
         );
-        true
     }
 
     /// Says that the editor you named couldn't start and which one opened instead, when so: your
@@ -3333,7 +3325,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quick_quit_is_quiet_and_a_window_editor_without_its_wait_flag_isnt_started() {
+    fn a_quick_quit_is_quiet_and_a_window_editor_without_its_wait_flag_is_given_it() {
         let mut app = app();
         let (key, id, reference) = waiting(&mut app);
         opened(&mut app, &key, &id, "Old words.", "sha256:aa");
@@ -3341,32 +3333,22 @@ mod tests {
         assert_eq!(app.edit_ended(&key, left("Old words.")), Action::None);
         assert_eq!(app.message(), None);
         assert!(app.edits.is_empty());
-        // code without --wait: not started, the flag named, and the text kept for e.
+        // code without --wait: started with it, and that said in one line (intent 0591, K1-84).
         opened(&mut app, &key, &id, "Old words.", "sha256:aa");
-        let code = |s: &str| vec![edit::editor_words(s), vec!["nvim".to_string()]];
-        assert!(app.editor_wont_wait(&key, &code("code")));
+        app.editor_note(&key, Some(&edit::editor_words("code")));
         let (text, tone) = app.message().unwrap();
-        assert_eq!(tone, Tone::Warn);
-        assert!(
-            text.contains(&format!("Didn't open {reference}'s text")),
-            "{text}"
-        );
-        assert!(
-            text.contains("Add --wait to editor in Kerdr's config"),
-            "{text}"
-        );
-        assert!(text.contains(r#"editor = "code --wait""#), "{text}");
-        assert!(app.edits.contains_key(&key), "the text is kept");
-        press(&mut app, 'e');
+        assert_eq!(tone, Tone::Info);
         assert_eq!(
-            app.edit_open.take().as_deref(),
-            Some(key.as_str()),
-            "e opens it with no read"
+            text,
+            format!(
+                "Kerdr opened {reference}'s text in code with --wait, so it waits for you to close its window."
+            )
         );
-        // With its flag, or a terminal editor, it starts.
+        // With its flag, or a terminal editor, nothing to say.
         app.message = None;
-        assert!(!app.editor_wont_wait(&key, &code("code --wait")));
-        assert!(!app.editor_wont_wait(&key, &code("nvim")));
+        app.editor_note(&key, Some(&edit::editor_words("code --wait")));
+        app.editor_note(&key, Some(&edit::editor_words("nvim")));
+        app.editor_note(&key, None);
         assert_eq!(app.message(), None);
     }
 
