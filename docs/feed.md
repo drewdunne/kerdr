@@ -83,7 +83,7 @@ know rather than guessing.
 | `priority` | `high` cards go first, with a ▲. |
 | `lane` | `background` adds a `bg` tag. |
 | `home` | The machine and session the work belongs to. A record with no home can still name the machine alone, with no `session`, where its work is (the one holding its agent's conversation, say): that copy wins over copies that name none, and `Enter` sends its reopen there. When copies name different machines, one that gives `resume` wins over one that doesn't. |
-| `workspace` | The herdr workspace it runs in, on the machine the feed ran on. Without it, Kerdr looks in `home` for one workspace whose label starts with the id's last two digits and a dash (`41-...`). Add `"tab": "w1:t2"` when the work runs in one tab of a workspace other work shares, such as a helper in a tab of the workspace that started it: `Enter` lands on that tab (on the workspace alone once the tab has closed), the card shows only that tab's agents, and the card the workspace belongs to leaves that tab's agents out. |
+| `workspace` | The herdr workspace it runs in, on the machine the feed ran on. Without it, Kerdr looks in `home` for one workspace whose label starts with the id's last two digits and a dash (`41-...`). Add `"tab": "w1:t2"` when the work runs in one tab of a workspace other work shares, such as a helper in a tab of the workspace that started it: `Enter` lands on that tab (on the workspace alone once the tab has closed), the card shows only that tab's agents, and the card the workspace belongs to leaves that tab's agents out. A backend may add `"conversations": ["<id>", …]`, the conversations herdr shows running there (only that tab's when it names `tab`). A feed carrying it on any card says, as `"cancel-conversations"` in `supports` does, that the backend checks `conversations` on a cancel that names a workspace; Kerdr then sends a card's list back, as its feed showed it when `X` was pressed, on the cancel it asks about itself (see [Cancelling work an agent is at](#cancelling-work-an-agent-is-at) and [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace)). |
 | `attention` | Your records' view: `needs_you`, `waiting`, `running`, `blocked`, `idle` or `done`. Kerdr combines it with herdr's agent state: an agent asking something always needs you, and an agent that stopped while the record says it's running needs you too, since nothing says what it's waiting on. A card's own agent back at work after the feed was made no longer needs you, even while the record still says `needs_you`: Kerdr saw it stopped in a read after the feed was made, and now it's working, so you've answered it, and the card turns at the next herdr read rather than the next feed. One working all along (a workflow or a background job still running in its pane after its turn ended on a question) still needs you until the record says otherwise; coming back from herdr, Kerdr reads that machine's feed at once, so an answer there shows within a read. Kerdr times the feed by `generated_at`, else by when it read it. An agent in a pane with herdr's `role=helper` token, a reviewer's, isn't the card's own unless the card names that tab. |
 | `status`, `needs`, `message`, `blockers` | Shown on the card and in its peek: what it's doing, what it needs from you, its last update, what's in its way. |
 | `waits_on` | Work it can't start before; shown in the backlog and the peek. |
@@ -104,8 +104,11 @@ know rather than guessing.
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
-| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"`, `"steps"`, `"cancel-backlog"` and `"cancel-workspace"`. See [Asking again](#asking-again-op-and-retry), [Each key's step first](#each-keys-step-first-and-questions-with-choices) and [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
+| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"`, `"steps"`, `"cancel-backlog"`, `"cancel-workspace"`, `"cancel-conversations"`, `"hold"` and `"forward"`. See [Asking again](#asking-again-op-and-retry), [Each key's step first](#each-keys-step-first-and-questions-with-choices), [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace) and [Holding and sending on a request](#holding-and-sending-on-a-request). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
 | `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)); until they're gone, and from the first read that names them, that session's workspaces are marked out of date, dim on the board, and a card with no workspace says "workspace not known" instead of "no workspace open". Entries of any other shape are ignored: a `session` on a `feed` or `herdr` entry, a `session` entry with none, or a `part` Kerdr doesn't know. An entry whose `why` is empty gets Kerdr's own words. |
+| `rev` | Optional, for a backend that lists `"hold"`: a short hash of what a decision about the card rests on (its state, disposition, status, home, workspace, conversation and text fingerprint), computed from the record alone, so every machine's copy gives the same one. A request that waited before it was sent carries the `rev` the card had when the key was pressed. See [Holding and sending on a request](#holding-and-sending-on-a-request). |
+| `held` | Optional, for a backend that lists `"hold"`: what it holds for this card, `[{"op": "<the request's op>", "action": "dispatch", "pending": "queued in ARK: starts when a place frees", "since": <epoch seconds>, "until": <epoch seconds>}]`, `until` only for one that runs at a set time. Write whole seconds; Kerdr also reads a time with a fraction (`1762873200.5`), as its whole second, and an entry whose time it can't read at all is kept, without that time, never left out for it. Kerdr shows the first on the card ("⧗ queued in ARK: …") and lists them all in its peek (`m`), each with a key to drop it. An entry with no `op` or no `pending` is left out. One whose `action` starts with `account-` (an `account-move` for later) is dropped with `account-drop`. An account one may carry `asks`, a question it waits on (see `pending` under the requests). |
+| `held` (top level) | Optional, for a backend that lists `"hold"`: what it holds that has no card yet, a new intent's save finishing in the background, `[{"op": "<the create's op>", "action": "create", "pending": "saving: its number comes once the central copy answers", "since": <epoch seconds>, "submission": "<its submission id>", "title": "<a title from his words>"}]`. While it lists a save, that save's card stays saying so, and a Kerdr opened after it was sent shows a card for it, titled `title` ("Your new intent" without one), until a card with its `submission` is read. See [Holding and sending on a request](#holding-and-sending-on-a-request). |
 | `outside_herdr` | For a card whose conversation runs in a process outside herdr (a plain terminal window, an SSH login): `{"terminal": "foot", "since": "<ISO time>"}`, the terminal's process name and when the process started. Decide it from the process itself (no herdr pane in its environment), never from herdr failing to answer. Kerdr shows "outside herdr · foot" on the card, and `Enter` on it sends `reopen` at once, for the backend to move the conversation into herdr (see [Moving a conversation in from outside herdr](#moving-a-conversation-in-from-outside-herdr)). `C`, `x` and `X` on it send their requests with `outside_since`, this `since`, for the backend to stop it there first. |
 
 ## Owners, teams and stage lists
@@ -188,6 +191,10 @@ Actions are off by default. Opt in separately from the read-only feed:
 command = "~/bin/my-tracker-action"
 ```
 
+With no `command` set, and a feed command that runs `ark-cards`, Kerdr uses `ark-card-action` from
+the same folder (or, for a bare `ark-cards`, `ark-card-action` on the path): ark-sdlc's own backend,
+so its keys just work. A `command` you set, an empty one included, always wins.
+
 Kerdr runs this trusted shell command on the card's home machine, locally or over the same
 SSH connection used to read that machine. The backend must update the canonical records there;
 Kerdr does not edit a cached feed or invent a replacement record. The configured command must
@@ -203,7 +210,7 @@ operation; the backend defines which additional fields that operation needs:
 ```
 
 The action names are `create`, `dispatch`, `reopen`, `refresh`, `dismiss`, `restore`, `move`,
-`close`, `cancel`, `edit` and `progress`.
+`close`, `cancel`, `edit`, `progress` and `drop`.
 `create` carries the user's own words, the session they were looking at, and an id for this
 submission, nothing else:
 
@@ -257,7 +264,10 @@ Optional request fields are `id`, `title`, `words`, `tenant`, `organization`, `p
 `create`). Omit fields that do not apply.
 The backend must validate the request, enforce its own permissions and slot limits, and print
 exactly one JSON response to standard output. Send diagnostic output to standard error: Kerdr keeps it
-with any failure it shows, in the log the README's "Errors are kept" describes.
+with any failure it shows, in the log the README's "Errors are kept" describes. The shell Kerdr runs
+the command in first prints a line of its own on standard error, `kerdr: its command started`, before
+anything of the command's; Kerdr takes it out again, and only its absence lets Kerdr count a request
+as never sent (see "A lost answer" below). A backend never needs to print it.
 
 ```json
 {"ok":true,"message":"Work started","id":"0041","session":"web"}
@@ -344,6 +354,9 @@ A success shows from the feed itself once a read has it (or
 after two reads, or a minute). Anything else (`ok: false`, a confirmation, a timeout, an invalid
 response) takes the change off the board at once, so the card is as the feed last said, and Kerdr
 says what didn't happen in a red box that stays until a key is pressed, or asks the question.
+It puts what didn't happen in front of your `message` ("#41 wasn't marked done: the store is
+locked."), unless the `message` already names the card, as "#41 didn't start yet (…)" does: then
+it's said alone, so the card is never named twice.
 While a `dispatch` or `reopen` is unanswered, or answered but not yet in the feed, Kerdr sends
 nothing else for that record. A later change the feed shows retires the earlier ones to the same
 record, and a failed `move` takes the later moves' shown orders with it. Account
@@ -360,8 +373,11 @@ there that was behind named the wrong home), answer `ok: false` with `home`, the
 When that machine is one of Kerdr's, other than the one asked, and is answering, Kerdr sends the
 same request there once (a `reopen` with `session` set to that session), and sends that record's
 later actions there too until the feed catches up, so a question that machine asks can be answered
-yes. It never sends it on a second time: when that machine's answer names yet another home, Kerdr
-says the two copies disagree. When the home is a machine Kerdr doesn't list, or one that isn't
+yes. When that machine's answer names yet another home, the two copies disagree about where it
+lives: Kerdr waits until both machines' feeds have been read again and their copies of the card give
+the same home, then sends it there once more by itself, with the same `op`, so one that already
+landed isn't done twice. It never sends it a third time: if the copies still disagree after two
+minutes, or that answer names yet another home, Kerdr says so, with the home each copy gives. When the home is a machine Kerdr doesn't list, or one that isn't
 answering, Kerdr says that in its own words instead of the message, since the message's "⏎ again"
 holds only when Kerdr sends it on. A home naming the machine asked is shown as the message.
 
@@ -416,7 +432,25 @@ Kerdr shows `say`, and asks the same machine, over the same connection, how it s
   workspaces its session has, Kerdr doesn't add its own count.
 - `failed`: shown as the request's failure, `message` and all. A worker that ended without
   finishing is `failed` too; say so, and that the card shows how it stands, since it may have done
-  part of the step.
+  part of the step. One with `retry` (a start whose launch was held a moment, say) is a refusal
+  that's passing, as on a direct answer: from a machine whose feed lists `"op"`, Kerdr waits that
+  many seconds and sends the request again by itself, once, with the same `op` and the card's
+  `rev`, saying "Trying again…" on the card and nothing on the message line meanwhile. Its next
+  answer is taken as the request's answer, a follow's end included. A `retry` in that answer, at
+  once or at a follow's end, is shown as it is, never sent again; an answer lost on the way is
+  asked for again with the same `op`, as any is. The wait and that resend both count from when
+  Kerdr had the end, however long the resend then waited for its turn: they fit in two minutes from
+  then, as in [Asking again](#asking-again-op-and-retry), checked before the wait and again before
+  the send, so a wait that doesn't fit, or a computer that slept before or during it, sends nothing
+  and shows the `message`. Later changes to the same card wait behind it.
+  A part-done end with `retry` (`partial: true`, when the only step that stood was starting its
+  herdr session) goes again the same way. Its `message` is said at once, in yellow, as any part-done
+  answer is, so what stood is never lost. If the next answer doesn't start it either, its line says
+  that `message` again just above why: "Started herdr session web, but then: #41 didn't start yet
+  (…)", then "#41 didn't start yet (…)".
+  For that resend to do the step again, the backend's record of its `op` must no longer give back
+  the follow: when followed work ends with `retry`, mark its `op` safe to send again, as a direct
+  `retry` answer is.
 - `unknown`: Kerdr says it lost track of the step and that the card shows how it stands. Any other
   `state` reads as `unknown`.
 
@@ -457,7 +491,9 @@ A backend that keeps ops lists `"op"` in its feed's `supports`, and does this, f
   `{"ok":false,"retry":5,"message":"…"}`.
 - A recorded answer is given again as it was, plus `"repeat": true`, and nothing is done. A recorded
   fingerprint that differs is refused: that id was used for another request. An answer with `follow`
-  is recorded with its token, so a repeat follows the same work; a question is recorded too, so a
+  is recorded with its token, so a repeat follows the same work, until that work ends with `retry`:
+  then it's a send that didn't happen yet, as below, and Kerdr sends it again (see
+  [Following work](#following-work-that-goes-on-after-its-answer)). A question is recorded too, so a
   repeat asks the same question with the same token. An answer with `retry` isn't recorded: it's a
   send that didn't happen yet.
 
@@ -470,6 +506,10 @@ come out of those two minutes, and a resend
 is given only what's left of them to answer in. A wait is never cut short: when N seconds, and at
 least 10 more for the resend to answer in, don't fit in what's left, or a wait ends with less than 10
 left, Kerdr sends nothing more and shows the last message as it is.
+A part-done answer with `retry` (`partial: true`) is sent again the same way, whether it comes at
+once or at the end of followed work: its `message` says what stood, so Kerdr says it at once, in
+yellow, as any part-done answer is, and again just above its last answer's line when that doesn't
+happen either; a plain `retry` refusal after it keeps it.
 Decide everything again at each send: a request whose card has changed meanwhile is decided for the
 card as it is now, and one that would now need a question asks it. Kerdr follows `retry` only from a
 machine whose feed lists `"op"`: there a change is followed with its `op`, and a read (an `edit` with
@@ -481,12 +521,33 @@ exit, 255), nobody can tell whether the request happened. To a machine whose fee
 sends it again with the same `op`, after 5, 10 and 15 seconds, within the same two minutes as
 `retry`, and the record answers if it did. To
 any other machine, Kerdr never sends it again: it says plainly that it can't tell whether it
-happened, and that the card shows how it stands. A backend that crashed or printed something that
+happened, and that the card shows how it stands. ssh's exit 255 with nothing printed isn't a lost
+answer only when both say the command never started: the shell's start line never came, and ssh's
+own words say it never reached the machine (it couldn't connect, find the name, or check its host
+key, or the machine refused the sign-in, on any of its lines, so a jump host's refusal followed by
+"Connection closed…" counts). Then nothing was sent, so the machine is away, and the change is held
+for it, or sent through a machine that forwards, as one asked while its machine isn't answering is
+(see [Holding and sending on a request](#holding-and-sending-on-a-request)), though never through
+another machine when it was the host key or the sign-in that was refused; a backend that holds
+nothing refuses it as before ("X couldn't be reached (…), so nothing was sent"). A command that
+started and then printed ssh's words itself, from a helper of its own, may have changed something
+first, so that's still a lost answer. After a try whose answer was lost, one that didn't reach the
+machine is still a lost answer, since the first may have landed; after a `retry` refusal, which says
+nothing changed, it's nothing sent. A backend that crashed or printed something that
 isn't JSON isn't a lost answer, since sending it again would most likely do the same: what it printed
 goes to Kerdr's error log, never the board.
 
 Kerdr waits in the place of that card's change, so later changes to the same record wait behind
 it. Quitting Kerdr while it waits leaves the request as it was last sent.
+
+A move of an account's waiting sessions (`account-move-waiting`) whose machine stops answering
+before its answer comes, after those resends, is kept for that machine with the same `op`, and sent
+once it answers, only to a machine whose feed lists `"op"`: "LAB-Server: moves its waiting sessions
+when it answers again". To any other, Kerdr doesn't ask it again, and says so: "LAB-Server stopped
+answering before it said whether its waiting sessions moved, so Kerdr didn't ask it again". That's
+checked again as it goes: back with a backend that no longer lists `"op"`, it isn't sent, and Kerdr
+says "LAB-Server stopped answering before it said whether its waiting sessions moved, and its backend
+no longer keeps track of a request sent twice, so Kerdr didn't ask it again."
 
 ### What an answer means
 
@@ -518,7 +579,8 @@ every step that changes something, in the order it says, in one request with one
 `message` says each step: "Brought #41 back from won't do and started it." When a later step fails
 after an earlier one stood, answer `ok: false` with `partial: true`, saying which step stood ("#41 is
 back in the backlog, but it didn't start: …"), never a plain failure, and never `retry` once anything
-has changed.
+has changed, except at the end of a followed start where only its herdr session's start stood (see
+[Following work](#following-work-that-goes-on-after-its-answer)).
 
 A step done first never overrides a choice of yours: an account picked, a no, or a card set aside.
 The one exception is a key that means starting or finishing that same card: `d`, `Enter`, `C` and
@@ -536,7 +598,7 @@ What Kerdr sends to a backend whose feed lists `"steps"`, where it would otherwi
 | `X` on work an agent is at (a workspace open) | `cancel` at once, naming no place (`{"action":"cancel","id":"0041"}`), with no question of Kerdr's: ask your own, naming where its agent is, with a `confirm` token and `wrap-up` among its `choices`. Its yes comes back with `session`, `confirm` and `override: true`, and `wrap-up` with `choice`; neither names the workspace, since the token does |
 | `x` on done work | `dismiss` at once: ask whether it goes to Won't do |
 | `s` on work in Won't do | the start `d` or `Enter` would send, with `account`: bring it back and start it on that account, in one request |
-| `X` on done work or work in Won't do, with a workspace open | `cancel`, asked first ("Stop #41's agent?"): stop the agent and close the workspace, and leave the record as it is |
+| `X` on done work or work in Won't do, with a workspace open | `cancel`, asked first ("Stop #41's agent?"), naming the place and, to a feed that announces them, its `conversations`, as in [Cancelling work an agent is at](#cancelling-work-an-agent-is-at): stop the agent and close the workspace, and leave the record as it is |
 | `e` on started or done work, or work in Won't do | `edit`, a read and then a save (see [Editing](#editing-a-backlog-items-text)) |
 
 Some keys Kerdr changes for every backend, since the request is one it already sends: `d` on work
@@ -627,7 +689,328 @@ the same key there then does what that backend takes.
   with no `id` to the machine the workspace runs on. Stop everything running there and close it; refuse
   in plain words one an intent's work is in. Kerdr says your `message`. A question you ask goes as any
   other, with its `confirm` token, and its yes with `override`. When the workspace closed, or an intent
-  took it, while you decided, Kerdr says so and sends nothing.
+  took it, while you decided, Kerdr says so and sends nothing. To a machine whose feed lists
+  `"cancel-conversations"` in `supports`, or carries `workspace.conversations` on its cards, the
+  cancel also carries `"conversations":
+  ["<id>", …]`: the conversations herdr's agent list showed running in that workspace when `X` was
+  pressed (its panes' `agent_session` values), sorted, without repeats, `[]` for none. Its yes, a
+  resend, and the yes to a question you ask carry the same list, never a fresh one. Just before
+  stopping, compare the workspace and those conversations with herdr then, and ask again if they
+  changed, so a held or late cancel never closes a workspace remade under the same id with other
+  agents in it. Kerdr leaves the list out when there would be more than 64, or one with a control
+  character: check the workspace by its id alone then, as for a request with none. A machine whose
+  feed does neither never gets the field. A cancel Kerdr asks about itself on a card with an intent
+  carries them too, from the card's feed (see [Cancelling work an agent is at](#cancelling-work-an-agent-is-at)).
+  `X` sent unanswered to a `"steps"` backend stays `{"action":"cancel","id":"0041"}`, with no
+  `conversations`: your own question binds its yes to what runs there. Esc's stop of a start
+  (`"to":"backlog"`) carries none either: the start's answer names none, and the card's feed may
+  not show its new conversation yet.
+
+## Holding and sending on a request
+
+A key whose change can't happen this minute, but will, is taken anyway: the card says what it waits
+for, and the change goes the moment it can. Each held request is one of the requests above, with its
+`op`, and is held in one place at a time: Kerdr's own hold file until a backend has taken it, and that
+backend's after.
+
+**`"hold"` in `supports`** says the backend does all of this but forwarding:
+
+- **`pending`, on an `ok` answer** for a request it accepted but holds (a start queued until a place
+  frees, a move for later, a save finishing in the background): words for the card, "queued in ARK:
+  starts when a place frees". A `dispatch` or `reopen` already queued for him may answer `ok: false`
+  with `pending` instead, so an older Kerdr says it didn't start: with no question, `home`,
+  `unreachable` or `retry`, Kerdr shows it as held, its `message` on the message line, not as a
+  failure. A start or reopen answered `ok` with `pending` shows as held in the same way, not as
+  starting: one queued on another machine at his word (`"pending": "queued on Y: starts in S once
+  there's room"`, with `machine` and `session`) never reads "Starting on Y…", and isn't taken as a
+  start just made. Kerdr shows them on the card, cyan, after ⧗, until the card's `held` lists that
+  request, or two reads of the feed after the answer don't (it ran). An account request's `pending`
+  shows on the card of the agent it moves, and the accounts feed's `agents[].held` (as cards'
+  `held`) keeps it there. `D` drops one with `{"action": "account-drop", "held": "<its op>", "op":
+  "k-…"}`, sent to the machine the agent runs on, through its actions command as every account
+  request is; answer it as `drop` below. A held account request that waits on his answer (a move for
+  later that, when due, found a background job started since his yes) carries `asks`: `{"message":
+  "<the question in full>", "confirm": "<token>", "yes": "<label>", "no": "<label>", "choices": [ …
+  ], "request": {<the account request his answer sends, without op, confirm or choice>}}`. Without
+  `message`, `confirm` and an account `request`, Kerdr passes over `asks` and shows `pending` as
+  before. Its card shows as asking him ("asks you: its move for later"), said once ("#44 asks you
+  first, about its move for later: n goes to it, and s on it asks."). n landing on it, or s on it,
+  asks the question. y sends `request` with `confirm` and an `op` of its own, and a choice adds
+  `choice`; n drops it with `account-drop`, as `D` does; Esc leaves it asking. The question keeps the
+  machine and the held request it opened for: n drops that request's `op` on that machine, even when
+  a read meanwhile gave the question another token, and y sends the token he was shown, which the
+  backend checks. Two machines' questions with the same token are each their own. When the backend
+  answers his yes with another question (`confirmation` with a new `confirm`), Kerdr asks it as the
+  first was, about the same held request: its n drops that request, and its yes or a choice goes as
+  the first's did, with the new token. While his answer is on its way (waiting its turn or its
+  machine, or under way), while the backend asks him more about it, and once its machine has taken it
+  (`ok`), its card asks no more until the feed says what came of it. An answer that fails (`ok:
+  false` with no question, or no answer back), that never went, or whose next question he leaves
+  with Esc, is forgotten: its card asks again while the feed still carries the question, and s opens
+  it again. An older Kerdr ignores `asks` and shows
+  `pending`, so `pending` should name the key that asks again ("moves to ARK_C once you answer: it
+  started background work since you asked; s on its card asks again").
+- **A save finishing in the background**: a `create` answered `ok` with `pending` and no `id`
+  (`{"ok": true, "pending": "saving: its number comes once the central copy answers", "message": "…",
+  "submission": "…"}`). Its card stays in the backlog, saying "✎ saving: its number comes once the
+  central copy answers", until a card with its `submission` is read, and `q` doesn't wait for it. The
+  feed's top-level `held` lists it meanwhile. Once three reads list it nowhere and no card has come for
+  it, its card goes, and Kerdr says it stopped saving without getting its number.
+- **`held` on each card** (see [Fields](#fields)), shown on the card after a restart, and in its peek.
+- **`drop`**: `{"action": "drop", "id": "0041", "held": "<that request's op>", "op": "k-…"}`, or
+  `session` and `workspace` in place of `id` for a card with no intent. Answer `ok` either way, saying
+  in `message` what was dropped, or that it had already run or is running, and `"dropped": true` or
+  `false`, or `state`: `dropped`, or `running`, `ran`, `ended`, `replaced` or `unknown` when it
+  wasn't dropped. An answer with neither counts as dropped. Kerdr sends `drop` only to a backend
+  that lists `"hold"`, from the peek's `D`. A drop is never kept in Kerdr's hold file, since its
+  `held` names what it drops and a change sent from the file is marked `held: true`: when it can't
+  get through (a forwarder answers `unreachable`, or its machine isn't answering), nothing is
+  dropped, and Kerdr says so: "#41: "queued in ARK: starts when a place frees" wasn't dropped:
+  build-box can't be reached from here. Once it answers, m then D drops it." A held request with no
+  `pending` words says "Nothing held for #41 was dropped: …" in the same shape, and an account
+  request's drop (`account-drop`) says the same when its machine isn't answering. A drop sent to a
+  machine that doesn't hold what it drops (the one that queued a start on another, say) may answer
+  `ok: false` with `home`, naming the machine that holds it: Kerdr sends the same drop there once,
+  with its `op` and `held`, as for any `home` refusal, but never takes it as the card's record having
+  moved, so the card's later actions still go to the home its feed shows. When this Kerdr can't reach
+  that machine (not one of its machines, with no forwarder, or one that isn't answering), nothing is
+  dropped, and Kerdr says so in the same way: "#41's queued start is held on X, which this Kerdr can't
+  reach, so it wasn't dropped. Once X answers, m then D drops it." It names the held request by its
+  card's `held` entry: "queued start" for a `dispatch` or `reopen`, else its `pending` words, else
+  "held request". A new intent still saving has no number, so its drop is `{"action": "drop", "held": "<the create's op>", "op":
+  "k-…"}` alone; once it's dropped, its card goes and Kerdr gives your words back, as a failed save
+  does. A save still finishing when you quit is kept in `words.json` with its words and its `op`, so
+  the next Kerdr shows it again and `D` drops it the same way. One whose words aren't here (sent from
+  another computer), shown from the feed's list, isn't dropped from here: this Kerdr couldn't give its
+  words back, and `D` says so.
+- **`rev`**: a request that waited before it was sent (from Kerdr's hold file, or sent again after a
+  `retry` refusal or a lost answer) carries the card's `rev` from when the key was pressed. Recompute
+  it; if it differs, do nothing and answer with the question for the card as it is now, as any
+  question that changed. A request with no `rev` (sent at once, or from an older Kerdr) behaves as
+  before. Kerdr sends `rev` only to a backend that lists `"hold"`, or through a forwarder (below). Leave
+  `rev`, `held` and `forward_to` out of the `op` fingerprint: a resend adds them to the same request.
+- **A start or change that waited for its card's write-up** can't carry the `rev` from when its key
+  was pressed, since the write-up itself changes it. Kerdr holds it instead to the card's footing
+  then: whether it was set aside (`disposition` `wont_do`), finished (`state` `closed`, or `stage`
+  `maintain` or `done`) or under way
+  (`state` `active` or `background`, or a `workspace`). Once a read shows any of those has come about
+  since, it's taken out unsent, and said: "#41 wasn't started: it changed since you pressed d, so
+  Kerdr dropped that start." That holds until it starts, after its write-up too, while it still
+  waits behind another change to the same card. Otherwise it goes once a read shows it written up and
+  nothing for that card is ahead of it, with the card's `rev` as the read that showed it written up
+  gives it, never a later read's, to a backend that lists `"hold"`, so a change after that read is
+  asked about rather than done.
+- **`"held": true`** marks a request sent from Kerdr's hold file. Stopping an agent or closing a
+  workspace with `held: true` is never done straight away: answer with its question, which Kerdr shows
+  as waiting on the card. Anything else whose `rev` matches goes ahead. The yes, or a choice, that
+  answers a question is pressed then, so it goes as a fresh request, without `held` or `rev`, even
+  when the question came from a request that waited. Kerdr marks a held request, and gives it its
+  `rev`, for wherever it's checked: the card's own machine, when its backend lists `"hold"`; and,
+  through a machine that forwards, a machine Kerdr doesn't have, always, whatever the forwarder's own
+  backend does, since it passes one on only to a backend that checks them. When the card's machine
+  answers with a backend that no longer lists `"hold"`, a held change isn't sent unchecked: it stays
+  held, and Kerdr says once "d on #41 stays held: LAB-Server's backend no longer checks a held change
+  again, so Kerdr won't send it unchecked. Press d again to send it now, or m then D drops it." One
+  refused because its card lives on another machine (`home`) goes there with its `held` and `rev`,
+  and isn't sent there unchecked either: when that machine's backend doesn't list `"hold"`, Kerdr
+  says once "d on #41 stays held: it lives on build-box now, whose backend doesn't check a held
+  change again, so Kerdr won't send it unchecked. Press d again to send it now, or m then D drops
+  it." One that also waited behind a start, a save or a write-up is decided again by Kerdr itself, so
+  it goes all the same, except a stop: Kerdr deciding it still makes sense isn't the question its
+  backend would ask. One kept from before Kerdr last closed (a yes to "Cancel #41 once it opens?") goes
+  only to a backend that lists `"hold"` or `"steps"`, which asks again; with any other it stays held,
+  and Kerdr says once "X on #41 stays held: LAB-Server's backend wouldn't ask again before stopping
+  it, so Kerdr won't send the yes you gave before it last closed. Press X again to be asked now, or m
+  then D drops it." The same goes where a refusal sends it on (`home`): checked and marked as that
+  machine's backend takes it, it goes there only as that backend would ask about it, naming no
+  workspace for one that asks its own question first, and otherwise stays held ("X on #41 stays
+  held: it lives on build-box now, whose backend wouldn't ask again before stopping it, …"). The
+  entry keeps why it stays (`stays` in the hold file). Pressing its key again
+  on that card sends the change now as that same entry, with its `op`, unmarked, and its answer
+  takes it out of the file, so it never stays behind as a second copy. Sending it clears `stays`. A
+  key pressed again on a card whose same change is on its way from the file already sends nothing,
+  under its `op` or a new one: from this Kerdr, the key says Kerdr is still asking, as for any change
+  on its way; from another Kerdr open now, "d on #41 is already on its way to build-box from another
+  Kerdr open now, so it isn't sent again from here." When
+  Kerdr can't record that the entry is this one's to send (the file can't be written), nothing is
+  sent either, under its `op` or a new one: "d on #41 wasn't sent: Kerdr couldn't write …/held.json
+  (why), so Kerdr can't tell whether another Kerdr is sending it. Press d again once it can be
+  written."
+
+**Kerdr's hold file.** A change to a card whose machine isn't answering, to a backend that listed
+`"hold"` when Kerdr last read it, goes into `held.json` in Kerdr's state folder (readable by you
+alone): the request with its `op`, the machine, the card's `rev`, and when the key was pressed. The
+card says "⧗ d waits for LAB-Server", and the message line "Held: d on #582 goes when LAB-Server
+answers (it dropped 40 s ago)." A backlog card's row on the board stays one line: a cyan ⧗ takes the
+place of its glyph, and while it's selected the message line under the board says it in full ("#582
+⧗ d waits for LAB-Server"), as for any held request the card shows. Once that machine answers, and its feed has been read since, the next
+read sends it as it was asked, with `held: true` and its `rev`; it leaves the file when it's answered,
+and the card says "⧗ d is on its way to LAB-Server" meanwhile. One sent that got no answer, or that a
+forwarder couldn't get through, waits in the file again, to go once more with the same `op`. One
+refused because its card lives on another machine (`home`) stays the same entry, with its `op` and
+the time its key was pressed, for that machine now: sent on there, or through a machine that
+forwards, it leaves the file only once that answer comes or it's dropped; held for that machine when
+it isn't answering, it waits for it; and while two copies disagree about where the card lives, it
+waits for them to agree, then goes once more from the file, or leaves it when Kerdr says they still
+disagree. So a Kerdr that ends meanwhile leaves it for the next one, which sends it there once.
+Quitting doesn't lose it: the next Kerdr opened sends it, and nothing sends it while no Kerdr is
+open. One older than a day isn't sent: the card says "⧗ d dropped: LAB-Server didn't answer for a
+day", or, for one that stayed held though its machine answered, why: "⧗ d dropped after a day:
+build-box's backend doesn't check a held change again, so it wasn't sent". One that was sent and got
+no answer back (`unanswered` in the file) may have gone ahead, so it never says it wasn't sent: "⧗ d
+dropped after a day: build-box never answered after it was sent, so it may have gone ahead". Kerdr
+writes `unanswered` before it hands the change over, so a Kerdr that ends before the answer comes
+leaves it so for the next. An answer that says nothing reached the machine (the connection never
+carried it, a forwarder couldn't get it through, or a refusal because its card lives elsewhere)
+puts back what it said before, when this was the first time it could have reached it.
+
+Several Kerdrs open at once share the file. Each change to `held.json`, or to `words.json` (below),
+holds `kept.lock` in the state folder while it reads the file, changes it and writes it whole, a new
+file moved into place, so none loses another's change and a crash never leaves half a file. Each
+Kerdr also holds `kerdr-<name>.lock` there while it runs, which the system lets go however it ends.
+A held change's entry names the Kerdr that sent it (`by`) until it's answered: another Kerdr open
+meanwhile neither sends it too nor drops it ("d on #41 is on its way from another Kerdr open now, so
+it can't be dropped from here."), and its card says "⧗ d is on its way to LAB-Server from another
+Kerdr". Once the Kerdr that sent it has gone, the next one sends it again with the same `op`, so its
+backend does it once. Who has an entry is only ever decided by a change that reached the file: when
+the file can't be read or written, a held change isn't sent ("d on #41 waits: Kerdr couldn't write
+…/held.json (why), so it can't tell whether another Kerdr is sending it. It goes once the file can be
+written.") and `D` doesn't drop it ("d on #41 wasn't dropped: Kerdr couldn't write …/held.json (why).
+Press D again once it can be written."). Only one this Kerdr held that never reached the file is its
+own to send meanwhile, and it goes into the file as being sent by it. An entry a day old is checked
+for its Kerdr, and taken out, in the same change to the file, so one another Kerdr has just taken
+isn't dropped under it. A file that can't be read is never written over or deleted: it's moved aside,
+and that's said ("Kerdr couldn't read …/held.json, so it moved it to
+…/held-unreadable-1762873200.json and started a new one."). A change that can't be written, the disk full say, is still held while
+Kerdr is open, and said: "Held: d on #41 goes when LAB-Server answers. Kerdr couldn't write …/held.json
+(why), so it's held only while this Kerdr is open." It goes into the file with the next write that
+can. A start that waited for its intent's write-up when you quit is kept the same way, and the next
+Kerdr starts it once it's written up, if its card still waits to start (Kerdr checks this itself,
+since an older backend checks no `rev`). The peek (`m`) lists Kerdr's held requests and the
+backend's, and `D` drops the first, `2D` the second. A save of an item's text (`edit`) whose machine
+stopped answering while your editor was open is held the same way, your version kept meanwhile. The
+board reads no machine while your editor is open, so when it closes on a changed text Kerdr first
+applies what the machines said meanwhile, and reads the save's machine again, waiting three seconds
+at most ("Checking LAB-Server is answering before #582's new text goes…"): a machine known to be
+away has the save held at once. One that turns out to be away only once the save is tried (ssh
+couldn't connect) has it held then, as above. A
+change still held after ten minutes is said once: "d on #582 still waits for LAB-Server (10 min so
+far): it goes when LAB-Server answers, and m then D on its card drops it." A machine that had stopped
+answering long enough to show it (past a drop's quiet first seconds, or unreachable) is said once it
+answers again, with what's held for it that goes now: "LAB-Server is answering again: the 2 changes
+held for it go now." A machine whose backend doesn't list `"hold"` or `"forward"` is refused as
+before: "That machine is not answering."
+
+**Keys on a card that's on its way.** A key on a card whose start or reopen is still on its way
+(sent and unanswered, waiting for its backend's question, or with its workspace open while its agent
+takes its brief), on a card still being written up (`intake: "pending"`), or on a new intent still
+being saved, is taken, never refused. Any question it asks (C's "Mark #41 done?", x's and X's) is
+asked first; the change then waits in Kerdr, and nothing of it reaches the backend meanwhile:
+
+- **Behind a start:** "Held: J on #41 goes once its start is answered.", and the card says "⧗ J goes
+  once its start is answered". Once the start is answered, and its card shows what it did, the change
+  is decided again against the card as it is now. It goes when it still fits: C or x while the work
+  still waits, J, K, t, B or y while it's still in the backlog, `restore` while it's still set aside.
+  Otherwise it's dropped and said: "#41 started meanwhile, so the move wasn't done: it has no place in
+  the backlog order now." C or x on work that started meanwhile goes only to a backend that lists
+  `"steps"`, which asks what it stops (its question waits on the card); with any other it's dropped:
+  "#41 started meanwhile and has a workspace open, so C wasn't done: an agent may be at it. ⏎ goes
+  in, and X stops it."
+- **x, C or X on a start with no workspace yet** asks "Cancel #41 once it opens?" instead. Its yes
+  waits behind the start as `{"action": "cancel", "id": "0041"}` and goes once the workspace opens:
+  as it is to a backend that lists `"steps"`, which asks its own question, and naming the workspace
+  (`session`, `workspace`, `tab`) to any other. When the start opened nothing, it's dropped: "#41
+  didn't open a workspace, so there was nothing to stop: x sets it aside." On a start waiting for its
+  backend's question, nothing will open, so the key asks its usual question and its yes waits the same
+  way.
+- **Behind a write-up:** "Held: C on #41 goes once it's written up.", and the card says "⧗ C goes
+  once it's written up". It waits in the order its record's changes run, as `d` does, and goes once a
+  read shows the record written up.
+- **Behind a save:** "Held: d on your new intent goes once it's saved and has its number.", and the
+  card says "✎ d goes once it's saved". Once a card with its `submission` is read, it goes to that
+  number, decided again as above. When the save fails, or its backend stops saving it, the change is
+  dropped and said after the failure: "d on your new intent was dropped: it wasn't saved."
+
+Each is listed in the peek (`m`), and `D` there drops it: "Dropped: C on #41 won't be sent." `D` drops
+a change by where it is, a held one on its way included: one still in Kerdr is taken out at once; one
+waiting its turn, or for its write-up, behind changes already sent is taken out of that order first,
+and said dropped only then; one whose command has begun isn't dropped from here, and that's said: "C
+on #41 had already gone when D came, so it carries on: its card shows what it does." or "C on #41 is
+already with LAB-Server, so it can't be dropped now: its card shows what it does." When you quit, a
+change waiting behind a start or a save goes into the hold file, its entry's `after` saying `"start"`
+or `"save:<submission>"`, and one waiting for a write-up with `after` `"write-up"`; one that came
+from the hold file waits there again as itself. The next Kerdr decides each again the same way once
+its machine answers, and it stays the same entry, with the same `op`, until it's answered. A write-up that fails sends the
+change as it was, as `d` does for a start: "#41 couldn't be written up; C goes now, with its words as
+they are."
+
+**`⏎` on a card just started** waits for its workspace up to ten minutes after the start was
+answered, reading the feed as it goes. When the card's `held` (or the start's `pending`) says its
+backend holds the start, Kerdr says that instead and stops waiting: "#41 has no workspace yet: queued
+in pick4me: starts when a workspace there frees up. ⏎ goes in once it's under way." Past ten minutes:
+"#41 still has no workspace ten minutes after its start, so Kerdr stopped waiting: its card says
+"…". ⏎ tries again." Waiting sends nothing.
+
+**`"forward"` in `supports`** says the backend sends a request on to another machine it can reach.
+When a card's machine Y can't be reached for want of a connection (it dropped, or is unreachable),
+or isn't one of Kerdr's machines at all, Kerdr sends the request to a machine X that's answering and
+lists `"forward"`, with `"forward_to": "Y"` and the same `op`. A host key or sign-in that Y's SSH
+refused is never gone around: the change is held for Y when its backend holds, and refused otherwise. X sends it to Y's backend only along a route its access settings already allow, one hop and no
+further, after checking that Y and the card's owner match its own record; a host-key or sign-in
+refusal stops it there. The answer carries `"via": "X"`, and Kerdr says "Sent through X, since Y isn't
+answering here." When no allowed route reaches Y, X answers `{"ok": false, "unreachable": "Y",
+"message": "…"}` with no `retry`, and Kerdr holds the request in its file for Y, with its `op`. For a Y that isn't one of Kerdr's
+machines, Kerdr tries it again through a machine that forwards, at most every two minutes. A
+refusal naming a home Kerdr can't reach goes the same way: through a machine that forwards, else held
+for that home when its backend holds.
+
+**Quitting.** `q` quits at once unless something is still being handed over: a new intent until it's
+answered, words waiting for their image, a change whose command doesn't have the whole request yet,
+a save of an item's text not answered yet, which is held if its machine turns out to be away
+("Quitting once #41's new text is saved or held…"), a change sent once more when its card's copies
+agree ("Quitting once #41's copies agree and it's sent again…"), or an account change, or one
+waiting its turn behind it. Then it says "Quitting once
+#41's change is handed over… Esc stays." and quits by itself as soon as that's done; `Esc` stays. A
+second `q` quits at once when what's left can be kept: an account change, or a change to a backend
+that holds, which goes into the hold file with its `op` (an unanswered save as one that may have gone
+ahead, so its backend answers from its record if it landed), or a save to a backend that doesn't
+hold, whose words are kept as your version (below). What a quitting Kerdr puts in the hold file
+stays marked as its own until it has really gone, when its `kerdr-<name>.lock` lets go: no other
+Kerdr sends any of it while this one may still, even when its words can't be written and it stays
+open. A new intent's words that come back from a failed save keep Kerdr open with them. Your words
+are never lost by quitting: the new-intent box's words and images, words a save gave back, and your
+unsaved versions of item texts go into `words.json` in the state folder (readable by you alone), and
+the next Kerdr puts them back (`c` brings the box's words, `e` your version, reading the text first
+to see whether a save of it landed). Words a save gave back keep the send they came from (`from`:
+its submission, machine, session and owner), so sent again they go as that same send, and a create
+whose answer was lost never makes a second intent. New intents still being saved in their backend go
+in too (`saving`), so the next Kerdr shows them and `D` drops them. Each Kerdr's words are one set
+in the file, marked with that Kerdr; a Kerdr takes the sets no Kerdr open now has, and they stay in
+the file, marked as its own, until it keeps its words in their place, so a crash meanwhile leaves
+them for the next one. While it's open, it keeps its words there as they are now whenever they
+change: as you send a new intent, when it's answered, and when you close the box. A new intent on
+its way, unanswered, is kept as the send it is, with its submission. It isn't sent until it's there:
+when the words file can't be written, it waits in Kerdr, tried again every two seconds, and Kerdr
+says "Your new intent waits: Kerdr couldn't write …/words.json (why). It's sent once its words are
+kept there, so a crash can never save it twice." So after a crash, words already sent come back as
+that send, which finds what it may have made, and words already saved don't come back at all. When
+what Kerdr keeps can't be written, `q` stays open with it and says so: "Kerdr couldn't write
+…/words.json (why), so quitting now would lose what Kerdr keeps for the next one: your words, and
+changes it holds. q again quits anyway, Esc stays." A hang-up or a request to stop (`SIGHUP`,
+`SIGTERM`) while your editor is open waits for the editor to close, then sends its save and waits
+for the answer when its machine is answering. When it can't (no answer, or the machine isn't
+answering), the save goes into the hold file with its `op` for a backend that holds, and your
+version stays in `words.json` either way; the line Kerdr ends with says which.
+
+**Older and newer, mixed.** A Kerdr that doesn't know these fields ignores `pending`, `held`, `rev`,
+`via`, `unreachable` and `dropped`, and never sends `drop`, `held`, `rev` or `forward_to`. This Kerdr
+sends `rev` and `held` only to a backend that lists `"hold"`, or through one that lists `"forward"`
+to a machine it doesn't have, and `forward_to` only to one that lists `"forward"`.
+
+**`u` on a machine's row** makes an intent to update herdr there, through that machine's
+infrastructure code (or omarchy-config on an Omarchy machine), when a machine whose feed's `source`
+is `ark-sdlc` answers: Kerdr installs nothing itself. Otherwise `u` runs herdr's own setup there, as
+before.
 
 ## A quiet board
 
@@ -684,10 +1067,19 @@ that isn't waiting in the backlog (started, done or in won't do) itself, unless 
 `"steps"`: then the backend edits it where it is (in Won't do it stays there; started work's agent is
 told; a save of done work's text may ask to save it as a new intent made from it, and Kerdr asks that
 question, sending the same text again with `override` and the `confirm` on a yes, and showing your
-`message` once it's saved). Kerdr refuses one still being written
-up (`intake: "pending"`) with "#416 is still being written up; edit it once that's done.", without
-asking the backend; so too a new intent's card while its words are still being saved, a card whose
-start or reopen is on its way, and one `d` asked to start once it's written up. A card whose feed
+`message` once it's saved). On a card still being written up (`intake: "pending"`), or just saved and
+being written up again, or a new intent's card whose words are still being saved, `e` waits: "#416
+is still being written up: its text opens once that's done. Esc on the board stops waiting." Once a
+read shows it written up, its text opens by itself if you're still on that card and haven't been into
+a workspace since; otherwise Kerdr says "#416 is written up: e opens its text." On a card `d` asked to
+start once it's written up, `e` opens its text, and the start waits for your edit: once the editor
+closes it goes, after the save and the save's own write-up when you saved, so it starts from your new
+text. It waits for the edit whatever else let it go meanwhile: its write-up landing, or another change
+to the card that it waited behind finishing. Kerdr's runner puts a save of a record's text ahead of a start for that record still waiting
+for a write-up, and the start then waits for the save's write-up too. On a card whose start or
+reopen is on its way, `e`'s read waits its turn behind the start, and its save follows the rules for
+the card as it is by then: on started work it sends nothing, unless its backend lists `"steps"`. A
+card whose feed
 carries `item_text` and `item_was`, read within the last five minutes, opens from those with no read,
 and only its save asks the backend anything; so whatever a read would refuse that the feed can't show,
 the save must refuse. Otherwise Kerdr says it's reading, and reads the text:
@@ -696,7 +1088,10 @@ the save must refuse. Otherwise Kerdr says it's reading, and reads the text:
 {"action":"edit","id":"0414","from":"amd-lzm4"}
 ```
 
-`from` is the hostname of the machine Kerdr runs on, for the record's log. Answer with the text and
+`from` is the hostname of the machine Kerdr runs on, for the record's log. An `ok` answer with no
+`text` comes from a backend too old to edit text: Kerdr says it asked that machine to update (ark-sdlc's
+backend pulls before every request, a read included) and reads the text again once; only when that
+read has no text either does it say the text can't be opened. Answer with the text and
 `was`, a fingerprint of it that Kerdr sends back with a save (ark-sdlc's is `sha256:` and the
 text's SHA-256). Which text that is belongs to the backend (ark-sdlc's is the body of intent.md's
 first `## ` section); it never ends in a newline:
@@ -811,8 +1206,15 @@ conversation running in another pane, say), it answers with it, and Kerdr goes s
 opened a new tab in a workspace already open (beside its parent's agent, or beside a tab still
 open there), add `tab`, that tab's id: herdr leaves a workspace's active tab as it was, so Kerdr
 goes onto that tab, and only that tab. Create the tab without focusing it, so nobody else's screen
-moves. Kerdr goes in only while you're still on that card; if you've moved on, or pressed `Esc`,
-it says the work is open again instead.
+moves. Kerdr goes in only while you're still on that card, and it's still the same work; if
+you've moved on, or pressed `Esc`, it says the work is open again instead. A feed read while the
+reopen ran may already show the card in the workspace the answer names, with no `resume` (which the
+feed gives only while there's no workspace): that's what the reopen did, so it's still the same work
+and Kerdr goes in. That workspace is the one the answer names by both `session` and `workspace`,
+and a workspace the card already showed when you pressed `Enter` is still its own only in the same
+session: one with the same id in another session is another workspace. Another workspace, or
+`resume` naming another conversation, isn't. The same holds for a start `Enter` asked for,
+answered at once or once its followed work is done.
 
 To ask first (the session is at its usual limit, the conversation may still be open somewhere
 else), answer with `"confirmation": true`, a `message` that names every reason, and optionally
@@ -871,8 +1273,9 @@ anything:
 {"action":"close","id":"0117"}
 ```
 
-Kerdr offers it for an open record that isn't dismissed or still being written up, in the backlog
-or in a working column, with no workspace open. `x` (`dismiss`) works on the same started work,
+Kerdr offers it for an open record that isn't dismissed, in the backlog or in a working column, with
+no workspace open. On one still being written up, its yes waits for the write-up (see [Holding and
+sending on a request](#holding-and-sending-on-a-request)). `x` (`dismiss`) works on the same started work,
 not only on the backlog: the record leaves the board for the Won't do view, keeping its state, and
 `restore` brings it back where it was. Kerdr refuses a card with a workspace open itself, since its
 agent may be there; refuse in the backend, with a plain `message`, whatever only it can tell. Done
@@ -904,6 +1307,19 @@ machine, naming where the yes was given:
 {"action":"cancel","id":"0300","session":"default","workspace":"w2M"}
 {"action":"cancel","id":"0322","session":"default","workspace":"w2M","tab":"w2M:t3"}
 ```
+
+To a machine whose feed lists `"cancel-conversations"` in `supports`, or carries
+`workspace.conversations` on its cards, the request also carries `"conversations": ["<id>", …]`:
+the card's `workspace.conversations` as its feed showed them when `X` was pressed, sorted, without
+repeats, `[]` for none, when that `workspace` is the place the request names (its `session`, `id`
+and `tab`). Kerdr leaves the list out when the card's feed gave none for that place, when there
+would be more than 64, or when one has a control character: check the place by its id alone then,
+as for a request with none. Its yes, a resend, and the yes to a question you ask carry the same
+list, never a fresh one. Just before stopping, compare the place and those conversations with
+herdr then, and ask again if they changed, so a yes that comes after the workspace was closed and
+opened again under the same id, before Kerdr's board caught up, never stops what runs there now.
+The same goes for `X` on done work or work in Won't do, with a workspace open, which Kerdr asks
+about itself to a backend that lists `"steps"` too.
 
 The backend stops that agent, mid-step or idle, and everything else running in that workspace or
 tab, then closes it, and then sets the record aside as `dismiss` does: it leaves the board for
@@ -950,7 +1366,24 @@ question so ("Hand #45 over to Codex?"). `S` edits the list new agents start on,
 saved unchanged while an agent there could move, it says that `s` on its card is the key and names
 those cards, those off the list's first account first. It edits the viewed session's owner's list,
 or with no session chosen, the selected card's owner's: its session's, its home session's, else the
-tenant or organization its record names.
+tenant or organization its record names, looked up in its own machine's feed first, then in any
+other machine's that names that owner, since every list lives in the one shared catalog. A session
+belongs to the owner whose `sessions` list it, else to the owner whose `code` is its name or the part
+of its name before a `-` (`P4M-Marketing` is P4M's), as the backend reads it. A viewed session no
+owner has opens no list, since its backend starts nothing there on any list. Instead `S` asks "Who
+owns web?", listing the owners its machine's accounts feed names. Owners are Arknet's
+infrastructure code, so neither Kerdr nor its backend writes one: `⏎` makes an intent, through the
+usual `create` on a machine whose backend is ark-sdlc's and filed under Arknet when a feed names
+it, for an agent to give that session the owner picked in Arknet's owners code ("Give herdr session
+web on laptop the owner Pick4me (pick4me) in Arknet's owners code…"). No backend action is needed for
+it. Where no owners are listed, or no ark-sdlc backend answers, Kerdr says the session needs an owner
+in the owners file first, as before. With no card selected, `S` opens the owner of the machine on the
+board's machine tab, else of the machine Kerdr runs on, else of the machine the accounts screen
+opens on (its `machine_owner`, else its first organization), saying "Tab switches owner" when that
+machine has several; on the list, `Tab` and `Shift+Tab` go to the machine's next and previous owner
+while the list is unchanged (a changed one is saved with `Enter` or left with `Esc` first). When the
+card's machine's feed hasn't come yet and no other feed names its owner, `S` says it's waiting for
+that feed and opens the list once it comes, if you're still where you pressed it; `Esc` stops waiting.
 
 ## Starting a card on an account
 
@@ -1105,7 +1538,11 @@ while the backend takes ownership, and persistent log storage belongs to the bac
 ## Accounts
 
 All account fields are optional additions to format 1. Older feeds need no changes and older
-Kerdr ignores these fields. Each feed reports only that machine’s account state:
+Kerdr ignores these fields. Each feed reports only that machine’s account state. `A` opens the
+accounts screen on the board's machine tab, else on the machine Kerdr runs on; while that machine's
+feed hasn't come, it opens on a machine that has accounts instead and says why the first shows none
+(being read, its feed failed and with what, not answering and for how long, or no feed configured);
+`Tab` switches machine as ever. A machine with no accounts to show says the same on its screen.
 
 ```json
 {
@@ -1136,15 +1573,36 @@ Kerdr ignores these fields. Each feed reports only that machine’s account stat
     "how":"next","handed_from":{"account":"KBZ_C","program":"claude","conversation":"conversation-id",
     "why":"usage_limit","at":"2026-10-21T17:44:00-05:00"}}],
   "current": {"account":"KBZ_X","name":"Personal Codex","since":"2026-10-21T16:00:00-05:00",
-    "status":"ready","until":null,"machine":"build-box"}
+    "status":"ready","until":null,"machine":"build-box"},
+  "catalog": "ark-sdlc"
 }
 ```
+
+`catalog`, optional, names the shared account catalog this backend writes: model lists, the current
+account, and the accounts themselves (ark-sdlc's backend sends `"ark-sdlc"` for the catalog every
+machine's copy shares). Two machines whose feeds give the same `catalog` write the same one. A
+backend that lists `"hold"` but sends no `catalog` writes a catalog of its own (a test's, or a
+scratch copy's), shared with no other. Without it from an older backend, Kerdr counts two feeds as
+sharing one only when both give the same `source` and the same `owners_source`, and that isn't
+`mock`. Kerdr uses it to send a change to the shared
+catalog to another machine when the one it's meant for can't take it (see
+[Account actions](#account-actions)). An older Kerdr ignores it.
 
 `agents` lists the agents this machine started, newest first. A card shows the account of the
 record whose `conversation` is the one herdr sees in the card's pane, and shows none when no record
 has it; until herdr knows the pane's conversation, it takes the first record on that pane. A
 backend should leave out records of agents that no longer run, but one left in can't change a card
 whose conversation herdr knows.
+
+An agent's record may carry `held`, as a card's does (see [Fields](#fields)): what the backend holds
+for it, such as a move for later (`{"op": "k-…", "action": "account-move", "pending": "moves to ARK_C
+at 02:00", "since": …, "until": …}`). Kerdr shows it on the agent's card and lists it in its peek, and
+`D` there sends `drop` naming the card's `session` and `workspace` (or its `id`, for a card with an
+intent). An `account-move` answered `ok` with `pending` (a move for later, or one queued behind a move
+under way) shows those words on the agent's card at once. When an account is out until a set time, a
+backend can ask with `choices` (as in [Each key's step first](#each-keys-step-first-and-questions-with-choices)),
+for example `then` ("move it at 02:00") and `next-ready` ("move it now to ARK_X"); give each a one-letter
+`key` other than `y`, `n` and `q`, which a yes, a no and leaving take.
 
 `current` is the **current account**: the one new sessions start on ahead of every owner's
 list, set for every machine at once. It's `null` when none is set. A backend that has no current
@@ -1186,7 +1644,10 @@ the words another's gives. What a machine can do comes from its own feed alone: 
 `+` offers there, their code rules, how its accounts sign in and take a paste, and the programs
 `s` moves, since another machine's newer backend may know more than this one's. The add form ticks only
 machines whose own feed offers that provider, and each machine's sign-in takes a pasted token by
-its own feed's answer.
+its own feed's answer. When the viewed machine's feed names no providers (it hasn't come, or its
+backend has none to offer), `+` offers those any machine's feed names, and the account is added
+through the first machine whose own feed offers the one picked; when no feed has named any yet, `+`
+says it's waiting and opens once one does, while the accounts screen is still on that machine.
 
 An owner's optional `code` (`KBZ`) is what `+` suggests a new account's code from: the viewed
 session's owner's, else the machine owner's, else the first organization's whose code with the
@@ -1253,12 +1714,36 @@ Kerdr sends one account request at a time: one asked for while another is on its
 move Kerdr makes by itself, waits its turn with what it was asked from, and each answer is matched
 to its own request. What an answer brings (a question, the box that signs an account in, an offer
 to resume a conversation) is shown over the screen it was asked from, or held with its request when
-you've gone on to type something and shown once you're back on the board, never dropped. One whose
-machine drops before its turn stays queued while the drop is a passing one and goes once it's back;
-once the drop lasts (30 seconds), its own screen says it wasn't sent. `account-start` and
-`account-resume` go only to a backend whose feed lists them in `starts_on`, checked as each is sent,
-a queued one again as its turn comes; one that can't go is finished as its own failure, said on the
-screen it came from, and never sent.
+you've gone on to type something and shown once you're back on the board, never dropped. Keys
+pressed on an accounts screen while a request is on its way are kept and pressed in order once its
+answer comes, as long as that answer left the screen as it was; if the answer changed or closed it,
+they're dropped and Kerdr says how many. `account-start` and `account-resume` go only to a backend
+whose feed lists them in `starts_on`, checked as each is sent, a queued one again as its turn comes;
+one that can't go is finished as its own failure, said on the screen it came from, and never sent.
+
+A request for a machine that isn't answering waits for it, as a card's change does, and goes once
+it answers, while Kerdr is open, for a day at most ("Held: moving the agent to ARK_C goes when
+LAB-Server answers (it dropped 40 s ago)."). The day is checked before it's sent any way, so one a
+day old isn't sent though its machine has just answered, or another machine shares its catalog: "Moving
+the agent to ARK_C: LAB-Server didn't answer for a day, so nothing was sent." A move and a fresh agent's start show on their card as
+held ("⧗ moving the agent to ARK_C waits for LAB-Server") and in its peek, where `D` drops them; `q`
+says one is still waiting and quits on a second `q`, dropping it. They stay in Kerdr's memory, not in
+its hold file: what their answers open (a question, a sign-in, the next move of a list's round) needs
+the screen they were asked from, and a sign-in's code or a pasted token must never be written to a
+file. Each is checked again as it goes, and isn't sent if what it was about changed meanwhile: a
+move whose agent is no longer at that pane with that conversation, a start whose workspace closed
+or got an agent, a resume whose conversation is running again. A move or start always goes to the
+agent's own machine. A sign-in's steps and an `account-test` wait only while their own screen is
+open: leaving it drops them, so nothing opens a browser or sends a token unasked. A list's "move them
+now" round doesn't wait: it says that machine isn't answering and goes on.
+
+A change to the shared catalog (`account-models`, `account-current`, and `account-add`, which also
+renames) meant for a machine that isn't answering goes instead to the first other machine that
+answers and whose feed shares its [`catalog`](#accounts), and the answer adds where it went ("Sent
+through build-box, since LAB-Server isn't answering; LAB-Server has it once its copy of the account
+list updates."). One already waiting goes that way as soon as such a machine answers. `account-remove`
+never goes elsewhere: it also forgets that machine's own saved sign-in, which only that machine can
+do, so it waits for it.
 Model lists and account metadata have one canonical writer owned by the backend.
 
 | Action | Request fields | Result |
@@ -1276,10 +1761,16 @@ Model lists and account metadata have one canonical writer owned by the backend.
 `c` on the accounts screen sends `account-current` with `to`, and `C` sends it with `clear`, to
 the machine being viewed, whatever its feed last said (the backend answers if it was already
 so); Kerdr shows the answer's `message`, and its `current` at once on that
-machine, while the other machines' feeds follow as their backends do.
+machine, while the other machines' feeds follow as their backends do. When the viewed machine's
+backend has no current account (its feed leaves `current` out), `c` and `C` go to an answering
+machine whose backend has one and shares its `catalog`, and the answer adds "Set on laptop and
+build-box; LAB-Server follows once its backend updates."
 
 The `S` tick runs `account-move-waiting` on configured feed machines only after the list was
-saved successfully. Unreachable machines are reported rather than silently claimed as moved.
+saved successfully. A machine that isn't answering is never claimed as moved: Kerdr says "LAB-Server:
+moves its waiting sessions when it answers again", keeps its request, and sends it once that machine
+answers, while Kerdr is open. The same goes for one whose machine stops answering while it's being
+sent again: it's kept for that machine, not said as failed, and only a failure once it answers is.
 
 ```json
 {"ok":false,"confirmation":"This agent is mid-step. Move when it next stops? Restarting ends its background job.",
@@ -1379,12 +1870,24 @@ so. `user_code` and `expires` go through the same credential scrub as the rest o
 
 Enter starts this on the machine the accounts screen is viewing, which opens on the board's
 machine tab or else on the machine Kerdr runs on, then, one after another as below, on every
-other answering machine whose feed says `sign_in` or `missing` for that code (a copy's line
-signs in that copy alone). When the account's `status` on the viewed machine is already
-`ready`, Kerdr asks first instead, offering those machines (all in turn, then each) and signing
-in again there; each `start` goes to its own machine. By each later machine's turn, one whose
-feed no longer says `sign_in` or `missing` is skipped (machines ticked when adding an account
-aren't). A `cancel` for a machine not answering is kept and sent once it answers.
+other machine whose feed says `sign_in` or `missing` for that code, answering ones first (a copy's
+line signs in that copy alone). When the account's `status` on the viewed machine is already
+`ready` and other machines need it, Enter signs it in on those, one after another, with no question
+("ARK_C is ready on laptop; signing it in on build-box and LAB-Server."), and the bottom line says
+so ("⏎ ready on laptop: sign in on build-box, then LAB-Server once it answers"). When none needs it,
+Kerdr asks first, since signing in again replaces a working sign-in; each `start` goes to its own
+machine. By each later machine's turn, one whose feed no longer says `sign_in` or `missing` is
+skipped (machines ticked when adding an account aren't). A `cancel` for a machine not answering is
+kept and sent once it answers.
+
+A sign-in whose machine isn't answering waits for it rather than fail. When a later machine of the
+same sign-in answers, that one goes first and the waiting one after ("LAB-Server isn't answering, so
+build-box signs in first, and LAB-Server after."). Otherwise the box says "Waiting for LAB-Server to
+answer: the sign-in starts once it does. Esc leaves it." and starts by itself once it answers, while
+the box is open. A token pasted meanwhile waits with it ("Waiting for LAB-Server to answer: your
+token goes once it does.") and goes in place of the browser sign-in; so does a page code typed after
+the machine stopped answering, and the box's polling waits too.
+Leaving the box drops whatever of it waits, so no browser opens and no token is sent unasked.
 
 On a copy's line, `start` names it: `{"action":"account-signin","code":"ARK_C","step":"start","copy":"tenants"}`.
 Kerdr sends the line's `id` for every copy, the first included; a request without `copy` means

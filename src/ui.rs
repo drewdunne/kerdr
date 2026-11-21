@@ -309,6 +309,10 @@ fn card_hints(app: &App) -> Vec<Span<'static>> {
         return started_hints(app);
     };
     let mut spans = card_badge(card, YELLOW);
+    // Something held for it: m lists it, with a key to drop it (intent 0591, release 4).
+    if !app.held_lines(card).is_empty() {
+        spans.extend(key_hints(&[("m", "peek: what's held, and drop it")]));
+    }
     // On the board ⏎ starts it too (intent 0404); the backlog screen's ⏎ peeks.
     let start = if matches!(app.mode, Mode::Board) && app.actions_on() {
         "d ⏎"
@@ -377,6 +381,10 @@ fn started_hints(app: &App) -> Vec<Span<'static>> {
     };
     let mut spans = card_badge(card, if card.no_agent() { YELLOW } else { CYAN });
     let mut hints: Vec<(&str, String)> = vec![];
+    // Something held for it: m lists it, with a key to drop it (intent 0591, release 4).
+    if !app.held_lines(card).is_empty() {
+        hints.push(("m", "peek: what's held, and drop it".into()));
+    }
     if card.outside_herdr().is_some() && !card.done() {
         // ⏎ moves its conversation into herdr, and goes in (intent 0591).
         hints.push(("⏎", "move it into herdr".into()));
@@ -597,6 +605,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
     let message = app.message();
     // What was said takes the line first; this lasts as long as the ⏎ does (intent 0491).
     let remembered = remembered_line(app);
+    // Then what's held for the list row selected, which its row has no room for.
+    let held_row = held_row_line(app);
     let filter_line = filtered(app);
     let accounts = app
         .machines
@@ -608,7 +618,7 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
         Constraint::Length(if accounts { 1 } else { 3 }),
         Constraint::Min(4),
         Constraint::Length(u16::from(
-            pending.is_some() || message.is_some() || remembered.is_some(),
+            pending.is_some() || message.is_some() || remembered.is_some() || held_row.is_some(),
         )),
         Constraint::Length(1),
     ])
@@ -706,6 +716,8 @@ fn board_view(f: &mut Frame, area: Rect, app: &App) {
             vec![Span::styled(text.to_string(), fg(color))],
         );
     } else if let Some(line) = remembered {
+        put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
+    } else if let Some(line) = held_row {
         put(f.buffer_mut(), rows[4].x, rows[4].y, rows[4].width, line);
     }
     let backlog_hints = card_hints(app);
@@ -1360,6 +1372,21 @@ fn pending_line(app: &App) -> Option<Vec<Span<'static>>> {
         .map(|_| card.machine_index)
         .map(|i| app.machines[i].conn.short(app.now()))
         .unwrap_or_default();
+    // Its machine answers, but herdr there, or the connection, didn't answer ⏎ just now (intent
+    // 0591, K3-12, K3-13).
+    if pending.after.is_some() && app.machines[card.machine_index].conn.is_live() {
+        return Some(vec![
+            Span::styled(format!("{} ", card.reference), bold(CYAN)),
+            Span::styled(
+                format!("is on {}, which didn't answer just now. ", card.machine),
+                fg(FG),
+            ),
+            Span::styled(
+                "Kerdr jumps in when it answers again · esc stops waiting",
+                fg(DIM),
+            ),
+        ]);
+    }
     Some(vec![
         Span::styled(format!("{} ", card.reference), bold(CYAN)),
         Span::styled(format!("is on {}, which is {conn}. ", card.machine), fg(FG)),
@@ -1383,6 +1410,18 @@ fn remembered_line(app: &App) -> Option<Vec<Span<'static>>> {
             "Kerdr goes in when its workspace opens · esc stops waiting",
             fg(DIM),
         ),
+    ])
+}
+
+/// What's held for the selected card when it shows as a one-line row (the backlog, done work):
+/// "#41 ⧗ d waits for LAB-Server", in full, since its row shows only ⧗ (the end-to-end check's
+/// P2). A card box shows its own line.
+fn held_row_line(app: &App) -> Option<Vec<Span<'static>>> {
+    let card = app.selected().filter(|c| c.stage.is_list())?;
+    let line = app.held_line_for(card)?;
+    Some(vec![
+        Span::styled(format!("{} ", card.reference), bold(CYAN)),
+        Span::styled(line, fg(CYAN)),
     ])
 }
 
@@ -1733,6 +1772,12 @@ fn list_rows(buf: &mut Buffer, body: Rect, app: &App, items: &[usize], selected:
             meta = format!("in {r}");
             mcolor = CYAN;
         }
+        // A change held for it, Kerdr's or its backend's (intent 0591, release 4): ⧗ in its
+        // glyph's place, so its row stays one line, and its words on the message line while it's
+        // selected (the end-to-end check's P2).
+        if app.held_line_for(c).is_some_and(|l| l.starts_with('⧗')) {
+            (glyph, gcolor) = ("⧗", CYAN);
+        }
         // A question waits on it for you (intent 0591).
         if let Some(line) = app.waiting_line_for(&c.key) {
             (glyph, gcolor) = (Attention::NeedsYou.glyph(), YELLOW);
@@ -2057,6 +2102,10 @@ fn card_lines(app: &App, c: &Card, inner_w: usize) -> CardLines {
         // Its account request is being sent again by itself, with the same op: quietly, as a
         // change's card says it (intent 0591).
         ("trying again…".to_string(), BLUE)
+    } else if let Some(line) = app.held_line_for(c) {
+        // A change that waits for its machine, or what its backend holds for it, until it
+        // happens (intent 0591, release 4).
+        (line, CYAN)
     } else if let Some(outside) = c.outside_herdr().filter(|_| !cached) {
         (format!("outside herdr · {}", outside.short()), CYAN)
     } else if c.no_agent() && !cached {
@@ -2431,6 +2480,46 @@ fn peek(f: &mut Frame, area: Rect, app: &App, scroll: u16) {
             lines.extend(wrapped(problem, w, fg(RED), None));
         }
         lines.push(line_for_account_keys());
+    }
+    // What's held for it, Kerdr's and its backend's, each with its key to drop it (intent 0591,
+    // release 4).
+    let held = app.held_lines(c);
+    if !held.is_empty() {
+        lines.push(Line::raw(""));
+        lines.push(section("HELD"));
+        let droppable = held.iter().filter(|h| h.drop.is_some()).count();
+        let mut k = 0;
+        for h in &held {
+            // Numbered when there are several, for the count before D.
+            let key = match (&h.drop, droppable) {
+                (Some(_), 2..) => {
+                    k += 1;
+                    format!("{k} ")
+                }
+                _ => String::new(),
+            };
+            let since = h
+                .since
+                .map(|t| {
+                    let secs = now.timestamp() - t;
+                    format!(" · {} ago", crate::app::holding::span(secs))
+                })
+                .unwrap_or_default();
+            lines.extend(wrapped(
+                &format!("{key}⧗ {}{since}", h.words),
+                w,
+                fg(CYAN),
+                None,
+            ));
+        }
+        let keys: &[(&str, &str)] = match droppable {
+            0 => &[],
+            1 => &[("D", "drop it")],
+            _ => &[("D", "drop the first"), ("2D", "the second")],
+        };
+        if !keys.is_empty() {
+            lines.push(Line::from(key_hints(keys)));
+        }
     }
     if let Some(story) = c.detail.as_ref().and_then(|d| d.story.clone()) {
         lines.push(Line::raw(""));
@@ -5975,6 +6064,56 @@ mod tests {
         }
     }
 
+    /// K2-62: Enter on an account ready here names the machines it signs it in on, with no
+    /// question, and one not answering signs in once it answers.
+    #[test]
+    fn enter_on_a_ready_account_names_where_it_still_needs_a_sign_in() {
+        use crate::app::account_controls::{AccountScreen as S, Row};
+        let mut a = demo(false);
+        a.open_accounts();
+        if let Mode::Accounts {
+            screen: S::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = 1;
+        }
+        let code = match &a.mode {
+            Mode::Accounts {
+                screen: S::List { rows, sel, .. },
+                ..
+            } => match &rows[*sel] {
+                Row::Account(code) => code.clone(),
+                other => panic!("{other:?}"),
+            },
+            _ => panic!(),
+        };
+        for f in a.machines[1].feed.iter_mut() {
+            f.accounts
+                .iter_mut()
+                .find(|x| x.code == code)
+                .unwrap()
+                .status = "sign_in".into();
+        }
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("⏎ ready on laptop: sign in on build-box · t test"),
+            "{text}"
+        );
+        let since = a.now();
+        a.machines[1].conn = crate::poll::Conn::Reconnecting {
+            since,
+            attempt: 1,
+            retry_at: since,
+            detail: String::new(),
+        };
+        let text = rendered(&a, 176, 44);
+        assert!(
+            text.contains("⏎ ready on laptop: sign in on build-box once it answers"),
+            "{text}"
+        );
+    }
+
     /// Intent 0327: the accounts screen names the machine Enter signs in on, the sign-in box names
     /// it in its title, says which code it wants, and offers a pasted token only where one works.
     #[test]
@@ -6018,10 +6157,7 @@ mod tests {
             *sel = 1;
         }
         let text = rendered(&a, 176, 44);
-        assert!(
-            text.contains("⏎ ready on laptop: choose where to sign in"),
-            "{text}"
-        );
+        assert!(text.contains("⏎ ready on laptop: sign in again?"), "{text}");
         let screens = crate::demo::account_screens(&a);
         let find = |f: &dyn Fn(&S) -> bool| {
             screens
@@ -7909,6 +8045,7 @@ mod tests {
         let again = crate::actions::Resend::Retry {
             wait: std::time::Duration::from_secs(5),
             message: "#4's record is locked by a pull under way.".into(),
+            partial: false,
         };
         let backlog: Vec<Card> = a
             .board

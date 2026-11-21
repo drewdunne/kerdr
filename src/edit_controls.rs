@@ -13,7 +13,7 @@
 //! says so in the red box that stays until it's read: a save that works says nothing, so one that
 //! doesn't can't be missed.
 
-use super::controls::short;
+use super::controls::{short, what_and_why};
 use super::*;
 use crate::actions::Response;
 use crate::edit::{self, Ended, Run};
@@ -156,7 +156,7 @@ impl App {
     /// Whether a request for this card's text is on its way: its read (`reads`), or a save. By
     /// its card, `key`, never another source's card with the same number; by number only for one
     /// asked with no card (Codex's sixth look, swept).
-    fn edit_on_its_way(&self, key: &str, id: &str, reads: bool) -> bool {
+    pub(crate) fn edit_on_its_way(&self, key: &str, id: &str, reads: bool) -> bool {
         self.resolver.on_its_way().any(|j| {
             j.request["action"] == "edit"
                 && j.reads() == reads
@@ -178,9 +178,13 @@ impl App {
             );
             return Action::None;
         };
-        // As the other card keys: nothing on a new intent's card while its words are saved, nor
-        // while a start or a reopen of it is on its way.
-        if self.still_saving(&card) || self.still_changing(&card, "edit") {
+        // A new intent's card while its words are saved: its text opens once it has its number
+        // and is written up (intent 0591, K1-42).
+        if card.intake() == Some(crate::resolve::SAVING) {
+            self.edit_once_written(&card);
+            return Action::None;
+        }
+        if self.still_changing(&card, "edit") {
             return Action::None;
         }
         // The question its last save asked while you were elsewhere, waiting on it (intent 0591).
@@ -189,12 +193,10 @@ impl App {
         }
         self.backlog_focus = Some(card.key.clone());
         let reference = card.reference.clone();
-        // Its new text on its way, then written up again: the card shows ✎ meanwhile.
+        // Its new text on its way, then written up again: the card shows ✎ meanwhile, and its
+        // text opens once that's done (intent 0591, K1-78).
         if self.edit_on_its_way(&card.key, &detail.id, false) {
-            self.say(
-                format!("{reference} is still being written up; edit it once that's done."),
-                Tone::Info,
-            );
+            self.edit_once_written(&card);
             return Action::None;
         }
         // Asked already: it opens when it comes, counted from now.
@@ -226,14 +228,14 @@ impl App {
                 "{reference} has started, so its text can't be edited here."
             ))
         } else if card.intake() == Some("pending") {
-            Some(format!(
-                "{reference} is still being written up; edit it once that's done."
-            ))
-        } else if self.starts_when_written(&card.key) {
-            // d was pressed while it was written up: its start goes in a moment (intent 0445).
-            Some(format!(
-                "{reference} starts as soon as its write-up is read, so its text can't be edited here. Esc on the board drops the start."
-            ))
+            // Its text opens once it's written up (intent 0591, K1-78).
+            self.edit_once_written(&card);
+            return Action::None;
+        } else if self.starts_when_written(&card.key) && !self.demo {
+            // d was pressed while it was written up: that start waits for this edit, and goes
+            // after its save and the save's own write-up (intent 0591, K1-82).
+            self.hold_start_for_edit(&card.key);
+            None
         } else if self.demo {
             Some(
                 "This is the demo: on your own board, e opens this item's text in your editor."
@@ -284,7 +286,7 @@ impl App {
         let Some(machine) = self.home_machine(&card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         // Its feed holds the text: it opens now, as `d` opens a card's questions (intent 0491).
@@ -512,20 +514,37 @@ impl App {
     /// machine stopped answering while it was open.
     fn cant_send(&self, machine: usize) -> Option<String> {
         if !self.actions_on() {
-            return Some("intent controls are not configured for this board.".into());
+            return Some(
+                "Kerdr has no action backend here (set [actions] command in its config).".into(),
+            );
         }
         match self.machines.get(machine) {
             Some(m) if m.conn.is_live() => None,
+            // Held for it, or sent through a machine that forwards (intent 0591, release 4, K1-93).
+            Some(_) if self.holds_on(machine) || self.forwarder(machine).is_some() => None,
             Some(m) => Some(format!("{} isn't answering.", m.name())),
             None => Some("its machine isn't on this board.".into()),
         }
     }
 
+    /// The machine a backlog item's text open in your editor is saved to, and the item's number.
+    pub fn saved_to(&self, key: &str) -> Option<(usize, String)> {
+        let held = self.edits.get(key)?;
+        Some((held.machine, self.reference_for(&held.id)))
+    }
+
     /// The editor has closed on this card's text. A changed text is sent as a save, which the
     /// card shows at once; closing with nothing changed, or with `:cq`, says nothing. What you
     /// wrote that can't be sent says so where it can't be missed, and your version is kept until a
-    /// save of it succeeds.
+    /// save of it succeeds. A start that waited for this edit goes after the save, or as it would
+    /// have with none (intent 0591, K1-82).
     pub fn edit_ended(&mut self, key: &str, ended: Ended) -> Action {
+        let action = self.edit_ended_saving(key, ended);
+        self.edit_closed_for(key);
+        action
+    }
+
+    fn edit_ended_saving(&mut self, key: &str, ended: Ended) -> Action {
         let Some(mut held) = self.edits.get(key).cloned() else {
             return Action::None;
         };
@@ -951,7 +970,11 @@ impl App {
             if reads {
                 self.say(problem, Tone::Warn);
             } else {
-                self.fail(format!("{reference}'s text wasn't saved: {problem}"));
+                self.fail(what_and_why(
+                    &format!("{reference}'s text wasn't saved"),
+                    &reference,
+                    &problem,
+                ));
             }
             return;
         };
@@ -1023,13 +1046,20 @@ impl App {
             Err(problem) => return self.say(problem, Tone::Warn),
         };
         let (Some(text), Some(was)) = (response.text, response.was) else {
+            // An old backend: brought up to date, then read again, once (K1-97).
+            let away = flight.as_ref().map_or(self.away, |f| f.away);
+            if self.read_after_update(key, id, machine, away, from.clone()) {
+                return;
+            }
+            let name = self.machines[machine].name();
             return self.say(
                 format!(
-                    "{reference}'s text didn't come with the answer, so there's nothing to open: its action backend may not know edit yet."
+                    "{reference}'s text still didn't come after Kerdr asked {name} to update, so there's nothing to open: {name}'s ark-sdlc may not update, and an agent there can say why."
                 ),
                 Tone::Warn,
             );
         };
+        self.catch_up.edit_updated.remove(key);
         let held = self.edits.entry(key.to_string()).or_insert_with(|| Held {
             id: id.to_string(),
             machine,
@@ -1122,20 +1152,23 @@ impl App {
                     held.machine = machine;
                     held.check_first = true;
                 }
+                let words = what_and_why(
+                    &format!("{reference}'s save happened only in part"),
+                    reference,
+                    &short(r.message),
+                );
                 self.say(
-                    format!(
-                        "{reference}'s save happened only in part: {} e checks the text, and opens your version if it isn't there.",
-                        short(r.message)
-                    ),
+                    format!("{words} e checks the text, and opens your version if it isn't there."),
                     Tone::Warn,
                 );
             }
             Ok(r) => {
                 let stale = r.status.as_deref() == Some("stale");
                 let Some(held) = self.edits.get_mut(key) else {
-                    return self.fail(format!(
-                        "{reference}'s text wasn't saved: {}",
-                        short(r.message)
+                    return self.fail(what_and_why(
+                        &format!("{reference}'s text wasn't saved"),
+                        reference,
+                        &short(r.message),
                     ));
                 };
                 held.machine = machine;
@@ -1158,10 +1191,12 @@ impl App {
                     held.check_first = false;
                     "Your version is kept: e opens it."
                 };
-                self.fail(format!(
-                    "{reference}'s text wasn't saved: {} {next}",
-                    short(r.message)
-                ));
+                let words = what_and_why(
+                    &format!("{reference}'s text wasn't saved"),
+                    reference,
+                    &short(r.message),
+                );
+                self.fail(format!("{words} {next}"));
             }
             Err(error) => {
                 if let Some(held) = self.edits.get_mut(key) {
@@ -1456,9 +1491,12 @@ mod tests {
         assert_eq!(press(&mut app, 'e'), Action::None);
         assert_eq!(
             said(&app),
-            format!("{reference} is still being written up; edit it once that's done.")
+            format!(
+                "{reference} is still being written up: its text opens once that's done. Esc on the board stops waiting."
+            )
         );
         assert_eq!(app.edit_open, None);
+        app.edit_after = None;
         app.message = None;
         // Saved: nothing more is said, and the card keeps showing it until the feed does.
         answer(&mut app, &sent, saved());
@@ -1752,13 +1790,14 @@ mod tests {
         check(
             &mut app,
             &|c| c.detail.as_mut().unwrap().intake = Some("pending".into()),
-            &format!("{reference} is still being written up; edit it once that's done."),
+            &format!("{reference} is still being written up: its text opens once that's done."),
         );
-        // A new intent's card while its words are saved: no record yet (intent 0445).
+        // A new intent's card while its words are saved: no record yet (intent 0445), so its
+        // text opens once it has one (intent 0591, K1-42).
         check(
             &mut app,
             &|c| c.detail.as_mut().unwrap().intake = Some(crate::resolve::SAVING.into()),
-            "This new intent is still being saved",
+            "Your new intent is still being saved: its text opens once it's saved and written up.",
         );
         check(
             &mut app,
@@ -2316,27 +2355,36 @@ mod tests {
             said(&app),
             format!("{reference}'s text is on its way; it opens when it comes.")
         );
-        // A start on its way: as d and ⏎, e waits for it.
+        // A start on its way: e's read waits its turn behind it in the runner (intent 0591,
+        // K1-41).
         let mut app = self::app();
         crate::app::tests::room_in_every_session(&mut app);
         let (key, id, _) = waiting(&mut app);
         let machine = app.card(&key).unwrap().machine_index;
         app.queue_action(machine, json!({"action":"dispatch","id":id}));
         select(&mut app, &key);
-        assert_eq!(press(&mut app, 'e'), Action::None);
-        assert!(said(&app).contains("is starting"), "{}", said(&app));
+        let Action::Mutate { request, .. } = press(&mut app, 'e') else {
+            panic!("e read nothing: {}", said(&app))
+        };
+        assert_eq!(request["action"], "edit");
+        assert!(request.get("text").is_none(), "a read");
         // Without an action backend, as d.
         let mut app = self::app();
         waiting(&mut app);
         app.cfg.actions.command = None;
         assert_eq!(press(&mut app, 'e'), Action::None);
-        assert!(said(&app).contains("not configured"), "{}", said(&app));
+        assert!(
+            said(&app).contains("no action backend here"),
+            "{}",
+            said(&app)
+        );
     }
 
     #[test]
-    fn e_on_a_card_whose_start_waits_for_its_write_up_says_so_and_queues_nothing() {
-        // d on work still being written up starts it once that's done (intent 0445); e there
-        // still says it's being written up, and once the write-up is read, that it's starting.
+    fn e_on_a_card_being_written_up_opens_its_text_once_written_and_a_start_waits_for_the_edit() {
+        // d on work still being written up starts it once that's done (intent 0445). e there
+        // waits for the write-up too, and that start waits for the edit, going after its save
+        // (intent 0591, K1-78, K1-82).
         let mut app = app();
         let (key, _, reference) = waiting(&mut app);
         let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
@@ -2344,26 +2392,68 @@ mod tests {
         select(&mut app, &key);
         assert_eq!(press(&mut app, 'd'), Action::None);
         assert!(app.starts_when_written(&key));
-        let handed = app.resolver.ready().len();
-        assert_eq!(handed, 1, "the start, held for its write-up");
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1, "the start, held for its write-up");
+        let start = ready[0].0;
         select(&mut app, &key);
         assert_eq!(press(&mut app, 'e'), Action::None);
         assert_eq!(
             said(&app),
-            format!("{reference} is still being written up; edit it once that's done.")
+            format!(
+                "{reference} is still being written up: its text opens once that's done, and its start waits for your edit. Esc on the board stops waiting."
+            )
         );
-        // The board has read the write-up before the runner started it.
+        assert_eq!(app.resolver.take_pauses(), vec![(start, true)]);
+        assert!(app.edit_after_due().is_none(), "not written up yet");
+        // Written up, and he's still on the card: its text is read, and the start goes on
+        // waiting while the editor is open.
         app.board.cards[i].detail.as_mut().unwrap().intake = None;
-        assert_eq!(press(&mut app, 'e'), Action::None);
+        let Some(Action::Mutate { request, .. }) = app.edit_after_due() else {
+            panic!("nothing read: {}", said(&app))
+        };
+        assert_eq!(request["action"], "edit");
+        assert!(request.get("text").is_none());
+        assert_eq!(app.edit_paused.get(&key), Some(&start));
+        assert!(app.resolver.take_pauses().is_empty());
+        // The editor closes: the start waits no more (the runner puts it behind any save).
+        app.edit_closed_for(&key);
+        assert_eq!(app.resolver.take_pauses(), vec![(start, false)]);
+        // Moved off it before the write-up: said to be ready, and the start goes.
+        let mut app = self::app();
+        let (key, _, reference) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        select(&mut app, &key);
+        press(&mut app, 'd');
+        let start = app.resolver.ready()[0].0;
+        select(&mut app, &key);
+        press(&mut app, 'e');
+        app.resolver.take_pauses();
+        app.sel.key = None;
+        app.board.cards[i].detail.as_mut().unwrap().intake = None;
+        assert!(app.edit_after_due().is_none());
+        assert_eq!(
+            said(&app),
+            format!("{reference} is written up: e opens its text.")
+        );
+        assert_eq!(app.resolver.take_pauses(), vec![(start, false)]);
+        // Written up, its start not yet gone: e opens the editor, and the start waits for it.
+        let mut app = self::app();
+        let (key, _, _) = waiting(&mut app);
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.board.cards[i].detail.as_mut().unwrap().intake = Some("pending".into());
+        select(&mut app, &key);
+        press(&mut app, 'd');
+        let start = app.resolver.ready()[0].0;
+        app.board.cards[i].detail.as_mut().unwrap().intake = None;
+        select(&mut app, &key);
+        let action = press(&mut app, 'e');
         assert!(
-            said(&app).starts_with(&format!(
-                "{reference} starts as soon as its write-up is read"
-            )),
+            matches!(action, Action::Mutate { .. }) || app.edit_open.is_some(),
             "{}",
             said(&app)
         );
-        assert!(app.resolver.ready().is_empty(), "no read was queued");
-        assert!(app.edit_flights.is_empty() && app.edit_open.is_none());
+        assert_eq!(app.resolver.take_pauses(), vec![(start, true)]);
     }
 
     #[test]
@@ -2555,6 +2645,39 @@ mod tests {
     }
 
     #[test]
+    fn an_old_backends_read_without_the_text_is_read_again_after_it_updates_and_opens() {
+        let mut app = app();
+        let (key, id, _) = waiting(&mut app);
+        let sent = read(&mut app, &id);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                message: "".into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            said(&app).contains("too old to edit text"),
+            "{}",
+            said(&app)
+        );
+        let (n, machine, request, _) = app.resolver.ready()[0].clone();
+        app.job_started(n);
+        app.resolver.handed(n);
+        let again = Sent {
+            n,
+            machine,
+            request,
+        };
+        // Brought up to date, its read gives the text: the editor opens, as for any read.
+        answer(&mut app, &again, text_answer("Words.", "sha256:aa"));
+        assert_eq!(app.edit_open.take().as_deref(), Some(key.as_str()));
+        assert!(app.catch_up.edit_updated.is_empty());
+    }
+
+    #[test]
     fn a_read_refused_or_without_its_text_says_so_without_the_failure_box() {
         let mut app = app();
         let (key, id, reference) = waiting(&mut app);
@@ -2581,11 +2704,43 @@ mod tests {
             }),
         );
         assert_eq!(app.edit_open, None);
+        // An old backend: asked to update, and read again by itself, once (K1-97).
+        let name = app.machines[sent.machine].name();
+        assert_eq!(
+            said(&app),
+            format!(
+                "{name}'s ark-sdlc is too old to edit text; Kerdr asked it to update, and reads {reference}'s text again."
+            )
+        );
+        let (n, machine, again, _) = app.resolver.ready()[0].clone();
+        assert_eq!(machine, sent.machine);
+        assert_eq!(
+            crate::actions::without_op(&again),
+            json!({"action":"edit","id":id,"from":crate::config::hostname()})
+        );
+        let again = Sent {
+            n,
+            machine,
+            request: again,
+        };
+        app.job_started(n);
+        app.resolver.handed(n);
+        answer(
+            &mut app,
+            &again,
+            Ok(Response {
+                ok: true,
+                message: "done".into(),
+                ..Default::default()
+            }),
+        );
+        // Still without it: said, and not asked a third time.
         assert!(
-            said(&app).contains("may not know edit yet"),
+            said(&app).contains("still didn't come after Kerdr asked"),
             "{}",
             said(&app)
         );
+        assert!(app.resolver.ready().is_empty());
         let sent = read(&mut app, &id);
         answer(&mut app, &sent, Err("the action timed out; x".into()));
         assert_eq!(app.edit_open, None);
@@ -2639,11 +2794,10 @@ mod tests {
             })
         };
         answer(&mut app, &sent, stale());
+        // Its words name the card already, so it isn't named twice.
         assert_eq!(
             said(&app),
-            format!(
-                "{reference}'s text wasn't saved: {changed} Your version is kept: e opens it, with the newer text below it."
-            )
+            format!("{changed} Your version is kept: e opens it, with the newer text below it.")
         );
         seen(&mut app);
         assert_eq!(press(&mut app, 'e'), Action::None);
@@ -2776,6 +2930,128 @@ mod tests {
         assert!(text.contains("nvim: not found; vim: not found"), "{text}");
         assert!(text.contains("editor in Kerdr's config"), "{text}");
         assert!(app.edits.contains_key(&key));
+    }
+
+    #[test]
+    fn a_save_for_a_machine_that_isnt_answering_is_held_when_its_backend_holds() {
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        app.machines[machine].conn = crate::poll::Conn::Connecting;
+        let name = app.machines[machine].name();
+        let Action::Mutate {
+            machine: to,
+            request,
+        } = app.edit_ended(&key, wrote("Mine."))
+        else {
+            panic!("not sent: {}", said(&app))
+        };
+        app.queue_action(to, request);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].request["text"], "Mine.");
+        assert_eq!(
+            said(&app),
+            format!("Held: your new text on {reference} goes when {name} answers.")
+        );
+        // Your version stays yours until a save of it lands.
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
+    }
+
+    #[test]
+    fn a_save_whose_machine_left_while_the_editor_was_open_is_held_once_ssh_cant_connect() {
+        // The end-to-end check's P1: the board takes no reads while the editor is open, so its
+        // machine still reads as answering when it closes, and the save goes. ssh couldn't
+        // connect, so nothing was sent: the save is held as one made while its machine is away
+        // is, and q waits for its answer as for any change being handed over.
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        app.machines[machine]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        let name = app.machines[machine].name();
+        assert!(app.machines[machine].conn.is_live());
+        let sent = saves(&mut app, &key, wrote("Mine."));
+        app.resolver.handed(sent.n);
+        assert!(!app.quit_key());
+        assert_eq!(
+            said(&app),
+            format!("Quitting once {reference}'s new text is saved or held… Esc stays.")
+        );
+        assert!(!app.quit_due());
+        app.answer_unreached = Some(crate::actions::Unreached::Away);
+        answer(
+            &mut app,
+            &sent,
+            Err(format!(
+                "{name} couldn't be reached (ssh: connect to host {name} port 22: No route to host), so nothing was sent"
+            )),
+        );
+        assert_eq!(app.kept.held.len(), 1, "{}", said(&app));
+        let held = app.kept.held[0].clone();
+        assert_eq!(
+            (&held.request["text"], &held.request["op"], held.unanswered),
+            (&json!("Mine."), &sent.request["op"], false)
+        );
+        assert_eq!(
+            said(&app),
+            format!("Held: your new text on {reference} goes when {name} answers.")
+        );
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.resolver.unanswered(), 0);
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
+        // Held, so nothing is lost by quitting: q quits by itself.
+        assert!(app.quit_due());
+    }
+
+    #[test]
+    fn a_second_q_holds_a_save_still_waiting_for_its_answer() {
+        // q again while the save is unanswered: held with its op, as one that may have gone
+        // ahead, so the next Kerdr sends it and its backend answers from its record if it landed.
+        // A backend that doesn't hold: your version is in the words file, so q quits all the same.
+        for holds in [true, false] {
+            let mut app = app();
+            let (key, id, reference) = waiting(&mut app);
+            let machine = opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+            if holds {
+                app.machines[machine]
+                    .feed
+                    .as_mut()
+                    .unwrap()
+                    .supports
+                    .push("hold".into());
+            }
+            let sent = saves(&mut app, &key, wrote("Mine."));
+            app.resolver.handed(sent.n);
+            assert!(!app.quit_key());
+            assert!(
+                said(&app).contains(&format!("{reference}'s new text")),
+                "{}",
+                said(&app)
+            );
+            assert!(app.quit_key(), "{}", said(&app));
+            if holds {
+                assert_eq!(app.kept.held.len(), 1);
+                let held = &app.kept.held[0];
+                assert_eq!(
+                    (&held.request["op"], held.unanswered),
+                    (&sent.request["op"], true)
+                );
+            } else {
+                assert!(app.kept.held.is_empty());
+                assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine.");
+            }
+        }
     }
 
     #[test]

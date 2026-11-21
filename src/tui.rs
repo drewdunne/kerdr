@@ -27,6 +27,12 @@ use crate::state::State;
 /// lands well inside it, and giving up only chooses from a read a few seconds old (intent 0491).
 const FRESH_WAIT: Duration = Duration::from_millis(250);
 
+/// How long a save from a closed editor waits for its machine to be read afresh. The board takes
+/// no reads while your editor is open, so how a machine stood when it opened says nothing about
+/// now; a machine that can't be reached takes seconds to say so, and past this the save goes and
+/// its answer says it (the end-to-end check's P1).
+const EDIT_CHECK_WAIT: Duration = Duration::from_secs(3);
+
 /// How long after coming back to the board its turn stays quick for the read asked for then.
 const READ_LANDS: Duration = Duration::from_secs(1);
 
@@ -184,7 +190,20 @@ fn event_loop(
             .iter()
             .map(|c| (c.id.clone(), c.intake.clone()))
             .collect();
-        let _ = feeds.send(ToRunner::Feed { machine, intakes });
+        let holds = feed.supports(crate::app::holding::HOLD);
+        let footings = feed
+            .cards
+            .iter()
+            .map(|c| {
+                let rev = c.rev.clone().filter(|_| holds);
+                (c.id.clone(), (crate::resolve::Footing::of(c), rev))
+            })
+            .collect();
+        let _ = feeds.send(ToRunner::Feed {
+            machine,
+            intakes,
+            footings,
+        });
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
     let holds = RefCell::new(if live.is_some() && !app.demo {
@@ -199,8 +218,6 @@ fn event_loop(
         inbox,
         holds: &holds,
     };
-    // When q last said what still runs: a second q soon after quits (intent 0445).
-    let mut quit_asked: Option<Instant> = None;
     // Colours from the desktop theme, read again when it changes (palette.rs).
     let mut theme = crate::palette::ThemeWatch::new(app.cfg.theme.colors.as_deref());
     theme.check(true);
@@ -216,7 +233,7 @@ fn event_loop(
         theme.check(false);
         send_loaded_images(app, &bg, None);
         while let Ok(answer) = action_rx.try_recv() {
-            let (job, machine, request, result, stderr) = match answer {
+            let (job, machine, request, result, stderr, unreached) = match answer {
                 Answer::Started(n) => {
                     // A start that waited for its write-up shows from now.
                     app.job_started(n);
@@ -227,7 +244,7 @@ fn event_loop(
                     continue;
                 }
                 Answer::Dropped(n, dropped) => {
-                    app.resolver.drop_answered(n, dropped);
+                    app.job_drop_answered(n, dropped);
                     continue;
                 }
                 // How followed work stands (intent 0591): once it has ended, its machine's feed is
@@ -256,6 +273,10 @@ fn event_loop(
                     app.starts_from_words(n);
                     continue;
                 }
+                Answer::Changed(n) => {
+                    app.gate_changed(n);
+                    continue;
+                }
                 Answer::Done(done) => *done,
             };
             // Done, or done in part (intent 0591): its machine's feed is read now, to show it.
@@ -266,8 +287,16 @@ fn event_loop(
             });
             // For the error log, should it be a failure.
             app.answer_stderr = stderr;
+            // Its machine couldn't be reached, so nothing was sent: read it now, so the board
+            // shows it away and what comes next for it is held (the end-to-end check's P1).
+            if unreached.is_some()
+                && let Some(l) = live.as_deref()
+            {
+                l.wake(machine);
+            }
             match job {
                 Some(n) => {
+                    app.answer_unreached = unreached;
                     app.finish_job(n, request, result);
                     // Finished with: its record's next change may start. One sent on to another
                     // machine keeps its place in the runner's queue, and runs again from there.
@@ -282,6 +311,10 @@ fn event_loop(
                     let _ = poller.wake.send(Wake::Feed);
                 }
             }
+        }
+        // q waited for a hand-over, which is done: Kerdr quits by itself (intent 0591).
+        if app.quit_due() && app.quit_now() {
+            return Ok(());
         }
         // Changes to cards go to the runner, which starts each in its turn (intents 0416, 0445).
         run_ready(app, &runner);
@@ -338,7 +371,7 @@ fn event_loop(
         }
         // A backlog item's text you just asked for with e: your editor, full screen (intent 0414).
         if let Some(key) = app.editor_due() {
-            edit_text(terminal, flags, app, &bg, &key)?;
+            edit_text(terminal, flags, app, live.as_deref(), &bg, &key)?;
         }
         // A resend to a record's real home, or a card whose workspace closed as you went in
         // reopening (intent 0411), whatever account action runs (intent 0445).
@@ -363,6 +396,13 @@ fn event_loop(
         }
         app.settle_refresh(&fed);
         holds.borrow_mut().sync(app);
+        // e that waited for a write-up or a save: its text is read, or opens (intent 0591,
+        // K1-78); a start kept waiting for an editor that won't open goes (K1-82).
+        if let Action::Mutate { machine, request } = app.edit_after_due().unwrap_or(Action::None) {
+            start_action(app, &action_tx, &runner, machine, request);
+        }
+        app.edit_pauses_due();
+        run_ready(app, &runner);
         match app.pending_jump_ready() {
             Some(Action::Jump(key)) => jump_cards(
                 terminal,
@@ -470,9 +510,6 @@ fn event_loop(
             Event::Paste(text) => app.on_paste(&text),
             _ => continue,
         };
-        if !matches!(action, Action::Quit) {
-            quit_asked = None;
-        }
         match action {
             Action::None => {}
             Action::LoadImages(source) => {
@@ -500,28 +537,12 @@ fn event_loop(
             }
             Action::OpenLink(url) => open_signin(app, &url),
             Action::Quit => {
-                // Only what would be lost holds Kerdr open: a change whose command doesn't have
-                // all of it yet, or a new intent until it's answered. A start or move whose
-                // command has the whole request carries on without Kerdr, so a second q quits
-                // (intent 0445).
-                if let Some(text) = app.quit_held() {
-                    app.say(text, Tone::Warn);
-                } else if app.busy || !app.account_queue.is_empty() {
-                    app.say(
-                        "An account change is still running. Wait for its result before quitting.",
-                        Tone::Warn,
-                    );
-                } else if let Some((text, tone)) = app
-                    .quit_loses()
-                    .map(|t| (t, Tone::Warn))
-                    .or_else(|| app.still_running().map(|t| (t, Tone::Info)))
-                    && quit_asked.is_none_or(|at| at.elapsed() > Duration::from_secs(5))
-                {
-                    // What only Kerdr keeps, or what finishes without it: said once, and a
-                    // second q soon after quits (intent 0445).
-                    quit_asked = Some(Instant::now());
-                    app.say(format!("{text} q again quits."), tone);
-                } else {
+                // Only what's being handed over holds Kerdr open, and only for the moment that
+                // takes: it quits by itself once it's done, and Esc stays. A start or move whose
+                // command has the whole request carries on without Kerdr, starts waiting for
+                // their write-up go into the hold file, and your words into the words file, so
+                // nothing else stops q (intent 0591, release 4).
+                if app.quit_key() {
                     return Ok(());
                 }
             }
@@ -733,6 +754,7 @@ type ActionResult = (
     serde_json::Value,
     Result<crate::actions::Response, String>,
     String,
+    Option<crate::actions::Unreached>,
 );
 
 /// What comes back to the board's thread: a change's command has started, its command has the
@@ -753,6 +775,9 @@ enum Answer {
     Resending(Option<u64>, usize, crate::actions::Resend),
     /// A start that waited for its write-up goes ahead from the words as they are: it failed.
     NotWrittenUp(u64),
+    /// A change that waited for its write-up was taken out unstarted: its card was set aside,
+    /// finished or started meanwhile (Codex's review 60).
+    Changed(u64),
 }
 
 /// What the runner is told: a change to run in its turn, or that one has answered.
@@ -768,16 +793,43 @@ enum ToRunner {
         gated: bool,
         /// Its machine's backend keeps ops: an answer lost on the way is asked for again.
         resends: bool,
+        /// Its card's `rev` when the key was pressed, which a resend carries (intent 0591).
+        rev: Option<String>,
+        /// For one waiting for its write-up, its card's footing when the key was pressed: it
+        /// doesn't go once that has moved (Codex's review 60).
+        guard: Option<crate::resolve::Footing>,
+        /// Sent again after its followed work ended refused with `retry`: how long it waits
+        /// first, holding its record's turn, and the answer that stands if it can't go in time
+        /// (intent 0591).
+        after: Option<Box<crate::actions::After>>,
     },
     Done(u64),
     /// A change dropped before it started (Esc on a start waiting for its write-up).
     Drop(u64),
-    /// A machine's feed as its reader brought it: each record by id, with its intake.
+    /// A start waiting for its write-up kept waiting whatever that says (true), or let go to it
+    /// again: e is open on its card (intent 0591, K1-82).
+    Pause(u64, bool),
+    /// A machine's feed as its reader brought it: each record by id, with its intake, and with
+    /// its footing and `rev` (Codex's review 60).
     Feed {
         machine: usize,
         intakes: std::collections::HashMap<String, Option<String>>,
+        footings: crate::resolve::Footings,
     },
 }
+
+/// A change waiting its turn in the runner: its machine, where and how it's sent, its request,
+/// whether its backend keeps ops, its card's `rev`, and the wait before it's sent again after a
+/// followed end.
+type Waiting = (
+    usize,
+    Machine,
+    String,
+    serde_json::Value,
+    bool,
+    Option<String>,
+    Option<Box<crate::actions::After>>,
+);
 
 /// Runs changes to cards in their turn on a thread of its own, which never touches App: a change
 /// whose turn comes while Andrew is inside a workspace starts then, not once he's back (intent
@@ -792,18 +844,21 @@ impl Runner {
         let back = tx.clone();
         std::thread::spawn(move || {
             let mut queue = crate::resolve::Queue::default();
-            let mut waiting: std::collections::HashMap<
-                u64,
-                (usize, Machine, String, serde_json::Value, bool),
-            > = Default::default();
+            let mut waiting: std::collections::HashMap<u64, Waiting> = Default::default();
             // Each machine's newest feed, by record: a start that waits for its write-up checks
             // it as soon as it's asked for, not only at the next read.
             let mut seen: std::collections::HashMap<
                 usize,
                 std::collections::HashMap<String, Option<String>>,
             > = Default::default();
+            // And each record's footing and `rev` there, which a change that waited for its
+            // write-up is held to, and goes with (Codex's review 60).
+            let mut footed: std::collections::HashMap<usize, crate::resolve::Footings> =
+                Default::default();
+            let mut gated_ones: std::collections::HashSet<u64> = Default::default();
             for msg in rx {
                 let mut failed = vec![];
+                let mut moved = vec![];
                 match msg {
                     ToRunner::Run {
                         n,
@@ -814,35 +869,71 @@ impl Runner {
                         request,
                         gated,
                         resends,
+                        rev,
+                        guard,
+                        after,
                     } => {
                         if gated {
                             queue.push_gated(n, machine, key, &request);
+                            queue.guard(n, guard);
+                            gated_ones.insert(n);
+                            if let Some(footings) = footed.get(&machine) {
+                                moved = queue.moved(machine, footings);
+                            }
                             if let Some(intakes) = seen.get(&machine) {
                                 failed = queue.written(machine, intakes);
+                            }
+                            if let Some(footings) = footed.get(&machine) {
+                                queue.released(machine, footings);
                             }
                         } else {
                             queue.push(n, machine, key, &request);
                         }
-                        waiting.insert(n, (machine, target, command, request, resends));
+                        waiting.insert(n, (machine, target, command, request, resends, rev, after));
                     }
                     ToRunner::Done(n) => queue.done(n),
+                    // Let go again, it's judged by its machine's newest read at once.
+                    ToRunner::Pause(n, paused) => {
+                        queue.pause(n, paused);
+                        let machine = waiting.get(&n).map(|w| w.0);
+                        if let (false, Some(machine)) = (paused, machine)
+                            && let Some(intakes) = seen.get(&machine)
+                        {
+                            failed = queue.written(machine, intakes);
+                            if let Some(footings) = footed.get(&machine) {
+                                queue.released(machine, footings);
+                            }
+                        }
+                    }
                     // Said either way, so the board keeps a start Esc came too late for.
                     ToRunner::Drop(n) => {
                         let dropped = queue.drop_unstarted(n);
                         if dropped {
                             waiting.remove(&n);
+                            gated_ones.remove(&n);
                         }
                         let _ = answers.send(Answer::Dropped(n, dropped));
                     }
                     ToRunner::Feed {
                         machine,
                         mut intakes,
+                        footings,
                     } => {
+                        moved = queue.moved(machine, &footings);
                         failed = queue.written(machine, &intakes);
+                        queue.released(machine, &footings);
                         queue.forget_rewriting(machine, &mut intakes);
                         queue.read_passed(machine);
                         seen.insert(machine, intakes);
+                        footed.insert(machine, footings);
                     }
+                }
+                // Its card was set aside, finished or started meanwhile: it never goes, and the
+                // board says so.
+                for n in moved {
+                    waiting.remove(&n);
+                    gated_ones.remove(&n);
+                    let _ = answers.send(Answer::Changed(n));
                 }
                 // Its write-up failed: it starts from his words as they are, and the board says
                 // so (intent 0591).
@@ -850,10 +941,22 @@ impl Runner {
                     let _ = answers.send(Answer::NotWrittenUp(n));
                 }
                 for n in queue.startable() {
-                    let Some((machine, target, command, request, resends)) = waiting.remove(&n)
+                    let Some((machine, target, command, mut request, resends, mut rev, after)) =
+                        waiting.remove(&n)
                     else {
                         continue;
                     };
+                    // One that waited for its write-up goes with its card's `rev` as the read
+                    // that let it go shows it, from a backend that holds, never a later read's:
+                    // changed after that, its backend asks rather than does it (Codex's reviews
+                    // 60 and 62).
+                    if gated_ones.remove(&n)
+                        && request.get("rev").is_none()
+                        && let Some(then) = queue.released_rev(n)
+                    {
+                        request["rev"] = serde_json::Value::String(then.clone());
+                        rev = Some(then);
+                    }
                     let _ = answers.send(Answer::Started(n));
                     let (answers, back) = (answers.clone(), back.clone());
                     std::thread::spawn(move || {
@@ -861,11 +964,14 @@ impl Runner {
                         let handed = answers.clone();
                         let told = answers.clone();
                         // Sent again by itself, same op, while it holds its record's turn: what
-                        // comes after it for the same card waits (intent 0591).
-                        let answered = crate::actions::run_resending(
+                        // comes after it for the same card waits (intent 0591). One sent again
+                        // after its followed work ended refused waits that refusal's `retry` first.
+                        let answered = crate::actions::run_resending_after(
                             &target,
                             &command,
                             &request,
+                            rev.as_deref(),
+                            after.map(|a| *a),
                             Some(Box::new(move || {
                                 let _ = handed.send(Answer::Handed(n));
                             })),
@@ -889,6 +995,7 @@ impl Runner {
                             metadata,
                             answered.result,
                             answered.stderr,
+                            answered.unreached,
                         ))));
                         if !held {
                             let _ = back.send(ToRunner::Done(n));
@@ -973,8 +1080,9 @@ fn start_action(
         return;
     };
     let tx = tx.clone();
-    // Its own op, kept for Kerdr's own resends of it (intent 0591).
-    let request = crate::actions::with_op(request);
+    // Its own op, kept for Kerdr's own resends of it (intent 0591), or the one it had when it's
+    // sent again after its answer was lost (Codex's review 60).
+    let request = app.account_op(request);
     let resends = app.resends_to(machine);
     app.busy = true;
     app.busy_id = request["id"].as_str().map(str::to_string);
@@ -1004,6 +1112,7 @@ fn start_action(
             metadata,
             answered.result,
             answered.stderr,
+            answered.unreached,
         ))));
     });
 }
@@ -1054,10 +1163,13 @@ fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
 
 /// Hands every new change to a card to the runner, which starts each in its turn.
 fn run_ready(app: &mut App, runner: &Runner) {
+    // A new intent waiting for the words file goes once it's written there (Codex's review 63, 2).
+    app.keep_waiting_words();
     for n in app.resolver.take_dropped() {
         let _ = runner.tx.send(ToRunner::Drop(n));
     }
-    for (n, machine, request, gated) in app.resolver.ready() {
+    // One from the hold file is written as possibly gone ahead first (Codex's review 65, 2).
+    for (n, machine, request, gated) in app.hand_over() {
         let command = app.cfg.actions.command.clone();
         let target = app.machines.get(machine).map(|m| m.machine.clone());
         let (Some(command), Some(target)) = (command, target) else {
@@ -1067,6 +1179,11 @@ fn run_ready(app: &mut App, runner: &Runner) {
         };
         let key = app.resolver.key_of(n);
         let resends = app.resends_to(machine);
+        let rev = app.resolver.rev_of(n);
+        // Its card's footing now, in the pass its key was taken in.
+        let guard = gated.then(|| app.gate_footing(n)).flatten();
+        // Sent again after its followed work ended refused with `retry` (intent 0591).
+        let after = app.resolver.take_again(n).map(Box::new);
         let _ = runner.tx.send(ToRunner::Run {
             n,
             machine,
@@ -1076,7 +1193,15 @@ fn run_ready(app: &mut App, runner: &Runner) {
             request,
             gated,
             resends,
+            rev,
+            guard,
+            after,
         });
+    }
+    // After the changes just handed over: a save of a text reaches the runner before the start it
+    // lets go again, so that start waits behind the save (intent 0591, K1-82).
+    for (n, paused) in app.resolver.take_pauses() {
+        let _ = runner.tx.send(ToRunner::Pause(n, paused));
     }
 }
 
@@ -1088,6 +1213,7 @@ fn edit_text(
     terminal: &mut DefaultTerminal,
     flags: &TerminalFlags,
     app: &mut App,
+    live: Option<&Live>,
     bg: &Bg,
     key: &str,
 ) -> anyhow::Result<()> {
@@ -1114,13 +1240,77 @@ fn edit_text(
         })
     });
     if let Some(signal) = stops.held() {
-        anyhow::bail!("Kerdr was asked to stop (signal {signal}) while your editor was open.");
+        // Its save goes first if its machine answers, else it's held for it or kept in your words
+        // file, and the line Kerdr ends with says which: never lost (intent 0591, K3-31).
+        let action = app.edit_ended(key, ended);
+        let command = app.cfg.actions.command.clone();
+        let targets: Vec<_> = app.machines.iter().map(|m| m.machine.clone()).collect();
+        let went = app.save_before_stopping(key, action, &mut |machine, request| match (
+            &command,
+            targets.get(machine),
+        ) {
+            (Some(command), Some(target)) => crate::actions::run(target, command, request),
+            _ => Err(crate::actions::NO_BACKEND.into()),
+        });
+        let unkept = app
+            .keep_on_quit()
+            .err()
+            .map(|why| format!(" {why}, so what it keeps for the next Kerdr was lost."))
+            .unwrap_or_default();
+        let went = went.map(|w| format!(" {w}")).unwrap_or_default() + &unkept;
+        anyhow::bail!(
+            "Kerdr was asked to stop (signal {signal}) while your editor was open.{went}"
+        );
     }
     drop(stops);
+    // A changed text: its machine is read afresh first, so one that stopped answering while the
+    // editor was open has the save held, as any change for it is (the end-to-end check's P1).
+    if matches!(ended, crate::edit::Ended::Wrote { touched: true, .. })
+        && let Some((machine, reference)) = app.saved_to(key)
+    {
+        let checking = format!(
+            "Checking {} is answering before {reference}'s new text goes…",
+            app.machines[machine].name()
+        );
+        read_before_saving(app, live, bg.inbox, machine, EDIT_CHECK_WAIT, &mut |app| {
+            app.say(checking.clone(), Tone::Info);
+            let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        });
+        app.unsay(&checking);
+    }
     if let Action::Mutate { machine, request } = app.edit_ended(key, ended) {
         start_action(app, bg.answers, bg.runner, machine, request);
     }
     Ok(())
+}
+
+/// Before a save from a closed editor goes: what the machines said while the editor was open,
+/// which nobody applied, is applied now, and the save's machine, if it still reads as live, is read
+/// again, `wait` at most, with `waiting` told first. The save then goes to a machine that answered
+/// a moment ago, or is held for one that didn't (the end-to-end check's P1).
+fn read_before_saving(
+    app: &mut App,
+    live: Option<&Live>,
+    inbox: &Inbox,
+    machine: usize,
+    wait: Duration,
+    waiting: &mut dyn FnMut(&mut App),
+) {
+    for ev in inbox.take() {
+        app.apply(ev);
+    }
+    let Some(l) = live else { return };
+    let polled = l.pollers.get(machine).is_some_and(Option::is_some);
+    if !polled || !app.machines.get(machine).is_some_and(|m| m.conn.is_live()) {
+        return;
+    }
+    waiting(app);
+    let since = Instant::now();
+    l.wake(machine);
+    inbox.wait_since(&[machine], since, wait);
+    for ev in inbox.take() {
+        app.apply(ev);
+    }
 }
 
 /// Before the board hands the terminal over (into herdr, or to your editor): a new intent Enter
@@ -1153,13 +1343,6 @@ fn jump_workspace(
     tab: Option<String>,
 ) -> Option<Outcome> {
     let machine = app.machines[mi].name();
-    if !app.machines[mi].conn.is_live() {
-        app.say(
-            format!("{machine} isn't answering; r tries it now."),
-            Tone::Warn,
-        );
-        return None;
-    }
     let label = label
         .or_else(|| {
             app.board
@@ -1169,6 +1352,14 @@ fn jump_workspace(
                 .map(|w| w.label.clone())
         })
         .unwrap_or_else(|| id.clone());
+    // Its machine isn't answering: Kerdr waits for it and goes in then, as ⏎ on a card does
+    // (intent 0591, K3-09).
+    if app.wait_for_workspace(mi, &session, &id, &label, tab.clone()) {
+        if let Some(l) = live.as_deref() {
+            l.wake(mi);
+        }
+        return None;
+    }
     // Its session didn't answer its last read: Kerdr waits for it rather than refuse (intent 0591).
     if app.stuck_refusal(mi, &session, &label).is_some() {
         app.wait_for_stuck(mi, &session.clone(), &label, None, Some((session, id, tab)));
@@ -1187,7 +1378,26 @@ fn jump_workspace(
         l.wake(mi);
         l.wake_feed(mi);
     }
+    // Only a jump that got no answer again remembers that it waited once (K3-12).
+    if !matches!(outcome, Outcome::Unanswered(_)) {
+        app.answer_waited = None;
+    }
     match &outcome {
+        // herdr there, or its machine, didn't answer: Kerdr waits for it and goes in then
+        // (intent 0591, K3-12, K3-13).
+        Outcome::Unanswered(why) => {
+            app.wait_for_answer(
+                mi,
+                &j.session,
+                &j.label,
+                None,
+                Some((j.session.clone(), j.workspace.clone(), j.tab.clone())),
+                why,
+            );
+            if let Some(l) = live.as_deref() {
+                l.wake(mi);
+            }
+        }
         Outcome::Failed(e) => app.say(e.clone(), Tone::Warn),
         Outcome::Closed => app.say(closed(&format!("Workspace {}", j.label)), Tone::Warn),
         Outcome::Stopped => app.say(stopped(&j.session, &j.machine.name), Tone::Warn),
@@ -1256,15 +1466,12 @@ fn run_jump(
             workspace: j.workspace.clone(),
         },
     );
-    // While you're in there the board keeps up, unseen, so what's held follows what waits on you
-    // and the minute after you left another session still ends on time.
-    let mut keep_up = || {
-        for ev in bg.inbox.take() {
-            app.apply(ev);
-        }
-        bg.holds.borrow_mut().sync(app);
-    };
     let mut opened = false;
+    let mut keep_up = KeepUp {
+        app,
+        bg,
+        said: None,
+    };
     let outcome = jump::run(
         terminal,
         flags,
@@ -1276,12 +1483,45 @@ fn run_jump(
         &mut keep_up,
         &mut opened,
     );
+    let waited = keep_up.said.take();
     bg.holds.borrow_mut().left(app, opened);
     app.unsay(&opening);
+    if let Some(line) = waited {
+        app.unsay(&line);
+    }
     if let Some(note) = jump::take_note() {
         app.say(note, Tone::Info);
     }
     outcome
+}
+
+/// The board while a jump runs. While you're in there it keeps up, unseen, so what's held follows
+/// what waits on you and the minute after you left another session still ends on time; while
+/// herdr is asked again, it says why, and Esc stops it (intent 0591, K3-12).
+struct KeepUp<'a, 'b> {
+    app: &'a mut App,
+    bg: &'a Bg<'b>,
+    /// The last line said while it waited, taken down once the jump is over.
+    said: Option<String>,
+}
+
+impl jump::Meanwhile for KeepUp<'_, '_> {
+    fn tick(&mut self) {
+        for ev in self.bg.inbox.take() {
+            self.app.apply(ev);
+        }
+        self.bg.holds.borrow_mut().sync(self.app);
+    }
+
+    fn waiting(&mut self, terminal: &mut DefaultTerminal, line: &str) -> bool {
+        if let Some(before) = self.said.replace(line.to_string()) {
+            self.app.unsay(&before);
+        }
+        self.app.say(line, Tone::Info);
+        let app = &*self.app;
+        let _ = terminal.draw(|f| crate::ui::draw(f, app));
+        jump::esc_pressed()
+    }
 }
 
 /// Whether Kerdr's two keys are installed in that machine's herdr config.
@@ -1421,6 +1661,17 @@ fn jump_cards(
             keys: keys_on(app, mi),
         };
         let outcome = run_jump(terminal, flags, app, mi, &j, client_config, bg);
+        // herdr there, or its machine, didn't answer however many times it was asked: Kerdr waits
+        // for it and goes in then, as for a machine that isn't answering (intent 0591, K3-12,
+        // K3-13). Only a jump that got no answer again remembers that it waited once.
+        if let Outcome::Unanswered(why) = &outcome {
+            app.wait_for_answer(mi, &j.session, &card.reference, Some(&key), None, why);
+            if let Some(l) = live.as_deref() {
+                l.wake(mi);
+            }
+            return;
+        }
+        app.answer_waited = None;
         // The next card is chosen only on ctrl+space space, or when one Kerdr picked has gone.
         let choosing_next = matches!(outcome, Outcome::Next)
             || (!yours && matches!(outcome, Outcome::Closed | Outcome::Stopped));
@@ -1488,6 +1739,8 @@ fn jump_cards(
             }
             Outcome::TabGone => closed_on_the_way.push(key.clone()),
             Outcome::Next => {}
+            // Taken above: Kerdr waits for an answer.
+            Outcome::Unanswered(_) => return,
         }
         match app.next_needs_you_after(&key, &closed_on_the_way) {
             Some(next) => {
@@ -1617,6 +1870,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_save_from_a_closed_editor_goes_by_what_its_machine_said_while_the_editor_was_open() {
+        // The end-to-end check's P1: the board takes no reads while the editor is open, so the
+        // reads that came meanwhile wait in the inbox. Before the save goes they're applied: a
+        // machine that stopped answering meanwhile has the save held, never sent into the dark.
+        let mut app = App::new(
+            crate::config::Config::default(),
+            crate::demo::machines(false),
+        );
+        app.cfg.actions.command = Some("test-adapter".into());
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| crate::app::waiting_work(c) && c.intake().is_none() && !c.dismissed())
+            .expect("a waiting backlog card in the demo")
+            .clone();
+        let m = card.machine_index;
+        app.machines[m]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push("hold".into());
+        assert!(app.machines[m].conn.is_live());
+        let inbox = Inbox::default();
+        let reader = inbox.next_reader(m);
+        let since = app.now() - chrono::Duration::seconds(20);
+        inbox.put(
+            poll::Event {
+                machine: m,
+                conn: Conn::Reconnecting {
+                    since,
+                    attempt: 1,
+                    retry_at: since,
+                    detail: "ssh: connect to host: No route to host".into(),
+                },
+                data: None,
+                at: since,
+            },
+            Instant::now(),
+            reader,
+        );
+        // Known away from what came meanwhile: not read again, nothing waited for.
+        read_before_saving(&mut app, None, &inbox, m, Duration::ZERO, &mut |_| {
+            panic!("waited for a machine already known away")
+        });
+        assert!(!app.machines[m].conn.is_live());
+        let id = card.detail.as_ref().unwrap().id.clone();
+        app.action_key = Some(card.key.clone());
+        app.queue_action(
+            m,
+            serde_json::json!({"action":"edit","id":id,"text":"Mine.","was":"sha256:aa","from":"here"}),
+        );
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 1);
+        assert_eq!(app.kept.held[0].request["text"], "Mine.");
+    }
+
+    #[test]
     fn a_reopen_that_opened_a_tab_lands_on_that_tab_only() {
         let app = App::new(
             crate::config::Config::default(),
@@ -1680,6 +1992,7 @@ mod tests {
             Answer::Progress(token, _, _) => format!("progress {token}"),
             Answer::Update(machine, n, _) => format!("update {n} on machine {machine}"),
             Answer::NotWrittenUp(n) => format!("not written up {n}"),
+            Answer::Changed(n) => format!("changed {n}"),
             Answer::Resending(n, _, why) => format!(
                 "resending {} {}",
                 n.unwrap_or(0),
@@ -1733,6 +2046,9 @@ mod tests {
                     request: serde_json::json!({"action":"move","id":"7","delta":1}),
                     gated: false,
                     resends: false,
+                    rev: None,
+                    guard: None,
+                    after: None,
                 })
                 .unwrap();
         }
@@ -1780,6 +2096,9 @@ mod tests {
                     ),
                     gated: false,
                     resends: true,
+                    rev: None,
+                    guard: None,
+                    after: None,
                 })
                 .unwrap();
         }
@@ -1835,6 +2154,9 @@ mod tests {
             request: serde_json::json!({"action":"move","id":"7","delta":1}),
             gated: false,
             resends: false,
+            rev: None,
+            guard: None,
+            after: None,
         };
         runner.tx.send(run(1, 0, &refused)).unwrap();
         runner.tx.send(run(2, 0, &ok)).unwrap();
@@ -1845,6 +2167,190 @@ mod tests {
         runner.tx.send(run(1, 1, &ok)).unwrap();
         let seen: Vec<String> = (0..4).filter_map(|_| next(10_000)).collect();
         assert_eq!(seen, ["started 1", "done 1 ok", "started 2", "done 2 ok"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_change_sent_again_after_its_follow_waits_first_holding_its_record_s_turn() {
+        // Intent 0591: a start whose followed work ended refused with `retry` goes again after
+        // that wait, with its op, and a change to the same card made meanwhile waits behind it.
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let command = format!(
+            "req=$(cat)\nprintf '%s\\n' \"$req\" >> '{}'\nprintf '%s' '{{\"ok\":true,\"message\":\"done\"}}'\n",
+            log.display()
+        );
+        let last = crate::actions::parse_response(
+            r##"{"ok":false,"retry":1,"message":"#7 didn't start yet; ⏎ again in a moment."}"##,
+        )
+        .unwrap();
+        let run = |n: u64, request: serde_json::Value, after| ToRunner::Run {
+            n,
+            machine: 0,
+            key: Some("here:7".into()),
+            target: machine.clone(),
+            command: command.clone(),
+            request,
+            gated: false,
+            resends: true,
+            rev: Some("r-7".into()),
+            guard: None,
+            after,
+        };
+        let began = Instant::now();
+        let start = serde_json::json!({"action":"dispatch","id":"7","op":"k-0123abcd"});
+        runner
+            .tx
+            .send(run(
+                1,
+                start,
+                Some(Box::new(crate::actions::After {
+                    wait: Duration::from_secs(1),
+                    last,
+                    since: crate::actions::Clocks::now(),
+                })),
+            ))
+            .unwrap();
+        runner
+            .tx
+            .send(run(
+                2,
+                serde_json::json!({"action":"close","id":"7","op":"k-4567ef01"}),
+                None,
+            ))
+            .unwrap();
+        let seen: Vec<String> = (0..5).filter_map(|_| next_heard(&rx, 10_000)).collect();
+        assert_eq!(
+            seen,
+            [
+                "started 1",
+                "resending 1 retry",
+                "done 1 ok",
+                "started 2",
+                "done 2 ok"
+            ]
+        );
+        assert!(began.elapsed() >= Duration::from_secs(1), "it waited first");
+        let sent: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2, "each sent once: {sent:?}");
+        assert_eq!(sent[0]["op"], "k-0123abcd");
+        assert_eq!(sent[0]["rev"], "r-7", "as a resend goes");
+        assert_eq!(sent[1]["action"], "close");
+    }
+
+    /// The runner's resend after a followed end refused with `retry` 1: `since`, when Kerdr had it.
+    #[cfg(unix)]
+    fn after_follow(since: crate::actions::Clocks) -> Option<Box<crate::actions::After>> {
+        let last = crate::actions::parse_response(
+            r##"{"ok":false,"retry":1,"message":"#7 didn't start yet; ⏎ again in a moment."}"##,
+        )
+        .unwrap();
+        Some(Box::new(crate::actions::After {
+            wait: Duration::from_secs(1),
+            last,
+            since,
+        }))
+    }
+
+    /// A dispatch of #7 run with `after`, by a backend that answers `answer` and logs each request:
+    /// what the runner said of it, and the requests it was sent.
+    #[cfg(unix)]
+    fn followed_resend(
+        after: Option<Box<crate::actions::After>>,
+        answer: &str,
+    ) -> (Vec<String>, Vec<serde_json::Value>) {
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let command = format!(
+            "req=$(cat)\nprintf '%s\\n' \"$req\" >> '{}'\nprintf '%s' '{answer}'\n",
+            log.display()
+        );
+        runner
+            .tx
+            .send(ToRunner::Run {
+                n: 1,
+                machine: 0,
+                key: Some("here:7".into()),
+                target: machine,
+                command,
+                request: serde_json::json!({"action":"dispatch","id":"7","op":"k-0123abcd"}),
+                gated: false,
+                resends: true,
+                rev: Some("r-7".into()),
+                guard: None,
+                after,
+            })
+            .unwrap();
+        let mut seen = vec![];
+        while let Some(said) = next_heard(&rx, 10_000) {
+            let done = said.starts_with("done");
+            seen.push(said);
+            if done {
+                break;
+            }
+        }
+        // Nothing more comes after its answer.
+        assert_eq!(next_heard(&rx, 1_500), None, "{seen:?}");
+        let sent = std::fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (seen, sent)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_followed_end_is_sent_again_once_and_a_retry_answer_to_that_is_said_as_it_is() {
+        // Codex's review 75, 2: after the one resend, a `retry` answer to it is the answer; the
+        // runner's ordinary retrying doesn't send it a third time.
+        let (seen, sent) = followed_resend(
+            after_follow(crate::actions::Clocks::now()),
+            r##"{"ok":false,"retry":1,"message":"#7 is not started yet; Enter again in a moment."}"##,
+        );
+        assert_eq!(seen, ["started 1", "resending 1 retry", "done 1 refused"]);
+        assert_eq!(sent.len(), 1, "sent once: {sent:?}");
+        assert_eq!(sent[0]["op"], "k-0123abcd");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_followed_end_queued_before_a_sleep_isnt_sent_once_its_two_minutes_are_gone() {
+        // Codex's review 75, 3: Kerdr had the end three minutes ago by the wall clock, and the
+        // computer slept before the runner began (Linux's steady clock stops meanwhile). Its two
+        // minutes count from that end, so nothing is sent and the refusal stands.
+        let since = crate::actions::Clocks {
+            steady: Instant::now(),
+            wall: std::time::SystemTime::now() - Duration::from_secs(180),
+        };
+        let (seen, sent) = followed_resend(
+            after_follow(since),
+            r#"{"ok":true,"message":"Started #7."}"#,
+        );
+        assert_eq!(seen, ["started 1", "done 1 refused"]);
+        assert!(sent.is_empty(), "nothing sent: {sent:?}");
     }
 
     #[cfg(unix)]
@@ -1871,6 +2377,9 @@ mod tests {
             request: serde_json::json!({"action":"dispatch","id":n.to_string()}),
             gated,
             resends: false,
+            rev: None,
+            guard: None,
+            after: None,
         };
         let next = || heard(rx.recv_timeout(Duration::from_secs(10)).unwrap());
         // Not yet written up: taken out before it started.
@@ -1888,6 +2397,7 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: std::collections::HashMap::from([("3".to_string(), None)]),
+                footings: Default::default(),
             })
             .unwrap();
         assert_eq!(next(), "started 3");
@@ -1981,6 +2491,7 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: intakes(&[("8", None)]),
+                footings: Default::default(),
             })
             .unwrap();
         for (n, id) in [(1, "7"), (2, "8"), (3, "9")] {
@@ -1995,6 +2506,9 @@ mod tests {
                     request: serde_json::json!({"action":"dispatch","id":id}),
                     gated: true,
                     resends: false,
+                    rev: None,
+                    guard: None,
+                    after: None,
                 })
                 .unwrap();
         }
@@ -2006,6 +2520,7 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: intakes(&[("7", Some("pending")), ("9", Some("failed"))]),
+                footings: Default::default(),
             })
             .unwrap();
         // Its write-up failed: it starts from his words as they are, and that's said (intent 0591).
@@ -2017,9 +2532,177 @@ mod tests {
             .send(ToRunner::Feed {
                 machine: 0,
                 intakes: intakes(&[("7", None)]),
+                footings: Default::default(),
             })
             .unwrap();
         assert_eq!(next(), "started 1");
         assert_eq!(next(), "done 1 ok");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_waiting_for_its_write_up_never_goes_once_its_card_is_set_aside_and_goes_with_its_rev()
+     {
+        // Codex's review 60, 5: d on #7 and #8 during their write-ups, then #7 is set aside
+        // elsewhere. Once both are written up, #7 is taken out unstarted and the board told; #8
+        // goes, with its card's rev as the read that let it go shows it, so its backend checks it.
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("requests.log");
+        let (tx, rx) = mpsc::channel();
+        let runner = Runner::spawn(tx);
+        let machine = Machine {
+            name: "here".into(),
+            ssh: None,
+            herdr: "herdr".into(),
+            feed: None,
+            hidden: false,
+        };
+        let log_q = crate::transport::quote(log.to_str().unwrap());
+        let command = format!(
+            "cat >> {log_q}\necho >> {log_q}\nprintf '%s' '{{\"ok\":true,\"message\":\"started\"}}'\n"
+        );
+        for (n, id) in [(1, "7"), (2, "8")] {
+            runner
+                .tx
+                .send(ToRunner::Run {
+                    n,
+                    machine: 0,
+                    key: Some(format!("here:{id}")),
+                    target: machine.clone(),
+                    command: command.clone(),
+                    request: serde_json::json!({"action":"dispatch","id":id}),
+                    gated: true,
+                    resends: false,
+                    rev: None,
+                    guard: Some(crate::resolve::Footing::default()),
+                    after: None,
+                })
+                .unwrap();
+        }
+        let footing = |set_aside: bool| {
+            let footing = crate::resolve::Footing {
+                set_aside,
+                ..Default::default()
+            };
+            (footing, Some("r9".to_string()))
+        };
+        runner
+            .tx
+            .send(ToRunner::Feed {
+                machine: 0,
+                intakes: std::collections::HashMap::from([
+                    ("7".to_string(), None),
+                    ("8".to_string(), None),
+                ]),
+                footings: std::collections::HashMap::from([
+                    ("7".to_string(), footing(true)),
+                    ("8".to_string(), footing(false)),
+                ]),
+            })
+            .unwrap();
+        let seen: Vec<String> = (0..3).filter_map(|_| next_heard(&rx, 10_000)).collect();
+        assert_eq!(seen, ["changed 1", "started 2", "done 2 ok"]);
+        assert_eq!(next_heard(&rx, 300), None);
+        let sent: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["id"], "8");
+        assert_eq!(sent[0]["rev"], "r9");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_start_let_go_by_its_write_up_but_waiting_behind_another_change_is_still_held_to_its_card()
+    {
+        // Codex's review 62, 4: d on #7 during its write-up, behind a y on #7 that's still
+        // running. A read shows #7 written up, so the start no longer waits for that, only for y.
+        // A later read shows #7 set aside: the start is taken out unstarted. Shown changed in any
+        // other way, it goes once y is done, with the rev of the read that let it go, so its
+        // backend asks about what changed since.
+        let run = |later_set_aside: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let log = dir.path().join("requests.log");
+            let gate = dir.path().join("y-may-finish");
+            let (tx, rx) = mpsc::channel();
+            let runner = Runner::spawn(tx);
+            let machine = Machine {
+                name: "here".into(),
+                ssh: None,
+                herdr: "herdr".into(),
+                feed: None,
+                hidden: false,
+            };
+            let log_q = crate::transport::quote(log.to_str().unwrap());
+            let gate_q = crate::transport::quote(gate.to_str().unwrap());
+            let send = |n: u64, request: serde_json::Value, gated: bool, command: String| {
+                runner
+                    .tx
+                    .send(ToRunner::Run {
+                        n,
+                        machine: 0,
+                        key: Some("here:7".into()),
+                        target: machine.clone(),
+                        command,
+                        request,
+                        gated,
+                        resends: false,
+                        rev: None,
+                        guard: gated.then(crate::resolve::Footing::default),
+                        after: None,
+                    })
+                    .unwrap();
+            };
+            let answer = "printf '%s' '{\"ok\":true,\"message\":\"done\"}'\n";
+            send(
+                1,
+                serde_json::json!({"action":"refresh","id":"7"}),
+                false,
+                format!("cat >/dev/null\nwhile [ ! -e {gate_q} ]; do sleep 0.05; done\n{answer}"),
+            );
+            assert_eq!(next_heard(&rx, 10_000).as_deref(), Some("started 1"));
+            send(
+                2,
+                serde_json::json!({"action":"dispatch","id":"7"}),
+                true,
+                format!("cat >> {log_q}\necho >> {log_q}\n{answer}"),
+            );
+            let read = |set_aside: bool, rev: &str| ToRunner::Feed {
+                machine: 0,
+                intakes: std::collections::HashMap::from([("7".to_string(), None)]),
+                footings: std::collections::HashMap::from([(
+                    "7".to_string(),
+                    (
+                        crate::resolve::Footing {
+                            set_aside,
+                            ..Default::default()
+                        },
+                        Some(rev.to_string()),
+                    ),
+                )]),
+            };
+            runner.tx.send(read(false, "r9")).unwrap();
+            runner.tx.send(read(later_set_aside, "r10")).unwrap();
+            let mut heard: Vec<String> = next_heard(&rx, 500).into_iter().collect();
+            std::fs::write(&gate, "").unwrap();
+            while let Some(h) = next_heard(&rx, 1_000) {
+                heard.push(h);
+            }
+            let sent: Vec<serde_json::Value> = std::fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            (heard, sent)
+        };
+        let (heard, sent) = run(true);
+        assert_eq!(heard, ["changed 2", "done 1 ok"]);
+        assert!(sent.is_empty(), "{sent:?}");
+        let (heard, sent) = run(false);
+        assert_eq!(heard, ["done 1 ok", "started 2", "done 2 ok"]);
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0]["rev"], "r9");
     }
 }

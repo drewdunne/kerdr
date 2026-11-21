@@ -503,8 +503,8 @@ impl Card {
 }
 
 /// A card as it was when an action about it started: which card, on which machine, its home, the
-/// conversation a reopen would resume and its workspace. A late question, its yes and a jump apply
-/// only to the same work.
+/// conversation a reopen would resume and its workspace, by session and id. A late question, its
+/// yes and a jump apply only to the same work.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct CardSnapshot {
     pub key: String,
@@ -514,6 +514,9 @@ pub struct CardSnapshot {
     pub resume_agent: Option<String>,
     pub resume_conversation: Option<String>,
     pub workspace: Option<String>,
+    /// The herdr session that workspace is in: an id names a workspace only within its session, so
+    /// web's w7 isn't api's w7 (Codex's review 76). None when it had no workspace.
+    pub workspace_session: Option<String>,
     /// Whether it was work waiting in the backlog: a won't do asked about it then applies only
     /// while it still is, and one asked about started work only while it isn't. Not part of
     /// same_work.
@@ -537,6 +540,7 @@ impl CardSnapshot {
             resume_agent: resume.and_then(|r| r.agent.clone()),
             resume_conversation: resume.and_then(|r| r.conversation.clone()),
             workspace: card.workspace_id.clone(),
+            workspace_session: card.workspace_id.as_ref().and(card.session.clone()),
             waiting: crate::app::waiting_work(card),
             done: card.done() || card.state.as_deref() == Some("closed"),
             dismissed: card.dismissed(),
@@ -548,25 +552,50 @@ impl CardSnapshot {
         self.same_work_or(card, None)
     }
 
-    /// The same, also allowing for it to have the workspace `made` (the one a reopen just made).
-    pub fn same_work_or(&self, card: &Card, made: Option<&str>) -> bool {
+    /// The same, also allowing for what the answer that named the workspace `made` (a reopen's, or
+    /// a start's) brought about by itself. The card may have that workspace, and once it does, by
+    /// herdr's view or its feed's, its feed names no conversation to resume, since it gives one
+    /// only while there's no workspace: a feed read between the question and the answer shows both
+    /// (the end-to-end check's F1). It's still the same card on the same machine with the same
+    /// home, and a conversation it does name must be the one it had. `made` is that workspace by
+    /// its session and id: a workspace with the same id in another session is another workspace
+    /// (Codex's review 75, 1). So is the workspace it had: one it shows must be that one by
+    /// session and id too, or the one made (review 76).
+    pub fn same_work_or(&self, card: &Card, made: Option<(&str, &str)>) -> bool {
         let now = CardSnapshot::of(card);
+        // The card's workspace is the one the answer made: herdr's view of it, by its session.
+        let shows_made = |w: &str| {
+            made.is_some_and(|(session, id)| id == w && card.session.as_deref() == Some(session))
+        };
+        let gained = made.is_some_and(|(session, id)| {
+            now.workspace.as_deref().is_some_and(shows_made)
+                || card
+                    .detail
+                    .as_ref()
+                    .and_then(|d| d.workspace.as_ref())
+                    .is_some_and(|w| {
+                        w.id.as_deref() == Some(id) && w.session.as_deref() == Some(session)
+                    })
+        });
+        let resume_gone = gained && now.resume_agent.is_none() && now.resume_conversation.is_none();
+        let bare = |s: &CardSnapshot| CardSnapshot {
+            workspace: None,
+            workspace_session: None,
+            waiting: false,
+            done: false,
+            dismissed: false,
+            resume_agent: s.resume_agent.clone().filter(|_| !resume_gone),
+            resume_conversation: s.resume_conversation.clone().filter(|_| !resume_gone),
+            ..s.clone()
+        };
+        // The workspace it had, by its session as well as its id.
+        let had = |w: &str| {
+            self.workspace.as_deref() == Some(w) && self.workspace_session == now.workspace_session
+        };
         now.workspace
             .as_deref()
-            .is_none_or(|w| self.workspace.as_deref() == Some(w) || made == Some(w))
-            && CardSnapshot {
-                workspace: None,
-                waiting: false,
-                done: false,
-                dismissed: false,
-                ..now
-            } == CardSnapshot {
-                workspace: None,
-                waiting: false,
-                done: false,
-                dismissed: false,
-                ..self.clone()
-            }
+            .is_none_or(|w| had(w) || shows_made(w))
+            && bare(&now) == bare(self)
     }
 }
 

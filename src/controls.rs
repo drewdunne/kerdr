@@ -17,6 +17,11 @@ const MAX_ANSWER: usize = 300;
 
 /// What the busy line of an account request adds while it's sent again by itself (intent 0591).
 const RETRYING_TAIL: &str = " trying again…";
+
+/// How long ⏎ on a card just started waits for its workspace to show, and how long a second ⏎
+/// or d meanwhile starts nothing again (intent 0591, K1-43): a start may wait for a place, or
+/// take minutes to open on a busy machine.
+const START_WAIT: Duration = Duration::from_secs(600);
 /// The backend's words when a yes doesn't fit the question it answers: nothing started.
 const YES_NOT_MATCHED: &str = "couldn't be matched to the question";
 
@@ -83,6 +88,32 @@ pub(super) fn short(text: String) -> String {
     match text.char_indices().nth(MAX_ANSWER) {
         Some((at, _)) => format!("{}…", text[..at].trim_end()),
         None => text,
+    }
+}
+
+/// Whether a backend's words already name the card by `reference` ("#21", or a workspace's
+/// name): as a whole word, so "#2" isn't found in "#21", and "#21's" counts.
+pub(super) fn names(words: &str, reference: &str) -> bool {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return false;
+    }
+    words.match_indices(reference).any(|(at, _)| {
+        let before = words[..at].chars().next_back();
+        let after = words[at + reference.len()..].chars().next();
+        !before.is_some_and(|c| c.is_alphanumeric() || c == '#')
+            && !after.is_some_and(char::is_alphanumeric)
+    })
+}
+
+/// What didn't happen and the backend's words why, as one line: "#41 wasn't marked done: it's
+/// locked." Words that already name the card are said alone, so a line never names it twice,
+/// as "#21 didn't start: #21 didn't start yet (…)" did.
+pub(super) fn what_and_why(what: &str, reference: &str, why: &str) -> String {
+    if names(why, reference) {
+        why.to_string()
+    } else {
+        format!("{what}: {why}")
     }
 }
 
@@ -877,7 +908,7 @@ impl App {
             .is_none_or(|s| s.trim().is_empty())
         {
             self.say(
-                "Intent controls are not configured for this board.",
+                "Kerdr has no action backend here to change intents: set [actions] command in its config.",
                 Tone::Info,
             );
             return false;
@@ -893,7 +924,17 @@ impl App {
     }
 
     pub(super) fn emit_mutation(&mut self, machine: usize, request: Value) -> Action {
-        if self.can_write(machine) {
+        // Only a change to a card is held or sent through another machine (intent 0591, release
+        // 4): a new intent or an account request needs its machine answering.
+        let routed = request["action"]
+            .as_str()
+            .is_some_and(|a| a != "create" && !a.starts_with("account-"));
+        let can = if routed {
+            self.can_change(machine)
+        } else {
+            self.can_write(machine)
+        };
+        if can {
             Action::Mutate { machine, request }
         } else {
             Action::None
@@ -921,7 +962,7 @@ impl App {
         let Some(machine) = self.home_machine(card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         let reference = &card.reference;
@@ -992,6 +1033,17 @@ impl App {
         from: Option<&CardSnapshot>,
         forwarded: bool,
     ) -> Option<&'static str> {
+        // A stop once its workspace opens waits behind the start, and names that workspace when
+        // it goes to a backend that doesn't ask first (K1-41).
+        if crate::app::behind::is_cancel_once_open(request)
+            && let Some(f) = from
+            && self
+                .resolver
+                .starting(&f.key, request["id"].as_str().unwrap_or_default())
+                .is_some()
+        {
+            return None;
+        }
         needs(request, from, forwarded).filter(|what| {
             !self
                 .machines
@@ -1085,6 +1137,13 @@ impl App {
         match target {
             Some(name) => {
                 let found = self.machine_index(&name);
+                // Not one of Kerdr's machines: a machine that forwards sends it there (intent
+                // 0591, release 4; route names it in `forward_to`).
+                if found.is_none()
+                    && let Some(via) = self.forwarder_for(Some(&name))
+                {
+                    return Some(via);
+                }
                 if found.is_none() {
                     self.say(format!("The home machine {name} is not configured. Add it before changing this intent."), Tone::Warn);
                 }
@@ -1123,7 +1182,7 @@ impl App {
             };
             self.say(
                 format!(
-                    "{} {what}; with [actions] configured, ⏎ reopens it. m peeks at it.",
+                    "{} {what}, and Kerdr has no action backend here to reopen it (set [actions] command in its config). m peeks at it.",
                     card.reference
                 ),
                 Tone::Info,
@@ -1133,7 +1192,7 @@ impl App {
         let Some(machine) = self.home_machine(card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         // Its home session, else the session tab you're on, if it's that machine's.
@@ -1159,7 +1218,7 @@ impl App {
     /// Whether you're still on this work, in the view you're looking at (the board, a peek, the
     /// backlog or Misc), and it hasn't changed since the action started: where a late answer may
     /// ask you something or take you in. Typing a search, a filter or a new intent isn't.
-    pub(super) fn still_on(&self, from: &CardSnapshot, made: Option<&str>) -> bool {
+    pub(super) fn still_on(&self, from: &CardSnapshot, made: Option<(&str, &str)>) -> bool {
         matches!(
             self.mode,
             Mode::Board
@@ -1259,7 +1318,13 @@ impl App {
             );
             return Action::None;
         };
-        if self.still_saving(&card) || self.still_changing(&card, action) {
+        // A new intent still saving: its key waits for its number (intent 0591, K1-42).
+        if self.still_changing(&card, action) {
+            return Action::None;
+        }
+        // C or x while its start is on its way, with nothing open yet: a stop once it opens
+        // (K1-41).
+        if matches!(action, "close" | "dismiss") && self.cancel_once_open(&card) {
             return Action::None;
         }
         // The question this key asked while you were elsewhere, waiting on it (intent 0591).
@@ -1270,11 +1335,15 @@ impl App {
         // rather than be refused until then. The runner holds the start until its home's feed
         // shows it written up, so it goes even while he's inside a workspace (intent 0445).
         if action == "dispatch" && card.intake() == Some("pending") && waiting_work(&card) {
-            if self.resolver.waiting_for_write_up(&card.key).is_none() {
+            if self
+                .resolver
+                .start_waiting_for_write_up(&card.key)
+                .is_none()
+            {
                 let Some(machine) = self.home_machine(&card) else {
                     return Action::None;
                 };
-                if !self.can_write(machine) {
+                if !self.can_change(machine) {
                     return Action::None;
                 }
                 let mut request = json!({"action":"dispatch","id":detail.id});
@@ -1361,8 +1430,6 @@ impl App {
                 format!(
                     "{reference} has a workspace open, so an agent may be at it: C and x are for work with none. ⏎ goes in."
                 )
-            } else if card.intake() == Some("pending") {
-                format!("{reference} is still being written up.")
             } else if ordering && finished {
                 format!("{reference} is done, so it has no place in the backlog order.")
             } else if ordering {
@@ -1401,7 +1468,7 @@ impl App {
         let Some(machine) = self.home_machine(&card) else {
             return Action::None;
         };
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         let mut request = json!({"action":action,"id":detail.id});
@@ -1505,7 +1572,7 @@ impl App {
         let Some(detail) = &card.detail else {
             return self.bare_cancel(&card);
         };
-        if self.still_saving(&card) || self.still_changing(&card, "cancel") {
+        if self.still_changing(&card, "cancel") || self.cancel_once_open(&card) {
             return Action::None;
         }
         if self.key_opens_waiting(&card.key, "cancel") {
@@ -1524,7 +1591,7 @@ impl App {
             let Some(machine) = self.home_machine(&card) else {
                 return Action::None;
             };
-            if !self.can_write(machine) {
+            if !self.can_change(machine) {
                 return Action::None;
             }
             // `outside_since` names the window this yes was for: its backend stops only that one.
@@ -1566,8 +1633,6 @@ impl App {
                 format!("{reference} is in won't do already.")
             } else if finished {
                 format!("{reference} is done already; there's nothing to cancel.")
-            } else if card.intake() == Some("pending") {
-                format!("{reference} is still being written up.")
             } else if card.closable() || waiting_work(&card) {
                 // Nothing to stop: X's end is Won't do, so it sets it aside, after its question
                 // (intent 0591, K1-30, K1-31).
@@ -1580,7 +1645,7 @@ impl App {
         }
         // Its workspace is where the card came from: that machine's herdr closes it.
         let machine = card.machine_index;
-        if !self.can_write(machine) {
+        if !self.can_change(machine) {
             return Action::None;
         }
         // Work an agent is at, to a backend that does the step first: sent as C and x send theirs,
@@ -1603,6 +1668,14 @@ impl App {
             json!({"action":"cancel","id":detail.id,"session":session,"workspace":workspace});
         if let Some(tab) = &card.tab_id {
             request["tab"] = json!(tab);
+        }
+        // What its feed showed running there when X was pressed, so its yes, held or late, never
+        // stops a workspace remade under the same id before the board caught up (r4-a's point 13).
+        // Its yes, and any resend, carry this list, never a fresh one.
+        if let Some(conversations) =
+            self.card_conversations(&card, machine, &session, &workspace, card.tab_id.as_deref())
+        {
+            request["conversations"] = json!(conversations);
         }
         let place = card
             .workspace_label
@@ -1888,6 +1961,8 @@ impl App {
             self.draft = draft.words;
             self.draft_images = draft.images;
             self.draft_came_back = draft.came_back;
+            // Kept as you left them, emptied included.
+            self.keep_words_now();
             // A read for words already sent carries on for them.
             if self.box_loading().is_some() {
                 self.image_load = None;
@@ -1976,7 +2051,7 @@ impl App {
     /// send went unanswered may be saved already: they go again where they went then, with the
     /// same submission, wherever you are now, so the adapter finds the first one rather than
     /// making a second.
-    fn send_draft(&mut self, mut draft: Draft) -> Action {
+    pub(super) fn send_draft(&mut self, mut draft: Draft) -> Action {
         // Its machine stopped answering meanwhile (a read that took a while): nothing is lost.
         if !self.can_write(draft.machine) {
             self.give_back(draft.words, draft.images, draft.came_back);
@@ -2078,12 +2153,15 @@ impl App {
 
     /// Words a failed save gives back: into the box for the next c when it's free, else kept
     /// for a later c. Whether they went into the box.
-    fn give_back(
+    pub(super) fn give_back(
         &mut self,
         words: String,
         images: Vec<images::Image>,
         from: Option<crate::app::Submission>,
     ) -> bool {
+        // Words that came back while q waited for them to be saved: Kerdr stays open with them
+        // (intent 0591, K1-45).
+        self.quitting = None;
         let open = matches!(self.mode, Mode::Compose { .. }) || self.send_after_load.is_some();
         if !open && self.draft.trim().is_empty() {
             self.draft = words;
@@ -2365,9 +2443,13 @@ impl App {
                 enter_queues,
                 ..
             } => {
-                // A yes is a new request: never the question's op (intent 0591).
+                // A yes is a new request: never the question's op (intent 0591). Nor the `held`
+                // and `rev` of a request that waited in the hold file: the yes is pressed now, and
+                // a held stop's yes marked held would only get its question back (release 4).
                 if let Some(fields) = request.as_object_mut() {
-                    fields.remove("op");
+                    for waited in ["op", "held", "rev"] {
+                        fields.remove(waited);
+                    }
                 }
                 // One of the answers its backend offers beyond yes and no, by its key (intent 0591).
                 let keys = crate::actions::choice_keys(&choices);
@@ -2589,12 +2671,19 @@ impl App {
             }
             return Some(Action::None);
         }
+        let counted = !self.count.is_empty();
         let count: i64 = std::mem::take(&mut self.count).parse().unwrap_or(1);
         match key.code {
             KeyCode::Char(
                 c @ ('d' | 'e' | 'y' | 'x' | 'u' | 't' | 'B' | 'J' | 'K' | 'C' | 'X'),
             ) => {
                 return Some(self.card_action(c, count));
+            }
+            // In a peek, D drops what's held for its card: the first, or with a count the one of
+            // that number, 2D the second (intent 0591, release 4).
+            KeyCode::Char('D') if matches!(self.mode, Mode::Peek { .. }) => {
+                let index = counted.then(|| usize::try_from(count - 1).unwrap_or(0));
+                return Some(self.drop_held(index));
             }
             KeyCode::Char('{') | KeyCode::Char('}')
                 if matches!(self.mode, Mode::Backlog { .. }) =>
@@ -2701,6 +2790,19 @@ impl App {
                     only(here)
                 }
             });
+        // A key on a card whose start, save or write-up is on its way waits for that, and is
+        // decided again then (intent 0591, release 4).
+        if self.hold_behind(machine, &request, from.as_ref(), key.as_deref()) {
+            return;
+        }
+        // The same change in the hold file, kept held because its backend doesn't check one, or
+        // on its way from a Kerdr already: it goes as that record, with its op, never as a second
+        // copy; or, on its way, or when Kerdr can't tell, not at all (Codex's review 64, 1).
+        let again = match self.pressed_again(machine, &request, key.as_deref()) {
+            super::holding::Again::Busy => return,
+            super::holding::Again::Record(op) => Some(op),
+            super::holding::Again::Fresh => None,
+        };
         let effect = key.as_deref().and_then(|k| self.effect_for(k, &request));
         // A workspace with no intent shows nothing until it closes: said meanwhile (K1-27).
         if crate::app::cancels::is_bare_cancel(&request)
@@ -2713,7 +2815,35 @@ impl App {
         let starts = matches!(request["action"].as_str(), Some("dispatch" | "reopen"));
         let asking = (!shows).then(|| self.asking_line(&request)).flatten();
         let by_enter = enter_sent.is_some_and(|e| key.as_deref() == Some(e.as_str()));
+        // Its machine isn't answering: sent through one that forwards, or held for it (intent
+        // 0591, release 4). A held change shows on its card, not as done.
+        let home = machine;
+        // A record pressed again, held for its machine again, waits as itself (route's
+        // `carrying`).
+        if again.is_some() {
+            self.carrying = again.clone();
+        }
+        let routed = self.route(machine, request, key.as_deref());
+        if again.is_some() {
+            self.carrying = None;
+        }
+        let Some((machine, request)) = routed else {
+            return;
+        };
+        let rev = key
+            .as_deref()
+            .filter(|_| self.holds_on(home))
+            .and_then(|k| self.card_rev(k));
         let n = self.resolver.add(machine, request, from, key, effect);
+        self.resolver.set_rev(n, rev);
+        if let Some(op) = again {
+            // On its way now: why it stayed held no longer holds, so if its answer is lost and
+            // its day runs out, its card never says it wasn't sent (Codex's review 64, 4).
+            self.kept.stays(&op, None);
+            self.resolver.keep_op(n, &op);
+            self.held_unchecked.remove(&op);
+            self.held_sending.insert(n, op);
+        }
         if by_enter {
             self.resolver.mark_by_enter(n);
         }
@@ -2772,8 +2902,27 @@ impl App {
                 team: request["team"].as_str().map(str::to_string),
             })
         });
-        self.resolver
+        let n = self
+            .resolver
             .add(machine, request, None, Some(key.clone()), effect);
+        // Into the words file as the send it is before it goes (Codex's review 62, 2), and not
+        // sent until it's there: sent first, a crash could bring its words back as new ones, to be
+        // saved twice (Codex's review 63, 2).
+        if self.kept.on_disk() {
+            self.resolver.wait_for_words(n);
+        }
+        if !self.keep_words_now() {
+            let why = self
+                .kept
+                .words_trouble()
+                .unwrap_or_else(|| "Kerdr couldn't write its words file".into());
+            self.say(
+                format!(
+                    "Your new intent waits: {why}. It's sent once its words are kept there, so a crash can never save it twice."
+                ),
+                Tone::Warn,
+            );
+        }
         if self.closed_on_send && matches!(self.mode, Mode::Backlog { .. }) {
             self.backlog_focus = Some(key.clone());
         }
@@ -2986,11 +3135,26 @@ impl App {
     /// A request is being sent again by itself, with the same op (intent 0591): a change's card,
     /// or the busy line of an account request, says so quietly. Nothing red, and nothing in the
     /// error log: only its last answer counts, and that's said as any answer is.
-    pub fn resending(&mut self, job: Option<u64>, _machine: usize, _why: &crate::actions::Resend) {
+    /// A part-done answer with `retry` is no plain refusal: what stood is said at once, in
+    /// yellow, as any part-done answer is, and again with its last answer if that doesn't happen
+    /// either, as at a follow's end (follow_again).
+    pub fn resending(&mut self, job: Option<u64>, _machine: usize, why: &crate::actions::Resend) {
         match job {
             Some(n) => {
                 if self.resolver.note_retrying(n, true) {
                     self.rebuild();
+                }
+                if let crate::actions::Resend::Retry {
+                    message,
+                    partial: true,
+                    ..
+                } = why
+                    && let Some(request) = self.resolver.job_request(n).cloned()
+                {
+                    let line = short(self.partly_line(&request, message));
+                    if self.resolver.keep_stood(n, line.clone()) {
+                        self.say(line, Tone::Warn);
+                    }
                 }
             }
             None if self.busy => {
@@ -3019,18 +3183,59 @@ impl App {
             return;
         };
         let reference = self.reference_for(&id);
-        self.say(
+        let starts = self
+            .resolver
+            .job_request(n)
+            .is_some_and(|r| r["action"] == "dispatch");
+        let said = if starts {
+            format!("{reference} couldn't be written up, so it starts from your words as they are.")
+        } else {
+            // Another key that waited for its write-up (intent 0591, K1-23): it goes now.
+            let what = self
+                .resolver
+                .job_request(n)
+                .map(super::holding::held_what)
+                .unwrap_or_default();
             format!(
-                "{reference} couldn't be written up, so it starts from your words as they are."
-            ),
-            Tone::Info,
-        );
+                "{reference} couldn't be written up; {what} goes now, with its words as they are."
+            )
+        };
+        self.say(said, Tone::Info);
     }
 
     /// A change's answer, from the action resolution tool: one that went as shown keeps showing
     /// until the feed has it; any other takes its effect with it, so the card is back as it really
     /// is before anything is said or asked.
     pub fn finish_job(&mut self, n: u64, request: Value, result: Result<Response, String>) {
+        // Sent from the hold file, through another machine, or held by its backend (intent 0591,
+        // release 4).
+        let unreached = self.answer_unreached.take();
+        if self.held_answer(n, &result, unreached) {
+            self.keep_words_now();
+            return;
+        }
+        if let Ok(response) = &result
+            && self.drop_answered(&request, response)
+        {
+            self.resolver.take(n);
+            self.redirected();
+            self.keep_words_now();
+            return;
+        }
+        let to = request["forward_to"].as_str().map(str::to_string);
+        let via = result.as_ref().ok().and_then(|r| r.via.clone());
+        self.finish_job_answered(n, request, result);
+        // A hold-file record refused because its card lives elsewhere stays one record until
+        // what became of it is answered (holding::redirected).
+        self.redirected();
+        self.note_via(to, via);
+        // A start or a save answered: what waited behind it is decided again.
+        self.release_behind();
+        // A new intent saved, or its words given back: the words file says so now.
+        self.keep_words_now();
+    }
+
+    fn finish_job_answered(&mut self, n: u64, request: Value, result: Result<Response, String>) {
         let Some(job) = self.resolver.take(n) else {
             return;
         };
@@ -3076,12 +3281,27 @@ impl App {
             }
             match job.effect.as_mut() {
                 // Its card stays until the feed has the record it made; nothing made, it goes.
+                // Unless its backend is still saving it (`pending`, and no number yet): then it
+                // stays, saying so, until the feed has a card with its submission (release 4).
                 Some(Effect::Saving(p)) => {
                     p.made = response.id.clone();
-                    if p.made.is_none() {
+                    let saving = response.pending.as_deref().is_some_and(|w| !w.is_empty())
+                        && self.holds_on(machine);
+                    if p.made.is_none() && !saving {
                         job.effect = None;
                         self.rebuild();
                     }
+                }
+                // Accepted but held by its backend (`pending`: queued until there's room, on this
+                // machine or another): it shows as held on its card, in those words, never as
+                // starting (intent 0591, release 4, r4-a's shape for B1-92).
+                Some(Effect::Starting | Effect::Reopening)
+                    if response
+                        .pending
+                        .as_deref()
+                        .is_some_and(|w| !w.trim().is_empty()) =>
+                {
+                    job.effect = None;
                 }
                 // Asked for on another machine, where it starts within minutes: it shows as
                 // starting there until that start reaches this copy (intent 0445).
@@ -3148,7 +3368,20 @@ impl App {
         self.answer_by_enter = by_enter;
         self.answer_job = Some(n);
         self.answer_key = job_key;
+        // Sent again after a part-done answer, at once or at a follow's end: what stood then is
+        // said again if this didn't happen either (intent 0591).
+        let stood = refused
+            .as_ref()
+            .and_then(|j| j.stood.clone())
+            .filter(|_| match &result {
+                Ok(r) => !r.confirmation && r.questions.is_empty() && !redirected,
+                Err(_) => true,
+            });
+        let since = Instant::now();
         self.finish_action(machine, request, result);
+        if let Some(stood) = stood {
+            self.say_what_stood(&stood, since);
+        }
         self.answer_job = None;
         self.answer_key = None;
         self.answer_by_enter = false;
@@ -3200,6 +3433,11 @@ impl App {
             if action == "cancel" {
                 return false;
             }
+        }
+        // Any other key waits behind it, and is decided again once it's answered (intent 0591,
+        // release 4, K1-39 to K1-41): held by queue_action, not refused here.
+        if !matches!(action, "dispatch" | "reopen" | "enter") {
+            return false;
         }
         let verb = if job.request["action"] == "reopen" {
             "reopening"
@@ -3385,14 +3623,35 @@ impl App {
         if self.resolver.starting(&card.key, &id).is_some() {
             return self.go_into_opened(&card);
         }
+        // Its start was queued, or is held by its backend: said, rather than waited for (intent
+        // 0591, K1-43).
+        let held = self
+            .held_lines(&card)
+            .into_iter()
+            .find(|l| matches!(l.drop, Some(super::holding::DropOf::Backend(_))));
+        if let Some(line) = held {
+            self.forget_enter();
+            self.say(
+                format!(
+                    "{} has no workspace yet: {}. ⏎ goes in once it's under way.",
+                    card.reference, line.words
+                ),
+                Tone::Info,
+            );
+            return None;
+        }
         // Followed work still going: it goes in once the card shows it open (intent 0591).
         if self.started_lately(&card.key, &id) || self.following_card(&card).is_some() {
             return None;
         }
         self.forget_enter();
+        let says = Some(card.why.trim())
+            .filter(|w| !w.is_empty())
+            .map(|w| format!(": its card says \"{w}\""))
+            .unwrap_or_default();
         self.say(
             format!(
-                "{} has no workspace to show for its start yet, so Kerdr stopped waiting; ⏎ tries again.",
+                "{} still has no workspace ten minutes after its start, so Kerdr stopped waiting{says}. ⏎ tries again.",
                 card.reference
             ),
             Tone::Info,
@@ -3400,12 +3659,13 @@ impl App {
         None
     }
 
-    /// Whether this card's start was answered yes lately: its workspace may yet come. Its own,
+    /// Whether this card's start was answered yes in the last ten minutes (START_WAIT): its
+    /// workspace may yet come, and nothing starts it twice meanwhile (intent 0591, K1-43). Its own,
     /// by `Resolver::for_card`: another source's card with the same number isn't held up by it
     /// (Codex's seventh look).
     pub(super) fn started_lately(&self, key: &str, id: &str) -> bool {
         self.started.as_ref().is_some_and(|(k, s, at)| {
-            self.resolver.for_card(Some(k), s, key, id) && at.elapsed() < Duration::from_secs(120)
+            self.resolver.for_card(Some(k), s, key, id) && at.elapsed() < START_WAIT
         })
     }
 
@@ -3483,7 +3743,8 @@ impl App {
     pub fn job_started(&mut self, n: u64) {
         let started = self.resolver.started(n);
         // To a backend that can put it back in the backlog, asked instead (intent 0591, K1-44).
-        if started.too_late && !self.ask_stop_start(n) {
+        // m's D came too late, not Esc: the runner's answer to it says so (job_drop_answered).
+        if started.too_late && !self.drops_asked.contains_key(&n) && !self.ask_stop_start(n) {
             let reference = self
                 .resolver
                 .job(n)
@@ -3502,7 +3763,7 @@ impl App {
 
     /// Whether a start d asked for waits for this card's write-up.
     pub fn starts_when_written(&self, key: &str) -> bool {
-        self.resolver.waiting_for_write_up(key).is_some()
+        self.resolver.start_waiting_for_write_up(key).is_some()
     }
 
     /// What a card's own screen and its peek say while a change to it is on its way: "◐ Starting
@@ -3660,6 +3921,41 @@ impl App {
         ))
     }
 
+    /// A part-done answer's line: its words, the card named in front when they don't name it.
+    pub(super) fn partly_line(&self, request: &Value, message: &str) -> String {
+        match request["id"].as_str() {
+            Some(id) if !names(message, &self.reference_for(id)) => {
+                format!("{}: {message}", self.reference_for(id))
+            }
+            _ => message.to_string(),
+        }
+    }
+
+    /// What stood before a change was sent again by itself (Job::stood), said again with its
+    /// last answer when that didn't happen either, so it's never lost (intent 0591): just above
+    /// the line that answer put up since `since`, or after whatever is up when that line waits.
+    pub(super) fn say_what_stood(&mut self, stood: &str, since: Instant) {
+        match &self.message {
+            Some((text, _, _)) if text.contains(stood) => {}
+            Some((text, tone, at)) if *at >= since => {
+                let text = match text.rsplit_once('\n') {
+                    Some((older, newest)) => format!("{older}\n{stood}\n{newest}"),
+                    None => format!("{stood}\n{text}"),
+                };
+                self.message = Some((text, *tone, Instant::now()));
+            }
+            _ => self.show(stood.to_string(), Tone::Warn),
+        }
+    }
+
+    /// How the board names a request's card, "#41"; empty for one with no record.
+    fn reference_of(&self, request: &Value) -> String {
+        request["id"]
+            .as_str()
+            .map(|id| self.reference_for(id))
+            .unwrap_or_default()
+    }
+
     /// How a failure names the change that didn't happen: "#41 wasn't marked done".
     fn what_failed(&self, request: &Value) -> Option<String> {
         let id = request["id"].as_str()?;
@@ -3745,6 +4041,18 @@ impl App {
                 // Answered at last: no longer being sent again (intent 0591).
                 self.account_retrying = None;
             }
+            // His answer to a question a held request waits on: taken, or its card asks again
+            // (Codex's review 64, 3).
+            self.asks_answer_came(machine, &request, &result);
+            // A drop of an account request its backend held: said as any drop (r4-b's shape).
+            if let Ok(response) = &result
+                && self.drop_answered(&request, response)
+            {
+                return;
+            }
+            // A move for later, or one queued behind another: its card says so (intent 0591,
+            // release 4, K2-30 and K2-31).
+            self.account_pending(machine, &request, &result);
             self.finish_account_action(machine, request, result);
             return;
         }
@@ -3788,6 +4096,9 @@ impl App {
             && let Some(home) = response.home.as_deref()
         {
             let (host, session) = home.split_once('/').unwrap_or((home, ""));
+            // A drop's `home` names the machine that holds what it drops, not where its record
+            // lives (r4-a's round 4): the drop goes there, once, and its card's home never moves.
+            let moves = request["action"] != "drop";
             let reference = self.reference_for(&id);
             let asked = self
                 .machines
@@ -3796,7 +4107,28 @@ impl App {
                 .unwrap_or_default();
             // A save of an item's text that can't go on: his version stays (intent 0414).
             let kept = self.edit_kept(&request);
+            // Sent on through a machine that forwards, when Kerdr can't reach that home itself,
+            // once (intent 0591, release 4).
+            let through = (!was_resent && request.get("forward_to").is_none())
+                .then(|| self.forwarder_for(Some(host)))
+                .flatten();
             match self.machine_index(host) {
+                None if through.is_some() => {
+                    let mut request = request;
+                    request["forward_to"] = json!(host);
+                    if request["action"] == "edit" {
+                        self.edit_resend(&mut request, Some(&key));
+                    }
+                    let via = through.unwrap_or(machine);
+                    self.resent.push((via, key.clone()));
+                    self.resend.push_back((via, request, from, Some(key)));
+                    return;
+                }
+                None if !moves => {
+                    let said = self.drop_unreached(&key, &reference, &request, host);
+                    self.say(said, Tone::Warn);
+                    return;
+                }
                 None => {
                     self.fail(
                         format!("{reference} lives on {host} now, which isn't one of this board's machines, so Kerdr can't change it there.{kept}"),
@@ -3804,8 +4136,14 @@ impl App {
                     return;
                 }
                 Some(to) if to == machine => {}
-                Some(_) if was_resent => {
-                    self.moved_home.retain(|(k, ..)| *k != key);
+                Some(named) if was_resent => {
+                    if moves {
+                        self.moved_home.retain(|(k, ..)| *k != key);
+                    }
+                    // Once more by itself, after both copies are read and agree (K1-53).
+                    if self.wait_for_agreement(machine, named, &id, &key, request, from) {
+                        return;
+                    }
                     self.fail(
                         format!("{reference}'s copies on {asked} and {host} disagree about where it lives; one is behind. Wait a minute for it to catch up, then try again.{kept}"),
                     );
@@ -3818,9 +4156,34 @@ impl App {
                         .and_then(|c| c.detail.as_ref())
                         .and_then(|d| d.home.as_ref())
                         .and_then(|h| h.machine.clone());
-                    self.moved_home.retain(|(k, ..)| *k != key);
-                    self.moved_home.push((key.clone(), to, old_home));
+                    if moves {
+                        self.moved_home.retain(|(k, ..)| *k != key);
+                        self.moved_home.push((key.clone(), to, old_home));
+                    }
                     let name = self.machines[to].name();
+                    // Its home isn't answering: sent through a machine that forwards, else held
+                    // for it, shown on its card (intent 0591, release 4, K1-54).
+                    if !self.machines[to].conn.is_live() && (through.is_some() || self.holds_on(to))
+                    {
+                        let mut request = request;
+                        if request["action"] == "edit" {
+                            self.edit_resend(&mut request, Some(&key));
+                        }
+                        if let Some(via) = through {
+                            request["forward_to"] = json!(name);
+                            self.resent.push((via, key.clone()));
+                            self.resend.push_back((via, request, from, Some(key)));
+                        } else {
+                            let rev = self.card_rev(&key);
+                            self.hold_request(name, request, Some(key), rev, None);
+                        }
+                        return;
+                    }
+                    if !self.machines[to].conn.is_live() && !moves {
+                        let said = self.drop_unreached(&key, &reference, &request, &name);
+                        self.say(said, Tone::Warn);
+                        return;
+                    }
                     if !self.machines[to].conn.is_live() {
                         self.fail(
                             format!("{reference} lives on {name} now, and {name} isn't answering; nothing changed. Try again once it's back.{kept}"),
@@ -3978,7 +4341,12 @@ impl App {
                 let mut message = response.message.clone();
                 // What a change that went as shown still says: only what you'd need to find it.
                 let mut note = None;
-                if request["action"] == "dispatch" && response.ok {
+                // Queued rather than started (`pending`): no workspace is coming yet.
+                let queued = response
+                    .pending
+                    .as_deref()
+                    .is_some_and(|w| !w.trim().is_empty());
+                if request["action"] == "dispatch" && response.ok && !queued {
                     self.started = request["id"]
                         .as_str()
                         .zip(held.clone())
@@ -4037,7 +4405,7 @@ impl App {
                 {
                     // The board may already show the workspace it just made: that's still the card.
                     match from
-                        .filter(|f| self.still_on(f, Some(&workspace)))
+                        .filter(|f| self.still_on(f, Some((&session, &workspace))))
                         .map(|f| f.key)
                     {
                         Some(from) => {
@@ -4109,19 +4477,18 @@ impl App {
                     // Part of it happened, and the backend's words say which: not a change that
                     // didn't happen, so no "didn't" (intent 0591). The feed is read at once.
                     let kept = self.kickoff_kept_note(&request, held.as_deref());
-                    let text = match request["id"].as_str() {
-                        Some(id) if !message.contains(&self.reference_for(id)) => {
-                            format!("{}: {message}{kept}", self.reference_for(id))
-                        }
-                        _ => format!("{message}{kept}"),
-                    };
+                    let text = format!("{}{kept}", self.partly_line(&request, &message));
                     self.say(short(text), Tone::Warn);
                 } else if !response.ok {
-                    // The card is back as it really is; say what didn't happen, and why.
+                    // The card is back as it really is; say what didn't happen, and why, naming
+                    // the card once: words that already name it are said alone.
                     let what = self.what_failed(&request);
+                    let reference = self.reference_of(&request);
                     let kept = self.kickoff_kept_note(&request, held.as_deref());
                     self.fail(short(match what {
-                        Some(what) => format!("{what}: {message}{kept}"),
+                        Some(what) => {
+                            format!("{}{kept}", what_and_why(&what, &reference, &message))
+                        }
                         None => format!("{message}{kept}"),
                     }));
                 } else if let Some(note) = note {
@@ -4139,10 +4506,12 @@ impl App {
                 } else {
                     self.what_failed(&request)
                 };
+                let reference = self.reference_of(&request);
                 match what {
-                    Some(what) if !error.starts_with(&what) => {
-                        self.fail(short(format!("{what}: {error}{kept}")))
-                    }
+                    Some(what) if !error.starts_with(&what) => self.fail(short(format!(
+                        "{}{kept}",
+                        what_and_why(&what, &reference, &error)
+                    ))),
                     _ => self.fail(short(format!("{error}{kept}"))),
                 }
             }
@@ -4410,8 +4779,22 @@ impl App {
                     Some("close") if target.is_some_and(|t| t.dismissed) => {
                         c.dismissed() && target.is_some_and(|t| t.same_work(c))
                     }
-                    // Still open with no workspace, the same work (intent 0289).
-                    Some("close") => c.closable() && target.is_some_and(|t| t.same_work(c)),
+                    // Still open with no workspace, the same work (intent 0289), or that once
+                    // it's written up (K1-23).
+                    Some("close") => {
+                        crate::app::behind::closable_once_written(c)
+                            && target.is_some_and(|t| t.same_work(c))
+                    }
+                    // Its stop once it opens: only while its start is still on its way, as when
+                    // it was asked (K1-41).
+                    Some("cancel") if crate::app::behind::is_cancel_once_open(request) => {
+                        !c.is_open_workspace()
+                            && target.is_some_and(|t| t.same_work(c))
+                            && self
+                                .resolver
+                                .starting(&c.key, id)
+                                .is_some_and(|job| !job.asking)
+                    }
                     // Still the same work, open where the yes was given (intent 0321); done work
                     // or work in Won't do only while it's still that (intent 0591).
                     Some("cancel") => {

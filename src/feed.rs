@@ -38,6 +38,11 @@ pub struct Feed {
     pub owners: Vec<crate::accounts::Owner>,
     #[serde(default)]
     pub owners_source: Option<String>,
+    /// Which shared account catalog this machine's backend writes (intent 0591, release 4): the
+    /// same on every machine whose backend saves to the same central copy. A catalog change for a
+    /// machine that can't take it goes through another with the same one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub catalog: Option<String>,
     #[serde(default)]
     pub machine_owner: Option<String>,
     #[serde(default)]
@@ -88,6 +93,15 @@ pub struct Feed {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     #[serde(deserialize_with = "read_failures")]
     pub read_failures: Vec<ReadFailure>,
+    /// What its backend holds that has no card yet (intent 0591, release 4): a new intent's save
+    /// finishing in the background, each naming its `submission`. Its card says so while it's
+    /// listed here.
+    #[serde(
+        default,
+        deserialize_with = "held_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub held: Vec<Held>,
 }
 
 /// One thing a feed couldn't read: `part` is "feed" (the whole feed failed), "herdr" (herdr on
@@ -368,6 +382,134 @@ pub struct FeedCard {
     /// which terminal, and since when (intent 0411).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outside_herdr: Option<OutsideHerdr>,
+    /// A short hash of what a decision about it rests on, from a backend that holds requests
+    /// (intent 0591, release 4): a request that waited before it went carries the one its card had
+    /// when the key was pressed, and the backend does nothing when it's changed since.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rev: Option<String>,
+    /// What its backend holds for it, to do when it can: shown on the card and listed in its
+    /// peek, where each can be dropped (intent 0591, release 4).
+    #[serde(
+        default,
+        deserialize_with = "held_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub held: Vec<Held>,
+}
+
+/// One request a backend holds for a card (intent 0591, release 4): its `op`, the action it is,
+/// what the card says meanwhile, when it was taken, and, for one that runs at a set time, when.
+/// Both times are epoch seconds, whole or with a fraction (epoch_seconds).
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct Held {
+    pub op: String,
+    #[serde(default)]
+    pub action: String,
+    pub pending: String,
+    #[serde(
+        default,
+        deserialize_with = "epoch_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub since: Option<i64>,
+    #[serde(
+        default,
+        deserialize_with = "epoch_seconds",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub until: Option<i64>,
+    /// The new intent a save held at the feed's top level is for, by its submission id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub submission: Option<String>,
+    /// With `submission`: the title its card shows meanwhile, from his words ("Your new intent"
+    /// when there's none), so a Kerdr opened after it was sent can show it too (r4-a's shape).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// A question it waits on, his to answer: its card shows it as asking him (r4-b's shape). One
+    /// Kerdr can't use is passed over, and the entry shows its `pending` as any other does.
+    #[serde(
+        default,
+        deserialize_with = "held_asks",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub asks: Option<HeldAsks>,
+}
+
+/// A question a request its backend holds waits on (intent 0591, release 4, r4-b's shape): a
+/// move for later that, when due, found a background job started since his yes, and won't end it
+/// without asking. His yes, or a choice, sends `request` with `confirm` (and `choice`); his no
+/// drops what's held.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
+pub struct HeldAsks {
+    pub message: String,
+    pub confirm: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yes: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub no: Option<String>,
+    #[serde(
+        default,
+        deserialize_with = "crate::actions::choices",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub choices: Vec<crate::actions::Choice>,
+    /// The account request his answer sends.
+    pub request: serde_json::Value,
+}
+
+/// `asks` as a backend gives it: only one with the whole question, its token, and an account
+/// request to answer it with; anything else reads as none.
+fn held_asks<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<HeldAsks>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    Ok(serde_json::from_value::<HeldAsks>(value).ok().filter(|a| {
+        !a.message.trim().is_empty()
+            && !a.confirm.trim().is_empty()
+            && a.request["action"]
+                .as_str()
+                .is_some_and(|action| action.starts_with("account-"))
+    }))
+}
+
+/// An epoch time in seconds: a whole number, or one with a fraction, cut to the second, since a
+/// backend may write either (the end-to-end check's P4). Anything else reads as none, so an entry
+/// is never lost over its time.
+fn epoch_seconds<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+    let value = Option::<serde_json::Value>::deserialize(d)?;
+    Ok(value.and_then(|v| {
+        v.as_i64().or_else(|| {
+            v.as_f64()
+                .filter(|f| f.is_finite() && (i64::MIN as f64..=i64::MAX as f64).contains(f))
+                .map(|f| f.floor() as i64)
+        })
+    }))
+}
+
+/// A `held` list, its entries Kerdr can't read left out: one with no `op` or no words for the
+/// card can't be shown or dropped. Anything that isn't a list reads as none.
+pub fn held_list<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Held>, D::Error> {
+    let value = serde_json::Value::deserialize(d)?;
+    let mut out: Vec<Held> = vec![];
+    for item in value.as_array().into_iter().flatten() {
+        let Ok(held) = serde_json::from_value::<Held>(item.clone()) else {
+            continue;
+        };
+        let pending: String = held
+            .pending
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        if held.op.trim().is_empty()
+            || pending.trim().is_empty()
+            || out.iter().any(|h| h.op == held.op)
+        {
+            continue;
+        }
+        out.push(Held {
+            pending: pending.trim().to_string(),
+            ..held
+        });
+    }
+    Ok(out)
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -440,6 +582,12 @@ pub struct FeedWorkspace {
     /// never on a tab work inside the card runs in. `tab` keeps meaning work confined to one tab.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub own_tab: Option<String>,
+    /// The conversations herdr shows running there, sorted (r4-a's point 13): only its tab's when
+    /// `tab` names one. A machine whose feed carries it takes `conversations` on a cancel that
+    /// names a workspace, and the cancel Kerdr asks about on this card names these, as the board
+    /// had them when X was pressed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conversations: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
@@ -588,6 +736,123 @@ mod tests {
             Some("no account was free")
         );
         assert_eq!(feed.cards[1].intake_why, None);
+    }
+
+    #[test]
+    fn a_card_says_what_its_backend_holds_for_it_and_its_rev() {
+        // Intent 0591, release 4: what Kerdr can't read is left out, never a failed feed.
+        let feed = parse(
+            r#"{"kerdr_feed":1,"supports":["op","hold","forward"],"cards":[
+                {"id":"41","title":"a","rev":"r-1a2b","held":[
+                  {"op":"k-0000000000000001","action":"dispatch","pending":"queued in pick4me: starts when a workspace there frees up","since":1794400000},
+                  {"op":"k-0000000000000002","action":"account-move","pending":"moves to\nARK_C at 02:00","since":1794400000,"until":1794430000},
+                  {"op":"","action":"x","pending":"no op"},
+                  {"op":"k-0000000000000003","action":"x"},
+                  {"op":"k-0000000000000001","action":"dispatch","pending":"twice"},
+                  "nonsense", 7]},
+                {"id":"42","title":"b","held":"oops"},
+                {"id":"43","title":"c"}],
+              "agents":[{"pane":"w1:p1","session":"web","conversation":"c1","account":"KBZ_C",
+                 "held":[{"op":"k-0000000000000004","action":"account-move","pending":"moves to ARK_C at 02:00","until":1794430000}]}]}"#,
+        )
+        .unwrap();
+        assert!(feed.supports("hold") && feed.supports("forward"));
+        let card = &feed.cards[0];
+        assert_eq!(card.rev.as_deref(), Some("r-1a2b"));
+        assert_eq!(card.held.len(), 2, "{:?}", card.held);
+        assert_eq!(card.held[0].action, "dispatch");
+        assert_eq!(card.held[1].pending, "moves to ARK_C at 02:00");
+        assert_eq!(card.held[1].until, Some(1794430000));
+        assert!(feed.cards[1].held.is_empty() && feed.cards[2].held.is_empty());
+        assert_eq!(feed.cards[2].rev, None);
+        assert_eq!(feed.agents[0].held[0].op, "k-0000000000000004");
+        // An older feed says none of it.
+        let old = parse(r#"{"kerdr_feed":1,"cards":[{"id":"1","title":"a"}]}"#).unwrap();
+        assert!(!old.supports("hold") && old.cards[0].held.is_empty());
+        assert!(old.held.is_empty());
+    }
+
+    #[test]
+    fn a_held_request_that_asks_carries_its_question_and_one_kerdr_cant_use_reads_as_none() {
+        // r4-b's shape: the question, its token, and the account request that answers it.
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[],
+              "agents":[{"pane":"w1:p1","session":"web","conversation":"c1","account":"KBZ_C",
+                 "held":[
+                  {"op":"k-0000000000000001","action":"account-move","pending":"waits for your answer",
+                   "asks":{"message":"Move it now?","confirm":"t-1","yes":"move it now",
+                           "choices":[{"id":"after-job","key":"j","label":"move it when the job ends"},"oops"],
+                           "request":{"action":"account-move","pane":"w1:p1","to":"ARK_C"}}},
+                  {"op":"k-0000000000000002","action":"account-move","pending":"no request",
+                   "asks":{"message":"Move it now?","confirm":"t-2"}},
+                  {"op":"k-0000000000000003","action":"account-move","pending":"not an account one",
+                   "asks":{"message":"Move it now?","confirm":"t-3","request":{"action":"cancel"}}},
+                  {"op":"k-0000000000000004","action":"account-move","pending":"no token",
+                   "asks":{"message":"Move it now?","request":{"action":"account-move"}}},
+                  {"op":"k-0000000000000005","action":"account-move","pending":"not a question",
+                   "asks":"oops"}]}]}"#,
+        )
+        .unwrap();
+        let held = &feed.agents[0].held;
+        assert_eq!(
+            held.len(),
+            5,
+            "an entry whose question can't be used still shows"
+        );
+        let asks = held[0].asks.as_ref().expect("its question");
+        assert_eq!(
+            (asks.message.as_str(), asks.confirm.as_str()),
+            ("Move it now?", "t-1")
+        );
+        assert_eq!(asks.yes.as_deref(), Some("move it now"));
+        assert_eq!(asks.no, None);
+        assert_eq!(asks.choices.len(), 1);
+        assert_eq!(asks.request["to"], "ARK_C");
+        assert!(held[1..].iter().all(|h| h.asks.is_none()), "{held:?}");
+    }
+
+    #[test]
+    fn a_held_entry_whose_times_have_a_fraction_is_read_never_dropped() {
+        // The end-to-end check's P4: the accounts backend wrote `since` and `until` with a
+        // fraction, and Kerdr dropped every such entry, its question too. Cut to the second; a
+        // time it can't read at all is none, and the entry stays.
+        let feed = parse(
+            r#"{"kerdr_feed":1,"cards":[],
+              "agents":[{"pane":"w1:p1","session":"web","conversation":"c1","account":"KBZ_C",
+                 "held":[
+                  {"op":"k-5234ac48661e6ebb","action":"account-move","pending":"moves to ZZB_C at 05:53","since":1794657061.9556377,"until":1794657211.0},
+                  {"op":"k-c1abb6e1ac6cb5c8","action":"account-move","pending":"moves to ZZN_C once the move under way finishes","since":1794657243.6067748},
+                  {"op":"k-9ec7fba147ea3f72","action":"account-move","pending":"moves to ZZB_C once you answer","since":1794657300.5,
+                   "asks":{"message":"Move it now?","confirm":"t-1","request":{"action":"account-move","pane":"w1:p1","to":"ZZB_C"}}},
+                  {"op":"k-0000000000000004","action":"account-move","pending":"a time it can't read","since":"soon","until":[1]}]}]}"#,
+        )
+        .unwrap();
+        let held = &feed.agents[0].held;
+        assert_eq!(held.len(), 4, "{held:?}");
+        assert_eq!(
+            (held[0].since, held[0].until),
+            (Some(1794657061), Some(1794657211))
+        );
+        assert_eq!((held[1].since, held[1].until), (Some(1794657243), None));
+        assert_eq!(held[2].since, Some(1794657300));
+        assert!(held[2].asks.is_some(), "its question is kept");
+        assert_eq!((held[3].since, held[3].until), (None, None));
+    }
+
+    #[test]
+    fn a_feed_lists_the_saves_it_finishes_in_the_background_at_its_top() {
+        let feed = parse(
+            r#"{"kerdr_feed":1,"supports":["op","hold"],"cards":[],"held":[
+                {"op":"k-0000000000000005","action":"create","pending":"saving: its number comes once the central copy answers","since":1794400000,"submission":"s-1"},
+                {"op":"k-0000000000000006","action":"create"}, "nonsense"]}"#,
+        )
+        .unwrap();
+        assert_eq!(feed.held.len(), 1, "{:?}", feed.held);
+        assert_eq!(feed.held[0].submission.as_deref(), Some("s-1"));
+        assert_eq!(feed.held[0].action, "create");
+        // Anything else there is passed over, never a failed feed.
+        let odd = parse(r#"{"kerdr_feed":1,"cards":[],"held":{"op":"x"}}"#).unwrap();
+        assert!(odd.held.is_empty());
     }
 
     #[test]

@@ -15,6 +15,7 @@ pub mod herdr_keys;
 pub mod hold;
 pub mod images;
 pub mod jump;
+pub mod kept;
 pub mod model;
 pub mod owners;
 pub mod palette;

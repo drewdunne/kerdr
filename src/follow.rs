@@ -179,7 +179,8 @@ impl App {
             next: Instant::now() + POLL_FIRST,
             asking: false,
             misses: 0,
-            away: self.away,
+            // Sent again after an earlier follow ended (follow_again): as that one began.
+            away: job.again.as_ref().map_or(self.away, |a| a.away),
             entered: job.entered,
             follow,
         };
@@ -338,8 +339,17 @@ impl App {
     /// Followed work has finished, or needs a yes, or couldn't: its answer is taken as the answer to
     /// the request it followed would have been, had that waited.
     fn follow_ended(&mut self, i: usize, mut response: Response, done: bool) {
-        let f = self.follows.remove(i);
         let done = done && response.ok;
+        if !done && self.follow_again(i, &response) {
+            return;
+        }
+        let f = self.follows.remove(i);
+        // Sent again after a part-done end: what stood then is said again if this didn't happen.
+        let stood = self
+            .resolver
+            .what_stood(f.job)
+            .filter(|_| !done && !response.confirmation && response.questions.is_empty());
+        let since = Instant::now();
         if self.resolver.end_follow(f.job, done) {
             self.rebuild();
         }
@@ -377,12 +387,65 @@ impl App {
         self.answer_job = Some(f.job);
         self.answer_key = f.key.clone();
         self.finish_action(f.machine, f.request.clone(), Ok(response));
+        if let Some(stood) = stood {
+            self.say_what_stood(&stood, since);
+        }
         self.answer_job = None;
         self.answer_key = None;
         self.answer_by_enter = false;
         self.follow_end = None;
         self.action_from = None;
         self.answer_went_in = false;
+    }
+
+    /// Followed work that ended refused for something passing (its answer's `retry`: a start whose
+    /// launch lock a first run held past its wait, say) is sent again by itself, once, with the
+    /// same op, after that wait, as a refusal answered at once is (intent 0591): only to a backend
+    /// that keeps ops, and only when the wait leaves room for its answer within RETRY_MOST. Its card
+    /// says it's trying again meanwhile, nothing is said in red, and its next answer is taken as
+    /// its answer, a follow's end too; a second `retry` is said as it is. A part-done end (only
+    /// its session's start stood, say) goes again too: what stood is said now, in yellow, as any
+    /// part-done answer is, and again with the next answer if that doesn't happen either, so it's
+    /// never lost. Whether it's sent again.
+    fn follow_again(&mut self, i: usize, response: &Response) -> bool {
+        let Some(f) = self.follows.get(i) else {
+            return false;
+        };
+        let Some(retry) = response
+            .retry
+            .filter(|_| !response.ok && !response.confirmation)
+        else {
+            return false;
+        };
+        // As long as it asked, never less; at least a second.
+        let wait = Duration::from_secs(retry.max(1));
+        let fits = wait <= crate::actions::RETRY_MOST.saturating_sub(crate::actions::RESEND_ROOM);
+        if !fits || f.request.get("op").is_none() || !self.resends_to(f.machine) {
+            return false;
+        }
+        let (n, from, entered, away) = (f.job, f.from.clone(), f.entered, f.away);
+        let stood = response
+            .partial
+            .then(|| super::controls::short(self.partly_line(&f.request, &response.message)));
+        // Its two minutes count from now, however long it then waits for its turn.
+        let after = crate::actions::After {
+            wait,
+            last: response.clone(),
+            since: crate::actions::Clocks::now(),
+        };
+        if !self
+            .resolver
+            .send_again_after(n, after, from, entered, away, stood.clone())
+        {
+            return false;
+        }
+        let f = self.follows.remove(i);
+        self.unsay(&f.say);
+        self.rebuild();
+        if let Some(stood) = stood {
+            self.say(stood, Tone::Warn);
+        }
+        true
     }
 
     /// Past its limit and the margin with no end heard: Kerdr stops following, and says the step is
@@ -696,6 +759,197 @@ mod tests {
             .flat_map(|f| f.cards.iter())
             .find(|c| c.id == id)
             .and_then(|c| c.status.clone())
+    }
+
+    /// A read of build-box between ⏎ on #39 and its answer: herdr shows the workspace `ws` the
+    /// answer will name, and the feed card has it too, so it names no conversation to resume any
+    /// more (it gives one only while there's no workspace), or names `resume` instead.
+    fn read_shows_it_open(app: &mut App, ws: &str, resume: Option<&str>) {
+        read_shows_it_in(app, "api", ws, resume);
+    }
+
+    /// The same read, with the workspace in herdr session `session`, and in that one only.
+    fn read_shows_it_in(app: &mut App, session: &str, ws: &str, resume: Option<&str>) {
+        let mi = app.machine_index("build-box").unwrap();
+        let label = "39-flaky-login-test";
+        let data = app.machines[mi].data.as_mut().unwrap();
+        for snap in data.snapshots.values_mut().flatten() {
+            snap.workspaces.retain(|w| w.label != label);
+        }
+        let snap = data.snapshots.get_mut(session).unwrap().as_mut().unwrap();
+        snap.workspaces.push(crate::herdr::Workspace {
+            workspace_id: ws.into(),
+            label: label.into(),
+            ..Default::default()
+        });
+        let fc = app.machines[mi]
+            .feed
+            .as_mut()
+            .unwrap()
+            .cards
+            .iter_mut()
+            .find(|c| c.id == "39")
+            .unwrap();
+        fc.workspace = Some(crate::feed::FeedWorkspace {
+            session: Some(session.into()),
+            id: Some(ws.into()),
+            label: Some(label.into()),
+            ..Default::default()
+        });
+        fc.resume = resume.map(|conversation| crate::feed::Resume {
+            agent: Some("codex".into()),
+            conversation: Some(conversation.into()),
+        });
+        app.rebuild();
+        let card = app.card("demo:39").unwrap();
+        assert_eq!(
+            (card.session.as_deref(), card.workspace_id.as_deref()),
+            (Some(session), Some(ws))
+        );
+        assert_eq!(
+            card.detail.as_ref().unwrap().resume.is_some(),
+            resume.is_some()
+        );
+    }
+
+    fn reopened(id: &str, ws: &str) -> Value {
+        json!({"ok": true, "message": "Reopened #39 in api, resuming its Codex conversation.",
+               "id": id, "session": "api", "workspace": ws, "label": "39-flaky-login-test"})
+    }
+
+    #[test]
+    fn a_read_between_enter_and_its_answer_that_shows_the_workspace_still_goes_in() {
+        // The end-to-end check's F1: the feed was read while the reopen ran, so by its answer the
+        // card showed the workspace the answer names and its feed no longer named a conversation
+        // to resume. That's what the reopen itself did: still the same work, so Kerdr goes in.
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        assert_eq!(request["action"], "reopen");
+        read_shows_it_open(&mut app, "w7", None);
+        answer(&mut app, machine, &request, reopened(&id, "w7"));
+        let open = app
+            .open_after
+            .clone()
+            .unwrap_or_else(|| panic!("it didn't go in: {:?}", app.message()));
+        assert_eq!(
+            (open.workspace.as_str(), open.from.as_str()),
+            ("w7", key.as_str())
+        );
+        // Followed, the read coming before even the answer that it's being followed: in once it's
+        // done.
+        let mut app = demo_app();
+        let (key, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        read_shows_it_open(&mut app, "w7", None);
+        answer(
+            &mut app,
+            machine,
+            &request,
+            follow_reply(
+                &id,
+                "recover",
+                "Bringing api back on its machine, then the work…",
+            ),
+        );
+        poll(&mut app);
+        assert!(progress(&mut app, {
+            let mut done = reopened(&id, "w7");
+            done["state"] = json!("done");
+            done
+        }));
+        let open = app
+            .open_after
+            .clone()
+            .unwrap_or_else(|| panic!("it didn't go in when done: {:?}", app.message()));
+        assert_eq!(
+            (open.workspace.as_str(), open.from.as_str()),
+            ("w7", key.as_str())
+        );
+        // A workspace other than the one the answer names, or another conversation to resume,
+        // isn't what the reopen did: it says where it is instead of taking him in.
+        for (ws, resume) in [
+            ("w8", None),
+            ("w7", Some("9d1e2f3a-0b4c-4d5e-8f6a-7b8c9d0e1f2a")),
+        ] {
+            let mut app = demo_app();
+            let (_, id) = closed_card(&mut app);
+            let enter = key_enter(&mut app);
+            let (machine, request) = sent(&mut app, enter);
+            read_shows_it_open(&mut app, ws, resume);
+            answer(&mut app, machine, &request, reopened(&id, "w7"));
+            assert_eq!(app.open_after, None, "{ws} {resume:?}");
+            assert!(
+                app.message().unwrap().0.ends_with("⏎ on its card goes in."),
+                "{:?}",
+                app.message()
+            );
+        }
+    }
+
+    #[test]
+    fn an_answer_naming_the_same_workspace_id_in_another_session_isnt_gone_into() {
+        // Codex's review 75, 1: the card shows api's w7, and the reopen's answer names web's w7.
+        // Those are different workspaces, so the card isn't what the reopen made: no go-in.
+        let mut app = demo_app();
+        let (_, id) = closed_card(&mut app);
+        let enter = key_enter(&mut app);
+        let (machine, request) = sent(&mut app, enter);
+        read_shows_it_open(&mut app, "w7", None);
+        let mut elsewhere = reopened(&id, "w7");
+        elsewhere["session"] = json!("web");
+        answer(&mut app, machine, &request, elsewhere);
+        assert_eq!(app.open_after, None);
+        assert!(
+            app.message().unwrap().0.ends_with("⏎ on its card goes in."),
+            "{:?}",
+            app.message()
+        );
+        // Codex's review 76: a card that already showed api's w7 when the reopen went out (the
+        // board hadn't caught up with herdr saying it closed), and that a read shows in another
+        // session's w7 by the answer, with the same home and no conversation named either time.
+        // That's another workspace, so the answer naming api's w7 doesn't take him in. A read
+        // still showing api's w7 does.
+        for (now_in, goes_in) in [("api", true), ("background", false)] {
+            let mut app = demo_app();
+            let (key, id) = closed_card(&mut app);
+            read_shows_it_open(&mut app, "w7", None);
+            assert!(app.closed_under_you(&key, Some("w7")));
+            let reopen = app.next_owed();
+            let from = app
+                .action_from
+                .as_ref()
+                .expect("the reopen's card, as it was");
+            assert_eq!(
+                (
+                    from.workspace.as_deref(),
+                    from.resume_conversation.as_deref()
+                ),
+                (Some("w7"), None)
+            );
+            let (machine, request) = sent(&mut app, reopen);
+            assert_eq!(request["action"], "reopen");
+            read_shows_it_in(&mut app, now_in, "w7", None);
+            answer(&mut app, machine, &request, reopened(&id, "w7"));
+            match app.open_after.take() {
+                Some(open) if goes_in => assert_eq!(
+                    (
+                        open.session.as_str(),
+                        open.workspace.as_str(),
+                        open.from.as_str()
+                    ),
+                    ("api", "w7", key.as_str())
+                ),
+                None if !goes_in => assert!(
+                    app.message().unwrap().0.ends_with("⏎ on its card goes in."),
+                    "{:?}",
+                    app.message()
+                ),
+                open => panic!("now in {now_in}: {open:?}, {:?}", app.message()),
+            }
+        }
     }
 
     #[test]
@@ -1493,6 +1747,235 @@ mod tests {
                     "Started in web. ⏎ on its card goes in."
                 );
             }
+        }
+    }
+
+    /// The final answer of a followed start whose Claude launch a first run's write held past
+    /// ark-dispatch's wait (piece A's round 6, its outcome `launch_busy`).
+    fn launch_busy(id: &str, retry: u64) -> Value {
+        json!({"ok": false, "state": "failed", "id": id, "retry": retry,
+               "message": format!("#{id} didn't start yet (another start is setting up Claude's first run); ⏎ again in a moment. What was opened for it is closed again; nothing changed.")})
+    }
+
+    /// The board on a waiting card, selected, its backend keeping ops (`supports` "op") when
+    /// `ops`: its key and record.
+    fn on_waiting_card(ops: bool) -> (App, String, String) {
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        if ops {
+            for feed in app.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+                feed.supports.push("op".into());
+            }
+        }
+        let (key, id) = {
+            let c = app
+                .board
+                .cards
+                .iter()
+                .find(|c| crate::app::waiting_work(c))
+                .unwrap();
+            (c.key.clone(), c.detail.as_ref().unwrap().id.clone())
+        };
+        for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+            c.detail.as_mut().unwrap().kickoff = None;
+        }
+        let i = app.board.cards.iter().position(|c| c.key == key).unwrap();
+        app.sel = Selection {
+            col: app.board.cards[i].stage.index(),
+            key: Some(key.clone()),
+        };
+        (app, key, id)
+    }
+
+    /// d or ⏎ on the selected waiting card, answered with a follow, which ends `last`: the change,
+    /// its request as sent the first time, and as the key made it.
+    fn followed_start_ends(
+        app: &mut App,
+        id: &str,
+        by_enter: bool,
+        last: Value,
+    ) -> (u64, Value, usize, Value) {
+        let action = if by_enter {
+            key_enter(app)
+        } else {
+            press(app, 'd')
+        };
+        let Action::Mutate { machine, request } = action else {
+            panic!("nothing was sent: {:?}", app.message())
+        };
+        app.queue_action(machine, request.clone());
+        let ready = app.resolver.ready();
+        assert_eq!(ready.len(), 1);
+        let (n, _, first, _) = ready.into_iter().next().unwrap();
+        answer(
+            app,
+            machine,
+            &request,
+            follow_reply(id, "start", "Starting web, then the work…"),
+        );
+        poll(app);
+        progress(app, last);
+        (n, first, machine, request)
+    }
+
+    #[test]
+    fn a_followed_start_refused_for_a_moment_goes_again_by_itself_once_with_the_same_op() {
+        // Piece A's round 6: a start Kerdr follows can end `failed` with `retry` 10, its Claude
+        // launch held a moment by a first run. As a refusal answered at once is, it's sent again
+        // by itself after that wait, with the same op, once: its card says it's trying again and
+        // nothing is said as failed. Its next end is taken as its answer; a second such end is
+        // said as it is.
+        for by_enter in [false, true] {
+            for second_busy in [false, true] {
+                let (mut app, key, id) = on_waiting_card(true);
+                let (n, first, machine, request) =
+                    followed_start_ends(&mut app, &id, by_enter, launch_busy(&id, 10));
+                let op = first["op"].as_str().expect("a start has an op").to_string();
+                let again = app.resolver.ready();
+                assert_eq!(again.len(), 1, "sent again by itself: {:?}", app.message());
+                assert_eq!(again[0].0, n, "the same change, in its place");
+                assert_eq!(again[0].2["op"].as_str(), Some(op.as_str()), "the same op");
+                assert_eq!(again[0].2["action"], first["action"]);
+                let after = app
+                    .resolver
+                    .take_again(n)
+                    .expect("its runner waits what the refusal asked first");
+                assert_eq!(after.wait, Duration::from_secs(10));
+                assert!(after.last.message.contains("didn't start yet"), "{after:?}");
+                // Its two minutes count from that end, not from when its runner begins.
+                assert!(after.since.steady.elapsed() < Duration::from_secs(5));
+                assert!(app.follows.is_empty());
+                assert_eq!(
+                    status_shown(&app, &key).as_deref(),
+                    Some(crate::resolve::RETRYING),
+                    "its card says it's trying again"
+                );
+                assert!(
+                    !app.failing()
+                        && !app
+                            .message()
+                            .is_some_and(|m| m.0.contains("didn't start yet")),
+                    "{:?}",
+                    app.message()
+                );
+                // The resend is answered with a follow of its own.
+                answer(
+                    &mut app,
+                    machine,
+                    &request,
+                    follow_reply(&id, "start", "Starting web, then the work…"),
+                );
+                assert_eq!(app.follows.len(), 1);
+                poll(&mut app);
+                if second_busy {
+                    progress(&mut app, launch_busy(&id, 10));
+                    assert!(app.resolver.ready().is_empty(), "sent again once only");
+                    assert!(
+                        app.message()
+                            .is_some_and(|m| m.0.contains("didn't start yet")),
+                        "{:?}",
+                        app.message()
+                    );
+                    assert!(app.follows.is_empty());
+                } else {
+                    progress(
+                        &mut app,
+                        json!({"ok": true, "state": "done", "message": "Started in web.",
+                               "session": "web", "workspace": "w9", "label": "9-new"}),
+                    );
+                    if by_enter {
+                        assert!(app.open_after.is_some(), "⏎ goes in");
+                    } else {
+                        assert_eq!(
+                            app.message().unwrap().0,
+                            "Started in web. ⏎ on its card goes in."
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_followed_start_whose_session_started_then_refused_for_a_moment_keeps_saying_so() {
+        // Piece A: a followed start whose only step that stood is its session's start ends
+        // `ok: false, partial: true` with `retry`. It goes again by itself, once, with the same op
+        // and the card's rev; what stood is said while it waits, and again with a resend that
+        // doesn't start it either, whether that resend answers at once or after a follow.
+        for followed in [false, true] {
+            let (mut app, key, id) = on_waiting_card(true);
+            for feed in app.machines.iter_mut().filter_map(|m| m.feed.as_mut()) {
+                feed.supports.push("hold".into());
+            }
+            for c in app.board.cards.iter_mut().filter(|c| c.key == key) {
+                c.detail.as_mut().unwrap().rev = Some("r-1a2b".into());
+            }
+            let reference = app.reference_for(&id);
+            let stood = format!(
+                "Started herdr session web, but then: {reference} didn't start yet (Claude Code's first-run answers here were still being written); ⏎ again in a moment. What was opened for it is closed again."
+            );
+            let partial = json!({"ok": false, "partial": true, "state": "failed", "id": id,
+                                 "session": "web", "retry": 10, "message": stood});
+            let (n, first, machine, request) = followed_start_ends(&mut app, &id, false, partial);
+            let again = app.resolver.ready();
+            assert_eq!(again.len(), 1, "sent again by itself: {:?}", app.message());
+            assert_eq!(again[0].0, n);
+            assert_eq!(again[0].2["op"], first["op"], "the same op");
+            assert_eq!(
+                app.resolver.rev_of(n).as_deref(),
+                Some("r-1a2b"),
+                "its resend carries the card's rev"
+            );
+            let after = app.resolver.take_again(n).unwrap();
+            assert_eq!(after.wait, Duration::from_secs(10));
+            assert_eq!(
+                status_shown(&app, &key).as_deref(),
+                Some(crate::resolve::RETRYING)
+            );
+            // While it waits: what stood is said, in yellow, not lost.
+            assert_eq!(app.message(), Some((stood.as_str(), Tone::Warn)));
+            // The resend doesn't start it either: the session is up now, so only the refusal.
+            let busy = launch_busy(&id, 10);
+            if followed {
+                answer(
+                    &mut app,
+                    machine,
+                    &request,
+                    follow_reply(&id, "start", "Starting web, then the work…"),
+                );
+                poll(&mut app);
+                progress(&mut app, busy.clone());
+            } else {
+                let mut direct = busy.clone();
+                direct.as_object_mut().unwrap().remove("state");
+                answer(&mut app, machine, &request, direct);
+            }
+            assert!(app.resolver.ready().is_empty(), "once only");
+            let (said, tone) = app.message().unwrap();
+            assert_eq!(tone, Tone::Fail);
+            let refusal = busy["message"].as_str().unwrap();
+            assert_eq!(
+                said,
+                format!("{stood}\n{refusal}"),
+                "what stood, then why it still didn't start"
+            );
+        }
+    }
+
+    #[test]
+    fn a_followed_end_with_retry_isnt_sent_again_without_ops_or_past_two_minutes() {
+        // A backend that doesn't keep ops could start it twice; a wait that leaves no room for an
+        // answer within two minutes isn't waited. Either way, the refusal is said as it is.
+        for (ops, retry) in [(false, 10), (true, 115)] {
+            let (mut app, _, id) = on_waiting_card(ops);
+            followed_start_ends(&mut app, &id, false, launch_busy(&id, retry));
+            assert!(app.resolver.ready().is_empty(), "ops {ops}, retry {retry}");
+            assert!(
+                app.message()
+                    .is_some_and(|m| m.0.contains("didn't start yet")),
+                "{:?}",
+                app.message()
+            );
         }
     }
 

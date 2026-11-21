@@ -133,6 +133,35 @@ pub struct Response {
     /// to check (intent 0591, B1-108). The rest were saved.
     #[serde(default, deserialize_with = "prefill")]
     pub prefill: Vec<Prefill>,
+    /// With `ok`: the backend took the request and holds it, to do when it can, and these words
+    /// say what it waits for, for the card until the feed says otherwise ("moves to ARK_C at
+    /// 02:00") (intent 0591, release 4).
+    #[serde(default, deserialize_with = "plain_line")]
+    pub pending: Option<String>,
+    /// The machine that sent the request on to its home, when Kerdr asked it to (`forward_to`).
+    #[serde(default, deserialize_with = "plain_line")]
+    pub via: Option<String>,
+    /// The home a forwarded request couldn't reach by any route allowed: nothing was done, and Kerdr
+    /// holds it until that machine answers.
+    #[serde(default, deserialize_with = "plain_line")]
+    pub unreachable: Option<String>,
+    /// On a `drop`: false when the held request had already run, or was running.
+    #[serde(default)]
+    pub dropped: Option<bool>,
+}
+
+/// A line of words for the board: control characters out, trimmed; nothing left (or not a
+/// string) reads as none.
+fn plain_line<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<String>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value.as_str().and_then(|s| {
+        let line: String = s
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let line = line.trim();
+        (!line.is_empty()).then(|| line.to_string())
+    }))
 }
 
 /// One Kickoff answer that couldn't be saved, because its question changed while he answered: the
@@ -260,7 +289,7 @@ impl Choice {
 /// `choices` as a backend gives them: each usable one, in its order, at most MOST_CHOICES, and no
 /// id twice; anything else (not a list, an entry of another shape) is passed over, never a failed
 /// answer, so a question still asks yes or no.
-fn choices<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Choice>, D::Error> {
+pub(crate) fn choices<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Choice>, D::Error> {
     let value = Value::deserialize(d)?;
     let mut out: Vec<Choice> = vec![];
     for item in value.as_array().into_iter().flatten() {
@@ -416,6 +445,52 @@ pub const UNKNOWN: &str = "Kerdr can't tell whether it happened";
 /// How every error ends that Kerdr gives for a request it never sent: known not to have happened.
 pub const NOT_SENT: &str = "so nothing was sent";
 
+/// What an error says when ssh never reached the request's machine, so nothing was sent: that
+/// machine is away, though the board may not have seen it yet (the end-to-end check's P1).
+pub const UNREACHED: &str = "couldn't be reached";
+
+/// How a request's machine wasn't reached, so its command never started there and nothing was
+/// sent: known from the whole of what ssh returned, and kept apart from the words shown (Codex's
+/// review 74, 1). A change to a card is then held for its machine, or sent through one that
+/// forwards, as one pressed while it's away is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Unreached {
+    /// ssh couldn't connect to it, or find it: it's away.
+    Away,
+    /// ssh refused its host key, or it refused the sign-in: never gone around through another
+    /// machine, so a change for it is held when its backend holds, and refused otherwise.
+    Refused,
+}
+
+/// For tests elsewhere: what a command's output over ssh answers, and how it says its machine
+/// wasn't reached, as the runner would hand them to the board.
+#[cfg(test)]
+pub(crate) fn over_ssh_answer(
+    output: &transport::Output,
+    request: &Value,
+    machine: &str,
+) -> (Result<Response, String>, Option<Unreached>) {
+    let result = answer_of(output, request, deadline_for(request), machine, true);
+    let unreached = unreached_of(output, &result, true);
+    (result, unreached)
+}
+
+/// Whether, and how, a command's output says its request never reached its machine: over ssh,
+/// no answer, and ssh's own exit with its start mark missing and its words saying so.
+fn unreached_of(
+    output: &transport::Output,
+    result: &Result<Response, String>,
+    ssh: bool,
+) -> Option<Unreached> {
+    (ssh && result.is_err() && never_reached(output)).then(|| {
+        if transport::trust_refused(&output.stderr) {
+            Unreached::Refused
+        } else {
+            Unreached::Away
+        }
+    })
+}
+
 /// What a request says when Kerdr has no action backend to send it to.
 pub const NO_BACKEND: &str =
     "Kerdr has no action backend set ([actions] command in its config), so nothing was sent";
@@ -431,7 +506,12 @@ pub fn result_unknown(error: &str) -> bool {
 #[derive(Clone, Debug, PartialEq)]
 pub enum Resend {
     /// Refused for something passing: sent again after `wait`, the backend's words meanwhile.
-    Retry { wait: Duration, message: String },
+    /// `partial`: part of it stood, and those words say what, so they're kept (intent 0591).
+    Retry {
+        wait: Duration,
+        message: String,
+        partial: bool,
+    },
     /// Its answer was lost: sent again after `wait`, the `attempt`th time.
     Lost {
         wait: Duration,
@@ -620,10 +700,31 @@ pub fn run_resending(
     tell: &mut dyn FnMut(&Resend),
     pause: &dyn Fn(Duration),
 ) -> Answered {
+    run_resending_rev(
+        machine, command, request, None, handed, resends, tell, pause,
+    )
+}
+
+/// As run_resending, every resend carrying `rev`, the card's as it was when the key was pressed,
+/// for a backend that holds requests to check it against the card as it is now (intent 0591,
+/// release 4): the request waited before it went. The first send goes as it was asked.
+#[allow(clippy::too_many_arguments)]
+pub fn run_resending_rev(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    rev: Option<&str>,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+) -> Answered {
+    let again = with_rev(request, rev);
     run_resending_within(
         machine,
         command,
         request,
+        again.as_ref(),
         handed,
         resends,
         tell,
@@ -633,13 +734,137 @@ pub fn run_resending(
     )
 }
 
+/// A change whose followed work ended refused with `retry`, to be sent again once (intent 0591):
+/// the wait that `retry` asked for, the answer that stands if it can't go, and when Kerdr had that
+/// answer, from which the wait and the two minutes count, however long it then waited for its
+/// runner's turn, the computer asleep or not (Codex's review 75, 3).
+#[derive(Clone, Debug)]
+pub struct After {
+    pub wait: Duration,
+    pub last: Response,
+    pub since: Clocks,
+}
+
+/// As run_resending_rev, for a change whose followed work ended refused with `retry` (`after`,
+/// intent 0591). Nothing goes until what's left of its wait is over; then the request is sent
+/// once more, with its op and the card's `rev`, as a resend is. A `retry` answer to that is said as
+/// it is, never sent again (Codex's review 75, 2); an answer lost on the way is asked for again
+/// with the same op, as every send's is, within RETRY_MOST of `after`'s answer. When what's left of
+/// those two minutes, before the wait or after it, leaves less than RESEND_ROOM, nothing is sent
+/// and that answer stands. Without `after`, run_resending_rev.
+#[allow(clippy::too_many_arguments)]
+pub fn run_resending_after(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    rev: Option<&str>,
+    after: Option<After>,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+) -> Answered {
+    let Some(after) = after else {
+        return run_resending_rev(machine, command, request, rev, handed, resends, tell, pause);
+    };
+    resend_after(
+        machine,
+        command,
+        request,
+        rev,
+        after,
+        handed,
+        resends,
+        tell,
+        pause,
+        &Clocks::now,
+    )
+}
+
+/// As run_resending_after with `after`, `clock` telling the time (a test's own, which `pause`
+/// moves on).
+#[allow(clippy::too_many_arguments)]
+fn resend_after(
+    machine: &Machine,
+    command: &str,
+    request: &Value,
+    rev: Option<&str>,
+    After { wait, last, since }: After,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+    clock: &dyn Fn() -> Clocks,
+) -> Answered {
+    let stands = |last: Response| Answered {
+        result: Ok(last),
+        stderr: String::new(),
+        unreached: None,
+    };
+    if !resends || request.get("op").is_none() {
+        return stands(last);
+    }
+    // What's left of its wait and of its two minutes, both counted from that answer: a turn that
+    // came late, or a computer asleep before it came, has used them (Codex's review 75, 3).
+    let now = clock();
+    let left = Clocks::left_of_retrying(since, now);
+    let rest = wait.saturating_sub(now.steady.saturating_duration_since(since.steady));
+    if rest > left || left - rest < RESEND_ROOM {
+        return stands(last);
+    }
+    tell(&Resend::Retry {
+        wait: rest,
+        message: last.message.clone(),
+        partial: last.partial,
+    });
+    if !rest.is_zero() {
+        pause(rest);
+    }
+    let left = Clocks::left_of_retrying(since, clock());
+    if left < RESEND_ROOM {
+        return stands(last);
+    }
+    let again = with_rev(request, rev).unwrap_or_else(|| request.clone());
+    resending_from(
+        Some(since),
+        false,
+        &again,
+        handed,
+        resends,
+        tell,
+        pause,
+        clock,
+        deadline_for(request).min(left),
+        &mut |handed, deadline| {
+            let ran = run_with_deadline(machine, command, &again, deadline, handed);
+            let lost = ran.lost;
+            Sent {
+                answered: keep_stderr(ran, &again),
+                lost,
+            }
+        },
+    )
+}
+
+/// The request as it's sent again: with `rev`, when there is one and it carries none yet.
+pub fn with_rev(request: &Value, rev: Option<&str>) -> Option<Value> {
+    let rev = rev.filter(|r| !r.is_empty())?;
+    if request.get("rev").is_some() || !changes(request) {
+        return None;
+    }
+    let mut again = request.clone();
+    again["rev"] = Value::String(rev.to_string());
+    Some(again)
+}
+
 /// As run_resending, the first send given `deadline` to answer, and each resend no more than that;
-/// `clock` tells the time (a test's own, which `pause` moves on).
+/// `clock` tells the time (a test's own, which `pause` moves on). A resend is `again` when given.
 #[allow(clippy::too_many_arguments)]
 fn run_resending_within(
     machine: &Machine,
     command: &str,
     request: &Value,
+    again: Option<&Value>,
     handed: Option<transport::Handed>,
     resends: bool,
     tell: &mut dyn FnMut(&Resend),
@@ -647,6 +872,7 @@ fn run_resending_within(
     clock: &dyn Fn() -> Clocks,
     deadline: Duration,
 ) -> Answered {
+    let mut first = true;
     resending(
         request,
         handed,
@@ -656,10 +882,16 @@ fn run_resending_within(
         clock,
         deadline,
         &mut |handed, deadline| {
-            let ran = run_with_deadline(machine, command, request, deadline, handed);
+            let this = if first {
+                request
+            } else {
+                again.unwrap_or(request)
+            };
+            first = false;
+            let ran = run_with_deadline(machine, command, this, deadline, handed);
             let lost = ran.lost;
             Sent {
-                answered: keep_stderr(ran, request),
+                answered: keep_stderr(ran, this),
                 lost,
             }
         },
@@ -690,33 +922,63 @@ fn resending(
     deadline: Duration,
     send: &mut dyn FnMut(Option<transport::Handed>, Duration) -> Sent,
 ) -> Answered {
+    resending_from(
+        None, true, request, handed, resends, tell, pause, clock, deadline, send,
+    )
+}
+
+/// As resending, retrying having started at `began` when given (an earlier answer's, which a
+/// followed step's end with `retry` is: resend_after), not at the first answer here. Without
+/// `retries`, a `retry` answer is the answer, never sent again: only a lost one is asked again.
+#[allow(clippy::too_many_arguments)]
+fn resending_from(
+    began: Option<Clocks>,
+    retries: bool,
+    request: &Value,
+    handed: Option<transport::Handed>,
+    resends: bool,
+    tell: &mut dyn FnMut(&Resend),
+    pause: &dyn Fn(Duration),
+    clock: &dyn Fn() -> Clocks,
+    deadline: Duration,
+    send: &mut dyn FnMut(Option<transport::Handed>, Duration) -> Sent,
+) -> Answered {
     let mut handed = handed;
     // Safe to send again: the backend keeps ops and answers a second send of one from its record,
     // and a read changes nothing however often it's sent.
     let may = resends && (request.get("op").is_some() || !changes(request));
     let mut this_deadline = deadline;
     // When retrying started: at the first answer, fixed then. It ends RETRY_MOST later.
-    let mut start: Option<Clocks> = None;
+    let mut start: Option<Clocks> = began;
     let mut lost = 0;
+    // Whether an earlier send's answer was lost: one that didn't reach its machine now says
+    // nothing of that one, so the result stays unknown, and it's sent again while there's time.
+    // An answer that came, a `retry` refusal say, says nothing changed (Codex's review 74, 3).
+    let mut lost_before = false;
     loop {
         let sent = send(handed.take(), this_deadline);
+        let missed = sent.answered.unreached.is_some();
         if !may {
             return sent.answered;
         }
         let start = *start.get_or_insert_with(clock);
         let why = match &sent.answered.result {
-            Ok(r) if !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
+            Ok(r) if retries && !r.ok && !r.confirmation && r.retry.is_some() => Resend::Retry {
                 // As long as it asked, never less; at least a second.
                 wait: Duration::from_secs(r.retry.unwrap_or(1).max(1)),
                 message: r.message.clone(),
+                partial: r.partial,
             },
-            Err(error) if sent.lost && lost < LOST_WAITS.len() => Resend::Lost {
-                wait: LOST_WAITS[lost],
-                error: error.clone(),
-                attempt: lost + 1,
-            },
-            _ => return sent.answered,
+            Err(error) if (sent.lost || (missed && lost_before)) && lost < LOST_WAITS.len() => {
+                Resend::Lost {
+                    wait: LOST_WAITS[lost],
+                    error: error.clone(),
+                    attempt: lost + 1,
+                }
+            }
+            _ => return after_reaching(sent.answered, missed && lost_before),
         };
+        lost_before |= sent.lost;
         let wait = match &why {
             Resend::Retry { wait, .. } | Resend::Lost { wait, .. } => *wait,
         };
@@ -724,7 +986,7 @@ fn resending(
         // for, however long, can overflow.
         let left = Clocks::left_of_retrying(start, clock());
         if wait > left || left - wait < RESEND_ROOM {
-            return sent.answered;
+            return after_reaching(sent.answered, missed && lost_before);
         }
         if matches!(why, Resend::Lost { .. }) {
             lost += 1;
@@ -733,10 +995,24 @@ fn resending(
         pause(wait);
         let left = Clocks::left_of_retrying(start, clock());
         if left < RESEND_ROOM {
-            return sent.answered;
+            return after_reaching(sent.answered, missed && lost_before);
         }
         this_deadline = deadline.min(left);
     }
+}
+
+/// The last answer of a request sent more than once. When that last send never reached its
+/// machine but an earlier one may have (its answer was lost), it isn't "nothing was sent": its
+/// result is unknown, as that earlier send's was.
+fn after_reaching(mut answered: Answered, earlier_may_have: bool) -> Answered {
+    if earlier_may_have && let Err(error) = &answered.result {
+        answered.unreached = None;
+        let missed = error.replace(&format!(", {NOT_SENT}"), "");
+        answered.result = Err(format!(
+            "{missed} after an earlier try whose answer was lost; {UNKNOWN}, and its card shows how it stands."
+        ));
+    }
+    answered
 }
 
 /// As run, calling `handed` once the adapter has the whole request: from then on it carries on
@@ -798,6 +1074,8 @@ fn reference(request: &Value) -> String {
 pub struct Answered {
     pub result: Result<Response, String>,
     pub stderr: String,
+    /// When nothing was sent because its machine wasn't reached, how.
+    pub unreached: Option<Unreached>,
 }
 
 fn answer_with_stderr(
@@ -842,6 +1120,7 @@ fn keep_stderr(ran: Ran, request: &Value) -> Answered {
     Answered {
         result: ran.result,
         stderr,
+        unreached: ran.unreached,
     }
 }
 
@@ -886,6 +1165,8 @@ struct Ran {
     /// Whether its answer was lost (none in time, or the connection dropped): the request may or
     /// may not have happened.
     lost: bool,
+    /// When its machine wasn't reached, so nothing was sent, how.
+    unreached: Option<Unreached>,
 }
 
 impl Ran {
@@ -896,6 +1177,7 @@ impl Ran {
             stderr: String::new(),
             printed: None,
             lost: false,
+            unreached: None,
         }
     }
 }
@@ -943,6 +1225,7 @@ fn run_with_deadline(
         machine.ssh.is_some(),
     );
     let lost = result.is_err() && lost(&output, machine.ssh.is_some());
+    let unreached = unreached_of(&output, &result, machine.ssh.is_some());
     // An answer it couldn't read, or one far too long: what it printed goes to the error log, as
     // its error says (intent 0591). A lost answer's error promises nothing of the kind.
     let printed = (result.is_err() && !lost && !output.stdout.trim().is_empty())
@@ -952,6 +1235,7 @@ fn run_with_deadline(
         stderr: output.stderr,
         printed,
         lost,
+        unreached,
     }
 }
 
@@ -960,7 +1244,19 @@ fn run_with_deadline(
 /// that stopped without a proper answer, or sent one far too long, isn't lost: sent again, it
 /// would most likely do the same.
 fn lost(output: &transport::Output, ssh: bool) -> bool {
-    output.timed_out || (ssh && output.status == Some(255))
+    output.timed_out || (ssh && output.status == Some(255) && !never_reached(output))
+}
+
+/// Whether ssh's own exit says it never reached the machine, so the request never left Kerdr's
+/// side (the end-to-end check's P1). Known for certain only when the command's shell never said
+/// it had started (Codex's review 74, 2): a command that did start may itself print ssh's words,
+/// from a helper of its own, after changing something. And ssh's own words must say it never
+/// connected, since a connection that dropped may have lost the start mark on its way.
+fn never_reached(output: &transport::Output) -> bool {
+    output.started == Some(false)
+        && output.status == Some(255)
+        && output.stdout.trim().is_empty()
+        && transport::never_reached(&output.stderr)
 }
 
 /// What a command's output means.
@@ -1051,6 +1347,14 @@ fn answer_of(
         }
         response
     }).map_err(|_| {
+        // ssh never reached the machine: nothing was sent, so it's away (the end-to-end check's
+        // P1). Said with ssh's own line that says so, scrubbed.
+        if ssh && never_reached(output) {
+            let why = transport::unreached_line(&output.stderr)
+                .map(|l| redact(&l.chars().filter(|c| !c.is_control()).collect::<String>()))
+                .unwrap_or_default();
+            return format!("{machine} {UNREACHED} ({why}), {NOT_SENT}");
+        }
         // ssh's own exit when the connection failed or dropped: nothing of the backend's.
         if ssh {
             return format!(
@@ -1100,8 +1404,46 @@ mod tests {
             status: Some(0),
             timed_out: false,
             took: Duration::from_millis(5),
+            started: Some(true),
         };
         answer_of(&output, request, deadline_for(request), "arknet-one", true)
+    }
+
+    #[test]
+    fn an_answer_says_what_its_backend_holds_and_where_it_went() {
+        // Intent 0591, release 4.
+        let r = answered(
+            &json!({"action":"dispatch","id":"0041"}),
+            r#"{"ok":true,"message":"Queued #41 in pick4me.","pending":"queued in pick4me:\nstarts when a workspace there frees up","via":"LAB-Server"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            r.pending.as_deref(),
+            Some("queued in pick4me: starts when a workspace there frees up")
+        );
+        assert_eq!(r.via.as_deref(), Some("LAB-Server"));
+        let r = answered(
+            &json!({"action":"close","id":"0041"}),
+            r#"{"ok":false,"message":"arknet-one isn't reachable from LAB-Server.","unreachable":"arknet-one","via":"LAB-Server"}"#,
+        )
+        .unwrap();
+        assert_eq!(r.unreachable.as_deref(), Some("arknet-one"));
+        let r = answered(
+            &json!({"action":"drop","id":"0041","held":"k-0000000000000001"}),
+            r#"{"ok":true,"message":"It had already started.","dropped":false}"#,
+        )
+        .unwrap();
+        assert_eq!(r.dropped, Some(false));
+        // Words that aren't any are none, and an older backend sends none of it.
+        let r = answered(
+            &json!({"action":"close","id":"0041"}),
+            r#"{"ok":true,"message":"Done.","pending":"  ","via":7}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (r.pending, r.via, r.unreachable, r.dropped),
+            (None, None, None, None)
+        );
     }
 
     #[test]
@@ -1244,6 +1586,7 @@ printf '%s' "$answer"
             command,
             request,
             None,
+            None,
             resends,
             &mut |r| told.push(r.clone()),
             &|d| {
@@ -1332,6 +1675,123 @@ printf '%s' "$answer"
             matches!(&told[..], [Resend::Lost { attempt: 1, .. }]),
             "{told:?}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_resend_carries_the_rev_its_card_had_when_the_key_was_pressed() {
+        // Intent 0591, release 4: it waited before it went, so its backend checks the card is
+        // still as it was. The first send goes as it was asked.
+        let dir = tempfile::tempdir().unwrap();
+        let command = op_keeping_backend(dir.path());
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let again = with_rev(&request, Some("r-1a2b")).unwrap();
+        let waited = std::cell::Cell::new(Duration::ZERO);
+        let answered = run_resending_within(
+            &machine(),
+            &command,
+            &request,
+            Some(&again),
+            None,
+            true,
+            &mut |_| {},
+            &|d| waited.set(waited.get() + d),
+            &|| later(Clocks::now(), waited.get()),
+            Duration::from_millis(1500),
+        );
+        assert!(answered.result.unwrap().ok);
+        let sent: Vec<Value> = lines(dir.path(), "requests.log")
+            .iter()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[0].get("rev"), None);
+        assert_eq!(sent[1]["rev"], "r-1a2b");
+        assert_eq!(sent[0]["op"], sent[1]["op"]);
+        // Only a change carries it, and only one that has none.
+        assert_eq!(
+            with_rev(&json!({"action":"edit","id":"0041"}), Some("r")),
+            None
+        );
+        assert_eq!(with_rev(&again, Some("r-other")), None);
+        assert_eq!(with_rev(&request, None), None);
+        assert_eq!(with_rev(&request, Some("")), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_followed_end_with_retry_goes_again_once_its_wait_is_over_never_after_a_sleep() {
+        // Intent 0591: a start whose followed work ended refused with `retry` 10 (piece A's
+        // `launch_busy`). Its runner waits what's left of that, then sends it with the same op and
+        // its card's rev. Time before its runner began counts (Codex's review 75, 3): 3 s of it
+        // leaves a 7 s wait, and 115 s, as a computer asleep before its turn came, leaves no room
+        // for an answer within two minutes. That, a computer asleep through the wait, or a backend
+        // that keeps no ops, sends nothing: the refusal stands.
+        let last = parse_response(
+            r##"{"ok":false,"retry":10,"message":"#41 didn't start yet; ⏎ again in a moment."}"##,
+        )
+        .unwrap();
+        let request = with_op(json!({"action":"dispatch","id":"0041"}));
+        let secs = Duration::from_secs;
+        for (before, asleep, resends, goes) in [
+            (Duration::ZERO, Duration::ZERO, true, Some(secs(10))),
+            (secs(3), Duration::ZERO, true, Some(secs(7))),
+            (secs(115), Duration::ZERO, true, None),
+            (Duration::ZERO, secs(105), true, None),
+            (Duration::ZERO, Duration::ZERO, false, None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let d = quote(dir.path().to_str().unwrap());
+            let command = fixture(
+                dir.path(),
+                &format!(
+                    "req=$(cat)\nprintf '%s\\n' \"$req\" >> {d}/requests.log\nprintf '%s' '{{\"ok\":true,\"message\":\"Starting web.\",\"id\":\"0041\"}}'\n"
+                ),
+                "",
+            );
+            let mut told = vec![];
+            let waits = std::cell::RefCell::new(vec![]);
+            let waited = std::cell::Cell::new(before);
+            let since = Clocks::now();
+            let answered = resend_after(
+                &machine(),
+                &command,
+                &request,
+                Some("r-1a2b"),
+                After {
+                    wait: Duration::from_secs(10),
+                    last: last.clone(),
+                    since,
+                },
+                None,
+                resends,
+                &mut |r| told.push(r.clone()),
+                &|d| {
+                    waits.borrow_mut().push(d);
+                    waited.set(waited.get() + d + asleep);
+                },
+                &|| later(since, waited.get()),
+            );
+            let sent: Vec<Value> = lines(dir.path(), "requests.log")
+                .iter()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            let r = answered.result.unwrap();
+            if let Some(rest) = goes {
+                assert!(r.ok, "{r:?}");
+                assert_eq!(sent.len(), 1, "sent once: {sent:?}");
+                assert_eq!(sent[0]["op"], request["op"], "with the same op");
+                assert_eq!(sent[0]["rev"], "r-1a2b");
+                assert_eq!(waits.into_inner(), [rest], "before {before:?}");
+                assert!(
+                    matches!(&told[..], [Resend::Retry { wait, .. }] if *wait == rest),
+                    "{told:?}"
+                );
+            } else {
+                assert!(!r.ok && r.message == last.message, "it stands: {r:?}");
+                assert!(sent.is_empty(), "nothing sent: {sent:?}");
+            }
+        }
     }
 
     #[cfg(unix)]
@@ -1436,10 +1896,12 @@ printf '%s' "$answer"
                 }
                 let result = answer_of(&out, request, deadline, "arknet-one", true);
                 let lost = result.is_err() && lost(&out, true);
+                let unreached = unreached_of(&out, &result, true);
                 Sent {
                     answered: Answered {
                         result,
                         stderr: out.stderr.clone(),
+                        unreached,
                     },
                     lost,
                 }
@@ -1464,6 +1926,7 @@ printf '%s' "$answer"
             stderr: String::new(),
             timed_out: true,
             took: Duration::ZERO,
+            started: Some(true),
         }
     }
 
@@ -1590,6 +2053,59 @@ printf '%s' "$answer"
     }
 
     #[test]
+    fn a_part_done_refusal_with_retry_is_told_as_part_done() {
+        // Intent 0591: the board keeps what stood (App::resending), so the runner says so.
+        let close = with_op(json!({"action":"close","id":"0041"}));
+        let answer = |partial: bool| Answered {
+            result: Ok(Response {
+                ok: false,
+                partial,
+                retry: Some(5),
+                message: "Brought #41 back, but then: #41 is locked by another request.".into(),
+                ..Default::default()
+            }),
+            stderr: String::new(),
+            unreached: None,
+        };
+        let done = Answered {
+            result: Ok(Response {
+                ok: true,
+                message: "Marked #41 done.".into(),
+                ..Default::default()
+            }),
+            stderr: String::new(),
+            unreached: None,
+        };
+        let mut answers = vec![answer(true), answer(false), done].into_iter();
+        let now = std::cell::Cell::new(Clocks::now());
+        let mut told = vec![];
+        let answered = resending(
+            &close,
+            None,
+            true,
+            &mut |r| told.push(r.clone()),
+            &|d| now.set(later(now.get(), d)),
+            &|| now.get(),
+            deadline_for(&close),
+            &mut |_, _| Sent {
+                answered: answers.next().expect("sent more often than expected"),
+                lost: false,
+            },
+        );
+        assert!(answered.result.unwrap().ok);
+        assert!(
+            matches!(
+                &told[..],
+                [
+                    Resend::Retry { partial: true, .. },
+                    Resend::Retry { partial: false, .. }
+                ]
+            ),
+            "{told:?}"
+        );
+    }
+
+    #[test]
     fn a_wait_asked_for_however_long_is_set_against_what_is_left_and_never_added_up() {
         // However many seconds an answer asks for (one built by hand, past what's read from a
         // backend), they're set against what's left of the two minutes before anything is added:
@@ -1603,6 +2119,7 @@ printf '%s' "$answer"
                 ..Default::default()
             }),
             stderr: String::new(),
+            unreached: None,
         };
         let mut answers = vec![refusal(5), refusal(u64::MAX)].into_iter();
         let now = std::cell::Cell::new(Clocks::now());
@@ -1647,6 +2164,7 @@ printf '%s' "$answer"
                 ..Default::default()
             }),
             stderr: String::new(),
+            unreached: None,
         };
         let run = |asleep: Duration, wall_set: Duration| {
             let now = std::cell::Cell::new(Clocks::now());
@@ -1678,6 +2196,7 @@ printf '%s' "$answer"
                                 ..Default::default()
                             }),
                             stderr: String::new(),
+                            unreached: None,
                         }
                     };
                     Sent {
@@ -1734,6 +2253,7 @@ printf '%s' "$answer"
         assert_eq!(r.state.as_deref(), Some("unknown"));
     }
 
+    /// What a command whose shell started printed, and how it ended.
     fn output(status: i32, stdout: &str, stderr: &str) -> transport::Output {
         transport::Output {
             status: Some(status),
@@ -1741,7 +2261,24 @@ printf '%s' "$answer"
             stderr: stderr.into(),
             timed_out: false,
             took: Duration::from_millis(5),
+            started: Some(true),
         }
+    }
+
+    /// ssh's own exit, 255, its words `stderr`, with no start mark: the command never started.
+    fn unstarted(stderr: &str) -> transport::Output {
+        transport::Output {
+            status: Some(255),
+            stderr: stderr.into(),
+            took: Duration::from_millis(5),
+            started: Some(false),
+            ..Default::default()
+        }
+    }
+
+    /// How the answer says its machine wasn't reached.
+    fn how_unreached(answered: &Answered) -> Option<Unreached> {
+        answered.unreached
     }
 
     #[test]
@@ -1799,6 +2336,215 @@ printf '%s' "$answer"
         assert_eq!(sends, 1);
         assert!(told.is_empty());
         assert!(result_unknown(&answered.result.unwrap_err()));
+    }
+
+    #[test]
+    fn ssh_that_never_reached_the_machine_says_nothing_was_sent_and_isnt_sent_again() {
+        // The end-to-end check's P1: ssh refused at once (no route, no such name, a host key, a
+        // sign-in), so nothing reached the machine. Kerdr called it a lost answer, sent it four
+        // times, then said it couldn't tell whether it happened, so it was never held.
+        let request = with_op(
+            json!({"action":"edit","id":"0927","text":"New words.","was":"sha256:aa","from":"here"}),
+        );
+        for (stderr, how) in [
+            (
+                "ssh: connect to host zznew port 22: No route to host\n",
+                Unreached::Away,
+            ),
+            (
+                "ssh: connect to host 10.0.0.9 port 22: Connection timed out\n",
+                Unreached::Away,
+            ),
+            (
+                "ssh: Could not resolve hostname zznew: Name or service not known\n",
+                Unreached::Away,
+            ),
+            ("Host key verification failed.\n", Unreached::Refused),
+            (
+                "drew@zznew: Permission denied (publickey).\n",
+                Unreached::Refused,
+            ),
+        ] {
+            let (answered, told, sends) = over_ssh(&request, true, vec![unstarted(stderr)]);
+            assert_eq!(sends, 1, "{stderr}");
+            assert!(told.is_empty(), "{stderr}");
+            assert_eq!(how_unreached(&answered), Some(how), "{stderr}");
+            let error = answered.result.unwrap_err();
+            assert!(!result_unknown(&error), "{error}");
+            assert_eq!(
+                error,
+                format!(
+                    "arknet-one couldn't be reached ({}), so nothing was sent",
+                    stderr.trim()
+                )
+            );
+        }
+        // A connection that dropped once made, or anything printed, may have reached it: as
+        // before.
+        for (stdout, stderr) in [
+            ("", "Connection to zznew closed by remote host.\n"),
+            ("", "client_loop: send disconnect: Broken pipe\n"),
+            (
+                "",
+                "rm: cannot remove 'x': Permission denied (os error 13)\n",
+            ),
+            (
+                r#"{"ok":tr"#,
+                "ssh: connect to host zznew port 22: No route to host\n",
+            ),
+        ] {
+            let mut out = unstarted(stderr);
+            out.stdout = stdout.into();
+            let (answered, ..) = over_ssh(&request, false, vec![out]);
+            assert_eq!(how_unreached(&answered), None, "{stderr}");
+            assert!(result_unknown(&answered.result.unwrap_err()), "{stderr}");
+        }
+        // After a send whose answer was lost, one that never reached its machine says nothing of
+        // that first one: still unknown, and sent again while there's time.
+        let refused = || unstarted("ssh: connect to host zznew port 22: No route to host\n");
+        let (answered, told, sends) = over_ssh(
+            &request,
+            true,
+            vec![
+                output(255, "", "client_loop: send disconnect: Broken pipe\n"),
+                refused(),
+                refused(),
+                refused(),
+            ],
+        );
+        assert_eq!((sends, told.len()), (4, 3));
+        assert_eq!(how_unreached(&answered), None);
+        let error = answered.result.unwrap_err();
+        assert!(result_unknown(&error), "{error}");
+        assert!(
+            error.starts_with("arknet-one couldn't be reached (")
+                && error.contains("after an earlier try whose answer was lost"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_host_key_or_sign_in_refused_then_another_line_is_still_refused() {
+        // Codex's review 74, 1: a jump host's refusal followed by another line of ssh's. Taken
+        // from ssh's last line alone, it read as a machine that's away, so it was forwarded.
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        for (stderr, said) in [
+            (
+                "Host key verification failed.\nConnection closed by UNKNOWN port 65535\n",
+                "Host key verification failed.",
+            ),
+            (
+                "drew@zznew: Permission denied (publickey,password).\nConnection closed by 10.0.0.9 port 22\n",
+                "drew@zznew: Permission denied (publickey,password).",
+            ),
+        ] {
+            let (answered, told, sends) = over_ssh(&request, true, vec![unstarted(stderr)]);
+            assert_eq!((sends, told.len()), (1, 0), "{stderr}");
+            assert_eq!(
+                how_unreached(&answered),
+                Some(Unreached::Refused),
+                "{stderr}"
+            );
+            assert_eq!(
+                answered.result.unwrap_err(),
+                format!("arknet-one couldn't be reached ({said}), so nothing was sent")
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_words_from_a_command_that_started_never_mean_nothing_was_sent() {
+        // Codex's review 74, 2: the command started (its shell said so first), changed something,
+        // then a helper of its own printed ssh's words and it ended with 255. That may have
+        // happened, so it's a lost answer, sent again with its op, never "nothing was sent".
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let changed_then_failed = output(
+            255,
+            "",
+            "ssh: connect to host other port 22: No route to host\n",
+        );
+        let (answered, told, sends) = over_ssh(
+            &request,
+            true,
+            vec![
+                changed_then_failed,
+                output(0, r#"{"ok":true,"message":"Closed #41."}"#, ""),
+            ],
+        );
+        assert_eq!((sends, told.len()), (2, 1));
+        assert!(matches!(told[0], Resend::Lost { .. }));
+        assert!(answered.result.unwrap().ok);
+        // Without resends, said as unknown.
+        let (answered, ..) = over_ssh(
+            &request,
+            false,
+            vec![output(
+                255,
+                "",
+                "ssh: connect to host other port 22: No route to host\n",
+            )],
+        );
+        assert_eq!(how_unreached(&answered), None);
+        assert!(result_unknown(&answered.result.unwrap_err()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_real_command_that_changed_something_then_printed_ssh_words_isnt_unsent() {
+        // The same through the adapter's real shell: its start mark comes first, so a command that
+        // changes something and then prints ssh's words is known to have started.
+        let dir = tempfile::tempdir().unwrap();
+        let changed = dir.path().join("changed");
+        let command = format!(
+            "cat >/dev/null; touch {}; echo 'ssh: connect to host other port 22: No route to host' >&2; exit 255",
+            quote(&changed.display().to_string())
+        );
+        let request = with_op(json!({"action":"close","id":"0041"}));
+        let out = transport::run_adapter_handing(
+            &Target::Local,
+            &command,
+            Some(&request.to_string()),
+            Duration::from_secs(20),
+            None,
+        );
+        assert!(changed.exists());
+        assert_eq!(out.status, Some(255));
+        assert_eq!(
+            out.stderr.trim(),
+            "ssh: connect to host other port 22: No route to host"
+        );
+        let result = answer_of(&out, &request, deadline_for(&request), "arknet-one", true);
+        assert_eq!(unreached_of(&out, &result, true), None);
+        assert!(result_unknown(&result.unwrap_err()));
+        assert!(lost(&out, true));
+    }
+
+    #[test]
+    fn a_retry_refusal_then_an_unreachable_machine_is_nothing_sent() {
+        // Codex's review 74, 3: a refusal asking to try again (its lock was held) says nothing
+        // changed; the try after it that couldn't connect sent nothing either. So nothing was
+        // sent, and the save is held, never "Kerdr can't tell".
+        let request = with_op(
+            json!({"action":"edit","id":"0927","text":"New words.","was":"sha256:aa","from":"here"}),
+        );
+        let (answered, told, sends) = over_ssh(
+            &request,
+            true,
+            vec![
+                output(
+                    1,
+                    r##"{"ok":false,"message":"#927 is locked by another request.","retry":1}"##,
+                    "",
+                ),
+                unstarted("ssh: connect to host zznew port 22: No route to host\n"),
+            ],
+        );
+        assert_eq!((sends, told.len()), (2, 1));
+        assert!(matches!(told[0], Resend::Retry { .. }));
+        assert_eq!(how_unreached(&answered), Some(Unreached::Away));
+        let error = answered.result.unwrap_err();
+        assert!(!result_unknown(&error), "{error}");
+        assert!(error.ends_with("so nothing was sent"), "{error}");
     }
 
     #[test]

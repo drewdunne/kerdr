@@ -233,7 +233,7 @@ impl App {
         };
         if !self.actions_on() {
             return RunState::Unavailable(format!(
-                "{reference} has no agent running; with [actions] configured, s starts it on an account."
+                "{reference} has no agent running, and Kerdr has no action backend here to start it (set [actions] command in its config)."
             ));
         }
         // Where the start goes, as ⏎ and d send it (home_machine): where a refusal said it lives
@@ -331,6 +331,10 @@ impl App {
 
     /// `s` on a card: the picker its state calls for, or why there's none.
     pub(super) fn s_on_card(&mut self, card: Card) {
+        // What its backend holds for it waits on his answer: s asks it (intent 0591, release 4).
+        if self.open_held_asks(&card.key) {
+            return;
+        }
         // Work Kerdr follows (a start, a move into herdr) is left alone until it ends: its worker may
         // still be bringing the agent back (Codex's review).
         if self.follow_holds(&card, "s").is_some() {
@@ -548,9 +552,8 @@ impl App {
             );
             return Action::None;
         };
-        if !self.can_write(card.machine_index) {
-            return Action::None;
-        }
+        // Its machine not answering, the start waits for it (intent 0591, release 4): send_account
+        // holds it.
         // The card it's asked on goes in its own record, which its answer finds by the request,
         // through a question or a sign-in (Codex's third look).
         let machine = card.machine_index;
@@ -2431,6 +2434,7 @@ mod tests {
             &crate::actions::Resend::Retry {
                 wait: Duration::from_secs(3),
                 message: "herdr in web isn't answering yet; Kerdr asks again shortly.".into(),
+                partial: false,
             },
         );
         assert_eq!(a.busy_label, "Starting a fresh agent… trying again…");

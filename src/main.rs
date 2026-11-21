@@ -142,6 +142,15 @@ fn open_board() -> anyhow::Result<()> {
     let machines = machine_states(&cfg);
     let mut app = App::new(cfg, machines);
     app.prefix = herdr_keys::prefix();
+    // What the last Kerdr held and kept (intent 0591, release 4): its held changes go once their
+    // machines answer, and your words are back where you left them.
+    let state = kerdr::config::state_dir();
+    app.kept = kerdr::kept::Kept::at(&state, chrono::Local::now().timestamp());
+    let words = app.kept.take_words();
+    app.restore_words(words);
+    app.words_dir = Some(state);
+    app.say_kept_notes();
+    app.rebuild();
     kerdr::tui::run(app, true)
 }
 

@@ -1199,6 +1199,47 @@ pub(super) fn draw(f: &mut Frame, area: Rect, app: &App, screen: &AccountScreen)
                 if s.went_wrong() { RED } else { CYAN },
             );
         }
+        // Drawn as Where is: what it's about, then the list to pick from (K2-07).
+        AccountScreen::OwnerFor {
+            machine,
+            session,
+            owners,
+            sel,
+        } => {
+            let name = app
+                .machines
+                .get(*machine)
+                .map(|m| m.name())
+                .unwrap_or_default();
+            let message = format!(
+                "{session} on {name} has no owner, so work started there follows no list. Owners are set in Arknet's owners code, not here: ⏎ makes an intent for an agent to give {session} the owner you pick."
+            );
+            let mut lines = wrapped(&message, 68, fg(FG), None);
+            lines.push(Line::raw(""));
+            let top = lines.len();
+            lines.extend(owners.iter().enumerate().map(|(i, o)| {
+                let label = if o.name.is_empty() {
+                    o.id.clone()
+                } else {
+                    o.name.clone()
+                };
+                let label = if o.kind.is_empty() {
+                    label
+                } else {
+                    format!("{label} · {}", o.kind)
+                };
+                selected(label, i == *sel)
+            }));
+            modal(
+                f,
+                area,
+                &format!("Who owns {session}?"),
+                lines,
+                "j k choose    ⏎ make the intent    esc back",
+                top + sel,
+                YELLOW,
+            );
+        }
         AccountScreen::Where {
             code,
             message,
@@ -1431,18 +1472,42 @@ fn status_lines(app: &App, a: &Account) -> Vec<Line<'static>> {
 /// What Enter does on an account's line, naming every machine it signs in on (intent 0327).
 fn enter_hint(app: &App, mi: usize, a: &Account, copy: Option<&AccountCopy>) -> String {
     let name = app.machines.get(mi).map(|m| m.name()).unwrap_or_default();
+    // A machine not answering signs in when it does (K2-20, K2-62).
+    let when = |i: usize| {
+        let name = app.machines[i].name();
+        if app.machines[i].conn.is_live() {
+            name
+        } else {
+            format!("{name} once it answers")
+        }
+    };
     if !app.offered(mi).signs_in(&a.provider) {
         return format!("⏎ test it on {name} (it needs no sign-in)");
     }
     match copy {
         Some(c) if a.copy_ready(c) => format!("⏎ signed in on {name}: sign in again? · t test it"),
         Some(_) => format!("⏎ sign in this copy on {name} · t test it"),
-        None if a.ready() => format!("⏎ ready on {name}: choose where to sign in · t test"),
+        None if a.ready() => {
+            let others: Vec<String> = app
+                .signin_order(&a.code, false, mi)
+                .into_iter()
+                .skip(1)
+                .map(when)
+                .collect();
+            if others.is_empty() {
+                format!("⏎ ready on {name}: sign in again? · t test")
+            } else {
+                format!(
+                    "⏎ ready on {name}: sign in on {} · t test",
+                    others.join(", then ")
+                )
+            }
+        }
         None => {
             let names: Vec<String> = app
                 .signin_order(&a.code, false, mi)
                 .into_iter()
-                .map(|i| app.machines[i].name())
+                .map(when)
                 .collect();
             format!("⏎ sign in on {} · t test", names.join(", then "))
         }
@@ -1566,7 +1631,19 @@ fn list(f: &mut Frame, area: Rect, app: &App, mi: usize, rows: &[Row], sel: usiz
         right,
     );
     let Some(feed) = app.account_feed(mi) else {
-        f.render_widget(Paragraph::new("This machine's feed has no account information yet.\n\nTab another machine · Esc board").style(fg(DIM)),Rect{y:inner.y+2,height:inner.height.saturating_sub(2),..inner});
+        // Which case it is, filled in once the feed comes (intent 0591, K2-38).
+        let said = format!(
+            "{}\n\nTab another machine · Esc board",
+            app.no_account_feed_said(mi)
+        );
+        f.render_widget(
+            Paragraph::new(said).style(fg(DIM)),
+            Rect {
+                y: inner.y + 2,
+                height: inner.height.saturating_sub(2),
+                ..inner
+            },
+        );
         return;
     };
     let content = Rect {

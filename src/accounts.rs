@@ -558,6 +558,13 @@ pub struct AccountAgent {
     /// (intent 0591).
     #[serde(deserialize_with = "null_default")]
     pub programs: Vec<String>,
+    /// What its machine's backend holds for it, a move for later say, as a card's `held` (intent
+    /// 0591, release 4): its card shows it, intent or not.
+    #[serde(
+        deserialize_with = "crate::feed::held_list",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub held: Vec<crate::feed::Held>,
 }
 
 /// Where a handed-over agent's work came from: the account and program before, the conversation

@@ -638,6 +638,7 @@ impl App {
         // As it was when the box opened: unstarted work, not set aside, with no workspace.
         let then = from.unwrap_or_else(|| CardSnapshot {
             workspace: None,
+            workspace_session: None,
             waiting: true,
             done: false,
             dismissed: false,
