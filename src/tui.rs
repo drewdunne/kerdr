@@ -177,16 +177,69 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
 /// His words the words file couldn't keep, now the board has gone: on his own terminal only,
 /// never standard error or the error log (intent 0591, K3-34; Codex's review 98, 1).
 pub(crate) fn print_recovery(app: &mut App) {
-    use std::io::Write;
     let texts = std::mem::take(&mut app.print_on_exit);
     if let Some(mut terminal) = app.recovery_terminal.take() {
         for text in texts {
-            let _ = terminal.write_all(text.as_bytes());
-            let _ = terminal.write_all(b"\n");
+            let _ = to_terminal(&mut terminal, &format!("{text}\n"));
         }
-        let _ = terminal.flush();
     }
 }
+
+/// Writes `text` on his terminal: on Windows by the console's own wide call (WriteConsoleW), so
+/// any character shows whatever the console's code page (CP437, CP850); elsewhere as UTF-8, and
+/// flushed (Codex's review 99, 2). Whether all of it was written.
+fn to_terminal(terminal: &mut std::fs::File, text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::WriteConsoleW;
+        let handle = terminal.as_raw_handle();
+        write_wide(text, |units| {
+            let mut written = 0u32;
+            // SAFETY: the console handle Kerdr opened (CONOUT$), held for the call, and units
+            // this holds for it.
+            let ok = unsafe {
+                WriteConsoleW(
+                    handle,
+                    units.as_ptr().cast(),
+                    u32::try_from(units.len()).unwrap_or(u32::MAX),
+                    &mut written,
+                    std::ptr::null(),
+                )
+            };
+            (ok != 0).then_some(written as usize)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Write;
+        terminal.write_all(text.as_bytes()).is_ok() && terminal.flush().is_ok()
+    }
+}
+
+/// `text` as UTF-16, written by `write` (the console's wide call on Windows) in pieces of at most
+/// WIDE_PIECE units, a pair never split across two; `write` says how many it wrote. True once
+/// every unit is written.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn write_wide(text: &str, mut write: impl FnMut(&[u16]) -> Option<usize>) -> bool {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut at = 0;
+    while at < units.len() {
+        let mut end = (at + WIDE_PIECE).min(units.len());
+        if end < units.len() && end - at > 1 && (0xD800..0xDC00).contains(&units[end - 1]) {
+            end -= 1;
+        }
+        match write(&units[at..end]) {
+            Some(n) if n > 0 => at += n.min(end - at),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The most UTF-16 units one console write is given.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+const WIDE_PIECE: usize = 8192;
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
@@ -2081,6 +2134,38 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         true
+    }
+
+    #[test]
+    fn words_for_a_windows_console_go_as_utf16_whole() {
+        // Codex's review 99, 2: on Windows his words reach the console by its wide call, so
+        // "café" survives a console whose code page is CP437 or CP850. A real console can't run
+        // here; this is the UTF-16 Kerdr hands that call, through a stand-in for it that takes a
+        // few units at a time, across a piece's end with a pair at it.
+        let mut text = "café, naïve, 日本語, 😀\n".to_string();
+        text.push_str(&"x".repeat(WIDE_PIECE - 1));
+        text.push_str("😀 and the rest");
+        let mut console: Vec<u16> = vec![];
+        let written = write_wide(&text, |units| {
+            let n = units.len().min(7);
+            console.extend_from_slice(&units[..n]);
+            Some(n)
+        });
+        assert!(written);
+        assert_eq!(String::from_utf16(&console).unwrap(), text);
+        // Every piece it was handed ends on a whole character.
+        let mut ends = vec![];
+        write_wide(&text, |units| {
+            ends.push(*units.last().unwrap());
+            Some(units.len())
+        });
+        assert!(
+            ends.iter().all(|u| !(0xD800..0xDC00).contains(u)),
+            "a pair split"
+        );
+        // A console that takes nothing: not written.
+        assert!(!write_wide("café", |_| Some(0)));
+        assert!(!write_wide("café", |_| None));
     }
 
     /// Run only by the test below, in a child of its own: his words printed as Kerdr ends.
