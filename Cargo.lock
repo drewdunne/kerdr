@@ -906,7 +906,6 @@ dependencies = [
  "unicode-width",
  "windows-sys",
  "wl-clipboard-rs",
- "x11-clipboard",
  "x11rb",
 ]
 
@@ -2470,16 +2469,6 @@ dependencies = [
  "wayland-client",
  "wayland-protocols",
  "wayland-protocols-wlr",
-]
-
-[[package]]
-name = "x11-clipboard"
-version = "0.9.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "662d74b3d77e396b8e5beb00b9cad6a9eccf40b2ef68cc858784b14c41d535a3"
-dependencies = [
- "libc",
- "x11rb",
 ]
 
 [[package]]

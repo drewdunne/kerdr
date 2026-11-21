@@ -1131,58 +1131,163 @@ mod builtin {
     }
 
     fn x11_list() -> Listing {
-        match within(|| -> Result<Vec<String>, String> {
-            use x11rb::connection::Connection;
-            use x11rb::protocol::xproto::ConnectionExt;
-            let clip = x11_clipboard::Clipboard::new().map_err(|e| e.to_string())?;
-            let atoms = &clip.getter.atoms;
-            let raw = clip
-                .load(
-                    atoms.clipboard,
-                    atoms.targets,
-                    atoms.property,
-                    READ_DEADLINE,
-                )
-                .map_err(|e| e.to_string())?;
-            let conn = &clip.getter.connection;
-            let mut names = vec![];
-            for chunk in raw.as_chunks::<4>().0 {
-                let atom = u32::from_ne_bytes(*chunk);
+        match within(|| x11_get("TARGETS", 64 * 1024).map(|(_, names)| names)) {
+            None => {
+                Listing::Failed("Couldn't read the clipboard: the desktop didn't answer.".into())
+            }
+            Some(Ok(types)) if types.is_empty() => Listing::Empty,
+            Some(Ok(types)) => Listing::Types(types),
+            Some(Err(X11::Empty)) => Listing::Empty,
+            Some(Err(X11::Unusable(why))) => Listing::Missing(why),
+            Some(Err(X11::Failed(why))) => Listing::Failed(why),
+        }
+    }
+
+    fn x11_read(t: &str, cap: usize) -> Result<Vec<u8>, String> {
+        let t = t.to_string();
+        within(move || {
+            x11_get(&t, cap)
+                .map(|(bytes, _)| bytes)
+                .map_err(|e| match e {
+                    X11::Empty => {
+                        format!("Couldn't read the clipboard's {t}: it's no longer offered.")
+                    }
+                    X11::Unusable(why) | X11::Failed(why) => {
+                        format!("Couldn't read the clipboard's {t}: {why}.")
+                    }
+                })
+        })
+        .unwrap_or_else(|| {
+            Err("Couldn't read the clipboard: the program that copied it didn't answer.".into())
+        })
+    }
+
+    /// How an X11 read went wrong.
+    enum X11 {
+        /// Nothing is copied, or not in that type.
+        Empty,
+        /// There's no X11 display to read from here.
+        Unusable(String),
+        Failed(String),
+    }
+
+    /// The clipboard's `target` read from the X server, as ICCCM has a program read a selection:
+    /// asked for into a property of a window of Kerdr's own, then read from it whole, or piece by
+    /// piece (INCR) when it's large, at most `cap` bytes. With TARGETS, the names of the types it
+    /// offers too.
+    fn x11_get(target: &str, cap: usize) -> Result<(Vec<u8>, Vec<String>), X11> {
+        use std::time::Instant;
+        use x11rb::connection::Connection;
+        use x11rb::protocol::Event;
+        use x11rb::protocol::xproto::{
+            AtomEnum, ConnectionExt, CreateWindowAux, EventMask, Property, WindowClass,
+        };
+        let failed = |e: &dyn std::fmt::Display| X11::Failed(e.to_string());
+        let (conn, screen) =
+            x11rb::connect(None).map_err(|e| X11::Unusable(format!("no X11 display ({e})")))?;
+        let root = conn.setup().roots[screen].root;
+        let visual = conn.setup().roots[screen].root_visual;
+        let window = conn.generate_id().map_err(|e| failed(&e))?;
+        conn.create_window(
+            x11rb::COPY_DEPTH_FROM_PARENT,
+            window,
+            root,
+            0,
+            0,
+            1,
+            1,
+            0,
+            WindowClass::INPUT_OUTPUT,
+            visual,
+            &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+        )
+        .map_err(|e| failed(&e))?;
+        let atom = |name: &str| {
+            conn.intern_atom(false, name.as_bytes())
+                .map_err(|e| failed(&e))?
+                .reply()
+                .map(|r| r.atom)
+                .map_err(|e| failed(&e))
+        };
+        let (clipboard, wanted, property, incr) = (
+            atom("CLIPBOARD")?,
+            atom(target)?,
+            atom("KERDR_CLIPBOARD")?,
+            atom("INCR")?,
+        );
+        conn.convert_selection(window, clipboard, wanted, property, x11rb::CURRENT_TIME)
+            .map_err(|e| failed(&e))?;
+        conn.flush().map_err(|e| failed(&e))?;
+        let until = Instant::now() + READ_DEADLINE;
+        let next = |what: &dyn Fn(&Event) -> bool| -> Result<Event, X11> {
+            loop {
+                match conn.poll_for_event().map_err(|e| failed(&e))? {
+                    Some(event) if what(&event) => return Ok(event),
+                    Some(_) => {}
+                    None if Instant::now() >= until => {
+                        return Err(X11::Failed(
+                            "the program that copied it didn't answer".into(),
+                        ));
+                    }
+                    None => std::thread::sleep(std::time::Duration::from_millis(5)),
+                }
+            }
+        };
+        let Event::SelectionNotify(notice) = next(&|e| matches!(e, Event::SelectionNotify(_)))?
+        else {
+            unreachable!()
+        };
+        if notice.property == u32::from(AtomEnum::NONE) {
+            return Err(X11::Empty);
+        }
+        let take = || {
+            conn.get_property(true, window, property, AtomEnum::ANY, 0, u32::MAX / 4)
+                .map_err(|e| failed(&e))?
+                .reply()
+                .map_err(|e| failed(&e))
+        };
+        let first = take()?;
+        let (bytes, kind) = if first.type_ == incr {
+            // Large: it comes in pieces, each announced as the property is written again, until
+            // an empty one.
+            let mut bytes = Vec::new();
+            let mut kind = None;
+            loop {
+                next(&|e| {
+                    matches!(e, Event::PropertyNotify(p)
+                        if p.atom == property && p.state == Property::NEW_VALUE)
+                })?;
+                let piece = take()?;
+                if piece.value.is_empty() {
+                    break;
+                }
+                kind.get_or_insert(piece.type_);
+                bytes.extend_from_slice(&piece.value);
+                if bytes.len() > cap {
+                    break;
+                }
+            }
+            (bytes, kind.unwrap_or_default())
+        } else {
+            let kind = first.type_;
+            (first.value, kind)
+        };
+        let mut names = vec![];
+        if target == "TARGETS" && kind == u32::from(AtomEnum::ATOM) {
+            for chunk in bytes.as_chunks::<4>().0 {
+                let a = u32::from_ne_bytes(*chunk);
                 if let Ok(reply) = conn
-                    .get_atom_name(atom)
+                    .get_atom_name(a)
                     .map_err(|_| ())
                     .and_then(|c| c.reply().map_err(|_| ()))
                 {
                     names.push(String::from_utf8_lossy(&reply.name).into_owned());
                 }
             }
-            let _ = conn.flush();
-            Ok(names)
-        }) {
-            None => {
-                Listing::Failed("Couldn't read the clipboard: the desktop didn't answer.".into())
-            }
-            Some(Ok(types)) if types.is_empty() => Listing::Empty,
-            Some(Ok(types)) => Listing::Types(types),
-            Some(Err(why)) => Listing::Missing(why),
         }
-    }
-
-    fn x11_read(t: &str, cap: usize) -> Result<Vec<u8>, String> {
-        let t = t.to_string();
-        within(move || -> Result<Vec<u8>, String> {
-            let clip = x11_clipboard::Clipboard::new().map_err(|e| e.to_string())?;
-            let target = clip.getter.get_atom(&t).map_err(|e| e.to_string())?;
-            let atoms = &clip.getter.atoms;
-            let mut bytes = clip
-                .load(atoms.clipboard, target, atoms.property, READ_DEADLINE)
-                .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))?;
-            bytes.truncate(cap + 1);
-            Ok(bytes)
-        })
-        .unwrap_or_else(|| {
-            Err("Couldn't read the clipboard: the program that copied it didn't answer.".into())
-        })
+        let _ = conn.destroy_window(window);
+        let _ = conn.flush();
+        Ok((bytes, names))
     }
 }
 

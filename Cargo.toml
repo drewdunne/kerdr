@@ -32,7 +32,6 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # The clipboard read in Kerdr itself, so no wl-paste or xclip is needed (intent 0591, K3-63).
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wl-clipboard-rs = "0.9.5"
-x11-clipboard = "0.9.3"
 x11rb = "0.13.2"
 
 [target.'cfg(windows)'.dependencies]
