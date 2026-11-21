@@ -1670,10 +1670,23 @@ fn windows_clipboard(room: Room) -> Result<Found, String> {
         return Ok(Found::Bitmap(bytes));
     }
     if raw::is_format_avail(formats::CF_HDROP) {
-        let mut files: Vec<String> = Vec::new();
-        formats::FileList
-            .read_clipboard(&mut files)
-            .map_err(failed)?;
+        use windows_sys::Win32::UI::Shell::{DragQueryFileW, HDROP};
+        let hdrop = raw::get_clipboard_data(formats::CF_HDROP)
+            .map_err(failed)?
+            .as_ptr() as HDROP;
+        // SAFETY: the clipboard is open and holds this list while these run; a null buffer
+        // asks only for a count or a length.
+        let count = unsafe { DragQueryFileW(hdrop, u32::MAX, std::ptr::null_mut(), 0) };
+        let files = bounded_file_list(
+            count,
+            |i| unsafe { DragQueryFileW(hdrop, i, std::ptr::null_mut(), 0) },
+            |i, len| {
+                let mut name = vec![0u16; len as usize + 1];
+                // SAFETY: `name` has room for `len` units and the closing NUL.
+                let got = unsafe { DragQueryFileW(hdrop, i, name.as_mut_ptr(), len + 1) };
+                (got == len).then(|| String::from_utf16_lossy(&name[..len as usize]))
+            },
+        )?;
         if !files.is_empty() {
             let listed: String = files
                 .iter()
@@ -1702,6 +1715,41 @@ fn windows_clipboard(room: Room) -> Result<Found, String> {
         return Err("The clipboard is empty.".into());
     }
     Err(NO_IMAGE.into())
+}
+
+/// The most files a copied list may name, and the most its names may be together (in UTF-16, as
+/// Windows keeps them), before any name is read (Codex's review 88, 3).
+const MOST_COPIED_FILES: u32 = 1000;
+const MOST_COPIED_NAMES: usize = 1024 * 1024;
+
+/// A file list copied in Explorer, read within bounds: `count` the files it names, `len(i)` how
+/// long name `i` is in UTF-16 units, `read(i, len)` that name. Past MOST_COPIED_FILES, or names
+/// together past MOST_COPIED_NAMES, it's refused, said, before a name is read.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn bounded_file_list(
+    count: u32,
+    len: impl Fn(u32) -> u32,
+    read: impl Fn(u32, u32) -> Option<String>,
+) -> Result<Vec<String>, String> {
+    if count > MOST_COPIED_FILES {
+        return Err(format!(
+            "You copied {count} files; Kerdr takes at most {MOST_COPIED_FILES} at once, so none of them went in."
+        ));
+    }
+    let lens: Vec<u32> = (0..count).map(len).collect();
+    let together: usize = lens.iter().map(|&n| n as usize * 2).sum();
+    if together > MOST_COPIED_NAMES {
+        return Err(format!(
+            "The copied files' names come to over {}, more than Kerdr reads at once, so none of them went in.",
+            size(MOST_COPIED_NAMES)
+        ));
+    }
+    (0..count)
+        .zip(lens)
+        .map(|(i, n)| {
+            read(i, n).ok_or_else(|| "Couldn't read the names of the files you copied.".to_string())
+        })
+        .collect()
 }
 
 /// Runs a clipboard reader with nothing on its standard input, keeping at most `cap` bytes of
@@ -1800,6 +1848,49 @@ mod tests {
                 .why
                 .unwrap()
                 .starts_with("Couldn't read the clipboard's picture")
+        );
+    }
+
+    #[test]
+    fn a_copied_file_list_is_bounded_before_any_name_is_read() {
+        // Codex's review 88, 3: Windows' copied file list (CF_HDROP), read through stand-ins for
+        // DragQueryFileW: its count first, then each name's length, and only then the names. Past
+        // 1000 files, or names together past 1 MB, nothing is read, and he's told.
+        use std::cell::Cell;
+        let (asked, read) = (Cell::new(0), Cell::new(0));
+        let len = |n: u32| {
+            let asked = &asked;
+            move |_i: u32| {
+                asked.set(asked.get() + 1);
+                n
+            }
+        };
+        let name = |_i: u32, n: u32| {
+            read.set(read.get() + 1);
+            Some("C".repeat(n as usize))
+        };
+        let why = bounded_file_list(1001, len(20), name).unwrap_err();
+        assert_eq!(
+            why,
+            "You copied 1001 files; Kerdr takes at most 1000 at once, so none of them went in."
+        );
+        assert_eq!(
+            (asked.get(), read.get()),
+            (0, 0),
+            "names read past the count"
+        );
+        let why = bounded_file_list(1000, len(600), name).unwrap_err();
+        assert!(
+            why.starts_with("The copied files' names come to over"),
+            "{why}"
+        );
+        assert_eq!(read.get(), 0, "names read past their size");
+        let got = bounded_file_list(3, len(4), name).unwrap();
+        assert_eq!(got, vec!["CCCC"; 3]);
+        assert!(
+            bounded_file_list(2, len(4), |_, _| None)
+                .unwrap_err()
+                .contains("Couldn't read the names")
         );
     }
 
