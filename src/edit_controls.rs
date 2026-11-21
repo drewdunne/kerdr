@@ -1316,6 +1316,14 @@ impl App {
                     {
                         said = format!("{said} {note}");
                     }
+                    // Each fix in its own words, as the backend gave them, unless already said
+                    // (Codex's review 85, 9).
+                    for fix in &r.fixed {
+                        let fix = fix.message.trim();
+                        if !fix.is_empty() && !said.contains(fix) {
+                            said = format!("{said} {fix}");
+                        }
+                    }
                     if !r.fixed.is_empty()
                         && let Some(mut held) = held
                         && let Some(mine) = held.mine.take()
@@ -1806,6 +1814,36 @@ mod tests {
         assert!(said(&app).contains("is kept: e opens it, with the newer text below it"));
         assert!(!app.failing());
         assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine, again.");
+    }
+
+    #[test]
+    fn a_fixed_save_says_each_fix_in_its_own_words_when_the_message_doesnt() {
+        // Codex's review 85, 9: the answer's message is only "Saved.", no note; the fixes'
+        // explanations are what say which lines changed, and they're shown.
+        let mut app = fixing();
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote("# Title\n```\ncode"))
+        else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        let response = crate::actions::parse_response(
+            &json!({"ok":true,"status":"saved","message":"Saved.",
+                "fixed":[{"line":1,"kind":"heading","message":"Line 1's # heading is now ###."},
+                         {"line":4,"kind":"fence","message":"Line 4 closes the code block line 2 opened."}],
+                "text":"### Title\n```\ncode\n```","was":"sha256:ee"})
+            .to_string(),
+        )
+        .unwrap();
+        answer(&mut app, &sent, Ok(response));
+        let said = said(&app);
+        assert!(said.starts_with("Saved."), "{said}");
+        assert!(said.contains("Line 1's # heading is now ###."), "{said}");
+        assert!(
+            said.contains("Line 4 closes the code block line 2 opened."),
+            "{said}"
+        );
     }
 
     #[test]
