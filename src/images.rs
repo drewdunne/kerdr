@@ -3050,6 +3050,82 @@ mod tests {
     #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     #[ignore]
+    fn live_watch_retires_when_its_display_stops_answering_and_stops_when_dropped() {
+        // Codex's review 90, 2 and 3, against Xvfb (KERDR_LIVE_XVFB_PID names it): Kerdr's watch,
+        // dropped once set up, ends its thread. With the display stopped (SIGSTOP), a paste's
+        // check gives up within SYNC_BOUND and retires the watch: nothing from that paste goes
+        // in, pastes after it stay instant and are read as ones with no watch, and its thread
+        // ends. The display is let go on again however the test ends.
+        if live_desktop() != Some(false) {
+            eprintln!("skipped: no X11 display");
+            return;
+        }
+        let Some(pid) = std::env::var("KERDR_LIVE_XVFB_PID")
+            .ok()
+            .and_then(|p| p.parse::<i32>().ok())
+        else {
+            eprintln!("skipped: no KERDR_LIVE_XVFB_PID");
+            return;
+        };
+        let ready = |watch: &ClipboardWatch| {
+            let until = Instant::now() + Duration::from_secs(5);
+            while watch.now().is_none() {
+                assert!(Instant::now() < until, "the watch never set up");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        let gone = |ended: &dyn Fn() -> bool| {
+            let until = Instant::now() + Duration::from_secs(2);
+            while !ended() {
+                if Instant::now() > until {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            true
+        };
+        let watch = ClipboardWatch::start();
+        ready(&watch);
+        let ended = watch.ended();
+        drop(watch);
+        assert!(gone(&*ended), "a dropped watch's thread kept running");
+        let watch = ClipboardWatch::start();
+        ready(&watch);
+        let ended = watch.ended();
+        struct Resume(i32);
+        impl Drop for Resume {
+            fn drop(&mut self) {
+                // SAFETY: a signal to the Xvfb this test was given.
+                unsafe { libc::kill(self.0, libc::SIGCONT) };
+            }
+        }
+        let _resume = Resume(pid);
+        // SAFETY: as above.
+        unsafe { libc::kill(pid, libc::SIGSTOP) };
+        let pasted = watch.pasted().expect("numbered");
+        let began = Instant::now();
+        let got = take_since(Some(pasted), || Ok(Found::Text("words".into())));
+        assert_eq!(got, Err(UNCHECKED.to_string()));
+        assert!(
+            began.elapsed() < watch::SYNC_BOUND + Duration::from_millis(500),
+            "{:?}",
+            began.elapsed()
+        );
+        let began = Instant::now();
+        for _ in 0..100 {
+            assert!(watch.pasted().is_none(), "a retired watch numbered a paste");
+        }
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(gone(&*ended), "a retired watch's thread kept running");
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    #[ignore]
     fn live_reader_knows_a_copy_made_while_it_read() {
         // Codex's review 88, 1, against a real desktop: Kerdr's own reader, X11's (XFixes) or
         // Wayland's (the offer it listed), says whether anything was copied between its list and

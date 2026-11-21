@@ -8,23 +8,29 @@
 //! own (a property changed on Kerdr's window, whose notice comes back after every notice the
 //! server sent before it); under Wayland, which gives no round trip here, by a short wait. Then
 //! the count is compared. A watch that can't be brought up to date in time is retired: its count
-//! becomes unknown, and readers watch from their own start again. Windows numbers copies itself
-//! (GetClipboardSequenceNumber), read directly; macOS has no watch.
+//! becomes unknown, its thread is stopped, and readers watch from their own start again. Windows
+//! numbers copies itself (GetClipboardSequenceNumber), read directly; macOS has no watch.
+//!
+//! The thread stops with its owner: when the watch is dropped, when it's retired, and when it
+//! isn't set up within START_BOUND. Under X11 that shuts its socket, waking whatever it waits on,
+//! its first answer from the server included; under Wayland it's the watch's own cancel handle.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+/// How long the watch may take to set up before it's given up and its thread stopped.
+pub const START_BOUND: Duration = Duration::from_secs(3);
 /// How long a paste's check may take to bring the watch up to date.
 pub const SYNC_BOUND: Duration = Duration::from_secs(1);
 /// Under Wayland, how long a check waits for notices already sent to come in.
 #[cfg(not(any(target_os = "macos", windows)))]
 const WAYLAND_SETTLE: Duration = Duration::from_millis(50);
 
-/// Kerdr's clipboard watch. Clones share one watch.
+/// Kerdr's clipboard watch. Clones share one watch; it stops when the last is dropped.
 #[derive(Clone)]
 pub struct ClipboardWatch {
-    shared: Arc<Shared>,
+    owner: Arc<Owner>,
 }
 
 /// A paste's copy, as the watch numbered it when the paste was handled.
@@ -34,8 +40,19 @@ pub struct Pasted {
     copy: u64,
 }
 
+/// What stops the watch once nothing holds it.
+struct Owner(Arc<Shared>);
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
+}
+
 /// Brings the count up to date within the bound: true once every notice sent before it is in.
 type SyncFn = Box<dyn Fn(Duration) -> bool + Send + Sync>;
+/// What stops the watch's thread.
+type Stop = Box<dyn FnOnce() + Send>;
 /// What a watch's thread runs.
 #[cfg(not(any(target_os = "macos", windows)))]
 type Watching = Box<dyn FnOnce(&Arc<Shared>) + Send>;
@@ -49,6 +66,11 @@ pub(crate) struct Shared {
     sync: OnceLock<SyncFn>,
     /// A number the system keeps itself, read directly (Windows).
     number: OnceLock<Box<dyn Fn() -> Option<u64> + Send + Sync>>,
+    stopped: AtomicBool,
+    stops: Mutex<Vec<Stop>>,
+    /// The thread has ended.
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+    ended: AtomicBool,
 }
 
 impl Shared {
@@ -63,11 +85,17 @@ impl Shared {
     }
 
     #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
-    /// Set up: copies are counted from here.
-    fn ready(&self, sync: SyncFn) {
+    /// Set up: copies are counted from here. False when it's been stopped meanwhile.
+    fn ready(&self, sync: SyncFn) -> bool {
         let _ = self.sync.set(sync);
         self.copies.store(0, SeqCst);
+        let stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(SeqCst) {
+            return false;
+        }
         self.known.store(true, SeqCst);
+        drop(stops);
+        true
     }
 
     #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
@@ -76,9 +104,40 @@ impl Shared {
         self.copies.fetch_add(1, SeqCst);
     }
 
-    /// Its count unknown from now.
+    /// Its count unknown from now, and its thread stopped.
     fn retire(&self) {
         self.known.store(false, SeqCst);
+        self.stop();
+    }
+
+    fn stop(&self) {
+        let stops = {
+            let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+            self.known.store(false, SeqCst);
+            self.stopped.store(true, SeqCst);
+            std::mem::take(&mut *stops)
+        };
+        for stop in stops {
+            stop();
+        }
+    }
+
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+    /// Runs `stop` when the watch stops; at once, and false, if it has already.
+    fn on_stop(&self, stop: Stop) -> bool {
+        let mut stops = self.stops.lock().unwrap_or_else(|e| e.into_inner());
+        if self.stopped.load(SeqCst) {
+            drop(stops);
+            stop();
+            return false;
+        }
+        stops.push(stop);
+        true
+    }
+
+    #[cfg_attr(any(target_os = "macos", windows), allow(dead_code))]
+    fn stopped(&self) -> bool {
+        self.stopped.load(SeqCst)
     }
 
     fn sync(&self, bound: Duration) -> bool {
@@ -91,7 +150,9 @@ impl Shared {
 
 impl ClipboardWatch {
     fn with(shared: Arc<Shared>) -> ClipboardWatch {
-        ClipboardWatch { shared }
+        ClipboardWatch {
+            owner: Arc::new(Owner(shared)),
+        }
     }
 
     /// This desktop's watch, set up away from the board, which never waits for it: a paste before
@@ -113,24 +174,52 @@ impl ClipboardWatch {
         {
             let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
             if set("WAYLAND_DISPLAY") {
-                ClipboardWatch::running(Box::new(wayland))
+                ClipboardWatch::running(Box::new(wayland), START_BOUND)
             } else if set("DISPLAY") {
-                ClipboardWatch::running(Box::new(|shared| x11(shared, None)))
+                ClipboardWatch::running(Box::new(|shared| x11(shared, None)), START_BOUND)
             } else {
                 ClipboardWatch::with(Arc::default())
             }
         }
     }
 
-    /// A watch whose thread runs `watch`.
+    /// A watch whose thread runs `watch`, given up and stopped if it isn't set up within `bound`.
     #[cfg(not(any(target_os = "macos", windows)))]
-    fn running(watch: Watching) -> ClipboardWatch {
+    fn running(watch: Watching, bound: Duration) -> ClipboardWatch {
         let shared = Arc::new(Shared::default());
         let theirs = shared.clone();
-        let _ = std::thread::Builder::new()
+        let started = std::thread::Builder::new()
             .name("kerdr-clipboard-watch".into())
-            .spawn(move || watch(&theirs));
+            .spawn(move || {
+                watch(&theirs);
+                theirs.retire();
+                theirs.ended.store(true, SeqCst);
+            });
+        if started.is_err() {
+            shared.ended.store(true, SeqCst);
+            return ClipboardWatch::with(shared);
+        }
+        // Not set up in time: given up, its thread stopped with it. The timer holds the watch
+        // only weakly, so it never keeps one alive.
+        let late = Arc::downgrade(&shared);
+        let _ = std::thread::Builder::new()
+            .name("kerdr-clipboard-watch-start".into())
+            .spawn(move || {
+                std::thread::sleep(bound);
+                if let Some(shared) = late.upgrade()
+                    && !shared.known.load(SeqCst)
+                {
+                    shared.retire();
+                }
+            });
         ClipboardWatch::with(shared)
+    }
+
+    /// An X11 watch on the display at the socket `path`, given up after `bound`, for tests.
+    #[cfg(all(test, not(any(target_os = "macos", windows))))]
+    pub(crate) fn x11_at(path: &std::path::Path, bound: Duration) -> ClipboardWatch {
+        let path = path.to_path_buf();
+        ClipboardWatch::running(Box::new(move |shared| x11(shared, Some(&path))), bound)
     }
 
     /// A watch with no thread, its notices given by the test, already set up.
@@ -141,10 +230,17 @@ impl ClipboardWatch {
         (ClipboardWatch::with(shared.clone()), Notices(shared))
     }
 
+    /// Whether the watch's thread has ended.
+    #[cfg(all(test, not(any(target_os = "macos", windows))))]
+    pub(crate) fn ended(&self) -> Arc<dyn Fn() -> bool + Send + Sync> {
+        let shared = self.owner.0.clone();
+        Arc::new(move || shared.ended.load(SeqCst))
+    }
+
     /// The copy the clipboard holds now, as far as the watch has been told: an atomic load.
     /// None until it's set up, or once it's retired.
     pub fn now(&self) -> Option<u64> {
-        self.shared.now()
+        self.owner.0.now()
     }
 
     /// As a paste is handled: the copy it's for, at once.
@@ -166,7 +262,7 @@ impl Pasted {
     /// every notice sent before now brought in first. None when the watch can't be brought up
     /// to date in time: then it's retired.
     pub fn changed(&self) -> Option<bool> {
-        let shared = &self.watch.shared;
+        let shared = &self.watch.owner.0;
         if !shared.sync(SYNC_BOUND) {
             shared.retire();
             return None;
@@ -193,10 +289,13 @@ impl Notices {
     }
 }
 
-/// Kerdr's X11 watch: XFixes' notice of each change of the CLIPBOARD selection, counted.
+/// Kerdr's X11 watch: XFixes' notice of each change of the CLIPBOARD selection, counted. The
+/// socket is Kerdr's from before the first word to the server, so stopping the watch shuts it,
+/// and the thread wakes from any wait, its first answer included.
 #[cfg(not(any(target_os = "macos", windows)))]
 fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
-    use std::sync::{Condvar, Mutex};
+    use std::os::fd::{AsFd, AsRawFd};
+    use std::sync::Condvar;
     use x11rb::connection::Connection;
     use x11rb::protocol::Event;
     use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
@@ -233,6 +332,18 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
             (stream, Default::default(), 0)
         }
     };
+    let Ok(socket) = stream.as_fd().try_clone_to_owned() else {
+        return;
+    };
+    let shut = Box::new(move || {
+        // SAFETY: shuts down the socket this duplicate refers to; the duplicate is Kerdr's own
+        // and still open here.
+        unsafe { libc::shutdown(socket.as_raw_fd(), libc::SHUT_RDWR) };
+        drop(socket);
+    });
+    if !shared.on_stop(shut) {
+        return;
+    }
     let (auth_name, auth_data) = auth;
     let Ok(conn) =
         RustConnection::connect_to_stream_with_auth_info(stream, screen, auth_name, auth_data)
@@ -303,8 +414,10 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
             waited.is_ok_and(|(_, timeout)| !timeout.timed_out())
         })
     };
-    shared.ready(sync);
-    loop {
+    if !shared.ready(sync) {
+        return;
+    }
+    while !shared.stopped() {
         match conn.wait_for_event() {
             Ok(Event::XfixesSelectionNotify(_)) => shared.copied(),
             Ok(Event::PropertyNotify(e)) if e.window == window && e.atom == ping => {
@@ -319,8 +432,10 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
 }
 
 /// Kerdr's Wayland watch: each selection the desktop offers through data-control, counted as it
-/// comes (wl-clipboard-rs's watch). The first is the clipboard as the watch began. It gives no
-/// round trip, so a check waits WAYLAND_SETTLE for notices already sent.
+/// comes (wl-clipboard-rs's watch, whose cancel handle stops it). The first is the clipboard as
+/// the watch began. It gives no round trip, so a check waits WAYLAND_SETTLE for notices already
+/// sent. wl-clipboard-rs makes its connection itself: a desktop that never answers its first
+/// round trip holds this thread until it does, though nothing waits on it (a known limit).
 #[cfg(not(any(target_os = "macos", windows)))]
 fn wayland(shared: &Arc<Shared>) {
     use wl_clipboard_rs::paste::Seat;
@@ -328,8 +443,12 @@ fn wayland(shared: &Arc<Shared>) {
     let Ok(mut watcher) = Watcher::new(ClipboardType::Regular, Seat::Unspecified) else {
         return;
     };
+    let cancel = watcher.cancel_handle();
+    if !shared.on_stop(Box::new(move || cancel.cancel())) {
+        return;
+    }
     let mut first = true;
-    loop {
+    while !shared.stopped() {
         match watcher.next_event() {
             Ok(Some(_)) if first => {
                 first = false;
@@ -337,7 +456,9 @@ fn wayland(shared: &Arc<Shared>) {
                     std::thread::sleep(bound.min(WAYLAND_SETTLE));
                     true
                 });
-                shared.ready(settle);
+                if !shared.ready(settle) {
+                    return;
+                }
             }
             Ok(Some(_)) => shared.copied(),
             _ => return,
@@ -350,6 +471,19 @@ mod tests {
     use super::*;
     use crate::images::{COPIED_AGAIN, Found, UNCHECKED, take_since};
     use std::time::Instant;
+
+    /// Waits up to `most` for `done`.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    fn within(most: Duration, done: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + most;
+        while !done() {
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        true
+    }
 
     #[test]
     fn a_paste_is_numbered_at_once_and_a_notice_that_comes_late_is_still_told() {
@@ -455,5 +589,61 @@ mod tests {
             take_since(watch.pasted(), || Ok(Found::Text("<B>".into()))),
             Ok(Found::Text("<B>".into()))
         );
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn an_x11_server_that_never_answers_leaves_pastes_instant_and_its_watch_stops() {
+        // Codex's review 90, 2 and 3: a display that takes the connection and never answers.
+        // Pastes stay instant; the watch, never set up, is given up at its start-up bound and its
+        // thread ends; one dropped before then ends at once.
+        use std::os::unix::net::UnixListener;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("X0");
+        let listener = UnixListener::bind(&path).unwrap();
+        let kept = Arc::new(Mutex::new(vec![]));
+        let server = {
+            let kept = kept.clone();
+            std::thread::spawn(move || {
+                for _ in 0..2 {
+                    if let Ok((stream, _)) = listener.accept() {
+                        kept.lock().unwrap().push(stream);
+                    }
+                }
+            })
+        };
+        let watch = ClipboardWatch::x11_at(&path, Duration::from_millis(300));
+        let ended = watch.ended();
+        let began = Instant::now();
+        for _ in 0..100 {
+            assert!(watch.pasted().is_none());
+        }
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(
+            within(Duration::from_secs(2), || kept.lock().unwrap().len() == 1),
+            "it never reached the display"
+        );
+        assert!(
+            within(Duration::from_secs(3), || ended()),
+            "the watch's thread never stopped"
+        );
+        // Dropped while it waits for the server: its thread ends with it.
+        let watch = ClipboardWatch::x11_at(&path, Duration::from_secs(60));
+        let ended = watch.ended();
+        assert!(within(Duration::from_secs(2), || kept
+            .lock()
+            .unwrap()
+            .len()
+            == 2));
+        drop(watch);
+        assert!(
+            within(Duration::from_secs(2), || ended()),
+            "a dropped watch's thread kept running"
+        );
+        server.join().unwrap();
     }
 }

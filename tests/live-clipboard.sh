@@ -12,7 +12,9 @@ export KERDR_LIVE_CLIPBOARD_IMAGE
 # live_clipboard, and on Linux live_clipboard_own_reader (Kerdr's own reader with no program to
 # run), live_reader_knows_a_copy_made_while_it_read (xclip or wl-copy copies while Kerdr's own
 # reader reads: nothing goes in), live_watch_knows_a_copy_made_as_the_reader_set_up (Kerdr's watch,
-# kept from before the paste, knows a copy made before the reader set up) and
+# kept from before the paste, knows a copy made before the reader set up),
+# live_watch_retires_when_its_display_stops_answering_and_stops_when_dropped (under X11, given
+# the X server's pid as KERDR_LIVE_XVFB_PID, which xvfb-run doesn't give, so skipped here) and
 # live_x11_read_stops_at_its_cap (under X11: a read keeps no more than its cap).
 TEST="cargo test --locked --lib -- --ignored --test-threads=1 images::tests::live_"
 TMP=$(mktemp -d)
