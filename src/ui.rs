@@ -2982,6 +2982,13 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) -> Vec<String> {
+    // Typing shows the words' end: only that much is wrapped, so a box of a megabyte's words
+    // (intent 0591, release 5) draws as fast as a line's.
+    let value = if active {
+        shown_tail(value, max_width, max_lines)
+    } else {
+        value
+    };
     let mut lines = Vec::new();
     let mut line = String::new();
     for ch in value.chars().chain(active.then_some('▏')) {
@@ -3009,6 +3016,24 @@ fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) ->
         }
     }
     lines
+}
+
+/// The end of `value` that holds at least its last `max_lines` lines `max_width` wide: from just
+/// after a line break when one is near enough, else as many characters as those lines could hold.
+fn shown_tail(value: &str, max_width: usize, max_lines: usize) -> &str {
+    let most = (max_lines + 1) * (max_width + 1) * 4;
+    if value.len() <= most {
+        return value;
+    }
+    let mut start = value.len() - most;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &value[start..];
+    match tail.rmatch_indices('\n').nth(max_lines) {
+        Some((at, _)) => &tail[at + 1..],
+        None => tail,
+    }
 }
 
 /// One line of the new-intent box, its attached images' tags set apart from the words.
@@ -3369,6 +3394,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
         Some("reopen") => "go ahead",
         Some("cancel") => "stop it",
         Some(crate::app::SEND_WITHOUT) => "send without it",
+        Some(crate::app::SMALLER) => "attach a smaller copy",
         Some(crate::app::cancels::STOP_START) => "stop it and put it back",
         _ => "yes",
     };
@@ -3397,6 +3423,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
     let no = match q.action {
         Some("cancel") => "keep it running",
         Some(crate::app::SEND_WITHOUT) => "keep them unsent",
+        Some(crate::app::SMALLER) => "leave it out",
         Some(crate::app::cancels::STOP_START) => "let it start",
         _ if !q.choices.is_empty() => "leave it",
         _ => "cancel",
@@ -5488,6 +5515,21 @@ pub(crate) fn tests_render(a: &App, w: u16, h: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_box_of_a_megabytes_words_shows_its_end_as_a_short_one_would() {
+        // Intent 0591, release 5: only the end is wrapped, and it reads the same.
+        let short = "first line\nsecond, a longer line that wraps at forty columns or so\nlast";
+        let long = format!("{}{short}", "filler line\n".repeat(90_000));
+        let started = std::time::Instant::now();
+        let shown = field_lines(&long, 40, 3, true);
+        assert_eq!(shown, field_lines(short, 40, 3, true));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let one = "y".repeat(1_000_000);
+        let shown = field_lines(&one, 40, 3, true);
+        assert_eq!(shown.len(), 3);
+        assert!(shown[2].ends_with('▏'));
+    }
     use crate::app::{Search, SearchFilter, Selection};
     use crate::config::Config;
     use chrono::TimeZone;

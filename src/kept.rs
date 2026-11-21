@@ -802,13 +802,13 @@ impl KeptImage {
         }
     }
 
-    /// The image again; None for one that isn't an image Kerdr takes.
+    /// The image again, of any kind Kerdr knows by its bytes; None for bytes that aren't one.
     pub fn image(&self) -> Option<crate::images::Image> {
         use base64::Engine;
         let bytes = base64::engine::general_purpose::STANDARD
             .decode(&self.data)
             .ok()?;
-        let media_type = crate::images::media_type(&bytes)?;
+        let media_type = crate::images::kind_of(&bytes)?;
         Some(crate::images::Image {
             tag: self.tag,
             media_type,

@@ -10,6 +10,11 @@ use crate::transport::{self, Target};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 
+/// The most a new intent or an edit may be for a backend that fixes input (intent 0591, release 5,
+/// "fix-input" in its feed's `supports`): it goes over ssh's standard input, so a ceiling it can
+/// carry, and one generous enough that any words he writes fit.
+pub const FIX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
 /// One of your open questions on background work, for the Kickoff Questions box (intent 0409).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Question {
@@ -656,25 +661,59 @@ pub fn request_metadata(request: &Value) -> Value {
     value
 }
 
-/// Whether a request is past what Kerdr sends: 64 KiB, and room for a new intent's images.
+/// Whether a request is past what Kerdr sends a backend without fix-input: 64 KiB, and room for
+/// a new intent's images.
 pub fn too_large(request: &Value) -> bool {
+    serde_json::to_string(request).map_or(true, |json| json.len() > older_most_bytes(request))
+}
+
+/// Whether a request is past what Kerdr sends this backend: one that fixes input (`fix`) takes a
+/// new intent or an edit up to FIX_REQUEST_BYTES (intent 0591, K1-68, K1-92); any other, 0.35.0's.
+pub fn too_large_for(request: &Value, fix: bool) -> bool {
+    if !fix {
+        return too_large(request);
+    }
     serde_json::to_string(request).map_or(true, |json| json.len() > most_bytes(request))
 }
 
-/// The most an answer may be: 64 KiB, and for an edit room for an item's text (at most 48 KiB)
-/// however much of it JSON escapes.
+/// Why a request too large for a backend without fix-input wasn't sent, in 0.35.0's words.
+pub fn too_large_said(request: &Value) -> String {
+    if older_most_bytes(request) > MAX_JSON_BYTES {
+        format!(
+            "the request is too large to send (64 KiB at most, and {} of images), so nothing was sent",
+            crate::images::size(crate::images::MAX_IMAGES_BYTES)
+        )
+    } else {
+        "the request is too large to send (64 KiB at most), so nothing was sent".into()
+    }
+}
+
+/// The most an answer may be: 64 KiB, and for an edit room for an item's text, which a backend
+/// that fixes input keeps whole however long, however much of it JSON escapes.
 fn most_answer_bytes(request: &Value) -> usize {
     if request["action"] == "edit" {
-        3 * MAX_JSON_BYTES
+        3 * FIX_REQUEST_BYTES
     } else {
         MAX_JSON_BYTES
     }
 }
 
-/// The most a request may be: 64 KiB, and room for the images a new intent may carry.
-fn most_bytes(request: &Value) -> usize {
+/// The most a request may be for a backend without fix-input: 64 KiB, and room for the images a
+/// new intent may carry.
+fn older_most_bytes(request: &Value) -> usize {
     if request["action"] == "create" && request["images"].is_array() {
         MAX_JSON_BYTES + crate::images::REQUEST_ALLOWANCE
+    } else {
+        MAX_JSON_BYTES
+    }
+}
+
+/// The most any request is sent as: a new intent or an edit up to FIX_REQUEST_BYTES, which only a
+/// backend that fixes input is ever sent (the board holds any other to too_large first), and any
+/// other request 64 KiB.
+fn most_bytes(request: &Value) -> usize {
+    if matches!(request["action"].as_str(), Some("create" | "edit")) {
+        FIX_REQUEST_BYTES
     } else {
         MAX_JSON_BYTES
     }
@@ -1202,10 +1241,7 @@ fn run_with_deadline(
     };
     if json.len() > most_bytes(request) {
         let said = if most_bytes(request) > MAX_JSON_BYTES {
-            format!(
-                "the request is too large to send (64 KiB at most, and {} of images), so nothing was sent",
-                crate::images::size(crate::images::MAX_IMAGES_BYTES)
-            )
+            "the request is too large to send (32 MiB at most), so nothing was sent".to_string()
         } else {
             "the request is too large to send (64 KiB at most), so nothing was sent".into()
         };
@@ -3288,16 +3324,21 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
             request
         );
         assert_eq!(request_metadata(&request)["images"], 1);
-        // Images beyond what a new intent may carry are still refused before anything runs.
-        let sentinel = dir.path().join("ran");
+        // Past what a backend without fix-input takes, the board holds it back in 0.35.0's words;
+        // past 32 MiB, nothing runs whatever the backend (intent 0591, K1-68).
         let too_many = "x".repeat(crate::images::REQUEST_ALLOWANCE + MAX_JSON_BYTES);
+        let past = json!({"action":"create","words":"x","images":[{"data":too_many}]});
+        assert!(too_large_for(&past, false));
+        assert!(too_large_said(&past).contains("20 MB of images"));
+        assert!(!too_large_for(&past, true));
+        let sentinel = dir.path().join("ran");
         let error = run(
             &machine(),
             &format!("touch {}", quote(sentinel.to_str().unwrap())),
-            &json!({"action":"create","words":"x","images":[{"data":too_many}]}),
+            &json!({"action":"create","words":"x","images":[{"data":"x".repeat(FIX_REQUEST_BYTES)}]}),
         )
         .unwrap_err();
-        assert!(error.contains("20 MB of images"), "{error}");
+        assert!(error.contains("32 MiB at most"), "{error}");
         assert!(!sentinel.exists());
     }
 
@@ -3340,15 +3381,20 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         for status in ["saved", "unchanged", "partial", "stale"] {
             assert!(KNOWN_STATUSES.contains(&status), "{status}");
         }
-        // A save past 64 KiB is refused before anything runs, and said to be too large.
+        // A save past 64 KiB is too large for a backend without fix-input; one that fixes input
+        // takes it, up to 32 MiB, past which it's refused before anything runs (K1-92).
         let big = json!({"action":"edit","id":"0414","text":"x".repeat(70_000),"was":"sha256:aa"});
         assert!(too_large(&big));
+        assert!(too_large_for(&big, false));
+        assert!(!too_large_for(&big, true));
         assert!(!too_large(&request));
+        let huge = json!({"action":"edit","id":"0414","text":"x".repeat(FIX_REQUEST_BYTES),"was":"sha256:aa"});
+        assert!(too_large_for(&huge, true));
         let sentinel = dir.path().join("ran");
         let error = run(
             &machine(),
             &format!("touch {}", quote(sentinel.to_str().unwrap())),
-            &big,
+            &huge,
         )
         .unwrap_err();
         assert!(error.contains("too large"), "{error}");
@@ -3390,10 +3436,19 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         let error = run(
             &machine(),
             &command,
-            &json!({"action":"create","words":"x".repeat(70_000)}),
+            &json!({"action":"create","words":"x".repeat(FIX_REQUEST_BYTES)}),
         )
         .unwrap_err();
         assert!(error.contains("too large"), "{error}");
+        assert!(!sentinel.exists());
+        // Any other request past 64 KiB, whatever the backend.
+        let error = run(
+            &machine(),
+            &command,
+            &json!({"action":"answer","id":"0414","answers":"x".repeat(70_000)}),
+        )
+        .unwrap_err();
+        assert!(error.contains("64 KiB at most"), "{error}");
         assert!(!sentinel.exists());
     }
 }

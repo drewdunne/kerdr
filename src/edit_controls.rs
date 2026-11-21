@@ -673,9 +673,12 @@ impl App {
                     json!({"action":"edit","id":held.id,"text":text,"was":held.was,"from":crate::config::hostname()}),
                 );
                 self.edits.insert(key.to_string(), held);
-                if crate::actions::too_large(&request) {
+                // A backend that fixes input takes any text he writes, up to 32 MiB (K1-92).
+                let fix = self.fixes_input(machine);
+                if crate::actions::too_large_for(&request, fix) {
+                    let most = if fix { "32 MiB" } else { "64 KiB" };
                     self.fail(format!(
-                        "{reference}'s text is too large to send: a request is at most 64 KiB. Your version is kept: e opens it to make it shorter.{note}"
+                        "{reference}'s text is too large to send: a request is at most {most}. Your version is kept: e opens it to make it shorter.{note}"
                     ));
                     return Action::None;
                 }

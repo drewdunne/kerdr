@@ -8,8 +8,18 @@ use crate::model::{CardSnapshot, Summary};
 use crate::resolve::Effect;
 use serde_json::{Value, json};
 
-/// The most the new-intent box holds, kept under the actions' 64 KiB request limit.
+/// The most the new-intent box holds for a backend without fix-input, kept under its 64 KiB
+/// request limit.
 const MAX_WORDS: usize = 48_000;
+
+/// The most it holds for a backend that fixes input, which saves long words whole in a file beside
+/// the intent (intent 0591, release 5): a megabyte, well inside a 32 MiB request.
+const FIX_WORDS: usize = 1_000_000;
+
+/// The most the new-intent box holds for a backend that fixes input or not.
+pub(crate) fn max_words(fix: bool) -> usize {
+    if fix { FIX_WORDS } else { MAX_WORDS }
+}
 
 /// The most of an action's answer the board shows: a backend's error can run to thousands of
 /// characters, which would fill the screen (intent 0411).
@@ -155,28 +165,88 @@ fn take_tag(draft: &mut Draft, past_spaces: bool) -> bool {
     true
 }
 
-/// Puts images into a new intent's words, each as the next `[Image #N]` tag at `at` (where the
-/// words ended when the read began), or at the end when the words have since been cut shorter
-/// than that. What went in, and why anything didn't, to say.
-fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>) -> Vec<String> {
+/// What putting a read into a new intent's words did: what to say of it, the images too large to
+/// send (for a backend that fixes input, to ask about smaller copies of), and how much went in at
+/// the place it went.
+#[derive(Debug, Default)]
+struct Attached {
+    said: Vec<String>,
+    /// Something read didn't go in: refused, or past a limit.
+    refused: bool,
+    oversized: Vec<images::Loaded>,
+    inserted: usize,
+    at: usize,
+}
+
+/// Puts what a read found into a new intent's words at `at` (where the words ended when the read
+/// began), or at the end when the words have since been cut shorter than that: text first, as any
+/// paste would put it (intent 0591, K3-61), then each image as the next `[Image #N]` tag. For a
+/// backend that fixes input (`fix`) there's no count, and no image is refused for the words'
+/// room; one past the 20 MB its images may be together is held back for a question.
+fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>, fix: bool) -> Attached {
     let mut at = at
         .filter(|&a| a <= draft.words.len() && draft.words.is_char_boundary(a))
         .unwrap_or(draft.words.len());
-    let mut said = vec![];
-    for image in got.images {
-        if draft.images.len() >= images::MAX_IMAGES {
-            said.push(images::too_many());
-            break;
+    let before = draft.words.len();
+    let mut out = Attached {
+        at,
+        said: got.notes,
+        ..Attached::default()
+    };
+    if let Some(text) = got.text {
+        let room = max_words(fix).saturating_sub(draft.words.len());
+        let mut end = text.len().min(room);
+        while !text.is_char_boundary(end) {
+            end -= 1;
         }
+        let mut piece = String::new();
+        if draft.words[..at]
+            .chars()
+            .last()
+            .is_some_and(|c| !c.is_whitespace())
+            && !text.starts_with(char::is_whitespace)
+        {
+            piece.push(' ');
+        }
+        piece.push_str(&text[..end]);
+        draft.words.insert_str(at, &piece);
+        at += piece.len();
+        out.said.push(if end < text.len() {
+            format!(
+                "Pasted the clipboard's text, up to the {} the box holds.",
+                images::size(max_words(fix))
+            )
+        } else {
+            "Pasted the clipboard's text.".to_string()
+        });
+    }
+    for image in got.images {
         let total: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
-        if total + image.bytes.len() > images::MAX_IMAGES_BYTES {
-            said.push(images::too_much());
-            break;
+        if fix {
+            if total + image.bytes.len() > images::MAX_IMAGES_BYTES
+                || image.bytes.len() > images::FIX_IMAGE_BYTES
+            {
+                out.oversized.push(image);
+                continue;
+            }
+        } else {
+            if draft.images.len() >= images::MAX_IMAGES {
+                out.said.push(images::too_many());
+                out.refused = true;
+                break;
+            }
+            if total + image.bytes.len() > images::MAX_IMAGES_BYTES {
+                out.said.push(images::too_much());
+                out.refused = true;
+                break;
+            }
         }
         let n = draft.images.iter().map(|i| i.tag).max().unwrap_or(0) + 1;
         let tag = images::tag(n);
-        if draft.words.len() + tag.len() + 2 > MAX_WORDS {
-            said.push("The box is full; there's no room for another image's tag.".into());
+        if !fix && draft.words.len() + tag.len() + 2 > MAX_WORDS {
+            out.said
+                .push("The box is full; there's no room for another image's tag.".into());
+            out.refused = true;
             break;
         }
         // A space either side keeps the tag apart from the words around it.
@@ -194,7 +264,7 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>) -> Ve
         }
         draft.words.insert_str(at, &piece);
         at += piece.len();
-        said.push(format!(
+        out.said.push(format!(
             "Attached {tag}: a {} image, {}.",
             images::kind_name(image.media_type),
             images::size(image.bytes.len())
@@ -205,8 +275,79 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>) -> Ve
             bytes: std::sync::Arc::new(image.bytes),
         });
     }
-    said.extend(got.why);
-    said
+    out.refused |= got.why.is_some();
+    out.said.extend(got.why);
+    out.inserted = draft.words.len() - before;
+    out
+}
+
+/// What the board says while a read goes.
+fn reading(source: &images::Source) -> &'static str {
+    match source {
+        images::Source::Clipboard => "Reading the clipboard…",
+        images::Source::Files(_) => "Reading the image…",
+        images::Source::Smaller(..) => "Making a smaller copy…",
+    }
+}
+
+/// Names as a sentence lists them.
+fn and_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Why images didn't go with words Enter sent: past what one intent may carry, and how to send a
+/// smaller copy.
+fn too_large_to_send(images: &[images::Loaded]) -> String {
+    let each: Vec<String> = images
+        .iter()
+        .map(|i| format!("{} is {}", i.from, images::size(i.bytes.len())))
+        .collect();
+    format!(
+        "{}, past the {} one intent's images may be together; pasted again in the box, Kerdr offers a smaller copy.",
+        and_names(&each),
+        images::size(images::MAX_IMAGES_BYTES)
+    )
+}
+
+/// The question whether smaller copies go in, naming each image, its size and the room left.
+fn smaller_question(images: &[images::Loaded], left: usize) -> String {
+    let each: Vec<String> = images
+        .iter()
+        .map(|i| {
+            format!(
+                "{} ({}, {})",
+                i.from,
+                images::kind_name(i.media_type),
+                images::size(i.bytes.len())
+            )
+        })
+        .collect();
+    let room = if left >= images::MAX_IMAGES_BYTES {
+        format!(
+            "past the {} one intent's images may be together",
+            images::size(images::MAX_IMAGES_BYTES)
+        )
+    } else {
+        format!(
+            "past the {} this intent's images have room for",
+            images::size(left)
+        )
+    };
+    if images.len() == 1 {
+        format!(
+            "{} is {room}. Attach a smaller copy instead? It may lose fine detail; the image itself stays as it is. n leaves it out.",
+            each[0]
+        )
+    } else {
+        format!(
+            "{} are {room}. Attach smaller copies instead? They may lose fine detail; the images themselves stay as they are. n leaves them out.",
+            and_names(&each)
+        )
+    }
 }
 
 /// An id for one new intent's words, so an adapter can tell a resend from new work.
@@ -1963,10 +2104,11 @@ impl App {
             self.draft_came_back = draft.came_back;
             // Kept as you left them, emptied included.
             self.keep_words_now();
-            // A read for words already sent carries on for them.
+            // A read for words already sent carries on for them; the box's own stop.
             if self.box_loading().is_some() {
                 self.image_load = None;
             }
+            self.image_queue.retain(|q| q.for_send);
             self.mode = *back;
             return Action::None;
         }
@@ -1974,7 +2116,7 @@ impl App {
         let newline = key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
-        let room = draft.words.len() < MAX_WORDS;
+        let room = draft.words.len() < max_words(self.fixes_input(draft.machine));
         match key.code {
             KeyCode::Enter if newline => {
                 if room {
@@ -1991,12 +2133,25 @@ impl App {
                     self.say("Write what you want first.", Tone::Info);
                 } else if !self.can_write(draft.machine) {
                     // Said why; the box stays open with the words.
+                } else if self.send_after_load.is_some()
+                    && self.image_queue.iter().any(|q| !q.for_send)
+                {
+                    // His last new intent still waits for its image, and this one's is read after
+                    // it: the box keeps these words until theirs is in.
+                    self.say(
+                        "Your last new intent's image is still being read, and this one's after it: Enter sends these words once it's in.",
+                        Tone::Info,
+                    );
                 } else if let Some(load) = self.box_loading() {
                     // The image still being read goes with them: the box closes now, and they're
-                    // sent once it's in (intent 0445). What the box kept for next time is these
-                    // words, now on their way: it opens empty, and nothing else typed meanwhile
-                    // is cleared when they go.
+                    // sent once it's in (intent 0445), with any read asked after it (intent 0591,
+                    // K1-35). What the box kept for next time is these words, now on their way: it
+                    // opens empty, and nothing else typed meanwhile is cleared when they go.
                     self.clear_kept_draft();
+                    for q in &mut self.image_queue {
+                        q.for_send = true;
+                    }
+                    self.send_troubles.clear();
                     self.send_after_load = Some((load, draft));
                     self.closed_on_send = true;
                     self.enter_backlog(false);
@@ -2135,6 +2290,21 @@ impl App {
         if !images.is_empty() {
             request["images"] = Value::Array(images::request_images(&words, &images));
         }
+        // Past what its backend takes: nothing is sent, and the words come back (intent 0591,
+        // K1-68). A backend that fixes input takes up to 32 MiB; any other 0.35.0's 64 KiB.
+        let fix = self.fixes_input(draft.machine);
+        if crate::actions::too_large_for(&request, fix) {
+            let why = if fix {
+                "the request is too large to send (32 MiB at most), so nothing was sent".into()
+            } else {
+                crate::actions::too_large_said(&request)
+            };
+            self.give_back(draft.words, draft.images, draft.came_back);
+            self.fail(format!(
+                "Your new intent wasn't saved: {why}. Your words are kept: c opens them."
+            ));
+            return Action::None;
+        }
         self.emit_mutation(draft.machine, request)
     }
 
@@ -2205,12 +2375,16 @@ impl App {
         if self.account_paste(&text) {
             return Action::None;
         }
+        let fix = match &self.mode {
+            Mode::Compose { draft, .. } => self.fixes_input(draft.machine),
+            _ => false,
+        };
         if matches!(self.mode, Mode::Compose { .. }) {
             // Spaces and blank lines are words; only a paste with nothing in it means an image.
             if text.is_empty() {
                 return Action::LoadImages(images::Source::Clipboard);
             }
-            if let Some(paths) = images::paths_in_paste(&text) {
+            if let Some(paths) = images::paths_in_paste_for(&text, fix) {
                 return Action::LoadImages(images::Source::Files(paths));
             }
         }
@@ -2225,12 +2399,21 @@ impl App {
         match &mut self.mode {
             Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text),
             Mode::Compose { draft, .. } => {
-                let room = MAX_WORDS.saturating_sub(draft.words.len());
+                let room = max_words(fix).saturating_sub(draft.words.len());
                 let mut end = text.len().min(room);
                 while !text.is_char_boundary(end) {
                     end -= 1;
                 }
                 draft.words.push_str(&text[..end]);
+                // Never cut short unseen.
+                if end < text.len() {
+                    let said = format!(
+                        "Only the first {} of that paste went in: the box holds {}.",
+                        images::size(end),
+                        images::size(max_words(fix))
+                    );
+                    self.say(said, Tone::Warn);
+                }
             }
             Mode::Search(s) => {
                 s.query.push_str(&text.replace('\n', " "));
@@ -2256,31 +2439,108 @@ impl App {
         Action::None
     }
 
+    /// Whether `machine`'s backend fixes input (images::FIX_INPUT): then the box takes long
+    /// words, any kind and number of images within 20 MB, and a request up to 32 MiB.
+    pub(crate) fn fixes_input(&self, machine: usize) -> bool {
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .is_some_and(|f| f.supports(images::FIX_INPUT))
+    }
+
     /// Starts reading images for the new-intent box: the read's number and the room its draft
-    /// has left, or None (saying why) when there's no box to read them into.
+    /// has left, or None when there's no box to read them into, or another read is going: then
+    /// this one is read next, its tags where the words end now (intent 0591, K1-35).
     pub fn begin_image_load(&mut self, source: &images::Source) -> Option<(u64, images::Room)> {
         let Mode::Compose { draft, .. } = &self.mode else {
             return None;
         };
+        let fix = self.fixes_input(draft.machine);
+        let at = match source {
+            images::Source::Smaller(_, at) => *at,
+            _ => draft.words.len(),
+        };
+        let room = images::Room::for_backend(&draft.images, fix);
         if self.image_load.is_some() {
-            self.say("Still reading the last image.", Tone::Info);
+            self.image_queue.push_back(crate::app::QueuedRead {
+                source: source.clone(),
+                at,
+                for_send: false,
+            });
+            self.say(
+                "Still reading the last image: this one is read next, and goes in after it.",
+                Tone::Info,
+            );
             return None;
         }
-        let room = images::Room::left(&draft.images);
-        self.image_at = draft.words.len();
+        self.image_at = at;
         self.image_loads += 1;
         self.image_load = Some(self.image_loads);
-        let what = match source {
-            images::Source::Clipboard => "Reading the clipboard…",
-            images::Source::Files(_) => "Reading the image…",
-        };
-        self.say(what, Tone::Info);
+        self.say(reading(source), Tone::Info);
         Some((self.image_loads, room))
+    }
+
+    /// The next read asked for while another went (K1-35), once none is going: for the words
+    /// Enter sent, or for the box while it's open. Its number, what it reads and its room.
+    pub fn next_image_read(&mut self) -> Option<(u64, images::Source, images::Room)> {
+        if self.image_load.is_some() {
+            return None;
+        }
+        while let Some(q) = self.image_queue.pop_front() {
+            let draft = if q.for_send {
+                self.send_after_load.as_ref().map(|(_, d)| d)
+            } else {
+                match &self.mode {
+                    Mode::Compose { draft, .. } => Some(draft),
+                    _ => None,
+                }
+            };
+            // Its words have gone (the box closed): nothing to read it for.
+            let Some(draft) = draft else {
+                continue;
+            };
+            let room = images::Room::for_backend(&draft.images, self.fixes_input(draft.machine));
+            self.image_loads += 1;
+            let id = self.image_loads;
+            self.image_load = Some(id);
+            self.image_at = q.at;
+            if q.for_send
+                && let Some((load, _)) = self.send_after_load.as_mut()
+            {
+                *load = id;
+            }
+            if !q.for_send {
+                self.say(reading(&q.source), Tone::Info);
+            }
+            return Some((id, q.source, room));
+        }
+        None
+    }
+
+    /// After words and tags went in at `at`, `inserted` long: the reads still to come for the same
+    /// words, and smaller copies still asked about, keep their places after them.
+    fn shift_queued(&mut self, for_send: bool, at: usize, inserted: usize) {
+        for q in self
+            .image_queue
+            .iter_mut()
+            .filter(|q| q.for_send == for_send)
+        {
+            if q.at >= at {
+                q.at += inserted;
+            }
+        }
+        if !for_send {
+            for a in &mut self.smaller_asks {
+                if a.at >= at {
+                    a.at += inserted;
+                }
+            }
+        }
     }
 
     /// A read started by begin_image_load has ended: its images go in, unless the box it was
     /// for has closed since. When Enter sent the words while it read, they go now, with it: the
-    /// action that sends them (intent 0445).
+    /// action that sends them (intent 0445), once every read asked before Enter is in.
     pub fn images_loaded(&mut self, id: u64, loading: images::Loading) -> Action {
         if self.image_load != Some(id) {
             return Action::None;
@@ -2288,12 +2548,31 @@ impl App {
         self.image_load = None;
         if let Some((load, mut draft)) = self.send_after_load.take() {
             if load == id {
-                let said = attach_into(&mut draft, loading, Some(self.image_at));
-                if said.iter().any(|s| !s.starts_with("Attached")) {
+                let fix = self.fixes_input(draft.machine);
+                let got = attach_into(&mut draft, loading, Some(self.image_at), fix);
+                self.shift_queued(true, got.at, got.inserted);
+                if got.refused || !got.oversized.is_empty() {
+                    self.send_troubles.extend(
+                        got.said
+                            .iter()
+                            .filter(|s| !s.starts_with("Attached"))
+                            .cloned(),
+                    );
+                    if !got.oversized.is_empty() {
+                        self.send_troubles.push(too_large_to_send(&got.oversized));
+                    }
+                }
+                // More read for these words: they wait for them too (K1-35).
+                if self.image_queue.front().is_some_and(|q| q.for_send) {
+                    self.send_after_load = Some((load, draft));
+                    return Action::None;
+                }
+                let troubles = std::mem::take(&mut self.send_troubles);
+                if !troubles.is_empty() {
                     // Not everything read went in (none found, the box full, too many or too
                     // big). His words may be about it, so whether they go without it is his
                     // call (intent 0591, K1-37).
-                    self.ask_send_without(draft, &said);
+                    self.ask_send_without(draft, &troubles);
                     return Action::None;
                 }
                 return self.send_draft(draft);
@@ -2404,17 +2683,97 @@ impl App {
     }
 
     /// As attach_images, with the tags at `at` in the words (where they ended when the read
-    /// began), or at the end when the words have since been cut shorter than that.
+    /// began), or at the end when the words have since been cut shorter than that. Images past
+    /// what this intent may carry, for a backend that fixes input, are asked about: a smaller copy
+    /// of each goes in only if he says so.
     fn attach_images_at(&mut self, got: images::Loading, at: Option<usize>) {
+        let fix = match &self.mode {
+            Mode::Compose { draft, .. } => self.fixes_input(draft.machine),
+            _ => return,
+        };
         let Mode::Compose { draft, .. } = &mut self.mode else {
             return;
         };
-        let said = attach_into(draft, got, at);
-        if said.is_empty() {
-            return;
+        let attached = attach_into(draft, got, at, fix);
+        let after = attached.at + attached.inserted;
+        self.shift_queued(false, attached.at, attached.inserted);
+        if !attached.said.is_empty() {
+            let tone = if attached.refused {
+                Tone::Warn
+            } else {
+                Tone::Good
+            };
+            self.say(attached.said.join(" "), tone);
         }
-        let good = said.iter().all(|s| s.starts_with("Attached"));
-        self.say(said.join(" "), if good { Tone::Good } else { Tone::Warn });
+        if !attached.oversized.is_empty() {
+            self.ask_smaller(attached.oversized, after);
+        }
+    }
+
+    /// Asks whether smaller copies of images too large to send go in their place, their tags at
+    /// `at`. The images themselves are never changed; no leaves them out.
+    fn ask_smaller(&mut self, images: Vec<images::Loaded>, at: usize) {
+        let Mode::Compose { draft, .. } = &self.mode else {
+            return;
+        };
+        let machine = draft.machine;
+        let used: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
+        let left = images::MAX_IMAGES_BYTES.saturating_sub(used);
+        self.send_without_count += 1;
+        let n = self.send_without_count;
+        let message = smaller_question(&images, left);
+        let one = images.len() == 1;
+        self.smaller_asks
+            .push(crate::app::SmallerAsk { n, images, at });
+        self.mode = Mode::Confirm {
+            machine,
+            request: json!({ "action": crate::app::SMALLER, "n": n }),
+            title: if one {
+                "Attach a smaller copy?".into()
+            } else {
+                "Attach smaller copies?".into()
+            },
+            message,
+            back: Box::new(self.mode.clone()),
+            target: None,
+            queue: false,
+            ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+    }
+
+    /// The answer to ask_smaller: yes reads smaller copies, their tags where the images' would
+    /// have gone; no leaves them out, saying so.
+    fn smaller_answered(&mut self, n: u64, yes: bool) -> Action {
+        let Some(i) = self.smaller_asks.iter().position(|a| a.n == n) else {
+            return Action::None;
+        };
+        let ask = self.smaller_asks.remove(i);
+        if yes {
+            return Action::LoadImages(images::Source::Smaller(ask.images, ask.at));
+        }
+        let names: Vec<String> = ask.images.iter().map(|i| i.from.clone()).collect();
+        let they = if names.len() == 1 {
+            "It stays"
+        } else {
+            "They stay"
+        };
+        self.say(
+            format!(
+                "Left out {}. {they} as {} where you copied {}.",
+                and_names(&names),
+                if names.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                },
+                if names.len() == 1 { "it" } else { "them" }
+            ),
+            Tone::Info,
+        );
+        Action::None
     }
 
     pub(super) fn control_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -2486,6 +2845,22 @@ impl App {
                     self.question_view.to_end();
                     if let Mode::Confirm { ready_at, .. } = &mut self.mode {
                         *ready_at = Some(Instant::now() + std::time::Duration::from_millis(500));
+                    }
+                    return Some(Action::None);
+                }
+                // Kerdr's own question about smaller copies of images too large to send.
+                if request["action"] == crate::app::SMALLER {
+                    let n = request["n"].as_u64().unwrap_or_default();
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            return Some(self.smaller_answered(n, false));
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            return Some(self.smaller_answered(n, true));
+                        }
+                        _ => {}
                     }
                     return Some(Action::None);
                 }

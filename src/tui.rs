@@ -215,6 +215,7 @@ fn event_loop(
     });
     let bg = Bg {
         images: &image_rx,
+        image_tx: &image_tx,
         answers: &action_tx,
         runner: &runner,
         inbox,
@@ -516,10 +517,7 @@ fn event_loop(
             Action::None => {}
             Action::LoadImages(source) => {
                 if let Some((id, room)) = app.begin_image_load(&source) {
-                    let tx = image_tx.clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send((id, source.load(room)));
-                    });
+                    read_images(&image_tx, id, source, room);
                 }
             }
             Action::CopyLink(url) => {
@@ -1013,6 +1011,7 @@ impl Runner {
 /// What the board's thread hands work on through, which a jump into herdr needs too.
 struct Bg<'a> {
     images: &'a mpsc::Receiver<(u64, crate::images::Loading)>,
+    image_tx: &'a mpsc::Sender<(u64, crate::images::Loading)>,
     answers: &'a mpsc::Sender<Answer>,
     runner: &'a Runner,
     inbox: &'a Inbox,
@@ -1041,7 +1040,24 @@ fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
         if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {
             start_action(app, bg.answers, bg.runner, machine, request);
         }
+        // A read asked for while that one went goes next (intent 0591, K1-35).
+        if let Some((id, source, room)) = app.next_image_read() {
+            read_images(bg.image_tx, id, source, room);
+        }
     }
+}
+
+/// Reads images on a thread of its own; what it found comes back on `tx`.
+fn read_images(
+    tx: &mpsc::Sender<(u64, crate::images::Loading)>,
+    id: u64,
+    source: crate::images::Source,
+    room: crate::images::Room,
+) {
+    let tx = tx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send((id, source.load(room)));
+    });
 }
 
 /// Runs an action in the background; its answer comes back on the channel. A change to a card goes
@@ -2449,6 +2465,7 @@ mod tests {
         let holds = RefCell::new(Holds::off());
         let bg = Bg {
             images: &image_rx,
+            image_tx: &image_tx,
             answers: &answers,
             runner: &runner,
             inbox: &inbox,
@@ -2463,16 +2480,19 @@ mod tests {
                 ..Default::default()
             },
         ));
+        let sender = image_tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             let loading = crate::images::Loading {
                 images: vec![crate::images::Loaded {
                     media_type: "image/png",
                     bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+                    ..Default::default()
                 }],
                 why: None,
+                ..Default::default()
             };
-            let _ = image_tx.send((7, loading));
+            let _ = sender.send((7, loading));
         });
         send_loaded_images(&mut app, &bg, Some(Duration::from_secs(5)));
         assert!(app.send_after_load.is_none());

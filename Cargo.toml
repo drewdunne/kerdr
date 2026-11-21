@@ -25,6 +25,15 @@ serde_json = "1.0.154"
 toml = "1.1.8"
 toml_edit = "0.25.17"
 unicode-width = "0.2.2"
+# A smaller copy of a pasted image past what one intent may carry, made only when he says so
+# (intent 0591, release 5).
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }
+
+# The clipboard read in Kerdr itself, so no wl-paste or xclip is needed (intent 0591, K3-63).
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
+wl-clipboard-rs = "0.9.5"
+x11-clipboard = "0.9.3"
+x11rb = "0.13.2"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp"] }

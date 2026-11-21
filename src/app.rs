@@ -444,6 +444,29 @@ fn holds_peek(mode: &Mode) -> bool {
 /// didn't go in: never sent to a backend.
 pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
 
+/// The action of Kerdr's own question whether an image past what one intent may carry goes in as
+/// a smaller copy (intent 0591, release 5): never sent to a backend.
+pub(crate) const SMALLER: &str = "kerdr:attach-smaller-copy";
+
+/// Images too large to send, while Kerdr asks whether smaller copies go in their place, and where
+/// in the words their tags go.
+#[derive(Clone, Debug)]
+pub(crate) struct SmallerAsk {
+    pub n: u64,
+    pub images: Vec<crate::images::Loaded>,
+    pub at: usize,
+}
+
+/// A read asked for while another was still going (intent 0591, K1-35): read next, in the order
+/// pasted, its tags where the words ended when it was asked; for the words Enter sent, or for the
+/// box.
+#[derive(Clone, Debug)]
+pub(crate) struct QueuedRead {
+    pub source: crate::images::Source,
+    pub at: usize,
+    pub for_send: bool,
+}
+
 /// Words whose image didn't go in, and the question about them: its number goes in the question's
 /// request, so its answer finds these words and no others (Codex's review).
 #[derive(Clone, Debug)]
@@ -633,6 +656,13 @@ pub struct App {
     /// Where in the words that read's tags go: where the words ended when it began, so words
     /// typed while it reads come after them.
     image_at: usize,
+    /// Reads asked for while one was going, read next in that order (intent 0591, K1-35).
+    pub(crate) image_queue: std::collections::VecDeque<QueuedRead>,
+    /// Images too large to send, while Kerdr asks about smaller copies of them.
+    pub(crate) smaller_asks: Vec<SmallerAsk>,
+    /// What didn't go in with words Enter sent, from each read they waited for, said once the
+    /// last is in.
+    pub(crate) send_troubles: Vec<String>,
     /// New intents sent, each while its answer is still owed or unknown (intent 0445).
     pub submissions: Vec<Submission>,
     /// Words (and their images) whose save failed while the box held other words: c offers them,
@@ -949,6 +979,9 @@ impl App {
             image_load: None,
             image_loads: 0,
             image_at: 0,
+            image_queue: Default::default(),
+            smaller_asks: vec![],
+            send_troubles: vec![],
             new_intent_id: None,
             closed_on_send: false,
             submissions: vec![],
@@ -5160,6 +5193,7 @@ pub(crate) mod tests {
         let none = || crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         let type_in = |app: &mut App, words: &str| {
             press(app, 'c');
@@ -5470,8 +5504,10 @@ pub(crate) mod tests {
             images: vec![crate::images::Loaded {
                 media_type: "image/png",
                 bytes: png.clone(),
+                ..Default::default()
             }],
             why: None,
+            ..Default::default()
         };
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
@@ -5665,8 +5701,10 @@ pub(crate) mod tests {
             images: vec![crate::images::Loaded {
                 media_type: "image/png",
                 bytes: png,
+                ..Default::default()
             }],
             why: None,
+            ..Default::default()
         };
         let Action::Mutate { request, .. } = app.images_loaded(id, loaded) else {
             panic!("the words weren't sent once the image was in")
@@ -5683,6 +5721,7 @@ pub(crate) mod tests {
         let none = crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
         // Whether they go without it is his call (intent 0591, K1-37); they're kept meanwhile.
@@ -5725,6 +5764,7 @@ pub(crate) mod tests {
         let none = crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
         assert_eq!(
@@ -5758,6 +5798,7 @@ pub(crate) mod tests {
         let none = crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
         // Never asked over the words he's typing, where a y or ⏎ meant for them would send these
@@ -5802,6 +5843,7 @@ pub(crate) mod tests {
         crate::images::Loaded {
             media_type: "image/png",
             bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+            ..Default::default()
         }
     }
 
@@ -5828,6 +5870,7 @@ pub(crate) mod tests {
         let loading = crate::images::Loading {
             images: vec![a_png()],
             why: None,
+            ..Default::default()
         };
         let Action::Mutate { request, .. } = app.images_loaded(id, loading) else {
             panic!("the words weren't sent once the image was in")
@@ -5905,6 +5948,7 @@ pub(crate) mod tests {
         let loading = crate::images::Loading {
             images: vec![a_png()],
             why: None,
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
         let Mode::Confirm { message, .. } = &app.mode else {
@@ -5923,6 +5967,7 @@ pub(crate) mod tests {
         let loading = crate::images::Loading {
             images: vec![a_png()],
             why: Some("photo.heic isn't an image Kerdr can send.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
         let Mode::Confirm { message, .. } = &app.mode else {
@@ -5984,6 +6029,259 @@ pub(crate) mod tests {
         assert_eq!(app.resolver.unanswered(), 0);
     }
 
+    /// The demo with every machine's backend fixing input (intent 0591, release 5).
+    fn fixing_app() -> App {
+        let mut app = demo_app();
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        app
+    }
+
+    fn box_words(app: &App) -> String {
+        match &app.mode {
+            Mode::Compose { draft, .. } => draft.words.clone(),
+            m => panic!("the box isn't open: {m:?}"),
+        }
+    }
+
+    fn box_images(app: &App) -> usize {
+        match &app.mode {
+            Mode::Compose { draft, .. } => draft.images.len(),
+            m => panic!("the box isn't open: {m:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_read_asked_while_one_goes_is_read_next_and_both_go_in_in_order() {
+        // Intent 0591, K1-35: never "still reading"; the second waits its turn, and each tag goes
+        // where the words ended when it was pasted.
+        use crate::images::Source;
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        for c in "Shots:".chars() {
+            press(&mut app, c);
+        }
+        let (first, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        for c in " one".chars() {
+            press(&mut app, c);
+        }
+        assert!(app.begin_image_load(&Source::Clipboard).is_none());
+        assert!(
+            app.message().unwrap().0.contains("this one is read next"),
+            "{:?}",
+            app.message()
+        );
+        for c in " two".chars() {
+            press(&mut app, c);
+        }
+        assert_eq!(app.next_image_read(), None, "not while the first goes");
+        app.images_loaded(
+            first,
+            crate::images::Loading {
+                images: vec![a_png()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Shots: [Image #1] one two");
+        let (second, source, _) = app.next_image_read().expect("the second goes next");
+        assert_eq!(source, Source::Clipboard);
+        app.images_loaded(
+            second,
+            crate::images::Loading {
+                images: vec![a_png()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Shots: [Image #1] one [Image #2] two");
+        // Enter while both are still to come: the words go once both are in.
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "Again:".chars() {
+            press(&mut app, c);
+        }
+        let (a, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        assert!(app.begin_image_load(&Source::Clipboard).is_none());
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let png = || crate::images::Loading {
+            images: vec![a_png()],
+            ..Default::default()
+        };
+        assert_eq!(
+            app.images_loaded(a, png()),
+            Action::None,
+            "the second is still to come"
+        );
+        let (b, ..) = app
+            .next_image_read()
+            .expect("read for the words Enter sent");
+        let Action::Mutate { request, .. } = app.images_loaded(b, png()) else {
+            panic!("not sent once both were in")
+        };
+        assert_eq!(request["words"], "Again: [Image #1] [Image #2]");
+        assert_eq!(request["images"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_backend_that_fixes_input_takes_more_than_twenty_images_and_long_words() {
+        // Intent 0591, K1-36, K3-53: no count, and no tag refused for the words' room, while the
+        // images fit 20 MB together; the box takes words past 0.35.0's 48,000 characters.
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        let image = |n: usize| crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; n]].concat(),
+            ..Default::default()
+        };
+        let long = "x".repeat(60_000);
+        app.on_paste(&long);
+        assert_eq!(box_words(&app).len(), 60_000);
+        app.attach_images(crate::images::Loading {
+            images: (0..30).map(|_| image(10)).collect(),
+            ..Default::default()
+        });
+        assert_eq!(box_images(&app), 30);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Good, "{said}");
+        assert!(box_words(&app).ends_with("[Image #30] "));
+        // An older backend keeps 0.35.0's limits, and says when a paste is cut.
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        app.on_paste(&long);
+        assert_eq!(box_words(&app).len(), 48_000);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("Only the first 48 KB of that paste went in")
+        );
+    }
+
+    #[test]
+    fn an_image_past_what_an_intent_may_carry_is_asked_about_before_a_smaller_copy_goes_in() {
+        // Intent 0591, K3-54, K3-55: never shrunk without asking; yes reads a smaller copy, its
+        // tag where the image's would have gone, and no leaves it out, the image as it was.
+        use crate::images::Source;
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        for c in "Look:".chars() {
+            press(&mut app, c);
+        }
+        let big = crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 25_000_000]].concat(),
+            from: "The clipboard's image".into(),
+        };
+        app.attach_images(crate::images::Loading {
+            images: vec![big.clone()],
+            ..Default::default()
+        });
+        let Mode::Confirm { title, message, .. } = app.mode.clone() else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert_eq!(title, "Attach a smaller copy?");
+        assert!(
+            message.contains("The clipboard's image (PNG, 25 MB) is past the 20 MB one intent's images may be together"),
+            "{message}"
+        );
+        assert!(message.contains("It may lose fine detail"), "{message}");
+        answer_now(&mut app);
+        let Action::LoadImages(source) = press(&mut app, 'y') else {
+            panic!("yes read nothing")
+        };
+        assert_eq!(source, Source::Smaller(vec![big.clone()], "Look:".len()));
+        assert_eq!(box_images(&app), 0, "nothing went in yet");
+        // The copy goes in where the image would have gone, words typed since after it.
+        for c in " again".chars() {
+            press(&mut app, c);
+        }
+        let (id, _) = app.begin_image_load(&source).unwrap();
+        assert_eq!(app.message().unwrap().0, "Making a smaller copy…");
+        app.images_loaded(
+            id,
+            crate::images::Loading {
+                images: vec![a_png()],
+                notes: vec!["The clipboard's image went in as a smaller copy.".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Look: [Image #1] again");
+        // No: left out, said.
+        app.attach_images(crate::images::Loading {
+            images: vec![big],
+            ..Default::default()
+        });
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        assert_eq!(box_images(&app), 1);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .starts_with("Left out The clipboard's image.")
+        );
+    }
+
+    #[test]
+    fn the_clipboards_text_goes_into_the_words_where_it_was_pasted() {
+        // Intent 0591, K3-61.
+        use crate::images::Source;
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        for c in "Error:".chars() {
+            press(&mut app, c);
+        }
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        for c in " fix it".chars() {
+            press(&mut app, c);
+        }
+        app.images_loaded(
+            id,
+            crate::images::Loading {
+                text: Some("disk full\nat boot".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Error: disk full\nat boot fix it");
+        assert_eq!(app.message().unwrap().0, "Pasted the clipboard's text.");
+    }
+
+    #[test]
+    fn a_new_intent_past_64_kib_goes_to_a_backend_that_fixes_input_and_comes_back_from_one_that_doesnt()
+     {
+        // Intent 0591, K1-68: up to 32 MiB to a backend that fixes input; an older one keeps
+        // 0.35.0's limit, the words given back and said.
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste(&"word ".repeat(40_000));
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("not sent: {:?}", app.message())
+        };
+        assert!(request["words"].as_str().unwrap().len() > 64 * 1024);
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste(&"\u{1}".repeat(20_000));
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.contains("too large to send (64 KiB at most)"),
+            "{said}"
+        );
+        assert_eq!(app.draft.chars().count(), 20_000, "the words are kept");
+    }
+
     #[test]
     fn images_past_the_limits_are_refused_by_name() {
         let mut app = demo_app();
@@ -5991,8 +6289,13 @@ pub(crate) mod tests {
         let image = |n: usize| crate::images::Loaded {
             media_type: "image/png",
             bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; n]].concat(),
+            ..Default::default()
         };
-        let some = |images| crate::images::Loading { images, why: None };
+        let some = |images| crate::images::Loading {
+            images,
+            why: None,
+            ..Default::default()
+        };
         app.attach_images(some(vec![
             image(9_000_000),
             image(9_000_000),
