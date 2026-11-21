@@ -2499,6 +2499,14 @@ impl App {
             return None;
         }
         while let Some(q) = self.image_queue.pop_front() {
+            // The box behind a question about the last read's images: this one waits for the
+            // answer, so it never lands while the box can't take it.
+            if !q.for_send
+                && matches!(&self.mode, Mode::Confirm { back, .. } if matches!(**back, Mode::Compose { .. }))
+            {
+                self.image_queue.push_front(q);
+                return None;
+            }
             let draft = if q.for_send {
                 self.send_after_load.as_ref().map(|(_, d)| d)
             } else {

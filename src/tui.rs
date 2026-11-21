@@ -1035,6 +1035,10 @@ fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
             _ => bg.images.try_recv().ok(),
         };
         let Some((id, loading)) = got else {
+            // A read that waited for a question's answer goes once it's answered (K1-35).
+            if let Some((id, source, room)) = app.next_image_read() {
+                read_images(bg.image_tx, id, source, room);
+            }
             return;
         };
         if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {

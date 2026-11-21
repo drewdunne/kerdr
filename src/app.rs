@@ -6220,6 +6220,28 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(box_words(&app), "Look: [Image #1] again");
+        // A read queued behind one that's asked about waits for the answer, then goes (K1-35).
+        let first = app.begin_image_load(&Source::Clipboard).unwrap().0;
+        assert!(app.begin_image_load(&Source::Clipboard).is_none(), "queued");
+        app.images_loaded(
+            first,
+            crate::images::Loading {
+                images: vec![big.clone()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "asked about the first"
+        );
+        assert_eq!(
+            app.next_image_read(),
+            None,
+            "the second waits for the answer"
+        );
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        let (second, ..) = app.next_image_read().expect("and goes once it's answered");
+        app.images_loaded(second, crate::images::Loading::default());
         // No: left out, said.
         app.attach_images(crate::images::Loading {
             images: vec![big],
