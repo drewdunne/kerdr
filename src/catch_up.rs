@@ -358,9 +358,13 @@ impl App {
             let reference = app.reference_for(&held.id);
             // Written now: what the line Kerdr ends with says is so.
             if !(app.kept.on_disk() && app.keep_words_now()) {
-                app.print_unkept();
+                let then = if app.print_unkept() {
+                    "so it's printed below, to copy"
+                } else {
+                    "and there's no terminal to print it on, so it couldn't be kept"
+                };
                 return Some(format!(
-                    "Your new text for {reference} wasn't saved{why}, and Kerdr couldn't write it to its words file, so it's printed below, to copy."
+                    "Your new text for {reference} wasn't saved{why}, and Kerdr couldn't write it to its words file, {then}."
                 ));
             }
             let place = app
@@ -705,6 +709,7 @@ pub(crate) mod tests {
         let state = dir.path().join("kerdr");
         std::fs::create_dir(&state).unwrap();
         let mut app = demo_app();
+        app.open_terminal = || tempfile::tempfile().ok();
         let (key, id, machine) = stopping_with_no_machine(&mut app, &state);
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
         let went = app

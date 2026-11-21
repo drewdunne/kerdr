@@ -1712,7 +1712,7 @@ impl App {
             // Quitting anyway: what couldn't be kept is printed once the board has gone, so his
             // words are never held nowhere (intent 0591, K3-34).
             if self.keep_on_quit().is_err() {
-                self.print_unkept();
+                let _ = self.print_unkept();
             }
             return true;
         }
@@ -1774,9 +1774,14 @@ impl App {
         };
         self.quitting = Some(Instant::now());
         self.quit_unsaved = true;
+        let anyway = if (self.open_terminal)().is_some() {
+            "q again quits anyway and prints your words to copy"
+        } else {
+            "q again quits anyway, and with no terminal to print your words on they'd be lost"
+        };
         self.say(
             format!(
-                "{why}, so quitting now would lose what Kerdr keeps for the next one: your words, and changes it holds. q again quits anyway and prints your words to copy, Esc stays."
+                "{why}, so quitting now would lose what Kerdr keeps for the next one: your words, and changes it holds. {anyway}, Esc stays."
             ),
             Tone::Warn,
         );
@@ -2332,13 +2337,23 @@ impl App {
         )
     }
 
-    /// When the words file can't be written as Kerdr ends: his words to print once the board has
-    /// gone, replacing any said before.
-    pub(crate) fn print_unkept(&mut self) {
+    /// When the words file can't be written as Kerdr ends: his words to print on his own terminal
+    /// once the board has gone, replacing any said before. Whether they will be: false when
+    /// there's no terminal to print them on, and then nothing is said to have kept them (Codex's
+    /// review 98, 1).
+    pub(crate) fn print_unkept(&mut self) -> bool {
         let text = self.unkept_texts();
-        if !text.is_empty() {
-            self.print_on_exit = vec![text];
+        if text.is_empty() {
+            return true;
         }
+        let Some(terminal) = (self.open_terminal)() else {
+            self.print_on_exit.clear();
+            self.recovery_terminal = None;
+            return false;
+        };
+        self.print_on_exit = vec![text];
+        self.recovery_terminal = Some(terminal);
+        true
     }
 }
 
@@ -2369,6 +2384,7 @@ mod tests {
         let state = dir.path().join("kerdr");
         std::fs::create_dir(&state).unwrap();
         let mut app = app();
+        app.open_terminal = || tempfile::tempfile().ok();
         app.kept = Kept::at(&state, 1000);
         app.draft = "A new intent, not sent.".into();
         let card = app.board.cards[0].clone();
@@ -4060,6 +4076,7 @@ mod tests {
         // Codex's review 60, 9.
         let dir = tempfile::tempdir().unwrap();
         let mut app = app();
+        app.open_terminal = || tempfile::tempfile().ok();
         app.kept = Kept::at(dir.path(), app.now().timestamp());
         app.words_dir = Some(dir.path().to_path_buf());
         app.draft = "Words not yet sent".into();

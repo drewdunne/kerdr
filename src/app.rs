@@ -660,6 +660,17 @@ pub struct PendingJump {
 /// stuck (intent 0591).
 pub const STUCK_WAIT: Duration = Duration::from_secs(60);
 
+/// His own terminal, for words only he should see: /dev/tty, or the console on Windows. None when
+/// Kerdr has none (it runs with no controlling terminal, say): standard error is never used for
+/// them, since it may be redirected (Codex's review 98, 1).
+pub fn own_terminal() -> Option<std::fs::File> {
+    #[cfg(windows)]
+    let path = "CONOUT$";
+    #[cfg(not(windows))]
+    let path = "/dev/tty";
+    std::fs::OpenOptions::new().write(true).open(path).ok()
+}
+
 pub struct App {
     pub cfg: Config,
     pub machines: Vec<MachineState>,
@@ -800,9 +811,14 @@ pub struct App {
     /// What's typed in a Kickoff Questions box and not saved yet, by its card's key: never another
     /// source's card with the same number (Codex's fifth look).
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
-    /// What to print to the terminal once the board has gone: his words, when the words file
+    /// What to print to his terminal once the board has gone: his words, when the words file
     /// couldn't keep them as Kerdr ended (intent 0591, K3-34). Never written to the error log.
     pub print_on_exit: Vec<String>,
+    /// His own terminal, opened when there's something to print on it: never standard error,
+    /// which may be redirected to a file others can read (Codex's review 98, 1).
+    pub recovery_terminal: Option<std::fs::File>,
+    /// How his terminal is opened: /dev/tty, or the console on Windows. A test gives its own.
+    pub open_terminal: fn() -> Option<std::fs::File>,
     /// Kickoff answers its backend gave back because their questions changed while he answered,
     /// by its card's key: filled in on the next box d opens (intent 0591, B1-108).
     pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
@@ -1063,6 +1079,8 @@ impl App {
             moved_home: vec![],
             kickoff_kept: Default::default(),
             print_on_exit: vec![],
+            recovery_terminal: None,
+            open_terminal: own_terminal,
             kickoff_prefill: Default::default(),
             stop_starts: Vec::new(),
             answer_job: None,

@@ -165,17 +165,27 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
     }
     let _ = execute!(stdout(), ratatui::crossterm::event::DisableBracketedPaste);
     ratatui::restore();
-    // His words the words file couldn't keep, now the board has gone: to the terminal only, never
-    // the error log (intent 0591, K3-34).
-    for text in std::mem::take(&mut app.print_on_exit) {
-        eprintln!("{text}");
-    }
+    print_recovery(&mut app);
     if let Some(l) = live.as_mut() {
         for i in 0..l.pollers.len() {
             l.stop(i);
         }
     }
     result
+}
+
+/// His words the words file couldn't keep, now the board has gone: on his own terminal only,
+/// never standard error or the error log (intent 0591, K3-34; Codex's review 98, 1).
+pub(crate) fn print_recovery(app: &mut App) {
+    use std::io::Write;
+    let texts = std::mem::take(&mut app.print_on_exit);
+    if let Some(mut terminal) = app.recovery_terminal.take() {
+        for text in texts {
+            let _ = terminal.write_all(text.as_bytes());
+            let _ = terminal.write_all(b"\n");
+        }
+        let _ = terminal.flush();
+    }
 }
 
 fn event_loop(
@@ -1400,8 +1410,9 @@ fn edit_text(
         let unkept = match app.keep_on_quit() {
             Ok(()) => String::new(),
             Err(why) => {
-                app.print_unkept();
-                let printed = if app.print_on_exit.is_empty() {
+                let printed = if !app.print_unkept() {
+                    " There's no terminal to print your words on, so they couldn't be kept."
+                } else if app.print_on_exit.is_empty() {
                     ""
                 } else {
                     " Your words are printed below, to copy."
@@ -2070,6 +2081,123 @@ mod tests {
             std::thread::sleep(Duration::from_millis(10));
         }
         true
+    }
+
+    /// Run only by the test below, in a child of its own: his words printed as Kerdr ends.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a child of recovery_text_reaches_his_terminal_and_never_a_redirected_stderr"]
+    fn recovery_child() {
+        if std::env::var_os("KERDR_RECOVERY_CHILD").is_none() {
+            return;
+        }
+        let mut app = box_open();
+        app.mode = crate::app::Mode::Board;
+        app.draft = "Words only he should see.".into();
+        let kept = app.print_unkept();
+        print_recovery(&mut app);
+        println!("KEPT={kept}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_text_reaches_his_terminal_and_never_a_redirected_stderr() {
+        // Codex's review 98, 1: Kerdr run with standard error to a file (kerdr 2>errors.log), its
+        // words file unwritable as it ends. His words reach his own terminal, and nothing of them
+        // is in that file; with no terminal at all, they're nowhere, and never said to be kept.
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        const WORDS: &str = "Words only he should see.";
+        let dir = tempfile::tempdir().unwrap();
+        let run = |with_terminal: bool| -> (String, String, String) {
+            let err = dir.path().join(format!("stderr-{with_terminal}.log"));
+            // A terminal of the child's own: a pty, its controlling terminal.
+            let pty = with_terminal.then(|| {
+                // SAFETY: a new pty master, set up for its slave to be opened by path.
+                unsafe {
+                    let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                    assert!(master >= 0);
+                    assert_eq!(libc::grantpt(master), 0);
+                    assert_eq!(libc::unlockpt(master), 0);
+                    let name = std::ffi::CStr::from_ptr(libc::ptsname(master)).to_owned();
+                    (master, name)
+                }
+            });
+            let slave = pty.as_ref().map(|(_, name)| name.clone());
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--ignored",
+                "--exact",
+                "tui::tests::recovery_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("KERDR_RECOVERY_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&err).unwrap());
+            // SAFETY: only async-signal-safe calls, in the child before it runs: a session of its
+            // own, so no terminal but the pty given is its.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(name) = &slave {
+                        let fd = libc::open(name.as_ptr(), libc::O_RDWR);
+                        if fd < 0 || libc::ioctl(fd, libc::TIOCSCTTY as _, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            let reader = pty.map(|(master, _)| {
+                std::thread::spawn(move || {
+                    // SAFETY: the master is this test's own, read and closed here alone.
+                    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+                    let mut seen = vec![];
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = master.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                        if String::from_utf8_lossy(&seen).contains(WORDS) {
+                            break;
+                        }
+                    }
+                    String::from_utf8_lossy(&seen).into_owned()
+                })
+            });
+            let out = cmd.spawn().unwrap().wait_with_output().unwrap();
+            let terminal = reader.map(|r| r.join().unwrap()).unwrap_or_default();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                std::fs::read_to_string(&err).unwrap(),
+                terminal,
+            )
+        };
+        let (out, err, terminal) = run(true);
+        assert!(
+            !err.contains(WORDS),
+            "his words went to a redirected stderr: {err}"
+        );
+        assert!(
+            terminal.contains(WORDS),
+            "not on his terminal: {terminal:?} {out}"
+        );
+        assert!(out.contains("KEPT=true"), "{out}");
+        let (out, err, _) = run(false);
+        assert!(
+            !err.contains(WORDS),
+            "his words went to a redirected stderr: {err}"
+        );
+        assert!(
+            out.contains("KEPT=false"),
+            "said to be kept with no terminal: {out}"
+        );
     }
 
     #[test]
