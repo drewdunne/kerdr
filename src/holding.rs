@@ -2296,6 +2296,7 @@ mod tests {
     }
 
     /// Every file under `dir`, with its text, however deep.
+    #[cfg(unix)]
     fn every_file(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
         let mut out = vec![];
         for entry in std::fs::read_dir(dir).unwrap().flatten() {
