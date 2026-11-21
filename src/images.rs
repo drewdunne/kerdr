@@ -1207,8 +1207,24 @@ mod builtin {
         })
     }
 
+    /// How many 32-bit units to ask a property for when `room` bytes are left: enough for them,
+    /// never more (Codex's review 85, 7).
+    pub(super) fn property_length(room: usize) -> u32 {
+        u32::try_from(room.div_ceil(4))
+            .unwrap_or(u32::MAX / 4)
+            .clamp(1, u32::MAX / 4)
+    }
+
+    /// Adds what a property gave to `bytes`, never past `cap` and one byte more: whether there's
+    /// room for more.
+    pub(super) fn append_within(bytes: &mut Vec<u8>, value: &[u8], cap: usize) -> bool {
+        let room = (cap + 1).saturating_sub(bytes.len());
+        bytes.extend_from_slice(&value[..value.len().min(room)]);
+        bytes.len() <= cap
+    }
+
     /// How an X11 read went wrong.
-    enum X11 {
+    pub(super) enum X11 {
         /// Nothing is copied, or not in that type.
         Empty,
         /// There's no X11 display to read from here.
@@ -1220,7 +1236,7 @@ mod builtin {
     /// asked for into a property of a window of Kerdr's own, then read from it whole, or piece by
     /// piece (INCR) when it's large, at most `cap` bytes. With TARGETS, the names of the types it
     /// offers too.
-    fn x11_get(target: &str, cap: usize) -> Result<(Vec<u8>, Vec<String>), X11> {
+    pub(super) fn x11_get(target: &str, cap: usize) -> Result<(Vec<u8>, Vec<String>), X11> {
         use std::time::Instant;
         use x11rb::connection::Connection;
         use x11rb::protocol::Event;
@@ -1285,16 +1301,49 @@ mod builtin {
         if notice.property == u32::from(AtomEnum::NONE) {
             return Err(X11::Empty);
         }
-        let take = || {
-            conn.get_property(true, window, property, AtomEnum::ANY, 0, u32::MAX / 4)
-                .map_err(|e| failed(&e))?
-                .reply()
-                .map_err(|e| failed(&e))
+        // The property, read in pieces each no longer than what's left of `cap` (and one byte
+        // more, so one too large is known as that), its bytes_after followed, and never more
+        // kept than that; then deleted, which an INCR transfer takes as "the next piece"
+        // (Codex's review 85, 7). Its type, and whether it held nothing.
+        let read_property = |bytes: &mut Vec<u8>| -> Result<(u32, bool), X11> {
+            let mut offset = 0u32;
+            let mut kind = 0;
+            let mut empty = true;
+            loop {
+                let room = (cap + 1).saturating_sub(bytes.len());
+                if room == 0 {
+                    break;
+                }
+                let reply = conn
+                    .get_property(
+                        false,
+                        window,
+                        property,
+                        AtomEnum::ANY,
+                        offset,
+                        property_length(room),
+                    )
+                    .map_err(|e| failed(&e))?
+                    .reply()
+                    .map_err(|e| failed(&e))?;
+                kind = reply.type_;
+                empty &= reply.value.is_empty();
+                let more = append_within(bytes, &reply.value, cap);
+                if reply.bytes_after == 0 || !more || reply.value.is_empty() {
+                    break;
+                }
+                offset += (reply.value.len() / 4) as u32;
+            }
+            conn.delete_property(window, property)
+                .map_err(|e| failed(&e))?;
+            conn.flush().map_err(|e| failed(&e))?;
+            Ok((kind, empty))
         };
-        let first = take()?;
-        let (bytes, kind) = if first.type_ == incr {
+        let mut first = Vec::new();
+        let (first_kind, _) = read_property(&mut first)?;
+        let (bytes, kind) = if first_kind == incr {
             // Large: it comes in pieces, each announced as the property is written again, until
-            // an empty one.
+            // an empty one, or until it's past the cap.
             let mut bytes = Vec::new();
             let mut kind = None;
             loop {
@@ -1302,20 +1351,18 @@ mod builtin {
                     matches!(e, Event::PropertyNotify(p)
                         if p.atom == property && p.state == Property::NEW_VALUE)
                 })?;
-                let piece = take()?;
-                if piece.value.is_empty() {
+                let (piece_kind, empty) = read_property(&mut bytes)?;
+                if empty {
                     break;
                 }
-                kind.get_or_insert(piece.type_);
-                bytes.extend_from_slice(&piece.value);
+                kind.get_or_insert(piece_kind);
                 if bytes.len() > cap {
                     break;
                 }
             }
             (bytes, kind.unwrap_or_default())
         } else {
-            let kind = first.type_;
-            (first.value, kind)
+            (first, first_kind)
         };
         let mut names = vec![];
         if target == "TARGETS" && kind == u32::from(AtomEnum::ATOM) {
@@ -2297,6 +2344,44 @@ mod tests {
             panic!("Kerdr's own reader didn't read it: {found:?}")
         };
         assert_eq!(got.bytes, std::fs::read(&path).unwrap());
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn an_x11_property_is_asked_for_and_kept_only_within_the_cap() {
+        // Codex's review 85, 7: a piece asked for is no longer than what's left, and what's kept
+        // stops one byte past the cap, so one too large is known as that.
+        use builtin::{append_within, property_length};
+        assert_eq!(property_length(1), 1);
+        assert_eq!(property_length(4), 1);
+        assert_eq!(property_length(5), 2);
+        assert_eq!(property_length(100_001), 25_001);
+        assert_eq!(property_length(usize::MAX), u32::MAX / 4);
+        let mut bytes = vec![];
+        assert!(append_within(&mut bytes, &[1; 60], 100));
+        assert!(
+            !append_within(&mut bytes, &[2; 4_000_000], 100),
+            "past the cap"
+        );
+        assert_eq!(bytes.len(), 101);
+        assert!(!append_within(&mut bytes, &[3; 10], 100));
+        assert_eq!(bytes.len(), 101, "nothing more once past it");
+    }
+
+    /// Kerdr's own X11 reader against a real clipboard owner (the image KERDR_LIVE_CLIPBOARD_IMAGE
+    /// names, served whole or, when large, in INCR pieces): asked for half of it, it keeps no
+    /// more than that and one byte, however the owner sends it (Codex's review 85, 7).
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    #[ignore]
+    fn live_x11_read_stops_at_its_cap() {
+        let path = std::env::var("KERDR_LIVE_CLIPBOARD_IMAGE").expect("the image on the clipboard");
+        let whole = std::fs::read(path).unwrap().len();
+        let cap = whole / 2;
+        let Ok((bytes, _)) = builtin::x11_get("image/png", cap) else {
+            panic!("not read")
+        };
+        assert_eq!(bytes.len(), cap + 1, "kept past the cap");
     }
 
     #[cfg(unix)]
