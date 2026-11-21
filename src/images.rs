@@ -190,7 +190,7 @@ pub fn too_much() -> String {
 /// are: an image attaches, a text file's words go into the words (K3-58), anything else is named.
 pub fn from_files(paths: &[PathBuf], room: Room) -> Loading {
     let mut out = Loading::default();
-    let paths = expand_folders(paths, &mut out);
+    let paths = expand_folders(paths, room.fix, &mut out);
     let mut used = 0;
     let mut read = 0;
     for path in &paths {
@@ -239,9 +239,10 @@ enum Got {
     Text(String),
 }
 
-/// The paths, each folder among them replaced by the image files directly inside it, in name
-/// order, and said: what a folder sends is never more than he sees named (K3-60).
-fn expand_folders(paths: &[PathBuf], out: &mut Loading) -> Vec<PathBuf> {
+/// The paths, each folder among them replaced by the image files directly inside it (of the kinds
+/// its backend takes by their names, `any` for every kind), in name order, and said: what a
+/// folder sends is never more than he sees named (K3-60).
+fn expand_folders(paths: &[PathBuf], any: bool, out: &mut Loading) -> Vec<PathBuf> {
     let mut all = vec![];
     for path in paths {
         if !std::fs::metadata(path).is_ok_and(|m| m.is_dir()) {
@@ -253,7 +254,7 @@ fn expand_folders(paths: &[PathBuf], out: &mut Loading) -> Vec<PathBuf> {
                 entries
                     .flatten()
                     .map(|e| e.path())
-                    .filter(|p| image_name(p, true) && p.is_file())
+                    .filter(|p| image_name(p, any) && p.is_file())
                     .collect()
             })
             .unwrap_or_default();
