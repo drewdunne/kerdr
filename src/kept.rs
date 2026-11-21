@@ -589,6 +589,20 @@ impl Kept {
         let mut notes = vec![];
         let result = locked(&dir, || {
             let mut file: HeldFile = read_or_set_aside(&dir, HELD_FILE, &mut notes)?;
+            // What he typed into each held request is kept in the words file, never the hold file
+            // (Codex's review 85, secrets): put back here, taken out again as it's written.
+            // A words file that can't be read leaves the hold file to be read and written all
+            // the same, as long as nothing typed has to go there meanwhile.
+            let (mut words, readable) =
+                match read_or_set_aside::<WordsFile>(&dir, WORDS_FILE, &mut notes) {
+                    Ok(words) => (words, true),
+                    Err(_) => (WordsFile::default(), false),
+                };
+            for h in &mut file.held {
+                if let Some(typed) = words.held_typed.get(h.op()) {
+                    join_typed(&mut h.request, typed);
+                }
+            }
             let was = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
             for c in &unwritten {
                 c.apply(&mut file);
@@ -597,6 +611,26 @@ impl Kept {
             let text = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
             // Written only when it changed: a read alone leaves the file as it is.
             if text != was {
+                let mut disk = file.clone();
+                let mut typed = std::collections::BTreeMap::new();
+                for h in &mut disk.held {
+                    if let Some(t) = split_typed(&mut h.request) {
+                        typed.insert(h.op().to_string(), t);
+                    }
+                }
+                // The words first: a crash between leaves a held request whose words are kept,
+                // never one whose words went nowhere.
+                if !readable && !typed.is_empty() {
+                    return Err(io::Error::other(format!(
+                        "{} can't be read, so what you typed into a held change has nowhere to go",
+                        dir.join(WORDS_FILE).display()
+                    )));
+                }
+                if readable && words.held_typed != typed {
+                    words.held_typed = typed;
+                    write_words(&dir, &words)?;
+                }
+                let text = serde_json::to_string_pretty(&disk).map_err(io::Error::other)?;
                 write_private(&dir, HELD_FILE, &text)?;
             }
             Ok(out)
@@ -944,6 +978,10 @@ impl Words {
 struct WordsFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sets: Vec<WordSet>,
+    /// What he typed or pasted into each request in the hold file, by its op: there, it's left
+    /// out, so his words are in this file alone (Codex's review 85, secrets).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    held_typed: std::collections::BTreeMap<String, Value>,
     /// One set at the top, as an earlier Kerdr of this release kept it: no Kerdr's.
     #[serde(flatten)]
     loose: Words,
@@ -977,7 +1015,7 @@ struct WordSet {
 
 /// Writes the words file, or takes it away when no words are left in it.
 fn write_words(dir: &Path, file: &WordsFile) -> io::Result<()> {
-    if file.sets.iter().all(|s| s.words.is_empty()) {
+    if file.sets.iter().all(|s| s.words.is_empty()) && file.held_typed.is_empty() {
         return match std::fs::remove_file(dir.join(WORDS_FILE)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -985,6 +1023,39 @@ fn write_words(dir: &Path, file: &WordsFile) -> io::Result<()> {
     }
     let text = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
     write_private(dir, WORDS_FILE, &text)
+}
+
+/// The fields of a request that hold what he typed or pasted: kept in the words file for a request
+/// in the hold file (Codex's review 85, secrets).
+const TYPED_FIELDS: [&str; 7] = [
+    "words", "title", "text", "base", "answers", "images", "token",
+];
+
+/// Takes what he typed or pasted out of a request: those fields, when it had any.
+fn split_typed(request: &mut Value) -> Option<Value> {
+    let fields = request.as_object_mut()?;
+    let mut typed = serde_json::Map::new();
+    for name in TYPED_FIELDS {
+        if let Some(v) = fields.remove(name) {
+            typed.insert(name.to_string(), v);
+        }
+    }
+    if typed.is_empty() {
+        return None;
+    }
+    fields.insert("typed".into(), Value::from("kept in words.json"));
+    Some(Value::Object(typed))
+}
+
+/// Puts what split_typed took out back.
+fn join_typed(request: &mut Value, typed: &Value) {
+    let (Some(fields), Some(typed)) = (request.as_object_mut(), typed.as_object()) else {
+        return;
+    };
+    fields.remove("typed");
+    for (name, v) in typed {
+        fields.insert(name.clone(), v.clone());
+    }
 }
 
 /// Writes `name` in `dir` whole, readable by its owner alone: a new file, moved into place.
@@ -1046,6 +1117,52 @@ mod tests {
         let file: HeldFile =
             serde_json::from_str(&std::fs::read_to_string(dir.join(HELD_FILE)).unwrap()).unwrap();
         file.held.iter().map(|h| h.op().to_string()).collect()
+    }
+
+    #[test]
+    fn what_he_typed_into_a_held_change_is_kept_in_the_words_file_alone() {
+        // Codex's review 85, secrets: the hold file names the change, the words file keeps its
+        // words; the next Kerdr has it whole. One an older Kerdr held with its words in the hold
+        // file is read whole, and its words move to the words file at the next write.
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("kerdr");
+        let mut kept = Kept::at(&state, 1000);
+        let mut save = entry("op-2", 1000);
+        save.request = json!({"action":"edit","id":"0582","op":"op-2","text":"token = s3cr3t-value","base":"old"});
+        assert!(kept.hold(save.clone()));
+        let held = std::fs::read_to_string(state.join(HELD_FILE)).unwrap();
+        assert!(
+            !held.contains("s3cr3t-value") && !held.contains("\"base\""),
+            "{held}"
+        );
+        let words = std::fs::read_to_string(state.join(WORDS_FILE)).unwrap();
+        assert!(words.contains("s3cr3t-value"), "{words}");
+        drop(kept);
+        let mut next = Kept::at(&state, 2000);
+        assert_eq!(next.held, vec![save.clone()], "whole again");
+        assert!(next.release("op-2").is_some());
+        assert!(!state.join(WORDS_FILE).exists(), "nothing left to keep");
+        drop(next);
+        // As an older Kerdr wrote it: words in the hold file.
+        let older = HeldFile {
+            held: vec![save.clone()],
+            holds: vec![],
+        };
+        std::fs::write(
+            state.join(HELD_FILE),
+            serde_json::to_string(&older).unwrap(),
+        )
+        .unwrap();
+        let mut next = Kept::at(&state, 2000);
+        assert_eq!(next.held, vec![save.clone()]);
+        next.hold(entry("op-3", 2000));
+        let held = std::fs::read_to_string(state.join(HELD_FILE)).unwrap();
+        assert!(
+            !held.contains("s3cr3t-value"),
+            "moved out at the next write: {held}"
+        );
+        drop(next);
+        assert!(Kept::at(&state, 2000).held.contains(&save));
     }
 
     #[test]

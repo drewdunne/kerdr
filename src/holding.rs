@@ -2295,6 +2295,112 @@ mod tests {
         (card.key, id, card.reference, m)
     }
 
+    /// Every file under `dir`, with its text, however deep.
+    fn every_file(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = vec![];
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(every_file(&path));
+            } else {
+                let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+                out.push((path, text));
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_typed_while_offline_is_kept_only_in_the_private_words_file_and_sent_whole() {
+        // Codex's review 85, secrets: a new intent, a text and a Kickoff answer, each with a line
+        // like a token, made while their machine doesn't answer: the change and the answer are
+        // held, the new intent's words kept in the box. Every file Kerdr writes (the hold file,
+        // the words file, the error log, its locks and state) is read: the token is in the words
+        // file alone, readable by him alone, and every request goes whole once it answers.
+        use std::os::unix::fs::PermissionsExt;
+        const TOKEN: &str = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let state = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = Kept::at(state.path(), app.now().timestamp());
+        app.error_log = crate::errlog::ErrorLog::at(state.path().join("errors.log"));
+        let (_key, id, _reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        supports(&mut app, m, crate::images::FIX_INPUT);
+        away(&mut app, m, 30);
+        // The text and the answer are held for it.
+        let edit = json!({"action":"edit","id":id,"text":format!("Deploy it.\ntoken = {TOKEN}"),
+            "was":"sha256:aa","base":"Deploy it.","from":"here"});
+        app.queue_action(m, edit);
+        let answer = json!({"action":"answer","id":id,"asked":"fedcba9876543210",
+            "answers":[{"num":"1","text":format!("the key is {TOKEN}")}]});
+        app.queue_action(m, answer);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 2, "both held: {:?}", app.message());
+        // The new intent's words stay in the box, kept in the words file when it closes.
+        press(&mut app, 'c');
+        if let super::super::Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = m;
+        }
+        for c in format!("Use {TOKEN} to deploy").chars() {
+            press(&mut app, c);
+        }
+        press_code(&mut app, KeyCode::Enter);
+        press_code(&mut app, KeyCode::Esc);
+        assert!(app.draft.contains(TOKEN));
+        app.keep_words_now();
+        let only_in_words = |when: &str| {
+            let files = every_file(state.path());
+            assert!(
+                files.iter().any(|(p, _)| p.ends_with("held.json")),
+                "{when}: no hold file"
+            );
+            for (path, text) in &files {
+                let name = path.file_name().unwrap().to_string_lossy();
+                if name == "words.json" {
+                    let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "{when}: words.json is {mode:o}");
+                    assert!(
+                        text.contains(TOKEN),
+                        "{when}: the words file keeps his words"
+                    );
+                } else {
+                    assert!(
+                        !text.contains(TOKEN),
+                        "{when}: the token is in {}",
+                        path.display()
+                    );
+                }
+            }
+        };
+        only_in_words("while offline");
+        // Back: what was held goes whole, and so do the new intent's words.
+        back(&mut app, m);
+        let handed = app.hand_over();
+        let texts: Vec<String> = handed.iter().map(|(_, _, r, _)| r.to_string()).collect();
+        assert_eq!(handed.len(), 2, "{texts:?}");
+        assert!(
+            texts.iter().all(|t| t.contains(TOKEN)),
+            "sent whole: {texts:?}"
+        );
+        press(&mut app, 'c');
+        if let super::super::Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = m;
+        }
+        let Action::Mutate { machine, request } = press_code(&mut app, KeyCode::Enter) else {
+            panic!("the new intent wasn't sent: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        let handed = app.hand_over();
+        assert!(
+            handed
+                .iter()
+                .any(|(_, _, r, _)| r["words"].as_str().is_some_and(|w| w.contains(TOKEN)))
+        );
+        app.keep_words_now();
+        only_in_words("once sent");
+    }
+
     fn select(app: &mut App, key: &str) {
         let col = app.card(key).unwrap().stage.index();
         app.mode = super::super::Mode::Board;
