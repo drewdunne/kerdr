@@ -342,18 +342,27 @@ impl App {
 
     /// A stop signal came while your editor was open, and it has closed on `action` (K3-31): the
     /// save goes now if its machine answers (`run` sends it and waits for its answer), else it's
-    /// held for that machine when its backend holds, else your text stays in the words file. What
-    /// became of it, in words for the line Kerdr ends with; None when there was nothing to save.
+    /// held for that machine when its backend holds, else your text is written to the words file,
+    /// from the save itself whatever became of its edit's record, and when even that can't be
+    /// written it's printed once the board has gone (K3-34). What became of it, in words for the
+    /// line Kerdr ends with; None when there was nothing to save.
     pub(crate) fn save_before_stopping(
         &mut self,
         key: &str,
         action: Action,
         run: &mut dyn FnMut(usize, &Value) -> Result<Response, String>,
     ) -> Option<String> {
-        let words_file = |app: &App, why: String| {
+        let words_file = |app: &mut App, why: String| {
             let held = app.edits.get(key)?;
             held.mine.as_ref()?;
             let reference = app.reference_for(&held.id);
+            // Written now: what the line Kerdr ends with says is so.
+            if !(app.kept.on_disk() && app.keep_words_now()) {
+                app.print_unkept();
+                return Some(format!(
+                    "Your new text for {reference} wasn't saved{why}, and Kerdr couldn't write it to its words file, so it's printed below, to copy."
+                ));
+            }
             let place = app
                 .words_dir
                 .as_ref()
@@ -414,11 +423,37 @@ impl App {
         let why = refused
             .map(|m| format!(" ({})", crate::errlog::last_part(&m, 200)))
             .unwrap_or_default();
-        words_file(self, why).or_else(|| {
-            Some(format!(
-                "Your new text for {reference} wasn't saved, and Kerdr holds no copy of it."
-            ))
-        })
+        // His text is in the save itself: kept from it as his version, whether or not its edit's
+        // record has one (K3-34).
+        self.keep_edit_from(key, machine, &request);
+        words_file(self, why)
+    }
+
+    /// A save's text, as his version of `key`'s item: its record made from the save when there's
+    /// none, so the words file keeps it and e opens it, reading the item first.
+    fn keep_edit_from(&mut self, key: &str, machine: usize, request: &Value) {
+        let (Some(id), Some(text)) = (request["id"].as_str(), request["text"].as_str()) else {
+            return;
+        };
+        let held =
+            self.edits
+                .entry(key.to_string())
+                .or_insert_with(|| crate::app::edit_controls::Held {
+                    id: id.to_string(),
+                    machine,
+                    current: request["base"].as_str().unwrap_or_default().to_string(),
+                    was: request["was"].as_str().unwrap_or_default().to_string(),
+                    read_at: Instant::now(),
+                    mine: None,
+                    check_first: true,
+                    read_only: None,
+                });
+        if held.mine.as_ref().is_none_or(|m| m.text != text) {
+            held.mine = Some(crate::app::edit_controls::Mine {
+                text: text.to_string(),
+                from: held.current.clone(),
+            });
+        }
     }
 }
 
@@ -603,6 +638,85 @@ pub(crate) mod tests {
             machine: 0,
             request: json!({"action":"edit","id":id,"text":"New words.","was":"sha256:aa","from":"here"}),
         }
+    }
+
+    /// The demo with its words kept in `dir`, its first card's machine not answering and holding
+    /// nothing: a stopped save of that card's text has only the words file. The card's key, id
+    /// and machine.
+    fn stopping_with_no_machine(app: &mut App, dir: &std::path::Path) -> (String, String, usize) {
+        app.demo = false;
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.kept = Kept::at(dir, app.now().timestamp());
+        app.words_dir = Some(dir.to_path_buf());
+        let card = app.board.cards[0].clone();
+        let machine = card.machine_index;
+        if let Some(feed) = app.machines[machine].feed.as_mut() {
+            feed.supports.clear();
+        }
+        away(app, machine, 60);
+        let id = card.detail.as_ref().unwrap().id.clone();
+        (card.key, id, machine)
+    }
+
+    fn save_of(id: &str, machine: usize) -> Action {
+        Action::Mutate {
+            machine,
+            request: json!({"action":"edit","id":id,"text":"Words only the save has.","was":"sha256:bb","from":"here"}),
+        }
+    }
+
+    #[test]
+    fn a_stopped_save_with_no_record_of_its_edit_is_kept_from_the_save_itself() {
+        // Intent 0591, K3-34: the save doesn't go and can't be held, and Kerdr has no record of
+        // that card's edit. The save carries his text, so the words file keeps it from the save:
+        // e on it in the next Kerdr opens it, reading the item first.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = demo_app();
+        let (key, id, machine) = stopping_with_no_machine(&mut app, dir.path());
+        assert!(!app.edits.contains_key(&key));
+        let went = app
+            .save_before_stopping(&key, save_of(&id, machine), &mut |_, _| {
+                panic!("nothing is sent to a machine that isn't answering")
+            })
+            .unwrap();
+        assert!(went.contains("kept in Kerdr's words file"), "{went}");
+        app.keep_on_quit().unwrap();
+        let words = Kept::at(dir.path(), app.now().timestamp()).take_words();
+        let kept = words
+            .edits
+            .iter()
+            .find(|e| e.key == key)
+            .expect("his text in the words file");
+        assert_eq!(kept.text, "Words only the save has.");
+        assert_eq!(kept.was, "sha256:bb");
+        let mut next = demo_app();
+        next.restore_words(words);
+        assert!(next.edits[&key].check_first, "e reads the item first");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_stopped_save_the_words_file_cant_take_is_printed_once_the_board_has_gone() {
+        // Intent 0591, K3-34: not even the words file can be written. His text is printed to the
+        // terminal once the board has gone, never in the line Kerdr ends with, which the error
+        // log keeps.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("kerdr");
+        std::fs::create_dir(&state).unwrap();
+        let mut app = demo_app();
+        let (key, id, machine) = stopping_with_no_machine(&mut app, &state);
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let went = app
+            .save_before_stopping(&key, save_of(&id, machine), &mut |_, _| {
+                panic!("nothing is sent to a machine that isn't answering")
+            })
+            .unwrap();
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(went.contains("printed below, to copy"), "{went}");
+        assert!(!went.contains("Words only the save has."), "{went}");
+        let printed = app.print_on_exit.join("\n");
+        assert!(printed.contains("Words only the save has."), "{printed}");
     }
 
     #[test]

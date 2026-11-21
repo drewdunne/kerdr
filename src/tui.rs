@@ -165,6 +165,11 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
     }
     let _ = execute!(stdout(), ratatui::crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+    // His words the words file couldn't keep, now the board has gone: to the terminal only, never
+    // the error log (intent 0591, K3-34).
+    for text in std::mem::take(&mut app.print_on_exit) {
+        eprintln!("{text}");
+    }
     if let Some(l) = live.as_mut() {
         for i in 0..l.pollers.len() {
             l.stop(i);
@@ -1391,11 +1396,19 @@ fn edit_text(
             (Some(command), Some(target)) => crate::actions::run(target, command, request),
             _ => Err(crate::actions::NO_BACKEND.into()),
         });
-        let unkept = app
-            .keep_on_quit()
-            .err()
-            .map(|why| format!(" {why}, so what it keeps for the next Kerdr was lost."))
-            .unwrap_or_default();
+        // What can't be kept for the next Kerdr is printed once the board has gone (K3-34).
+        let unkept = match app.keep_on_quit() {
+            Ok(()) => String::new(),
+            Err(why) => {
+                app.print_unkept();
+                let printed = if app.print_on_exit.is_empty() {
+                    ""
+                } else {
+                    " Your words are printed below, to copy."
+                };
+                format!(" {why}, so what it keeps for the next Kerdr couldn't be kept.{printed}")
+            }
+        };
         let went = went.map(|w| format!(" {w}")).unwrap_or_default() + &unkept;
         anyhow::bail!(
             "Kerdr was asked to stop (signal {signal}) while your editor was open.{went}"

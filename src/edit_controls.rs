@@ -570,6 +570,10 @@ impl App {
         if !in_box {
             self.edit_closed_for(key);
         }
+        // His version into the words file now, before its save is answered, or while no save
+        // goes (his editor died): a Kerdr ended meanwhile never leaves it held nowhere (intent
+        // 0591, K3-34).
+        self.keep_words_now();
         action
     }
 
@@ -819,6 +823,8 @@ impl App {
             self.edits.remove(&edit.key);
         }
         self.edit_closed_for(&edit.key);
+        // Into the words file now (intent 0591, K3-34).
+        self.keep_words_now();
     }
 
     /// The editor has closed on your unsaved version of an item that can't be edited any more, or
@@ -1546,6 +1552,47 @@ mod tests {
                 ..Default::default()
             },
         }
+    }
+
+    #[test]
+    fn his_version_is_in_the_words_file_as_the_editor_closes_before_any_answer() {
+        // Intent 0591, K3-34: written as the editor closes, so a Kerdr ended before its save is
+        // answered, or after his editor died with nothing sent, never leaves it held nowhere.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = crate::kept::Kept::at(dir.path(), 1000);
+        let (key, id, _) = waiting(&mut app);
+        let machine = app.card(&key).unwrap().machine_index;
+        let held = Held {
+            id,
+            machine,
+            current: "Old words.".into(),
+            was: "sha256:aa".into(),
+            read_at: Instant::now(),
+            mine: None,
+            check_first: false,
+            read_only: None,
+        };
+        let words = || std::fs::read_to_string(dir.path().join("words.json")).unwrap_or_default();
+        app.edits.insert(key.clone(), held.clone());
+        let action = app.edit_ended(&key, wrote("Saved, not yet answered."));
+        assert!(matches!(action, Action::Mutate { .. }), "{action:?}");
+        assert!(words().contains("Saved, not yet answered."), "{}", words());
+        app.edits.insert(key.clone(), held);
+        let action = app.edit_ended(
+            &key,
+            Ended::Died {
+                text: "What the editor had when it died.".into(),
+                run: nvim(),
+                touched: true,
+            },
+        );
+        assert!(matches!(action, Action::None), "{action:?}");
+        assert!(
+            words().contains("What the editor had when it died."),
+            "{}",
+            words()
+        );
     }
 
     /// A request on its way, as the board sends it: into the action resolution tool, handed to

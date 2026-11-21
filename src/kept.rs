@@ -898,6 +898,18 @@ pub struct Words {
     pub edits: Vec<KeptEdit>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub saving: Vec<KeptSaving>,
+    /// Kickoff answers not saved yet, which d opens again: kept for the next Kerdr too, so a
+    /// failed answer is never held nowhere (intent 0591, K3-34).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub answers: Vec<KeptAnswers>,
+}
+
+/// One card's Kickoff answers, not saved yet: its card's key, and each answer as the box keeps
+/// it (the question's number, the question, his answer).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct KeptAnswers {
+    pub key: String,
+    pub answers: Vec<(String, String, String)>,
 }
 
 impl Words {
@@ -906,6 +918,7 @@ impl Words {
             && self.returned.is_empty()
             && self.edits.is_empty()
             && self.saving.is_empty()
+            && self.answers.is_empty()
     }
 
     /// Adds another set's words: a second draft comes back after this one's, an edit of the same
@@ -937,6 +950,10 @@ impl Words {
             {
                 self.saving.push(s);
             }
+        }
+        for a in other.answers {
+            self.answers.retain(|o| o.key != a.key);
+            self.answers.push(a);
         }
     }
 }
@@ -1417,6 +1434,10 @@ mod tests {
                 machine: "LAB-Server".into(),
                 request: json!({"action":"create","words":"Saving","submission":"s-2","op":"k-2"}),
                 pending: "saving…".into(),
+            }],
+            answers: vec![KeptAnswers {
+                key: "ark-sdlc:0042".into(),
+                answers: vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
             }],
         }
     }

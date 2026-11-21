@@ -5174,6 +5174,7 @@ impl App {
                 {
                     self.kickoff_kept.remove(held);
                     self.kickoff_prefill.remove(held);
+                    self.keep_words_now();
                 }
                 if !response.ok && response.partial {
                     // Part of it happened, and the backend's words say which: not a change that

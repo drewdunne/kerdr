@@ -1709,7 +1709,11 @@ impl App {
     /// it says so and stays, and a second q quits anyway (Codex's review 60).
     pub fn quit_key(&mut self) -> bool {
         if self.quit_unsaved && self.quitting.is_some() {
-            let _ = self.keep_on_quit();
+            // Quitting anyway: what couldn't be kept is printed once the board has gone, so his
+            // words are never held nowhere (intent 0591, K3-34).
+            if self.keep_on_quit().is_err() {
+                self.print_unkept();
+            }
             return true;
         }
         let Some(what) = self.quit_waits_for() else {
@@ -1772,7 +1776,7 @@ impl App {
         self.quit_unsaved = true;
         self.say(
             format!(
-                "{why}, so quitting now would lose what Kerdr keeps for the next one: your words, and changes it holds. q again quits anyway, Esc stays."
+                "{why}, so quitting now would lose what Kerdr keeps for the next one: your words, and changes it holds. q again quits anyway and prints your words to copy, Esc stays."
             ),
             Tone::Warn,
         );
@@ -2112,6 +2116,17 @@ impl App {
         }
         edits.sort_by(|a, b| a.key.cmp(&b.key));
         words.edits = edits;
+        // Kickoff answers not saved yet, which d opens again (intent 0591, K3-34).
+        let mut answers: Vec<crate::kept::KeptAnswers> = self
+            .kickoff_kept
+            .iter()
+            .map(|(key, answers)| crate::kept::KeptAnswers {
+                key: key.clone(),
+                answers: answers.clone(),
+            })
+            .collect();
+        answers.sort_by(|a, b| a.key.cmp(&b.key));
+        words.answers = answers;
         words
     }
 
@@ -2254,6 +2269,76 @@ impl App {
                 },
             );
         }
+        // Kickoff answers the last Kerdr kept: d opens them again. Ones typed here since stay.
+        for a in words.answers {
+            self.kickoff_kept.entry(a.key).or_insert(a.answers);
+        }
+    }
+
+    /// Everything the words file would keep for the next Kerdr, as text he can copy: for when it
+    /// can't be written and Kerdr ends anyway, printed to the terminal once the board has gone,
+    /// never to the error log (intent 0591, K3-34). Empty when there's nothing of his to keep.
+    pub(crate) fn unkept_texts(&self) -> String {
+        let words = self.words();
+        let images = |n: usize| match n {
+            0 => String::new(),
+            1 => " (and an image, which can't be shown here)".into(),
+            n => format!(" (and {n} images, which can't be shown here)"),
+        };
+        let mut parts = vec![];
+        for e in &words.edits {
+            let reference = self.reference_for(&e.id);
+            parts.push(format!("Your new text for {reference}:\n{}", e.text));
+        }
+        if let Some(d) = &words.draft {
+            parts.push(format!(
+                "Your new intent's words, not sent{}:\n{}",
+                images(d.images.len()),
+                d.words
+            ));
+        }
+        for r in &words.returned {
+            parts.push(format!(
+                "Words given back to you, not saved{}:\n{}",
+                images(r.images.len()),
+                r.words
+            ));
+        }
+        for a in &words.answers {
+            let id = a.key.rsplit(':').next().unwrap_or(&a.key);
+            let reference = self.reference_for(id);
+            let lines: Vec<String> = a
+                .answers
+                .iter()
+                .map(|(n, question, answer)| {
+                    if question.is_empty() {
+                        answer.clone()
+                    } else {
+                        format!("{n}. {question}\n{answer}")
+                    }
+                })
+                .collect();
+            parts.push(format!(
+                "Your answers to {reference}'s questions:\n{}",
+                lines.join("\n")
+            ));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        format!(
+            "Kerdr couldn't keep these for the next Kerdr, so here they are to copy:\n\n{}\n",
+            parts.join("\n\n")
+        )
+    }
+
+    /// When the words file can't be written as Kerdr ends: his words to print once the board has
+    /// gone, replacing any said before.
+    pub(crate) fn print_unkept(&mut self) {
+        let text = self.unkept_texts();
+        if !text.is_empty() {
+            self.print_on_exit = vec![text];
+        }
     }
 }
 
@@ -2271,6 +2356,56 @@ mod tests {
         let mut app = App::new(Config::default(), crate::demo::machines(false));
         app.cfg.actions.command = Some("test-adapter".into());
         app
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_anyway_without_the_words_file_prints_his_words() {
+        // Intent 0591, K3-34: the words file can't be written, and he quits anyway (q again).
+        // His words, a new intent's and his version of an item's text and a Kickoff answer, are
+        // printed once the board has gone, rather than held nowhere.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("kerdr");
+        std::fs::create_dir(&state).unwrap();
+        let mut app = app();
+        app.kept = Kept::at(&state, 1000);
+        app.draft = "A new intent, not sent.".into();
+        let card = app.board.cards[0].clone();
+        app.edits.insert(
+            card.key.clone(),
+            crate::app::edit_controls::Held {
+                id: card.detail.as_ref().unwrap().id.clone(),
+                machine: card.machine_index,
+                current: "Old words.".into(),
+                was: "sha256:aa".into(),
+                read_at: Instant::now(),
+                mine: Some(crate::app::edit_controls::Mine {
+                    text: "His version of it.".into(),
+                    from: "Old words.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        app.kickoff_kept.insert(
+            "demo:41".into(),
+            vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
+        );
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(!app.quit_key(), "{:?}", app.message());
+        assert!(app.message().unwrap().0.contains("prints your words"));
+        assert!(app.quit_key());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let printed = app.print_on_exit.join("\n");
+        for words in [
+            "A new intent, not sent.",
+            "His version of it.",
+            "Whose is it?",
+            "Kibbelz's",
+        ] {
+            assert!(printed.contains(words), "{words} not printed: {printed}");
+        }
     }
 
     /// A card waiting in the backlog, selected, with `rev` "r1" in its feed: its key, id,
@@ -3933,7 +4068,7 @@ mod tests {
         assert!(!app.quit_key(), "it doesn't quit as if they were kept");
         assert!(said(&app).contains("words.json"), "{}", said(&app));
         assert!(
-            said(&app).ends_with("q again quits anyway, Esc stays."),
+            said(&app).ends_with("q again quits anyway and prints your words to copy, Esc stays."),
             "{}",
             said(&app)
         );

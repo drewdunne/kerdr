@@ -800,6 +800,9 @@ pub struct App {
     /// What's typed in a Kickoff Questions box and not saved yet, by its card's key: never another
     /// source's card with the same number (Codex's fifth look).
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
+    /// What to print to the terminal once the board has gone: his words, when the words file
+    /// couldn't keep them as Kerdr ended (intent 0591, K3-34). Never written to the error log.
+    pub print_on_exit: Vec<String>,
     /// Kickoff answers its backend gave back because their questions changed while he answered,
     /// by its card's key: filled in on the next box d opens (intent 0591, B1-108).
     pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
@@ -1059,6 +1062,7 @@ impl App {
             resent: vec![],
             moved_home: vec![],
             kickoff_kept: Default::default(),
+            print_on_exit: vec![],
             kickoff_prefill: Default::default(),
             stop_starts: Vec::new(),
             answer_job: None,

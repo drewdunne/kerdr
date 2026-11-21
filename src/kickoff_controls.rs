@@ -527,6 +527,8 @@ impl App {
         } else {
             self.kickoff_kept.insert(held, kept);
         }
+        // In the words file too, so the next Kerdr has them (intent 0591, K3-34).
+        self.keep_words_now();
     }
 
     /// What a failure adds when it has words of yours in hand: where they went. `held` is its
@@ -1423,6 +1425,28 @@ mod tests {
         let reopened =
             Kickoff::from_answer(0, &request, &reworded, "#41".into(), "t".into(), &kept).unwrap();
         assert_eq!(reopened.drafts[0], "");
+    }
+
+    #[test]
+    fn answers_not_saved_are_kept_for_the_next_kerdr() {
+        // Intent 0591, K3-34: a Kickoff answer that didn't go is kept for d to open again; it's
+        // kept in the words file too, so quitting never leaves it held nowhere, and the next
+        // Kerdr's d opens it.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id) = open_on(&answer());
+        app.kept = crate::kept::Kept::at(dir.path(), 1000);
+        typed(&mut app, "kept for later");
+        key(&mut app, KeyCode::Enter);
+        let _ = sent(key(&mut app, KeyCode::Enter));
+        let file = std::fs::read_to_string(dir.path().join("words.json")).unwrap_or_default();
+        assert!(
+            file.contains("kept for later"),
+            "the answer isn't in the words file: {file}"
+        );
+        app.keep_on_quit().unwrap();
+        let mut next = App::new(Config::default(), crate::demo::machines(false));
+        next.restore_words(crate::kept::Kept::at(dir.path(), 2000).take_words());
+        assert_eq!(next.kickoff_kept[&held(&id)][0].2, "kept for later");
     }
 
     #[test]
