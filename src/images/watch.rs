@@ -13,7 +13,11 @@
 //!
 //! The thread stops with its owner: when the watch is dropped, when it's retired, and when it
 //! isn't set up within START_BOUND. Under X11 that shuts its socket, waking whatever it waits on,
-//! its first answer from the server included; under Wayland it's the watch's own cancel handle.
+//! its first answer from the server included, and a TCP connection is only tried within the
+//! bound; under Wayland it's the watch's own cancel handle. A step nothing can stop (looking up a
+//! display's host name, an Xauthority file on a file system that doesn't answer, wl-clipboard-rs
+//! making its connection) may hold the thread past the bound; the watch is given up at the bound
+//! all the same, and nothing waits on it.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -53,9 +57,9 @@ impl Drop for Owner {
 type SyncFn = Box<dyn Fn(Duration) -> bool + Send + Sync>;
 /// What stops the watch's thread.
 type Stop = Box<dyn FnOnce() + Send>;
-/// What a watch's thread runs.
+/// What a watch's thread runs, given when its start-up bound ends.
 #[cfg(not(any(target_os = "macos", windows)))]
-type Watching = Box<dyn FnOnce(&Arc<Shared>) + Send>;
+type Watching = Box<dyn FnOnce(&Arc<Shared>, std::time::Instant) + Send>;
 
 /// What the watch's thread and its owner share.
 #[derive(Default)]
@@ -174,9 +178,10 @@ impl ClipboardWatch {
         {
             let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
             if set("WAYLAND_DISPLAY") {
-                ClipboardWatch::running(Box::new(wayland), START_BOUND)
+                ClipboardWatch::running(Box::new(|shared, _| wayland(shared)), START_BOUND)
             } else if set("DISPLAY") {
-                ClipboardWatch::running(Box::new(|shared| x11(shared, None)), START_BOUND)
+                let watch = |shared: &Arc<Shared>, until| x11(shared, X11At::Display(None), until);
+                ClipboardWatch::running(Box::new(watch), START_BOUND)
             } else {
                 ClipboardWatch::with(Arc::default())
             }
@@ -188,10 +193,11 @@ impl ClipboardWatch {
     fn running(watch: Watching, bound: Duration) -> ClipboardWatch {
         let shared = Arc::new(Shared::default());
         let theirs = shared.clone();
+        let until = std::time::Instant::now() + bound;
         let started = std::thread::Builder::new()
             .name("kerdr-clipboard-watch".into())
             .spawn(move || {
-                watch(&theirs);
+                watch(&theirs, until);
                 theirs.retire();
                 theirs.ended.store(true, SeqCst);
             });
@@ -218,8 +224,21 @@ impl ClipboardWatch {
     /// An X11 watch on the display at the socket `path`, given up after `bound`, for tests.
     #[cfg(all(test, not(any(target_os = "macos", windows))))]
     pub(crate) fn x11_at(path: &std::path::Path, bound: Duration) -> ClipboardWatch {
-        let path = path.to_path_buf();
-        ClipboardWatch::running(Box::new(move |shared| x11(shared, Some(&path))), bound)
+        let at = X11At::Socket(path.to_path_buf());
+        ClipboardWatch::running(Box::new(move |shared, until| x11(shared, at, until)), bound)
+    }
+
+    /// An X11 watch on the display named `display`, given up after `bound`, for tests.
+    #[cfg(all(test, not(any(target_os = "macos", windows))))]
+    pub(crate) fn x11_named(display: &str, bound: Duration) -> ClipboardWatch {
+        let at = X11At::Display(Some(display.to_string()));
+        ClipboardWatch::running(Box::new(move |shared, until| x11(shared, at, until)), bound)
+    }
+
+    /// Whether the watch has been given up or stopped.
+    #[cfg(all(test, not(any(target_os = "macos", windows))))]
+    pub(crate) fn given_up(&self) -> bool {
+        self.owner.0.stopped()
     }
 
     /// A watch with no thread, its notices given by the test, already set up.
@@ -289,11 +308,77 @@ impl Notices {
     }
 }
 
-/// Kerdr's X11 watch: XFixes' notice of each change of the CLIPBOARD selection, counted. The
-/// socket is Kerdr's from before the first word to the server, so stopping the watch shuts it,
-/// and the thread wakes from any wait, its first answer included.
+/// Where Kerdr's X11 watch connects: the display DISPLAY names, or one named, or a test's own
+/// socket by its path.
 #[cfg(not(any(target_os = "macos", windows)))]
-fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
+enum X11At {
+    Display(Option<String>),
+    #[cfg_attr(not(test), allow(dead_code))]
+    Socket(std::path::PathBuf),
+}
+
+/// The most of an Xauthority file the watch reads (Codex's review 92, 2).
+#[cfg(not(any(target_os = "macos", windows)))]
+const MOST_XAUTHORITY: u64 = 1 << 20;
+
+/// Whether the Xauthority file x11rb would read (XAUTHORITY, else ~/.Xauthority) can be read
+/// without holding the watch: a plain file of at most MOST_XAUTHORITY. One that isn't (a FIFO,
+/// which would hold the read open, or one too large) is passed over, and the watch connects
+/// without it. A missing one is fine: there's nothing to read.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn xauthority_readable() -> bool {
+    let path = std::env::var_os("XAUTHORITY")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".Xauthority")));
+    path.is_none_or(|path| xauthority_file_readable(&path))
+}
+
+#[cfg(not(any(target_os = "macos", windows)))]
+fn xauthority_file_readable(path: &std::path::Path) -> bool {
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && meta.len() <= MOST_XAUTHORITY,
+        Err(_) => true,
+    }
+}
+
+/// Connects to one of a display's addresses within the start-up bound. Over TCP each address is
+/// tried with what's left of it; looking up a host name first can't be stopped (a known limit:
+/// the watch is given up at the bound all the same). A Unix socket is connected to at once, or
+/// refused.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn connect_within(
+    at: &x11rb::reexports::x11rb_protocol::parse_display::ConnectAddress<'_>,
+    until: std::time::Instant,
+) -> Option<(
+    x11rb::rust_connection::DefaultStream,
+    (x11rb::reexports::x11rb_protocol::xauth::Family, Vec<u8>),
+)> {
+    use std::net::{TcpStream, ToSocketAddrs};
+    use x11rb::reexports::x11rb_protocol::parse_display::ConnectAddress;
+    use x11rb::rust_connection::DefaultStream;
+    match at {
+        ConnectAddress::Hostname(host, port) => {
+            for addr in (*host, *port).to_socket_addrs().ok()? {
+                let left = until.saturating_duration_since(std::time::Instant::now());
+                if left.is_zero() {
+                    return None;
+                }
+                if let Ok(stream) = TcpStream::connect_timeout(&addr, left) {
+                    return DefaultStream::from_tcp_stream(stream).ok();
+                }
+            }
+            None
+        }
+        at => DefaultStream::connect(at).ok(),
+    }
+}
+
+/// Kerdr's X11 watch: XFixes' notice of each change of the CLIPBOARD selection, counted. The
+/// connection is made within the start-up bound, and the socket is Kerdr's from before the first
+/// word to the server, so stopping the watch shuts it, and the thread wakes from any wait, its
+/// first answer included (Codex's reviews 90, 3, and 92, 2).
+#[cfg(not(any(target_os = "macos", windows)))]
+fn x11(shared: &Arc<Shared>, at: X11At, until: std::time::Instant) {
     use std::os::fd::{AsFd, AsRawFd};
     use std::sync::Condvar;
     use x11rb::connection::Connection;
@@ -303,30 +388,27 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
     use x11rb::reexports::x11rb_protocol::parse_display::{ConnectAddress, parse_display};
     use x11rb::reexports::x11rb_protocol::xauth::get_auth;
     use x11rb::rust_connection::{DefaultStream, RustConnection};
-    // DISPLAY, as x11rb reads it; a test's own socket by its path.
-    let (stream, auth, screen) = match socket_at {
-        None => {
-            let Ok(parsed) = parse_display(None) else {
+    // The display, as x11rb reads its name; a test's own socket by its path.
+    let (stream, peer, screen) = match at {
+        X11At::Display(name) => {
+            let Ok(parsed) = parse_display(name.as_deref()) else {
                 return;
             };
             let Some((stream, (family, address))) = parsed
                 .connect_instruction()
-                .find_map(|at| DefaultStream::connect(&at).ok())
+                .find_map(|at| connect_within(&at, until))
             else {
                 return;
             };
-            let auth = get_auth(family, &address, parsed.display)
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            (stream, auth, usize::from(parsed.screen))
+            let screen = usize::from(parsed.screen);
+            (stream, Some((family, address, parsed.display)), screen)
         }
-        Some(path) => {
+        X11At::Socket(path) => {
             let at = ConnectAddress::Socket(path.to_string_lossy().into_owned());
             let Ok((stream, _)) = DefaultStream::connect(&at) else {
                 return;
             };
-            (stream, Default::default(), 0)
+            (stream, None, 0)
         }
     };
     let Ok(socket) = stream.as_fd().try_clone_to_owned() else {
@@ -341,7 +423,10 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
     if !shared.on_stop(shut) {
         return;
     }
-    let (auth_name, auth_data) = auth;
+    let (auth_name, auth_data) = peer
+        .filter(|_| xauthority_readable())
+        .and_then(|(family, address, display)| get_auth(family, &address, display).ok().flatten())
+        .unwrap_or_default();
     let Ok(conn) =
         RustConnection::connect_to_stream_with_auth_info(stream, screen, auth_name, auth_data)
     else {
@@ -691,6 +776,71 @@ mod tests {
         assert!(shared.now().is_none(), "the watch wasn't retired");
         assert!(shared.stopped(), "its socket wasn't shut");
         drop(theirs);
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn an_x11_display_over_tcp_whose_connection_gets_no_answer_is_given_up_by_its_bound() {
+        // Codex's review 92, 2: DISPLAY names a host whose connection attempt gets no answer
+        // (here a listener whose queue is full, so it drops the attempt). Pastes stay instant;
+        // the watch is unavailable by its start-up bound, and its thread, its connection tried
+        // only within that bound, ends.
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let Some(display) = addr.port().checked_sub(6000) else {
+            eprintln!("skipped: port {} is below X11's", addr.port());
+            return;
+        };
+        let mut held = vec![];
+        while let Ok(stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(200)) {
+            held.push(stream);
+            assert!(held.len() < 5000, "the listener's queue never filled");
+        }
+        let bound = Duration::from_millis(500);
+        let began = Instant::now();
+        let watch = ClipboardWatch::x11_named(&format!("127.0.0.1:{display}"), bound);
+        let ended = watch.ended();
+        for _ in 0..100 {
+            assert!(watch.pasted().is_none());
+        }
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "{:?}",
+            began.elapsed()
+        );
+        assert!(
+            within(bound + Duration::from_secs(1), || watch.given_up()),
+            "the watch wasn't given up by its bound"
+        );
+        assert!(
+            within(bound + Duration::from_secs(1), || ended()),
+            "the watch's thread lingered in its connection"
+        );
+        drop(listener);
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn an_xauthority_file_that_could_hold_the_watch_is_passed_over() {
+        // Codex's review 92, 2: a FIFO would hold the read open, and a file past the cap is more
+        // than the watch reads; a plain one, or none, is read.
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let name = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a FIFO made at a path in the test's own folder.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        assert!(!xauthority_file_readable(&fifo));
+        let big = dir.path().join("big");
+        std::fs::File::create(&big)
+            .unwrap()
+            .set_len(MOST_XAUTHORITY + 1)
+            .unwrap();
+        assert!(!xauthority_file_readable(&big));
+        let plain = dir.path().join("plain");
+        std::fs::write(&plain, [0u8; 64]).unwrap();
+        assert!(xauthority_file_readable(&plain));
+        assert!(xauthority_file_readable(&dir.path().join("none")));
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]
