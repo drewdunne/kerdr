@@ -715,12 +715,144 @@ pub fn valid_signin_url(url: &str) -> bool {
             .any(|c| c.is_control() || c.is_whitespace() || matches!(c, '\\' | '"' | '<' | '>'))
 }
 
-pub fn open_signin_url(url: &str) -> std::io::Result<()> {
+/// How an opener's start went.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Opened {
+    /// It handed the link on (it exited cleanly, or it's still running: a browser itself).
+    Yes,
+    /// It isn't on this machine.
+    Missing,
+    /// It ran and gave up: why, in words.
+    Failed(String),
+}
+
+/// How long an opener may take to say it failed before Kerdr takes it as having opened the link:
+/// xdg-open and gio hand the link to a browser and exit at once; a browser named in $BROWSER keeps
+/// running.
+const OPENER_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
+
+/// The programs that may open a link on this machine, each its words, tried in order (intent 0591,
+/// K2-40): each of `$BROWSER`'s (colon-separated, `%s` standing for the link), then Omarchy's
+/// launcher, `gio open` and `xdg-open`. None without a desktop to show a browser on (Kerdr over
+/// SSH). macOS has `open`; Windows its URL handler, which isn't a program.
+pub fn openers(browser: Option<&str>, desktop: bool) -> Vec<Vec<String>> {
+    if cfg!(target_os = "macos") {
+        return vec![vec!["open".into()]];
+    }
+    if !desktop {
+        return vec![];
+    }
+    let mut out: Vec<Vec<String>> = browser
+        .unwrap_or_default()
+        .split(':')
+        .map(crate::edit::editor_words)
+        .filter(|w| !w.is_empty())
+        .collect();
+    for fixed in [
+        &["omarchy-launch-browser"][..],
+        &["gio", "open"],
+        &["xdg-open"],
+    ] {
+        let words: Vec<String> = fixed.iter().map(|w| w.to_string()).collect();
+        if !out.contains(&words) {
+            out.push(words);
+        }
+    }
+    out
+}
+
+/// Opens a link with the first opener that takes it, each tried by `start` (which runs it with the
+/// link, the words' `%s` replaced by it or the link after them). Why none did, in words, when
+/// none did. Only a link valid_signin_url passes is ever handed to one.
+pub fn open_with(
+    url: &str,
+    openers: &[Vec<String>],
+    start: &dyn Fn(&[String]) -> Opened,
+) -> Result<(), String> {
     if !valid_signin_url(url) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "not a valid HTTPS sign-in link",
-        ));
+        return Err("it isn't a valid HTTPS sign-in link".into());
+    }
+    if openers.is_empty() {
+        return Err("no desktop here to open a browser on".into());
+    }
+    let mut why = vec![];
+    for words in openers {
+        let mut words = words.clone();
+        if words.iter().any(|w| w.contains("%s")) {
+            for w in &mut words {
+                *w = w.replace("%s", url);
+            }
+        } else {
+            words.push(url.to_string());
+        }
+        let name = openers_name(&words, url);
+        match start(&words) {
+            Opened::Yes => return Ok(()),
+            Opened::Missing => why.push(format!("{name} isn't installed")),
+            Opened::Failed(e) => why.push(format!("{name} {e}")),
+        }
+    }
+    Err(why.join(", "))
+}
+
+/// An opener's words for a message, without the link.
+fn openers_name(words: &[String], url: &str) -> String {
+    words
+        .iter()
+        .filter(|w| !w.contains(url))
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Starts one opener with nothing on its input or output, and waits a moment for it to say it
+/// couldn't (OPENER_WAIT); still running then, it's taken as having opened the link, and left to
+/// finish on its own.
+#[cfg(not(windows))]
+pub fn start_opener(words: &[String]) -> Opened {
+    use std::process::{Command, Stdio};
+    let Some((program, args)) = words.split_first() else {
+        return Opened::Missing;
+    };
+    let mut child = match Command::new(crate::jump::expand_home(program))
+        .args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Opened::Missing,
+        Err(e) => return Opened::Failed(format!("couldn't start ({e})")),
+    };
+    let until = std::time::Instant::now() + OPENER_WAIT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) if status.success() => return Opened::Yes,
+            Ok(Some(status)) => {
+                return Opened::Failed(match status.code() {
+                    Some(code) => format!("exited with {code}"),
+                    None => "was stopped".into(),
+                });
+            }
+            Ok(None) if std::time::Instant::now() < until => {
+                std::thread::sleep(std::time::Duration::from_millis(20))
+            }
+            _ => {
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                });
+                return Opened::Yes;
+            }
+        }
+    }
+}
+
+/// Opens a sign-in link in a browser on this machine: Windows' URL handler there, else the first
+/// opener that takes it (`openers`). Why it couldn't, in words.
+pub fn open_signin_url(url: &str) -> Result<(), String> {
+    if !valid_signin_url(url) {
+        return Err("it isn't a valid HTTPS sign-in link".into());
     }
     #[cfg(windows)]
     {
@@ -739,29 +871,16 @@ pub fn open_signin_url(url: &str) -> std::io::Result<()> {
             )
         };
         if (result as isize) <= 32 {
-            return Err(std::io::Error::other(
-                "the system URL handler refused the link",
-            ));
+            return Err("the system URL handler refused the link".into());
         }
         Ok(())
     }
     #[cfg(not(windows))]
     {
-        use std::process::{Command, Stdio};
-        let mut child = Command::new(if cfg!(target_os = "macos") {
-            "open"
-        } else {
-            "xdg-open"
-        })
-        .arg(url)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()?;
-        std::thread::spawn(move || {
-            let _ = child.wait();
-        });
-        Ok(())
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        let desktop = set("WAYLAND_DISPLAY") || set("DISPLAY");
+        let browser = std::env::var("BROWSER").ok();
+        open_with(url, &openers(browser.as_deref(), desktop), &start_opener)
     }
 }
 
@@ -983,6 +1102,82 @@ mod tests {
             "https://example.com/authorize?scope=a%20b&state=c"
         ));
     }
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn a_link_goes_to_the_next_opener_when_one_cant_take_it() {
+        // Intent 0591, K2-40: $BROWSER first, then Omarchy's launcher, gio and xdg-open, each
+        // tried in turn until one takes it; none without a desktop to open it on.
+        let url = "https://claude.ai/oauth/authorize?code=true&state=s";
+        let list = openers(Some("firefox --new-window %s:mybrowser"), true);
+        assert_eq!(
+            list,
+            [
+                vec!["firefox", "--new-window", "%s"],
+                vec!["mybrowser"],
+                vec!["omarchy-launch-browser"],
+                vec!["gio", "open"],
+                vec!["xdg-open"],
+            ]
+            .map(|w| w.into_iter().map(String::from).collect::<Vec<_>>())
+        );
+        assert_eq!(
+            openers(None, true)[0],
+            vec!["omarchy-launch-browser".to_string()]
+        );
+        assert!(openers(Some("firefox"), false).is_empty());
+        let tried = std::cell::RefCell::new(vec![]);
+        let start = |words: &[String]| {
+            tried.borrow_mut().push(words.join(" "));
+            match words[0].as_str() {
+                "firefox" => Opened::Missing,
+                "mybrowser" => Opened::Failed("exited with 1".into()),
+                "omarchy-launch-browser" => Opened::Missing,
+                _ => Opened::Yes,
+            }
+        };
+        assert_eq!(open_with(url, &list, &start), Ok(()));
+        assert_eq!(
+            tried.borrow().as_slice(),
+            [
+                format!("firefox --new-window {url}"),
+                format!("mybrowser {url}"),
+                "omarchy-launch-browser ".to_string() + url,
+                format!("gio open {url}"),
+            ]
+        );
+        // None takes it: each says why, and the link itself is never in the words.
+        let why = open_with(url, &list, &|_| Opened::Missing).unwrap_err();
+        assert!(
+            why.contains("firefox --new-window isn't installed"),
+            "{why}"
+        );
+        assert!(why.contains("xdg-open isn't installed"), "{why}");
+        assert!(!why.contains(url), "{why}");
+        assert_eq!(
+            open_with(url, &[], &start).unwrap_err(),
+            "no desktop here to open a browser on"
+        );
+        assert!(open_with("file:///etc/passwd", &list, &start).is_err());
+    }
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    #[test]
+    fn an_opener_that_fails_fast_is_a_failure_and_one_still_running_opened_it() {
+        let words = |w: &[&str]| w.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            start_opener(&words(&["sh", "-c", "exit 3"])),
+            Opened::Failed("exited with 3".into())
+        );
+        assert_eq!(start_opener(&words(&["sh", "-c", "exit 0"])), Opened::Yes);
+        assert_eq!(
+            start_opener(&words(&["kerdr-no-such-opener-here"])),
+            Opened::Missing
+        );
+        let started = std::time::Instant::now();
+        assert_eq!(start_opener(&words(&["sh", "-c", "sleep 1"])), Opened::Yes);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+    }
+
     #[test]
     fn pause_is_text_or_the_one_cell_fallback() {
         assert!(matches!(pause_glyph(), "⏸\u{fe0e}" | "✕"));

@@ -1856,18 +1856,38 @@ fn open_signin(app: &mut App, url: &str) {
         app.say("Demo sign-in: no browser opened.", Tone::Info);
         return;
     }
-    match crate::accounts::open_signin_url(url) {
-        Ok(()) => {}
-        Err(error) => app.say(
-            format!("Could not open the browser: {error}. Copy the link instead (c, or l where the page takes a code)."),
-            Tone::Warn,
-        ),
+    if let Err(why) = crate::accounts::open_signin_url(url) {
+        app.say(no_browser(&why, to_clipboard(url)), Tone::Warn);
+    }
+}
+
+/// What the board says when no browser took a sign-in link: it went to the terminal's clipboard by
+/// itself, as c sends it (intent 0591, K3-30), and the link isn't in the words, which the error log
+/// keeps.
+fn no_browser(why: &str, copied: bool) -> String {
+    if copied {
+        format!("No browser here ({why}); the sign-in link is on your clipboard.")
+    } else {
+        format!(
+            "No browser here ({why}). Copy the link instead (c, or l where the page takes a code)."
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_browser_puts_the_link_on_the_clipboard_and_says_so_without_it() {
+        // Intent 0591, K3-30.
+        let said = no_browser("no desktop here to open a browser on", true);
+        assert_eq!(
+            said,
+            "No browser here (no desktop here to open a browser on); the sign-in link is on your clipboard."
+        );
+        assert!(no_browser("xdg-open isn't installed", false).contains("Copy the link instead"));
+    }
 
     #[test]
     fn a_save_from_a_closed_editor_goes_by_what_its_machine_said_while_the_editor_was_open() {
