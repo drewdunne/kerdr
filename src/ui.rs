@@ -35,12 +35,11 @@ fn draw_screen(f: &mut Frame, app: &App) {
     if area.width < 32 || area.height < 10 {
         // The board in a window too small for its columns: the cards that need you, one to a
         // line, with the message line (intent 0591, K2-43).
-        // A question over the board is the whole window, all of it read before an answer acts
-        // (Codex's review 85, 2).
+        // A question, whatever it's over, is the whole window, all of it read before an answer
+        // acts (Codex's reviews 85, 2, and 86, 4).
         if let Mode::Confirm {
             title,
             message,
-            back,
             request,
             queue,
             ready_at,
@@ -48,7 +47,6 @@ fn draw_screen(f: &mut Frame, app: &App) {
             enter_queues,
             ..
         } = &app.mode
-            && matches!(**back, Mode::Board)
         {
             return small_question(
                 f,

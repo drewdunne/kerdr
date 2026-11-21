@@ -1746,10 +1746,19 @@ impl App {
     /// Whether the board is shown as the compact list: a window too small for its columns (under
     /// 32 columns or 10 rows), on the board itself (intent 0591, K2-43).
     pub fn compact(&self) -> bool {
-        self.width > 0
-            && self.height > 0
-            && (self.width < 32 || self.height < 10)
-            && matches!(self.mode, Mode::Board)
+        self.small_window() && matches!(self.mode, Mode::Board)
+    }
+
+    /// A window too small for the board's columns: under 32 columns or 10 rows.
+    pub fn small_window(&self) -> bool {
+        self.width > 0 && self.height > 0 && (self.width < 32 || self.height < 10)
+    }
+
+    /// Whether this screen is drawn in a small window: the board as the compact list, and a
+    /// question, whatever it's over, whole (Codex's review 86, 4). Every other says it needs a
+    /// bigger window.
+    pub fn small_draws(&self) -> bool {
+        matches!(self.mode, Mode::Board | Mode::Confirm { .. })
     }
 
     /// The compact list's rows: the cards on the board that need you, asking you something or
@@ -2672,6 +2681,14 @@ impl App {
         // Any key after the new-intent box closed is moving on (the Enter that closes it sets it).
         self.closed_on_send = false;
         if self.seen_failure(&key) {
+            return Action::None;
+        }
+        // A window too small to draw this screen: only Esc, back towards one it can (Codex's
+        // review 86, 4), so no key acts on what he can't see.
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.small_window() && !self.small_draws() && key.code != KeyCode::Esc && !ctrl_c {
+            self.say("This needs a bigger window: Esc goes back.", Tone::Info);
             return Action::None;
         }
         // Esc on the board lets a running action's answer go: it still finishes, but neither asks
@@ -4034,6 +4051,76 @@ pub(crate) mod tests {
         }
         assert!(matches!(app.mode, Mode::Confirm { .. }));
         press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn every_question_in_a_small_window_is_read_whole_before_an_answer_acts_and_a_resize_too() {
+        // Codex's review 86, 4: the smaller-copy question is over the new-intent box, not the
+        // board; in a small window it's drawn whole and gated as any other. A question that fit a
+        // big window, resized small while it's open, is gated again. A screen the window can't
+        // draw takes only Esc.
+        let big = crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 25_000_000]].concat(),
+            from: "The clipboard's image".into(),
+        };
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        app.attach_images(crate::images::Loading {
+            images: vec![big.clone()],
+            ..Default::default()
+        });
+        assert!(
+            matches!(&app.mode, Mode::Confirm { back, .. } if matches!(**back, Mode::Compose { .. }))
+        );
+        app.width = 28;
+        app.height = 8;
+        let mut presses = 0;
+        let answered = loop {
+            crate::ui::tests_render(&app, 28, 8);
+            settle(&mut app);
+            let action = press(&mut app, 'y');
+            presses += 1;
+            if !matches!(app.mode, Mode::Confirm { .. }) {
+                break action;
+            }
+            assert!(presses < 30, "never answered");
+        };
+        assert!(presses > 1, "answered before its words were shown");
+        assert!(matches!(answered, Action::LoadImages(_)), "{answered:?}");
+        // Asked in a big window, where it fits whole; the window shrinks while it's open.
+        if let Mode::Compose { .. } = app.mode {
+        } else {
+            panic!("{:?}", app.mode)
+        }
+        app.image_reads.clear();
+        app.width = 120;
+        app.height = 40;
+        app.attach_images(crate::images::Loading {
+            images: vec![big],
+            ..Default::default()
+        });
+        crate::ui::tests_render(&app, 120, 40);
+        assert!(!app.question_view.unseen(), "whole in the big window");
+        app.width = 28;
+        app.height = 6;
+        crate::ui::tests_render(&app, 28, 6);
+        settle(&mut app);
+        assert_eq!(
+            press(&mut app, 'y'),
+            Action::None,
+            "not taken unseen after the resize"
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        // Typing into a box he can't see does nothing; Esc still leaves it.
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        let before = box_words(&app);
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert_eq!(box_words(&app), before);
+        assert!(app.message().unwrap().0.contains("needs a bigger window"));
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(matches!(app.mode, Mode::Board));
     }
 
