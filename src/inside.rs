@@ -274,10 +274,57 @@ impl App {
                 opened.push(g);
             }
         }
-        // A piece that has left this card (closed out of the feed, or moved to another family)
-        // stays the focus, with nothing selected, so no key acts on a card you didn't choose
-        // until you move.
+        // A row that has left this card (intent 0591, K2-56): a piece that moved to another card
+        // is followed there, still the same work; else the row nearest where it was is chosen,
+        // and keys that act wait half a second, so none lands on a row he didn't see.
         let foci = focusable(self, &opened);
+        if !foci.contains(&focus) && !foci.is_empty() {
+            let moved_to = self
+                .card_index(&focus)
+                .and_then(|p| self.board.up.get(p).copied().flatten().map(|up| (p, up)))
+                .filter(|&(_, up)| up != i);
+            if let Some((p, up)) = moved_to {
+                let (piece, holder) = (
+                    self.board.cards[p].reference.clone(),
+                    self.board.cards[up].reference.clone(),
+                );
+                let holder_key = self.board.cards[up].key.clone();
+                self.mode = Mode::Card {
+                    card: holder_key,
+                    focus,
+                    opened: vec![],
+                    back,
+                };
+                self.say(
+                    format!("{piece} moved to {holder}'s card; Kerdr followed it there."),
+                    Tone::Info,
+                );
+                return self.fix_card_screen();
+            }
+            let (near, reference) = match &self.card_row_at {
+                Some((f, at, r)) if *f == focus => (*at, r.clone()),
+                _ => (0, String::new()),
+            };
+            let next = foci[near.min(foci.len() - 1)].clone();
+            let said = if focus.starts_with("group:") || reference.is_empty() {
+                "The row you were on has left this card; the row nearest it is chosen.".to_string()
+            } else if self.card(&focus).is_some() {
+                format!("{reference} has left this card; the row nearest it is chosen.")
+            } else {
+                format!(
+                    "{reference} has finished and left this card; the row nearest it is chosen."
+                )
+            };
+            self.card_row_moved = Some(Instant::now());
+            self.mode = Mode::Card {
+                card,
+                focus: next,
+                opened,
+                back,
+            };
+            self.say(said, Tone::Info);
+            return self.fix_card_screen();
+        }
         let gone = !foci.contains(&focus);
         // Where the chosen row is, while it's there: once it leaves, ⏎ knows the rows near it.
         if let Some(at) = foci.iter().position(|f| *f == focus) {
@@ -357,6 +404,18 @@ impl App {
             };
             app.fix_card_screen();
         };
+        // The row was just chosen for him, his own having left: what acts on it waits (K2-56).
+        let acts = matches!(
+            key.code,
+            KeyCode::Enter | KeyCode::Char('d' | 'e' | 'y' | 'x' | 'C' | 'X')
+        );
+        if acts
+            && self
+                .card_row_moved
+                .is_some_and(|at| at.elapsed() < Duration::from_millis(500))
+        {
+            return Action::None;
+        }
         match key.code {
             KeyCode::Esc | KeyCode::Char('q') => {
                 self.leave_card(&card, &focus, *back.clone());
@@ -2244,7 +2303,10 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_piece_that_leaves_its_card_leaves_nothing_selected() {
+    fn a_selected_piece_that_leaves_its_card_is_followed_or_the_row_nearest_it_chosen() {
+        // Intent 0591, K2-56: a piece that moved to another card is followed there, still the
+        // same work; one that finished leaves the row nearest it chosen, and for half a second
+        // after, keys that act on a row do nothing, so none lands on a row he didn't see.
         for change in ["gone", "moved"] {
             let mut app = families(Some("w2K:t1"));
             select(&mut app, "0256");
@@ -2258,44 +2320,39 @@ mod tests {
                 c.parent = Some("0139".into());
             }
             app.rebuild();
-            let Mode::Card { card, focus, .. } = &app.mode else {
+            let Mode::Card { card, focus, .. } = app.mode.clone() else {
                 panic!("{:?}", app.mode)
             };
-            assert_eq!(
-                (card.as_str(), focus.as_str()),
-                ("ark-sdlc:0256", "ark-sdlc:0262")
-            );
-            assert_eq!(app.sel.key, None, "{change}: not its parent");
-            // X acts on nothing, rather than on the parent's whole workspace.
-            assert_eq!(press(&mut app, KeyCode::Char('X')), Action::None);
-            assert!(
-                matches!(app.mode, Mode::Card { .. }),
-                "{change}: {:?}",
-                app.mode
-            );
-            let text = rendered(&mut app, 176, 44);
-            assert!(text.contains("has left this card"), "{text}");
-            // ⏎ (intent 0591, K3-32): a piece still on the board is gone into where it is now,
-            // that same piece and no other; one gone from the board finished, and the row nearest
-            // it is chosen, opening nothing.
-            let action = press(&mut app, KeyCode::Enter);
+            let said = app
+                .message()
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default();
             if change == "moved" {
+                assert_eq!(focus, key(&app, "0262"), "the same piece");
+                assert_ne!(card, key(&app, "0256"), "on the card it moved to");
                 assert_eq!(app.sel.key, Some(key(&app, "0262")));
-                assert_eq!(action, app.jump_action(key(&app, "0262")), "{change}");
-                assert_ne!(action, Action::None, "{change}");
+                assert!(said.contains("#262 moved to #139's card"), "{said}");
+                // The same work stays selected, so a key acts on it at once.
+                assert_ne!(press(&mut app, KeyCode::Enter), Action::None);
             } else {
-                assert_eq!(action, Action::None, "{change}");
+                assert_eq!(card, key(&app, "0256"));
+                assert!(!focus.is_empty() && focus != "ark-sdlc:0262", "{focus}");
+                assert!(app.sel.key.is_some(), "a row is chosen");
                 assert!(
-                    app.message()
-                        .is_some_and(|(m, _)| m.contains("#262 has finished and left this card")),
-                    "{:?}",
-                    app.message()
+                    said.contains(
+                        "#262 has finished and left this card; the row nearest it is chosen"
+                    ),
+                    "{said}"
                 );
-                assert!(app.sel.key.is_some(), "{change}: a row is chosen again");
+                let text = rendered(&mut app, 176, 44);
+                assert!(!text.contains("Nothing is selected"), "{text}");
+                // A key pressed at once does nothing; a moment later, it acts.
+                assert_eq!(press(&mut app, KeyCode::Char('X')), Action::None);
+                assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
+                assert!(matches!(app.mode, Mode::Card { .. }), "{:?}", app.mode);
+                std::thread::sleep(std::time::Duration::from_millis(550));
+                assert_ne!(press(&mut app, KeyCode::Enter), Action::None);
             }
-            // Moving chooses a row again.
-            press(&mut app, KeyCode::Char('k'));
-            assert_eq!(app.sel.key, Some(key(&app, "0256")));
         }
     }
 
@@ -2344,7 +2401,8 @@ mod tests {
     }
 
     #[test]
-    fn a_selected_folded_group_that_vanishes_or_unfolds_leaves_nothing_selected() {
+    fn a_selected_folded_group_that_vanishes_or_unfolds_has_the_row_nearest_it_chosen() {
+        // Intent 0591, K2-56: never left with nothing selected.
         let mut app = families(Some("w2K:t1"));
         let f = app.machines[0].feed.as_mut().unwrap();
         for n in 700..704 {
@@ -2371,17 +2429,22 @@ mod tests {
             .cards
             .retain(|c| c.id != "700");
         app.rebuild();
-        assert_eq!(focus(&app), "group:done");
-        assert_eq!(app.sel.key, None);
-        assert_eq!(press(&mut app, KeyCode::Char('X')), Action::None);
-        assert!(matches!(app.mode, Mode::Card { .. }), "{:?}", app.mode);
-        assert_eq!(press(&mut app, KeyCode::Enter), Action::None);
-        assert_eq!(focus(&app), "group:done", "Enter opened nothing");
+        assert_ne!(focus(&app), "group:done");
+        assert!(app.sel.key.is_some(), "the row nearest it is chosen");
+        assert!(
+            app.message()
+                .is_some_and(|(m, _)| m.contains("the row nearest it is chosen")),
+            "{:?}",
+            app.message()
+        );
+        assert_eq!(
+            press(&mut app, KeyCode::Char('X')),
+            Action::None,
+            "not at once"
+        );
         let text = rendered(&mut app, 176, 44);
-        assert!(text.contains("has left this card"), "{text}");
-        assert!(text.contains("nothing selected"), "{text}");
-        assert!(!text.contains("opens the list"), "{text}");
-        // All of them go.
+        assert!(!text.contains("has left this card: it closed"), "{text}");
+        // All of them go: still a row chosen.
         app.machines[0]
             .feed
             .as_mut()
@@ -2389,10 +2452,7 @@ mod tests {
             .cards
             .retain(|c| !c.id.starts_with('7'));
         app.rebuild();
-        assert_eq!(app.sel.key, None);
-        let text = rendered(&mut app, 176, 44);
-        assert!(text.contains("has left this card"), "{text}");
-        assert!(!text.contains("opens the list"), "{text}");
+        assert!(app.sel.key.is_some());
     }
 
     #[test]

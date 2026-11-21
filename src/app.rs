@@ -675,6 +675,10 @@ pub struct App {
     /// among the rows, and its card's number. Once that piece leaves the card, ⏎ goes to the row
     /// nearest where it was (intent 0591, K3-32).
     pub(crate) card_row_at: Option<(String, usize, String)>,
+    /// When a card's screen last chose a row for him, its own row having left the card: keys
+    /// that act on a row wait half a second after it, so none lands on a row he didn't see
+    /// (intent 0591, K2-56).
+    pub(crate) card_row_moved: Option<Instant>,
     /// The card or workspace whose jump already waited once for herdr, or its machine, to answer
     /// again: a second jump there that gets no answer says so, rather than wait again (intent 0591,
     /// K3-12). Any other way a jump ends forgets it.
@@ -962,6 +966,7 @@ impl App {
             held: vec![],
             pending_jump: None,
             card_row_at: None,
+            card_row_moved: None,
             answer_waited: None,
             open_after: None,
             started: None,
