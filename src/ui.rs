@@ -6176,7 +6176,14 @@ mod tests {
         let text = rendered(&a, 176, 44);
         assert!(text.contains("Sign KBZ_C in on laptop"), "{text}");
         assert!(!text.contains("on each machine"));
-        assert!(text.contains("Once you allow it, the page shows a code"));
+        assert!(text.contains("Signing in KBZ_C on laptop"), "{text}");
+        let flat = flat_text(&a, 176, 44, "Sign KBZ_C in on laptop");
+        assert!(
+            flat.contains(&super::account_ui::SIGNIN_STEPS.replace("  ", " ")),
+            "the code box says which code goes where: {flat}"
+        );
+        assert!(flat.contains("the browser tab Kerdr opened, the one asking for it"));
+        assert!(flat.contains("go back to that first tab"));
         assert!(text.contains("code from the page"));
         assert!(text.contains("short code a sign-in page emails you"));
         assert!(!text.contains("claude.ai"), "{text}");
@@ -6219,6 +6226,205 @@ mod tests {
                 let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
                 t.draw(|f| draw(f, &a)).unwrap();
             }
+        }
+    }
+
+    #[test]
+    fn a_copys_details_say_its_own_state_on_each_machine_and_the_sign_in_names_its_machine() {
+        // Remote Control signed in on the laptop only. "build-box: ready" under its line read as
+        // Remote Control signed in there, and the sign-in box didn't say it wasn't (intent 0749).
+        use crate::app::account_controls::{AccountScreen as S, Row};
+        let mut a = demo(false);
+        let copies = |remote: serde_json::Value| -> Vec<crate::accounts::AccountCopy> {
+            serde_json::from_value(serde_json::json!([
+                {"id":"agents","label":"Your agents","stored":true,"works":true,"checked":null,"note":null},
+                remote
+            ]))
+            .unwrap()
+        };
+        fn ark(a: &mut App, mi: usize) -> &mut crate::accounts::Account {
+            a.machines[mi]
+                .feed
+                .as_mut()
+                .unwrap()
+                .accounts
+                .iter_mut()
+                .find(|x| x.code == "ARK_C")
+                .unwrap()
+        }
+        ark(&mut a, 0).copies = copies(serde_json::json!(
+            {"id":"remote","label":"Remote Control","stored":true,"works":true,"checked":null,"note":null}
+        ));
+        ark(&mut a, 0).status = "ready".into();
+        ark(&mut a, 1).copies = copies(serde_json::json!(
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ));
+        ark(&mut a, 1).status = "ready".into();
+        let rows = a.account_rows(0);
+        let sel = rows
+            .iter()
+            .position(|r| *r == Row::Copy("ARK_C".into(), "remote".into()))
+            .expect("the laptop lists ARK_C's Remote Control copy");
+        a.mode = Mode::Accounts {
+            screen: S::List {
+                machine: 0,
+                rows: rows.clone(),
+                sel,
+                model: 0,
+            },
+            back: Box::new(Mode::Board),
+        };
+        let lines = text_rows(&a, 176, 44);
+        let has = |words: &str| lines.iter().any(|l| l.contains(words));
+        assert!(has("Remote Control on each machine"), "{lines:#?}");
+        assert!(has("laptop     ✓ signed in and working"), "{lines:#?}");
+        assert!(has("build-box  ✕ not signed in"), "{lines:#?}");
+        assert!(has("Your agents' token, which new sessions start on"));
+        assert!(has("build-box  ready"));
+        assert!(
+            !has("build-box: ready"),
+            "the account's readiness never reads as the copy's: {lines:#?}"
+        );
+        // Refused, and stored but not yet checked, say so too.
+        ark(&mut a, 1).copies = copies(serde_json::json!(
+            {"id":"remote","label":"Remote Control","stored":true,"works":false,"checked":null,"note":null}
+        ));
+        assert!(
+            text_rows(&a, 176, 44)
+                .iter()
+                .any(|l| l.contains("build-box  ✕ signed in, but refused"))
+        );
+        ark(&mut a, 1).copies = copies(serde_json::json!(
+            {"id":"remote","label":"Remote Control","stored":true,"works":null,"checked":null,"note":null}
+        ));
+        assert!(
+            text_rows(&a, 176, 44)
+                .iter()
+                .any(|l| l.contains("build-box  – signed in, not checked yet"))
+        );
+        // A machine listing only that copy shows it, rather than taking it for none.
+        ark(&mut a, 1).copies = serde_json::from_value(serde_json::json!([
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ]))
+        .unwrap();
+        assert!(
+            text_rows(&a, 176, 44)
+                .iter()
+                .any(|l| l.contains("build-box  ✕ not signed in"))
+        );
+        // In a narrow panel the states wrap rather than being cut off: at every width that shows
+        // the panel, both states are there whole, and at some the rows wrap as "name: state".
+        let live = a.machines[1].conn.clone();
+        a.machines[1].conn = crate::poll::Conn::Connecting;
+        let mut wrapped_at = vec![];
+        for w in 90..=176 {
+            let flat = flat_text(&a, w, 44, "ARK_C · Studio");
+            if !flat.contains("on each machine") {
+                continue;
+            }
+            assert!(flat.contains("✕ not signed in"), "{w}: {flat}");
+            assert!(flat.contains("✓ signed in and working"), "{w}: {flat}");
+            assert!(flat.contains("(cached)"), "{w}: {flat}");
+            if flat.contains("build-box: ✕ not signed in (cached)") {
+                wrapped_at.push(w);
+            }
+        }
+        assert!(!wrapped_at.is_empty(), "no width wrapped the rows");
+        a.machines[1].conn = live;
+        // A machine whose account keeps no such copy says that, rather than nothing.
+        ark(&mut a, 1).copies = vec![];
+        assert!(
+            text_rows(&a, 176, 44)
+                .iter()
+                .any(|l| l.contains("– no Remote Control copy there"))
+        );
+        // The first copy selected shows its own state too: refused on build-box while the account
+        // still reads ready there.
+        ark(&mut a, 1).copies = serde_json::from_value(serde_json::json!([
+            {"id":"agents","label":"Your agents","stored":true,"works":false,"checked":null,"note":null},
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ]))
+        .unwrap();
+        let agents = rows
+            .iter()
+            .position(|r| *r == Row::Copy("ARK_C".into(), "agents".into()))
+            .unwrap();
+        if let Mode::Accounts {
+            screen: S::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = agents;
+        }
+        let lines = text_rows(&a, 176, 44);
+        let has = |words: &str| lines.iter().any(|l| l.contains(words));
+        assert!(has("Your agents on each machine"), "{lines:#?}");
+        assert!(has("build-box  ✕ signed in, but refused"), "{lines:#?}");
+        assert!(has("build-box  ready"), "{lines:#?}");
+        // The account's own line and an account without copies keep one line per machine.
+        let kbz = rows
+            .iter()
+            .position(|r| *r == Row::Account("KBZ_C".into()))
+            .unwrap();
+        if let Mode::Accounts {
+            screen: S::List { sel, .. },
+            ..
+        } = &mut a.mode
+        {
+            *sel = kbz;
+        }
+        let lines = text_rows(&a, 176, 44);
+        assert!(lines.iter().any(|l| l.contains("laptop: ")), "{lines:#?}");
+        assert!(!lines.iter().any(|l| l.contains("on each machine")));
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("which new sessions start on"))
+        );
+
+        // The sign-in box for the laptop's copy names the laptop, and says build-box's isn't done.
+        ark(&mut a, 1).copies = copies(serde_json::json!(
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ));
+        let mut signin = crate::demo::account_screens(&a)
+            .into_iter()
+            .find(|m| matches!(m, Mode::Accounts { screen: S::Signin(s), .. } if s.copy.is_some()))
+            .unwrap();
+        if let Mode::Accounts {
+            screen: S::Signin(s),
+            ..
+        } = &mut signin
+        {
+            s.copy = Some(("remote".into(), "Remote Control".into()));
+            s.machines = vec![0];
+        }
+        a.mode = signin;
+        let lines = text_rows(&a, 176, 44);
+        let has = |words: &str| lines.iter().any(|l| l.contains(words));
+        assert!(has("Sign ARK_C in on laptop: Remote Control"), "{lines:#?}");
+        assert!(has("Signs in Remote Control on laptop only"), "{lines:#?}");
+        let flat = flat_text(&a, 176, 44, "Sign ARK_C in on laptop");
+        assert!(
+            flat.contains("Remote Control on build-box isn't signed in yet, and this sign-in doesn't do it. Once this one is done, press esc, then tab to build-box and sign in there."),
+            "{flat}"
+        );
+        // build-box listing only that copy is still warned about.
+        ark(&mut a, 1).copies = serde_json::from_value(serde_json::json!([
+            {"id":"remote","label":"Remote Control","stored":false,"works":null,"checked":null,"note":null}
+        ]))
+        .unwrap();
+        assert!(
+            flat_text(&a, 176, 44, "Sign ARK_C in on laptop")
+                .contains("Remote Control on build-box isn't signed in yet")
+        );
+        // Signed in on build-box too, it says nothing of it.
+        ark(&mut a, 1).copies = copies(serde_json::json!(
+            {"id":"remote","label":"Remote Control","stored":true,"works":true,"checked":null,"note":null}
+        ));
+        assert!(!flat_text(&a, 176, 44, "Sign ARK_C in on laptop").contains("isn't signed in yet"));
+        for (w, h) in [(1, 1), (10, 3), (30, 8), (60, 15), (80, 24), (120, 40)] {
+            let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+            t.draw(|f| draw(f, &a)).unwrap();
         }
     }
 
@@ -6342,6 +6548,56 @@ mod tests {
         let screen = rendered(&a, 160, 40);
         assert!(screen.contains("Something else"), "{screen}");
         assert!(!screen.contains(line), "{screen}");
+    }
+
+    /// The screen's rows, each as one string.
+    fn text_rows(a: &App, w: u16, h: u16) -> Vec<String> {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, a)).unwrap();
+        t.backend()
+            .buffer()
+            .content
+            .chunks(w as usize)
+            .map(|r| r.iter().map(|c| c.symbol()).collect())
+            .collect()
+    }
+
+    /// The words inside the frame of the dialog whose text starts with `title`, its wrapped
+    /// lines joined with single spaces, so a test can look for a sentence that wraps.
+    fn flat_text(a: &App, w: u16, h: u16, title: &str) -> String {
+        let mut t = Terminal::new(TestBackend::new(w, h)).unwrap();
+        t.draw(|f| draw(f, a)).unwrap();
+        let cells: Vec<Vec<String>> = t
+            .backend()
+            .buffer()
+            .content
+            .chunks(w as usize)
+            .map(|r| r.iter().map(|c| c.symbol().to_string()).collect())
+            .collect();
+        let text = |r: &[String]| r.concat();
+        let Some((row, col)) = cells.iter().enumerate().find_map(|(i, r)| {
+            (0..r.len())
+                .find(|&c| text(&r[c..]).starts_with(title))
+                .map(|c| (i, c))
+        }) else {
+            return String::new();
+        };
+        let Some(left) = (0..col).rev().find(|&c| cells[row][c] == "│") else {
+            return String::new();
+        };
+        let Some(top) = (0..row).rev().find(|&r| cells[r][left] == "╭") else {
+            return String::new();
+        };
+        let Some(right) = (left + 1..cells[top].len()).find(|&c| cells[top][c] == "╮") else {
+            return String::new();
+        };
+        cells[top + 1..]
+            .iter()
+            .take_while(|r| r[left] == "│")
+            .map(|r| text(&r[left + 1..right]).trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     fn rendered(a: &App, w: u16, h: u16) -> String {

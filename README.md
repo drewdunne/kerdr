@@ -474,8 +474,9 @@ page, and nothing comes back to paste: the line ticks once you've allowed it.
 
 For a provider whose page gives a code back (Claude), Tab focuses the optional code field.
 After you press Authorize, the page shows a long code:
-paste it there and press Enter. A short code that claude.ai emails you goes in the browser
-instead, and Kerdr says so rather than sending it. For a token account, `p` opens a masked
+paste it there and press Enter. A short code that claude.ai emails you goes into the page in
+the browser tab Kerdr opened, the one asking for it (if you clicked the email's button instead,
+go back to that first tab), and Kerdr says so rather than sending it. For a token account, `p` opens a masked
 token field instead; a saved sign-in, or a copy that takes no token, doesn't offer it. Tokens
 are sent only to that machine, removed from UI and result state on submission, and never
 written to Kerdr’s logs or settings. Escape cancels the current browser sign-in. No sign-in
@@ -485,7 +486,12 @@ Where a machine keeps more than one copy of an account's sign-in (your agents' a
 tenants', say), each copy gets a line under the account: whether it is stored, whether it
 works (and when that was checked), and a note such as "held by root". `j k` move between the
 copy lines, Enter signs in the selected copy, whether it is missing, expired or wrong (one
-that works already is asked about first), and `t` tests it. The sign-in names its copy, and the other copies stay as they are.
+that works already is asked about first), and `t` tests it. The sign-in names its copy and the
+machine it signs in on, and the other copies stay as they are; where that copy isn't signed in on
+another machine, the sign-in says so, since it signs in only on its own. With a copy's line
+selected, the panel says that copy's own state on each machine (signed in and working, not signed
+in, or refused), and below it the account's own readiness, named as the first copy's, which new
+sessions start on.
 
 ![One line per copy of an account's sign-in](docs/screenshots/account-copies.png)
 
