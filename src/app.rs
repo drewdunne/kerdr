@@ -569,6 +569,8 @@ pub struct QuestionView {
     scroll: std::cell::Cell<u16>,
     /// Its lines below what the box shows when scrolled to its top: 0 when all of it shows.
     most: std::cell::Cell<u16>,
+    /// The rows the box gives its text: how far a yes that isn't taken yet moves it on.
+    page: std::cell::Cell<u16>,
 }
 
 impl QuestionView {
@@ -586,6 +588,11 @@ impl QuestionView {
     pub fn to_end(&self) {
         self.scroll.set(self.most.get());
     }
+    /// A page further on, so every part of the question is on screen before an answer acts
+    /// (Codex's review 85, 2): no further when the box has no rows for it at all.
+    pub fn next_page(&self) {
+        self.down(self.page.get());
+    }
     /// As it's drawn: this question, its lines and the rows the box gives them. Where its text
     /// starts.
     pub fn fit(&self, title: &str, message: &str, lines: u16, rows: u16) -> u16 {
@@ -599,6 +606,7 @@ impl QuestionView {
         }
         let most = lines.saturating_sub(rows);
         self.most.set(most);
+        self.page.set(rows);
         self.scroll.set(self.scroll.get().min(most));
         self.scroll.get()
     }
@@ -1743,8 +1751,7 @@ impl App {
     }
 
     /// The compact list's rows: the cards on the board that need you, asking you something or
-    /// stopped, in board order, each with what it wants of you. A question open over the board
-    /// is its card's, first if that card isn't one already.
+    /// stopped, in board order, each with what it wants of you.
     pub fn compact_rows(&self) -> Vec<CompactRow> {
         let layout = self.layout();
         let cols = self.columns_in(&layout);
@@ -1794,36 +1801,6 @@ impl App {
                     }
                     _ => {}
                 }
-            }
-        }
-        if let Mode::Confirm {
-            target: Some(t),
-            message,
-            back,
-            ..
-        } = &self.mode
-            && matches!(**back, Mode::Board)
-            && let Some(i) = self.card_index(&t.key)
-        {
-            let what = message
-                .lines()
-                .next()
-                .unwrap_or_default()
-                .trim()
-                .to_string();
-            match out.iter_mut().find(|r| r.index == i) {
-                Some(r) => {
-                    r.wants = Wants::Asks;
-                    r.what = what;
-                }
-                None => out.insert(
-                    0,
-                    CompactRow {
-                        index: i,
-                        wants: Wants::Asks,
-                        what,
-                    },
-                ),
             }
         }
         out
@@ -3984,6 +3961,81 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn in_a_small_window_no_answer_acts_on_a_question_before_all_of_it_was_on_screen() {
+        // Codex's review 85, 2: the question is the window, its words and its answers; y and ⏎
+        // show the next page until every part has been shown, and only then answer it. With no
+        // room for any of it, they never do.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.width = 28;
+        app.height = 8;
+        let words: Vec<String> = (1..=90).map(|n| format!("word{n}")).collect();
+        let message = format!("Start it past the session's limit? {}", words.join(" "));
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.is_some() && crate::app::controls::waiting_work(c))
+            .unwrap()
+            .clone();
+        let (machine, id) = (card.machine_index, card.detail.as_ref().unwrap().id.clone());
+        let asking = |app: &mut App| {
+            app.mode = Mode::Confirm {
+                machine,
+                request: serde_json::json!({"action": "dispatch", "id": id, "confirm": "0123456789abcdef"}),
+                title: "Start it?".into(),
+                message: message.clone(),
+                back: Box::new(Mode::Board),
+                target: None,
+                queue: false,
+                ready_at: None,
+                plain: false,
+                choices: vec![],
+                enter_queues: false,
+            };
+        };
+        asking(&mut app);
+        let mut seen = String::new();
+        let mut presses = 0;
+        let answered = loop {
+            seen.push_str(&crate::ui::tests_render(&app, 28, 8));
+            // Past the half second a new page holds its answers back for.
+            settle(&mut app);
+            let action = press(&mut app, 'y');
+            presses += 1;
+            if !matches!(app.mode, Mode::Confirm { .. }) {
+                break action;
+            }
+            assert_eq!(action, Action::None);
+            assert!(presses < 50, "never answered");
+        };
+        assert!(presses > 2, "it took a page at a time: {presses}");
+        for w in &words {
+            assert!(seen.contains(w.as_str()), "{w} was never on screen");
+        }
+        assert!(
+            seen.contains("Enter / y: start anyway"),
+            "its answers were shown"
+        );
+        assert!(
+            matches!(answered, Action::Mutate { .. }),
+            "{answered:?} {:?}",
+            app.message()
+        );
+        // A window with no row for its words: y never answers; n still leaves.
+        app.height = 1;
+        asking(&mut app);
+        for _ in 0..5 {
+            crate::ui::tests_render(&app, 28, 1);
+            settle(&mut app);
+            assert_eq!(press(&mut app, 'y'), Action::None);
+        }
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
     fn a_short_window_says_what_each_card_wants_and_a_question_is_answered_there() {
         // Intent 0591, K2-43: wide but under 10 rows, each row also says what its card wants; a
         // question open over the board is on its card's row, with its own keys in the hints.
@@ -4017,7 +4069,7 @@ pub(crate) mod tests {
             screen[6].starts_with("⏎ go in   j k move   ? keys"),
             "{screen:?}"
         );
-        // A question over the board: its card's row asks it, and y and n answer it.
+        // A question over the board takes the whole window (Codex's review 85, 2).
         app.mode = Mode::Confirm {
             machine: 0,
             request: serde_json::json!({"action": "dispatch", "id": "x"}),
@@ -4031,15 +4083,12 @@ pub(crate) mod tests {
             choices: vec![],
             enter_queues: false,
         };
-        let screen = rows_of(&crate::ui::tests_render(&app, 90, 7), 90);
+        let screen = rows_of(&crate::ui::tests_render(&app, 90, 7), 90).join("\n");
         assert!(
-            screen[1].contains("asks: Start it past the session's limit, queue it,"),
-            "{screen:?}"
+            screen.contains("Start it past the session's limit, queue it, or shelve the oldest?"),
+            "{screen}"
         );
-        assert!(
-            screen[6].starts_with("y n answer the question   ? keys"),
-            "{screen:?}"
-        );
+        assert!(screen.contains("Enter / y: start anyway"), "{screen}");
     }
 
     #[test]

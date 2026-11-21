@@ -2951,7 +2951,7 @@ impl App {
                 let answers = matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w'))
                     || chosen.is_some();
                 if answers && !early && self.question_view.unseen() {
-                    self.question_view.to_end();
+                    self.question_view.next_page();
                     if let Mode::Confirm { ready_at, .. } = &mut self.mode {
                         *ready_at = Some(Instant::now() + std::time::Duration::from_millis(500));
                     }

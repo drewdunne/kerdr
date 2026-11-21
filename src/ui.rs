@@ -35,9 +35,37 @@ fn draw_screen(f: &mut Frame, app: &App) {
     if area.width < 32 || area.height < 10 {
         // The board in a window too small for its columns: the cards that need you, one to a
         // line, with the message line (intent 0591, K2-43).
-        let over_board =
-            matches!(&app.mode, Mode::Confirm { back, .. } if matches!(**back, Mode::Board));
-        if matches!(app.mode, Mode::Board) || over_board {
+        // A question over the board is the whole window, all of it read before an answer acts
+        // (Codex's review 85, 2).
+        if let Mode::Confirm {
+            title,
+            message,
+            back,
+            request,
+            queue,
+            ready_at,
+            choices,
+            enter_queues,
+            ..
+        } = &app.mode
+            && matches!(**back, Mode::Board)
+        {
+            return small_question(
+                f,
+                area,
+                &app.question_view,
+                Question {
+                    title,
+                    message,
+                    action: request["action"].as_str(),
+                    queue: *queue,
+                    choices,
+                    enter_queues: *enter_queues,
+                    too_soon: ready_at.is_some_and(|at| Instant::now() < at),
+                },
+            );
+        }
+        if matches!(app.mode, Mode::Board) {
             return compact_board(f, area, app);
         }
         let text = trunc("Kerdr needs a bigger window.", area.width as usize);
@@ -59,25 +87,111 @@ fn draw_screen(f: &mut Frame, app: &App) {
     }
 }
 
+/// A question in a window too small for its box (Codex's review 85, 2): the window is the question,
+/// its title, its words and every answer it offers wrapped into one text that scrolls, and the
+/// last row what to press. An answer acts only once all of it has been on screen: until then ⏎
+/// and its keys show the next page; with no room for its text at all, they never act.
+fn small_question(f: &mut Frame, area: Rect, view: &crate::app::QuestionView, q: Question) {
+    let w = area.width.max(1) as usize;
+    // Every line of it, however many, and every character: never cut to a box's most.
+    let all = |text: &str, style: Style| -> Vec<Line<'static>> {
+        wrap_whole(text, w)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, style)))
+            .collect()
+    };
+    let mut lines = all(q.title, bold(YELLOW));
+    lines.extend(all(q.message, fg(FG)));
+    for (k, what) in question_keys(&q) {
+        lines.extend(all(&format!("{k}: {what}"), fg(FG2)));
+    }
+    let rows = area.height.saturating_sub(1);
+    let scroll = view.fit(q.title, q.message, lines.len() as u16, rows);
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)),
+        Rect {
+            height: rows,
+            ..area
+        },
+    );
+    let last = if view.unseen() {
+        key_hints(&[("⏎ PgDn", "the rest of it"), ("Esc", "leave it")])
+    } else {
+        vec![Span::styled("The keys above answer it.", fg(DIM))]
+    };
+    if area.height > 0 {
+        put(
+            f.buffer_mut(),
+            area.x,
+            area.bottom() - 1,
+            area.width,
+            fit(last, w),
+        );
+    }
+}
+
+/// Text wrapped to `w` columns losing nothing: its line breaks kept, a word wider than a line
+/// broken across lines rather than cut.
+fn wrap_whole(text: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let mut word = word.to_string();
+            loop {
+                let room = if line.is_empty() {
+                    w
+                } else {
+                    w.saturating_sub(width(&line) + 1)
+                };
+                if width(&word) <= room {
+                    if !line.is_empty() {
+                        line.push(' ');
+                    }
+                    line.push_str(&word);
+                    break;
+                }
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                    continue;
+                }
+                // Wider than a whole line: as much as fits, the rest on the next.
+                let mut cut = 0;
+                let mut used = 0;
+                for (i, c) in word.char_indices() {
+                    let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                    if used + cw > w && cut > 0 {
+                        break;
+                    }
+                    used += cw;
+                    cut = i + c.len_utf8();
+                }
+                out.push(word[..cut].to_string());
+                word = word[cut..].to_string();
+                if word.is_empty() {
+                    break;
+                }
+            }
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) && out.len() > 1 {
+        out.pop();
+    }
+    out
+}
+
 /// The board in a window too small for its columns (intent 0591, K2-43), as the release 5 canvas
 /// draws it: under 32 columns a list of the cards that need you, each with a bar and a word in its
 /// colour (yellow asks, red failed, blue yours); wider but under 10 rows, each line also says what
 /// its card wants. The selected row is on the board's selection colour; a question open over the
-/// board is on its card's row, its keys in the hints.
+/// board takes the whole window (small_question).
 fn compact_board(f: &mut Frame, area: Rect, app: &App) {
     use crate::app::Wants;
     let w = area.width as usize;
     let rows = app.compact_rows();
-    let asking = match &app.mode {
-        Mode::Confirm {
-            message, target, ..
-        } => Some((message.clone(), target.clone())),
-        _ => None,
-    };
-    let selected = asking
-        .as_ref()
-        .and_then(|(_, t)| t.as_ref().map(|t| t.key.clone()))
-        .or_else(|| app.sel.key.clone());
+    let selected = app.sel.key.clone();
     let narrow = area.width < 32;
     let count = match rows.len() {
         0 => "Nothing needs you.".to_string(),
@@ -92,11 +206,7 @@ fn compact_board(f: &mut Frame, area: Rect, app: &App) {
         };
         (text.lines().next().unwrap_or_default().to_string(), color)
     });
-    let mut hints: Vec<(&str, &str)> = vec![("⏎", "go in"), ("j k", "move")];
-    if asking.is_some() {
-        hints = vec![("y n", "answer the question")];
-    }
-    hints.push(("?", "keys"));
+    let hints: Vec<(&str, &str)> = vec![("⏎", "go in"), ("j k", "move"), ("?", "keys")];
     let color = |wants: Wants| match wants {
         Wants::Asks => YELLOW,
         Wants::Failed => RED,
@@ -135,13 +245,10 @@ fn compact_board(f: &mut Frame, area: Rect, app: &App) {
         if area.height >= 2 {
             rule(buf, area.y + 1);
         }
-        let about = match &asking {
-            Some((message, None)) => (message.clone(), YELLOW),
-            _ => (
-                "The cards that need you. Widen the window for the board.".to_string(),
-                FG2,
-            ),
-        };
+        let about = (
+            "The cards that need you. Widen the window for the board.".to_string(),
+            FG2,
+        );
         let about_lines = wrap(&about.0, w.max(1), 3);
         let mut end = bottom;
         if area.height >= 5 {
@@ -170,10 +277,9 @@ fn compact_board(f: &mut Frame, area: Rect, app: &App) {
         }
         (area.y + 2, end)
     } else {
-        let right = match (&said, &asking) {
-            (Some((text, color)), _) => (text.clone(), *color),
-            (None, Some((message, None))) => (message.clone(), YELLOW),
-            _ => (
+        let right = match &said {
+            Some((text, color)) => (text.clone(), *color),
+            None => (
                 "The cards that need you. Make the window taller for the board.".to_string(),
                 DIM,
             ),
