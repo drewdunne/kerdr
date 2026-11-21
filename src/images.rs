@@ -350,25 +350,31 @@ fn expand_folders(paths: &[PathBuf], any: bool, out: &mut Loading) -> Vec<PathBu
             all.push(path.clone());
             continue;
         }
-        // Bounded: a folder of thousands is never listed whole before its images are chosen.
-        let mut looked = 0;
-        let mut inside: Vec<PathBuf> = std::fs::read_dir(path)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .take(FOLDER_ENTRIES)
-                    .inspect(|_| looked += 1)
-                    .map(|e| e.path())
-                    .filter(|p| image_name(p, any) && p.is_file())
-                    .take(FOLDER_IMAGES)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // Bounded: a folder of thousands is never listed whole before its images are chosen. One
+        // cut short is a read that didn't get everything, so words waiting to be sent ask before
+        // they go without the rest (Codex's review 86, 8).
+        let (mut inside, mut cut) = (vec![], false);
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for (n, entry) in entries.flatten().enumerate() {
+                if n >= FOLDER_ENTRIES {
+                    cut = true;
+                    break;
+                }
+                let p = entry.path();
+                if image_name(&p, any) && p.is_file() {
+                    if inside.len() >= FOLDER_IMAGES {
+                        cut = true;
+                        break;
+                    }
+                    inside.push(p);
+                }
+            }
+        }
         inside.sort();
         let folder = name_of(path);
-        if looked >= FOLDER_ENTRIES || inside.len() >= FOLDER_IMAGES {
-            out.notes.push(format!(
-                "{folder} holds more than Kerdr looks through at once ({FOLDER_ENTRIES} entries, {FOLDER_IMAGES} images), so only those were."
+        if cut {
+            out.say(format!(
+                "{folder} holds more than Kerdr looks through at once ({FOLDER_ENTRIES} entries, {FOLDER_IMAGES} images), so only the first it found were read, and the rest didn't go in."
             ));
         }
         if inside.is_empty() {
@@ -2576,14 +2582,19 @@ mod tests {
             std::fs::write(folder.join(format!("{n:05}.txt")), "x").unwrap();
         }
         let got = from_files(std::slice::from_ref(&folder), Room::left(&[]));
+        let why = got.why.unwrap_or_default();
         assert!(
-            got.notes
-                .iter()
-                .any(|n| n.contains("more than Kerdr looks through at once")),
-            "{:?} {:?}",
-            got.notes,
-            got.why
+            why.contains("more than Kerdr looks through at once"),
+            "{why}"
         );
+        // A folder of just the most images is read whole, and nothing said of a limit.
+        let full = dir.path().join("full");
+        std::fs::create_dir(&full).unwrap();
+        for n in 0..FOLDER_IMAGES {
+            std::fs::write(full.join(format!("{n:03}.png")), PNG).unwrap();
+        }
+        let got = from_files(std::slice::from_ref(&full), Room::for_backend(&[], true));
+        assert_eq!((got.images.len(), got.why), (FOLDER_IMAGES, None));
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]

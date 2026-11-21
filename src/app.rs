@@ -6788,6 +6788,41 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_folder_cut_short_by_its_limits_asks_before_words_sent_with_enter_go_without_the_rest() {
+        // Codex's review 86, 8: a folder of 101 images, one more than Kerdr reads from a folder,
+        // pasted, and Enter pressed before it's all read. What didn't go in is said, and whether
+        // the words go without it is his call, as for any image that didn't go in.
+        use crate::images::Source;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("shots");
+        std::fs::create_dir(&folder).unwrap();
+        for n in 0..101 {
+            std::fs::write(folder.join(format!("{n:03}.png")), &a_png().bytes).unwrap();
+        }
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste("Look at these");
+        let source = Source::Files(vec![folder]);
+        let (id, room) = app.begin_image_load(&source).unwrap();
+        assert_eq!(press_code(&mut app, KeyCode::Enter), Action::None);
+        assert!(app.send_after_load.is_some(), "{:?}", app.message());
+        let action = app.images_loaded(id, source.load(room));
+        assert!(
+            !matches!(action, Action::Mutate { .. }),
+            "sent without asking: {action:?}"
+        );
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?} {:?}", app.mode, app.message());
+        };
+        assert!(
+            message.contains("holds more than Kerdr looks through at once"),
+            "{message}"
+        );
+        assert!(message.contains("without it?"), "{message}");
+    }
+
+    #[test]
     fn copied_text_that_doesnt_fit_the_box_is_kept_and_stops_a_send() {
         // Codex's review 85, 5: what fits goes in, cut between characters, never inside one; the
         // rest is kept for c, said; and words Enter sent while it was read aren't sent without it.
