@@ -495,10 +495,37 @@ impl AddAccount {
         self.kinds_at() + self.provider.kinds.len()
     }
 
-    /// The most a text row takes, typed or pasted: a code or name 80 characters, the provider's
-    /// own fields (an address, a model's name) 200.
+    /// The most a text row is sent with, as its backend takes them: a code or name 200 characters,
+    /// the provider's own fields (an address, a model's name) 400 (intent 0591, K2-19). A row
+    /// holds more, so a paste goes in whole and Enter says what's too long.
     pub fn limit(at: usize) -> usize {
-        if at < Self::FIELDS_AT { 80 } else { 200 }
+        if at < Self::FIELDS_AT { 200 } else { 400 }
+    }
+
+    /// The most a row holds, typed or pasted: a few KB, so a paste of megabytes can't fill memory.
+    pub const MOST_HELD: usize = 4096;
+
+    /// The first text row holding more than its backend takes: its row, its label and its limit.
+    fn too_long(&self) -> Option<(usize, String, usize)> {
+        let rows = [
+            (0, "code".to_string(), &self.code),
+            (1, "name".into(), &self.name),
+        ]
+        .into_iter()
+        .chain(
+            self.provider
+                .fields
+                .iter()
+                .zip(&self.extra)
+                .enumerate()
+                .map(|(i, (f, v))| {
+                    let label = if f.label.is_empty() { &f.id } else { &f.label };
+                    (Self::FIELDS_AT + i, label.clone(), v)
+                }),
+        );
+        rows.map(|(at, label, v)| (at, label, v.trim().chars().count()))
+            .find(|(at, _, n)| *n > Self::limit(*at))
+            .map(|(at, label, _)| (at, label, Self::limit(at)))
     }
 
     /// The text being typed in row `at`, if it's a text row.
@@ -581,6 +608,79 @@ pub fn code_ok(code: &str, letter: &str) -> bool {
         && owner
             .chars()
             .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+}
+
+/// A typed account code made into one (intent 0591, K2-15): upper-cased, and `_` and the
+/// provider's letter added when it has neither. `letters` are every provider's letter and name, so
+/// a code ending in another's letter is named as that. Why it can't be one, naming the part that's
+/// wrong, when it can't.
+pub fn fixed_code(
+    code: &str,
+    letter: &str,
+    provider: &str,
+    letters: &[(String, String)],
+) -> Result<String, String> {
+    let code = code.trim().to_uppercase();
+    let owner = if letter.is_empty() {
+        code.clone()
+    } else {
+        match code.rsplit_once('_') {
+            Some((owner, end)) if end == letter => owner.to_string(),
+            Some((_, end)) => {
+                return Err(match letters.iter().find(|(l, _)| l == end) {
+                    Some((_, other)) => format!(
+                        "{code} ends in _{end}, {other}'s letter; a {provider} account's code ends in _{letter}"
+                    ),
+                    None => format!(
+                        "{code} ends in _{end}; a {provider} account's code is the owner's code, _ and {letter} (like KBZ_{letter})"
+                    ),
+                });
+            }
+            None => code.clone(),
+        }
+    };
+    let part = if letter.is_empty() {
+        format!("{owner} is")
+    } else {
+        format!("its owner's part, {owner}, is")
+    };
+    let n = owner.chars().count();
+    if !(2..=4).contains(&n) {
+        return Err(format!("{part} {n} characters; a code's is 2–4"));
+    }
+    if let Some(c) = owner.chars().next().filter(|c| !c.is_ascii_uppercase()) {
+        return Err(format!(
+            "{part} starting with {c}; a code starts with a capital"
+        ));
+    }
+    let digits = !letter.is_empty();
+    if let Some(c) = owner
+        .chars()
+        .find(|c| !(c.is_ascii_uppercase() || (digits && c.is_ascii_digit())))
+    {
+        let takes = if digits {
+            "capitals and digits"
+        } else {
+            "capitals"
+        };
+        return Err(format!("{part} holding {c}; a code's is {takes}"));
+    }
+    Ok(if letter.is_empty() {
+        owner
+    } else {
+        format!("{owner}_{letter}")
+    })
+}
+
+/// A code like `code` that no account has yet, for a form whose code is taken: its owner's part
+/// with a digit after it (KBZ2_C), or in place of its last character when it's four long.
+fn next_free_code(code: &str, letter: &str, taken: impl Fn(&str) -> bool) -> Option<String> {
+    let owner = code.strip_suffix(letter)?.strip_suffix('_')?;
+    let part: String = owner.chars().take(3).collect();
+    (2..=9).find_map(|n| {
+        let free = format!("{part}{n}_{letter}");
+        (code_ok(&free, letter) && !taken(&free)).then_some(free)
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3959,13 +4059,56 @@ impl App {
                                 add.provider.letter, add.provider.letter
                             )
                         };
+                        let letters: Vec<(String, String)> = self
+                            .all_providers()
+                            .list()
+                            .iter()
+                            .filter(|p| !p.letter.is_empty())
+                            .map(|p| (p.letter.clone(), p.name().to_string()))
+                            .collect();
+                        let provider = add.provider.name().to_string();
+                        // No machine ticked: the form's own, ticked where it shows (K2-15).
+                        if !add.chosen.contains(&true) {
+                            let own = add
+                                .machines
+                                .iter()
+                                .position(|&m| m == add.machine)
+                                .unwrap_or(0);
+                            if let Some(c) = add.chosen.get_mut(own) {
+                                *c = true;
+                            }
+                        }
                         let (answers, missing) = add.answers();
-                        if !add.code_ok() || add.name().is_empty() || !add.chosen.contains(&true) {
+                        if let Some((row, label, most)) = add.too_long() {
+                            // A row's text past what its backend takes: said, with the cursor
+                            // there, never cut short unseen (K2-19).
+                            add.field = row;
                             self.say(
                                 format!(
-                                    "Use a code of {example}, a name, and at least one machine."
+                                    "The {label} is longer than the {most} characters {provider} takes; shorten it there."
                                 ),
                                 Tone::Warn,
+                            );
+                        } else if add.code().trim().is_empty() {
+                            add.field = 0;
+                            self.say(format!("Type a code: {example}."), Tone::Warn);
+                        } else if let Err(why) =
+                            fixed_code(add.code(), &add.provider.letter, &provider, &letters)
+                        {
+                            // Only a code that can't be made one is refused, naming its fault.
+                            add.field = 0;
+                            self.say(format!("{why}."), Tone::Warn);
+                        } else if let Ok(fixed) =
+                            fixed_code(add.code(), &add.provider.letter, &provider, &letters)
+                            && fixed != add.code()
+                        {
+                            // Fixed in the form, and sent only on the next Enter, so a typo never
+                            // becomes an account unseen (K2-15).
+                            let was = add.code().trim().to_string();
+                            add.code = fixed.clone();
+                            self.say(
+                                format!("{was} is written {fixed}: Enter adds it as that."),
+                                Tone::Info,
                             );
                         } else if let Some(missing) = missing {
                             self.say(
@@ -3986,12 +4129,86 @@ impl App {
                                 add.field = AddAccount::FIELDS_AT + row;
                             }
                         } else if self.code_taken(add.code()) {
-                            self.say(
-                                "That code exists. Select its account and press e to rename it.",
-                                Tone::Warn,
-                            );
+                            let code = add.code().to_string();
+                            let selected: Vec<usize> = add
+                                .machines
+                                .iter()
+                                .zip(&add.chosen)
+                                .filter_map(|(m, c)| c.then_some(*m))
+                                .collect();
+                            let same = self
+                                .machines
+                                .iter()
+                                .filter_map(|m| m.feed.as_ref())
+                                .flat_map(|f| &f.accounts)
+                                .find(|a| a.code == code)
+                                .is_some_and(|a| a.provider == add.provider.id);
+                            let lacking: Vec<usize> = selected
+                                .iter()
+                                .copied()
+                                .filter(|&m| self.account(m, &code).is_none())
+                                .collect();
+                            if same && !lacking.is_empty() {
+                                // On the shared account list already: the machines that haven't
+                                // pulled it yet sign it in, and nothing is added again, which
+                                // would rename it (K2-17, F-0274).
+                                let names = and_list(
+                                    &lacking
+                                        .iter()
+                                        .map(|&m| self.machines[m].name())
+                                        .collect::<Vec<_>>(),
+                                );
+                                let added = (add.provider.id.clone(), add.kind().to_string());
+                                let paste = self
+                                    .signin_takes_paste(lacking[0], &code, None)
+                                    .unwrap_or_else(|| {
+                                        self.added_takes_paste(lacking[0], &code, &added)
+                                    });
+                                self.mode = *back;
+                                let action = self.begin_signin(code.clone(), None, lacking);
+                                if let Mode::Accounts {
+                                    screen: AccountScreen::Signin(s),
+                                    ..
+                                } = &mut self.mode
+                                {
+                                    s.paste = paste;
+                                    s.added = Some(added);
+                                }
+                                self.say(
+                                    format!(
+                                        "{code} is on the account list already, so it isn't added again: it's signed in on {names}."
+                                    ),
+                                    Tone::Info,
+                                );
+                                return match action {
+                                    Action::Mutate { machine, request } => {
+                                        self.send_account(machine, request)
+                                    }
+                                    other => other,
+                                };
+                            }
+                            let free =
+                                next_free_code(&code, &add.provider.letter, |c| self.code_taken(c));
+                            let rename = "Select its account and press e to rename it.";
+                            match free {
+                                Some(free) => {
+                                    add.code = free.clone();
+                                    self.say(
+                                        format!(
+                                            "{code} exists. For a new account, {free} is free: Enter adds that. {rename}"
+                                        ),
+                                        Tone::Warn,
+                                    );
+                                }
+                                None => self.say(format!("That code exists. {rename}"), Tone::Warn),
+                            }
                         } else {
-                            let mut value = json!({"action":"account-add","code":add.code(),"name":add.name(),"provider":add.provider.id});
+                            let name = if add.name().is_empty() {
+                                add.code().to_string()
+                            } else {
+                                add.name().to_string()
+                            };
+                            let mut value = json!({"action":"account-add","code":add.code(),"name":name,"provider":add.provider.id});
                             // A provider with no kinds leaves the kind to its backend.
                             if !add.kind().is_empty() {
                                 value["kind"] = json!(add.kind());
@@ -4352,16 +4569,22 @@ impl App {
             };
             match screen {
                 AccountScreen::Add(add) if add.field < add.kinds_at() => {
+                    // Pasted whole, so Enter's own check says what's wrong with it (K2-19); only a
+                    // paste past a few KB is cut, and said.
                     let at = add.field;
-                    let limit = AddAccount::limit(at);
                     let text: String = text.chars().filter(|c| !c.is_control()).collect();
-                    if text.chars().count() > limit {
+                    let cut = text.chars().count() > AddAccount::MOST_HELD;
+                    if let Some(value) = add.text_mut(at) {
+                        *value = text.chars().take(AddAccount::MOST_HELD).collect();
+                    }
+                    if cut {
                         self.say(
-                            format!("That's longer than {limit} characters, so it wasn't pasted."),
+                            format!(
+                                "Only the first {} characters of that paste went in.",
+                                AddAccount::MOST_HELD
+                            ),
                             Tone::Warn,
                         );
-                    } else if let Some(value) = add.text_mut(at) {
-                        *value = text;
                     }
                     return true;
                 }
@@ -10896,11 +11119,14 @@ mod tests {
             screen.contains("a sign-in of its own, per machine"),
             "{screen}"
         );
-        // A code without the provider's letter is stopped here.
+        // A code with another provider's letter is stopped here, saying so.
         type_text(&mut a, "ARK_C");
         assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
         assert!(
-            a.message().unwrap().0.contains("_ and X"),
+            a.message()
+                .unwrap()
+                .0
+                .contains("ends in _C, Claude's letter"),
             "{:?}",
             a.message()
         );
@@ -11121,7 +11347,8 @@ mod tests {
         );
         let (_, t) = sent(press(&mut a, 't'));
         assert_eq!(t, test);
-        // A pasted address longer than the field takes is refused, not cut short.
+        // A pasted address goes in whole, past Kerdr's old 200 (intent 0591, K2-19), and Enter
+        // says what's longer than the backend takes; only megabytes are cut, and said.
         press(&mut a, '+');
         press(&mut a, 'j');
         press(&mut a, 'j');
@@ -11129,10 +11356,29 @@ mod tests {
         key(&mut a, KeyCode::Tab);
         key(&mut a, KeyCode::Tab);
         a.on_paste(&"x".repeat(201));
-        assert!(add_screen(&a).extra[0].is_empty());
-        assert!(a.message().unwrap().0.contains("longer than 200"));
-        a.on_paste(&"x".repeat(200));
-        assert_eq!(add_screen(&a).extra[0].len(), 200);
+        assert_eq!(add_screen(&a).extra[0].len(), 201);
+        a.on_paste(&"x".repeat(401));
+        assert_eq!(add_screen(&a).extra[0].len(), 401);
+        key(&mut a, KeyCode::Tab);
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert!(
+            a.message()
+                .unwrap()
+                .0
+                .contains("longer than the 400 characters"),
+            "{:?}",
+            a.message()
+        );
+        assert_eq!(
+            add_screen(&a).field,
+            AddAccount::FIELDS_AT,
+            "the cursor goes there"
+        );
+        a.on_paste(&"x".repeat(1_000_000));
+        assert_eq!(add_screen(&a).extra[0].len(), AddAccount::MOST_HELD);
+        assert!(a.message().unwrap().0.contains("Only the first 4096"));
+        a.on_paste(&"x".repeat(400));
+        assert_eq!(add_screen(&a).extra[0].len(), 400);
     }
 
     #[test]
@@ -11299,6 +11545,113 @@ mod tests {
         );
         complete(&mut a, action, json!({"ok":true,"message":"added NEW"}));
         assert!(signin_screen(&a).paste);
+    }
+
+    #[test]
+    fn a_code_typed_short_or_in_lower_case_is_fixed_in_the_form_and_sent_on_the_next_enter() {
+        // Intent 0591, K2-15: fixed, shown in the form, and sent only on the next Enter; with no
+        // machine ticked, the form's own is. Only a code that can't be one is refused, naming the
+        // part that's wrong.
+        let mut a = app();
+        a.open_accounts();
+        press(&mut a, '+');
+        key(&mut a, KeyCode::Enter);
+        assert_eq!(add_screen(&a).provider.id, "claude");
+        type_text(&mut a, "new");
+        if let Mode::Accounts {
+            screen: AccountScreen::Add(add),
+            ..
+        } = &mut a.mode
+        {
+            add.chosen.iter_mut().for_each(|c| *c = false);
+        }
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None, "fixed, not sent");
+        assert_eq!(add_screen(&a).code, "NEW_C");
+        let own = add_screen(&a).machine;
+        let ticked: Vec<usize> = add_screen(&a)
+            .machines
+            .iter()
+            .zip(&add_screen(&a).chosen)
+            .filter_map(|(m, c)| c.then_some(*m))
+            .collect();
+        assert_eq!(ticked, [own]);
+        assert!(
+            a.message().unwrap().0.contains("new is written NEW_C"),
+            "{:?}",
+            a.message()
+        );
+        let (machine, request) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(machine, own);
+        assert_eq!(request["code"], "NEW_C");
+        // What can't be made a code says which part is wrong.
+        let mut a = app();
+        a.open_accounts();
+        press(&mut a, '+');
+        key(&mut a, KeyCode::Enter);
+        for (typed, said) in [
+            (
+                "NEW_X",
+                "NEW_X ends in _X, Codex's letter; a Claude account's code ends in _C",
+            ),
+            (
+                "toolong",
+                "its owner's part, TOOLONG, is 7 characters; a code's is 2–4",
+            ),
+            (
+                "4BZ",
+                "its owner's part, 4BZ, is starting with 4; a code starts with a capital",
+            ),
+        ] {
+            if let Mode::Accounts {
+                screen: AccountScreen::Add(add),
+                ..
+            } = &mut a.mode
+            {
+                add.code.clear();
+            }
+            type_text(&mut a, typed);
+            assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+            assert_eq!(a.message().unwrap().0, format!("{said}."));
+        }
+    }
+
+    #[test]
+    fn a_code_already_on_the_list_is_signed_in_where_it_isnt_and_a_new_one_gets_a_free_code() {
+        // Intent 0591, K2-17: the laptop's feed has NEW_C, the build box's hasn't pulled it yet.
+        // Nothing is added again (that would rename it): the build box signs it in.
+        let mut a = app();
+        let new: Account = serde_json::from_value(json!({"code":"NEW_C","name":"New",
+            "provider":"claude","kind":"token","runs":"claude","status":"missing"}))
+        .unwrap();
+        a.machines[0].feed.as_mut().unwrap().accounts.push(new);
+        a.open_accounts();
+        press(&mut a, '+');
+        key(&mut a, KeyCode::Enter);
+        type_text(&mut a, "NEW_C");
+        let (machine, request) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(machine, 1, "the machine that lacks it");
+        assert_eq!(request["action"], "account-signin");
+        assert_eq!(request["code"], "NEW_C");
+        assert_eq!(signin_screen(&a).machines, [1]);
+        assert!(
+            a.message().unwrap().0.contains("isn't added again"),
+            "{:?}",
+            a.message()
+        );
+        // Every ticked machine has it: a free code for a new account, in the form.
+        let mut a = app();
+        a.open_accounts();
+        press(&mut a, '+');
+        key(&mut a, KeyCode::Enter);
+        type_text(&mut a, "ARK_C");
+        assert_eq!(key(&mut a, KeyCode::Enter), Action::None);
+        assert_eq!(add_screen(&a).code, "ARK2_C");
+        let said = a.message().unwrap().0.to_string();
+        assert!(said.contains("ARK2_C is free: Enter adds that"), "{said}");
+        assert!(said.contains("press e to rename it"), "{said}");
+        let (_, request) = sent(key(&mut a, KeyCode::Enter));
+        assert_eq!(request["action"], "account-add");
+        assert_eq!(request["code"], "ARK2_C");
     }
 
     #[test]
