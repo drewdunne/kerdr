@@ -307,12 +307,7 @@ impl Kept {
     /// another Kerdr held, answered or dropped meanwhile shows here too.
     pub fn sync(&mut self) {
         if let Some(file) = self.update(|f| f.clone()) {
-            // One whose words are kept apart and can't be found isn't Kerdr's to send.
-            self.held = file
-                .held
-                .into_iter()
-                .filter(|h| !typed_apart(&h.request))
-                .collect();
+            self.held = file.held;
             self.holds = file.holds;
         }
     }
@@ -594,20 +589,9 @@ impl Kept {
         let mut notes = vec![];
         let result = locked(&dir, || {
             let mut file: HeldFile = read_or_set_aside(&dir, HELD_FILE, &mut notes)?;
-            // A held request keeps what he typed in the hold file, private to him as the words
-            // file is. One a build of round 2 wrote with its words in the words file instead
-            // (`held_typed`) is put back whole here, and written whole at the next change; one
-            // whose words can't be found stays in the file, never sent without them.
-            let (mut words, readable) =
-                match read_or_set_aside::<WordsFile>(&dir, WORDS_FILE, &mut notes) {
-                    Ok(words) => (words, true),
-                    Err(_) => (WordsFile::default(), false),
-                };
-            for h in &mut file.held {
-                if let Some(typed) = words.held_typed.get(h.op()) {
-                    join_typed(&mut h.request, typed);
-                }
-            }
+            // A held request keeps what he typed here, whole, as 0.35.0 does: the hold file is
+            // private to him as the words file is, and is all a change to it reads or writes
+            // (Codex's reviews 86 and 88, as the lead ruled).
             let was = serde_json::to_string_pretty(&file).map_err(io::Error::other)?;
             for c in &unwritten {
                 c.apply(&mut file);
@@ -617,18 +601,6 @@ impl Kept {
             // Written only when it changed: a read alone leaves the file as it is.
             if text != was {
                 write_private(&dir, HELD_FILE, &text)?;
-                // Only once the hold file has them whole: words kept apart for a request that's
-                // now whole there, or gone, are let go.
-                if readable && !words.held_typed.is_empty() {
-                    let apart: Vec<String> = file
-                        .held
-                        .iter()
-                        .filter(|h| typed_apart(&h.request))
-                        .map(|h| h.op().to_string())
-                        .collect();
-                    words.held_typed.retain(|op, _| apart.contains(op));
-                    write_words(&dir, &words)?;
-                }
             }
             Ok(out)
         });
@@ -975,10 +947,6 @@ impl Words {
 struct WordsFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     sets: Vec<WordSet>,
-    /// What he typed or pasted into a request in the hold file, by its op, as a build of round 2
-    /// of release 5 kept it apart: read back into the hold file, never written anew.
-    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
-    held_typed: std::collections::BTreeMap<String, Value>,
     /// One set at the top, as an earlier Kerdr of this release kept it: no Kerdr's.
     #[serde(flatten)]
     loose: Words,
@@ -1012,7 +980,7 @@ struct WordSet {
 
 /// Writes the words file, or takes it away when no words are left in it.
 fn write_words(dir: &Path, file: &WordsFile) -> io::Result<()> {
-    if file.sets.iter().all(|s| s.words.is_empty()) && file.held_typed.is_empty() {
+    if file.sets.iter().all(|s| s.words.is_empty()) {
         return match std::fs::remove_file(dir.join(WORDS_FILE)) {
             Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
             _ => Ok(()),
@@ -1020,23 +988,6 @@ fn write_words(dir: &Path, file: &WordsFile) -> io::Result<()> {
     }
     let text = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
     write_private(dir, WORDS_FILE, &text)
-}
-
-/// Whether a held request's words are kept apart, in the words file, as a build of round 2 of
-/// release 5 kept them, and haven't been put back.
-fn typed_apart(request: &Value) -> bool {
-    request.get("typed").is_some()
-}
-
-/// Puts a held request's words, kept apart, back in it.
-fn join_typed(request: &mut Value, typed: &Value) {
-    let (Some(fields), Some(typed)) = (request.as_object_mut(), typed.as_object()) else {
-        return;
-    };
-    fields.remove("typed");
-    for (name, v) in typed {
-        fields.insert(name.clone(), v.clone());
-    }
 }
 
 /// Writes `name` in `dir` whole, readable by its owner alone: a new file, moved into place.
@@ -1101,72 +1052,61 @@ mod tests {
     }
 
     #[test]
-    fn a_held_change_keeps_its_words_and_one_kept_apart_by_round_two_is_read_back_whole() {
-        // Review 86, as the lead ruled: a held request keeps what he typed in the hold file, as
-        // 0.35.0 does. One a build of round 2 wrote with its words kept apart in the words file
-        // is read back whole, and written whole at the next change; one whose words can't be read
-        // stays in the file, never sent without them.
+    fn a_held_change_keeps_its_words_in_the_hold_file_and_never_touches_the_words_file() {
+        // Codex's reviews 86 and 88, as the lead ruled: a held request keeps what he typed in the
+        // hold file, as 0.35.0 does, and is read back whole. A change to the hold file reads and
+        // writes the hold file alone: a words file it can't read is left where it is, for the
+        // words' own reader to say and set aside.
         let dir = tempfile::tempdir().unwrap();
         let state = dir.path().join("kerdr");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join(WORDS_FILE), "not words at all").unwrap();
         let mut kept = Kept::at(&state, 1000);
         let mut save = entry("op-2", 1000);
         save.request = json!({"action":"edit","id":"0582","op":"op-2","text":"token = s3cr3t-value","base":"old"});
         assert!(kept.hold(save.clone()));
+        kept.sync();
         let held = std::fs::read_to_string(state.join(HELD_FILE)).unwrap();
         assert!(held.contains("s3cr3t-value"), "{held}");
-        assert!(!state.join(WORDS_FILE).exists());
         drop(kept);
-        assert_eq!(Kept::at(&state, 2000).held, vec![save.clone()]);
-        // As round 2 wrote it: the words apart.
-        let mut apart = save.clone();
-        apart.request =
-            json!({"action":"edit","id":"0582","op":"op-2","typed":"kept in words.json"});
-        let split = |state: &Path| {
-            std::fs::write(
-                state.join(HELD_FILE),
-                serde_json::to_string(&HeldFile {
-                    held: vec![apart.clone()],
-                    holds: vec![],
-                })
-                .unwrap(),
-            )
-            .unwrap();
-            std::fs::write(
-                state.join(WORDS_FILE),
-                json!({"held_typed": {"op-2": {"text": "token = s3cr3t-value", "base": "old"}}})
-                    .to_string(),
-            )
-            .unwrap();
-        };
-        split(&state);
-        let mut next = Kept::at(&state, 2000);
-        assert_eq!(next.held, vec![save.clone()], "whole again");
-        next.hold(entry("op-3", 2000));
-        let held = std::fs::read_to_string(state.join(HELD_FILE)).unwrap();
-        assert!(
-            held.contains("s3cr3t-value") && !held.contains("kept in words.json"),
-            "{held}"
+        assert_eq!(Kept::at(&state, 2000).held, vec![save]);
+        assert_eq!(
+            std::fs::read_to_string(state.join(WORDS_FILE))
+                .ok()
+                .as_deref(),
+            Some("not words at all"),
+            "the hold file's changes read the words file, and set it aside"
         );
-        assert!(!state.join(WORDS_FILE).exists(), "nothing left apart");
-        drop(next);
-        // Its words can't be read: it stays, unsent, and comes back whole once they can be.
-        split(&state);
-        let words = std::fs::read_to_string(state.join(WORDS_FILE)).unwrap();
-        std::fs::remove_file(state.join(WORDS_FILE)).unwrap();
-        std::fs::create_dir(state.join(WORDS_FILE)).unwrap();
-        let mut blocked = Kept::at(&state, 2000);
-        assert!(blocked.held.is_empty(), "never sent without its words");
-        blocked.hold(entry("op-4", 2000));
-        assert_eq!(blocked.held.len(), 1);
-        drop(blocked);
-        let held = std::fs::read_to_string(state.join(HELD_FILE)).unwrap();
+        // A hold file as 0.35.0 writes it, his words inline, reads whole.
+        let older = r##"[OPEN]
+  "held": [
+    [OPEN]
+      "machine": "build-box",
+      "request": [OPEN]"action": "edit", "id": "0582", "op": "op-9", "text": "token = s3cr3t-value"[CLOSE],
+      "key": "build-box/0582",
+      "reference": "#582",
+      "what": "e",
+      "pressed": 1500
+    [CLOSE]
+  ],
+  "holds": ["build-box"]
+[CLOSE]"##
+            .replace("[OPEN]", "\u{7b}")
+            .replace("[CLOSE]", "\u{7d}");
+        std::fs::write(state.join(HELD_FILE), older).unwrap();
+        let read = Kept::at(&state, 2000);
+        assert_eq!(read.held.len(), 1);
+        assert_eq!(read.held[0].request["text"], "token = s3cr3t-value");
+        assert_eq!(read.held[0].reference, "#582");
+        let names: Vec<String> = std::fs::read_dir(&state)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
         assert!(
-            held.contains("kept in words.json"),
-            "still in the file: {held}"
+            !names.iter().any(|n| n.starts_with("words-unreadable")),
+            "{names:?}"
         );
-        std::fs::remove_dir(state.join(WORDS_FILE)).unwrap();
-        std::fs::write(state.join(WORDS_FILE), words).unwrap();
-        assert!(Kept::at(&state, 2000).held.contains(&save));
     }
 
     #[test]
