@@ -35,6 +35,9 @@ wl-clipboard-rs = "0.9.5"
 x11rb = "0.13.2"
 
 [target.'cfg(windows)'.dependencies]
+# The clipboard read in Kerdr itself, at once, rather than by PowerShell, which takes seconds to start
+# (Codex's review 86, 7).
+clipboard-win = "5.4.3"
 windows-sys = { version = "0.61", features = ["Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Foundation", "Win32_Security", "Win32_System_IO", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_System_Console", "Win32_System_Diagnostics_ToolHelp"] }
 
 [dev-dependencies]

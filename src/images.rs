@@ -36,6 +36,10 @@ pub const MOST_READ: usize = 200_000_000;
 /// How long a clipboard reader may take before Kerdr gives up on it.
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 
+/// How long a paste may take to have what the clipboard holds in hand: after that, what it holds
+/// may not be what he pasted, so nothing from it goes in, and he's told (Codex's review 86, 7).
+pub const CLIPBOARD_BOUND: Duration = Duration::from_secs(3);
+
 /// The most reads for the box that run at once, one Kerdr has stopped waiting for counted until it
 /// really ends: past it, a paste is refused and said (Codex's review 86, 6).
 pub const MOST_READERS: usize = 8;
@@ -91,6 +95,14 @@ impl Workers {
 pub fn too_many_reads(running: usize) -> String {
     format!(
         "Kerdr is still waiting on {running} earlier reads that haven't ended (a drive or a clipboard that doesn't answer), so this one didn't go in. Paste it again once they have."
+    )
+}
+
+/// Why a paste didn't go in when the clipboard didn't answer within CLIPBOARD_BOUND.
+pub fn clipboard_late(bound: Duration) -> String {
+    format!(
+        "The clipboard didn't answer within {} seconds, so nothing from this paste went in: what it holds by now may not be what you pasted. Paste again.",
+        bound.as_secs_f32()
     )
 }
 
@@ -160,6 +172,8 @@ impl Source {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Found {
     Image(Loaded),
+    /// A picture Windows held as a bitmap, as BMP bytes: made a PNG once it's in hand.
+    Bitmap(Vec<u8>),
     Files(Vec<PathBuf>),
     Text(String),
 }
@@ -490,17 +504,7 @@ pub fn size(bytes: usize) -> String {
 /// taken, to be asked about; only bytes that are no image at all are refused.
 pub fn checked(bytes: Vec<u8>, from: &str, room: Room) -> Result<Loaded, String> {
     if bytes.len() > room.read_cap() {
-        return Err(if room.fix {
-            format!(
-                "{from} is over {}, more than Kerdr reads for one image.",
-                size(MOST_READ)
-            )
-        } else {
-            format!(
-                "{from} is over {}, the most Kerdr attaches for one image.",
-                size(MAX_IMAGE_BYTES)
-            )
-        });
+        return Err(too_big(from, room));
     }
     match kind_of(&bytes) {
         Some(media_type) if room.fix || shown(media_type) => Ok(Loaded {
@@ -512,6 +516,21 @@ pub fn checked(bytes: Vec<u8>, from: &str, room: Room) -> Result<Loaded, String>
             "{from} isn't a PNG, JPEG, GIF or WebP image, the kinds Kerdr attaches."
         )),
         _ => Err(format!("{from} isn't an image.")),
+    }
+}
+
+/// Why an image past what Kerdr reads for one didn't go in.
+fn too_big(from: &str, room: Room) -> String {
+    if room.fix {
+        format!(
+            "{from} is over {}, more than Kerdr reads for one image.",
+            size(MOST_READ)
+        )
+    } else {
+        format!(
+            "{from} is over {}, the most Kerdr attaches for one image.",
+            size(MAX_IMAGE_BYTES)
+        )
     }
 }
 
@@ -881,8 +900,14 @@ pub type Runner<'a> = &'a dyn Fn(&str, &[&str]) -> std::io::Result<Captured>;
 /// one image, or the files copied in a file manager, or text for the words, or plain words
 /// saying why there's nothing to attach.
 pub fn from_clipboard(room: Room) -> Loading {
+    loading_of(take_clipboard(room), room)
+}
+
+/// What the clipboard holds, in hand: an image's bytes, the list of files a file manager copied,
+/// or text. Nothing it offers is read later (Codex's review 86, 7).
+pub fn take_clipboard(room: Room) -> Result<Found, String> {
     if room.images == 0 {
-        return Loading::refused(too_many());
+        return Err(too_many());
     }
     #[cfg(target_os = "macos")]
     let found = macos_clipboard(room);
@@ -899,11 +924,26 @@ pub fn from_clipboard(room: Room) -> Loading {
         };
         clipboard_here(wayland, x11, &builtin::readers(wayland, x11), &run, room)
     };
+    found
+}
+
+/// What was taken from the clipboard, read for the box: a copied file list's files read, a
+/// bitmap made a PNG.
+pub fn loading_of(found: Result<Found, String>, room: Room) -> Loading {
     match found {
         Ok(Found::Image(image)) => Loading {
             images: vec![image],
             ..Loading::default()
         },
+        Ok(Found::Bitmap(bmp)) => {
+            match png_of_bitmap(&bmp).and_then(|png| checked(png, "The clipboard's image", room)) {
+                Ok(image) => Loading {
+                    images: vec![image],
+                    ..Loading::default()
+                },
+                Err(why) => Loading::refused(why),
+            }
+        }
         Ok(Found::Files(paths)) => from_files(&paths, room),
         Ok(Found::Text(text)) => Loading {
             text: Some(text),
@@ -911,6 +951,17 @@ pub fn from_clipboard(room: Room) -> Loading {
         },
         Err(why) => Loading::refused(why),
     }
+}
+
+/// A bitmap's BMP bytes as a PNG, as Kerdr sent a Windows clipboard's picture before.
+fn png_of_bitmap(bmp: &[u8]) -> Result<Vec<u8>, String> {
+    let picture = image::load_from_memory_with_format(bmp, image::ImageFormat::Bmp)
+        .map_err(|e| format!("Couldn't read the clipboard's picture: {e}."))?;
+    let mut out = std::io::Cursor::new(Vec::new());
+    picture
+        .write_to(&mut out, image::ImageFormat::Png)
+        .map_err(|e| format!("Couldn't make the clipboard's picture a PNG: {e}."))?;
+    Ok(out.into_inner())
 }
 
 const NO_IMAGE: &str = "There's no image on the clipboard. Copy a screenshot or an image first, or paste an image file's path.";
@@ -1198,8 +1249,8 @@ fn copied_files(uri_list: &str, any: bool) -> Result<Found, String> {
 
 /// Kerdr's own ways of reading the clipboard, with no program to run (intent 0591, K3-63): the
 /// Wayland data-control protocol, and X11's selections. Each runs on the paste's own read, which
-/// the board lets go at its deadline and counts until it ends (Codex's review 86, 6), so a
-/// desktop that doesn't answer can't stop the board, nor leave threads uncounted.
+/// the board waits for only CLIPBOARD_BOUND and counts until it ends (Codex's review 86, 6 and
+/// 7), so a desktop that doesn't answer can't stop the board, nor leave threads uncounted.
 #[cfg(not(any(target_os = "macos", windows)))]
 mod builtin {
     use super::{Listing, READ_DEADLINE, Reader};
@@ -1497,8 +1548,8 @@ mod builtin {
 }
 
 /// A private folder for a reader to write the clipboard's image into, and the path it writes:
-/// a path nobody has open, since Windows won't let another program write a file Kerdr holds.
-#[cfg(any(target_os = "macos", windows))]
+/// a path nobody has open.
+#[cfg(target_os = "macos")]
 fn scratch() -> Result<(tempfile::TempDir, PathBuf), String> {
     let dir = tempfile::Builder::new()
         .prefix("kerdr-clipboard-")
@@ -1570,65 +1621,72 @@ fn macos_clipboard(room: Room) -> Result<Found, String> {
     Err(NO_IMAGE.into())
 }
 
+/// Windows' clipboard, read in Kerdr itself (clipboard-win), at once: PowerShell took seconds to
+/// start, while what was copied could change (Codex's review 86, 7). The clipboard is open only
+/// while what it holds is copied out: a PNG as one (what browsers and screenshot tools put
+/// there), or else its bitmap, the files Explorer copied, or text.
 #[cfg(windows)]
 fn windows_clipboard(room: Room) -> Result<Found, String> {
-    use base64::Engine;
-    let (_dir, file) = scratch()?;
-    let path = file.to_string_lossy().into_owned();
-    // Exit 0: the image is saved; 4: copied files, one per line; 3: text, written out; 2: nothing; 5: an
-    // error, its message on standard error as plain text rather than PowerShell's CLIXML.
-    let script = format!(
-        "$ProgressPreference = 'SilentlyContinue'; $ErrorActionPreference = 'Stop'; \
-         try {{ \
-         [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false; \
-         Add-Type -AssemblyName System.Windows.Forms; Add-Type -AssemblyName System.Drawing; \
-         if ([System.Windows.Forms.Clipboard]::ContainsImage()) {{ \
-           [System.Windows.Forms.Clipboard]::GetImage().Save({}, [System.Drawing.Imaging.ImageFormat]::Png); exit 0 }}; \
-         $files = [System.Windows.Forms.Clipboard]::GetFileDropList(); \
-         if ($files.Count -gt 0) {{ [Console]::Out.Write(($files -join \"`n\")); exit 4 }}; \
-         if ([System.Windows.Forms.Clipboard]::ContainsText()) {{ [Console]::Out.Write([System.Windows.Forms.Clipboard]::GetText()); exit 3 }}; exit 2 \
-         }} catch {{ [Console]::Error.WriteLine($_.Exception.Message); exit 5 }}",
-        crate::transport::powershell_quote(&path)
-    );
-    let encoded: Vec<u8> = script.encode_utf16().flat_map(u16::to_le_bytes).collect();
-    let mut cmd = Command::new("powershell.exe");
-    // The clipboard needs a single-threaded apartment.
-    cmd.args([
-        "-NoLogo",
-        "-NoProfile",
-        "-NonInteractive",
-        "-STA",
-        "-ExecutionPolicy",
-        "Bypass",
-        "-EncodedCommand",
-        &base64::engine::general_purpose::STANDARD.encode(encoded),
-    ]);
-    // PowerShell takes a few seconds to start on a cold machine.
-    let got = capture(cmd, MOST_CLIPBOARD_TEXT + 1, READ_DEADLINE * 3)
-        .map_err(|e| format!("Couldn't read the clipboard with PowerShell: {e}."))?;
-    match got.status {
-        Some(0) => from_file(&file, room).map(Found::Image),
-        Some(4) => {
-            let listed: String = String::from_utf8_lossy(&got.stdout)
-                .lines()
+    use clipboard_win::{Clipboard, Getter, formats, raw};
+    let failed = |e: clipboard_win::ErrorCode| format!("Couldn't read the clipboard: {e}.");
+    let _open =
+        Clipboard::new_attempts(10).map_err(|e| format!("Couldn't open the clipboard: {e}."))?;
+    let held = |format: u32| raw::size(format).map_or(0, |n| n.get());
+    if let Some(png) = raw::register_format("PNG")
+        .map(|f| f.get())
+        .filter(|f| raw::is_format_avail(*f))
+    {
+        if held(png) > room.read_cap() {
+            return Err(too_big("The clipboard's image", room));
+        }
+        let mut bytes = Vec::new();
+        formats::RawData(png)
+            .read_clipboard(&mut bytes)
+            .map_err(failed)?;
+        return checked(bytes, "The clipboard's image", room).map(Found::Image);
+    }
+    if raw::is_format_avail(formats::CF_DIB) || raw::is_format_avail(formats::CF_BITMAP) {
+        // Made a PNG once it's in hand, and checked then: a bitmap is larger than its PNG.
+        if held(formats::CF_DIB) > MOST_READ {
+            return Err(too_big("The clipboard's image", Room { fix: true, ..room }));
+        }
+        let mut bytes = Vec::new();
+        formats::Bitmap.read_clipboard(&mut bytes).map_err(failed)?;
+        return Ok(Found::Bitmap(bytes));
+    }
+    if raw::is_format_avail(formats::CF_HDROP) {
+        let mut files: Vec<String> = Vec::new();
+        formats::FileList
+            .read_clipboard(&mut files)
+            .map_err(failed)?;
+        if !files.is_empty() {
+            let listed: String = files
+                .iter()
                 .map(|l| format!("file:///{}\n", l.trim().replace('%', "%25")))
                 .collect();
-            copied_files(&listed, room.fix)
+            return copied_files(&listed, room.fix);
         }
-        Some(2) => Err("The clipboard is empty.".into()),
-        // Text goes into the words, as any paste would (intent 0591, K3-61).
-        Some(3) if got.stdout.len() > MOST_CLIPBOARD_TEXT => Err(too_much_text()),
-        Some(3) if !got.stdout.is_empty() => Ok(Found::Text(
-            String::from_utf8_lossy(&got.stdout)
-                .replace("\r\n", "\n")
-                .replace('\r', "\n"),
-        )),
-        Some(3) => Err(NO_IMAGE.into()),
-        _ => Err(format!(
-            "Couldn't read the clipboard with PowerShell: {}",
-            got.stderr.lines().next().unwrap_or("it failed").trim()
-        )),
     }
+    if raw::is_format_avail(formats::CF_UNICODETEXT) {
+        // Each UTF-16 unit is a byte or more of the words: past the most, it's never copied out.
+        if held(formats::CF_UNICODETEXT) / 2 > MOST_CLIPBOARD_TEXT + 1 {
+            return Err(too_much_text());
+        }
+        let mut text = String::new();
+        formats::Unicode.read_clipboard(&mut text).map_err(failed)?;
+        // Text goes into the words, as any paste would (intent 0591, K3-61).
+        if text.len() > MOST_CLIPBOARD_TEXT {
+            return Err(too_much_text());
+        }
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        if !text.is_empty() {
+            return Ok(Found::Text(text));
+        }
+    }
+    if raw::count_formats() == Some(0) {
+        return Err("The clipboard is empty.".into());
+    }
+    Err(NO_IMAGE.into())
 }
 
 /// Runs a clipboard reader with nothing on its standard input, keeping at most `cap` bytes of
@@ -1698,6 +1756,37 @@ mod tests {
     use std::cell::RefCell;
 
     pub(crate) const PNG: &[u8] = b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
+
+    #[test]
+    fn a_bitmap_taken_from_the_clipboard_goes_in_as_a_png_an_older_backend_takes() {
+        // Codex's review 86, 7: Windows' clipboard is read in Kerdr itself now, and a picture it
+        // holds only as a bitmap is made a PNG once it's in hand, as PowerShell made it before.
+        let picture = image::RgbImage::from_pixel(3, 2, image::Rgb([200, 30, 40]));
+        let mut bmp = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(picture)
+            .write_to(&mut bmp, image::ImageFormat::Bmp)
+            .unwrap();
+        let got = loading_of(Ok(Found::Bitmap(bmp.into_inner())), Room::left(&[]));
+        assert_eq!(got.why, None);
+        assert_eq!(got.images.len(), 1);
+        assert_eq!(got.images[0].media_type, "image/png");
+        let back = image::load_from_memory(&got.images[0].bytes)
+            .unwrap()
+            .to_rgb8();
+        assert_eq!((back.width(), back.height()), (3, 2));
+        assert_eq!(back.get_pixel(2, 1), &image::Rgb([200, 30, 40]));
+        let broken = loading_of(
+            Ok(Found::Bitmap(b"BMnot a picture".to_vec())),
+            Room::left(&[]),
+        );
+        assert!(broken.images.is_empty());
+        assert!(
+            broken
+                .why
+                .unwrap()
+                .starts_with("Couldn't read the clipboard's picture")
+        );
+    }
 
     #[test]
     fn knows_the_kinds_it_attaches_by_their_bytes() {

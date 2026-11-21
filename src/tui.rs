@@ -519,9 +519,15 @@ fn event_loop(
                 if let Some(read) = app.begin_image_load(&source) {
                     let reading = Reading {
                         workers: &readers,
+                        bound: crate::images::CLIPBOARD_BOUND,
+                        take: crate::images::take_clipboard,
                         load: |source: crate::images::Source, room| source.load(room),
                     };
-                    start_read(app, &image_tx, read, source, reading);
+                    // A clipboard that's slow to answer: the board says it's reading meanwhile.
+                    let mut drawn = |app: &mut App| {
+                        let _ = terminal.draw(|f| crate::ui::draw(f, app));
+                    };
+                    start_read(app, &image_tx, read, source, reading, &mut drawn);
                 }
             }
             Action::CopyLink(url) => {
@@ -1051,37 +1057,118 @@ fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
     }
 }
 
-/// How a read for the box is done: on `workers`, at most images::MOST_READERS at once, read
-/// with `load`.
-pub(crate) struct Reading<'a, L> {
+/// How a read for the box is done: on `workers`, at most images::MOST_READERS at once; the
+/// clipboard taken with `take` within `bound`; anything else read with `load`.
+pub(crate) struct Reading<'a, T, L> {
     pub workers: &'a crate::images::Workers,
+    pub bound: Duration,
+    pub take: T,
     pub load: L,
 }
 
-/// Starts a read begun by begin_image_load; what it found comes back on `tx`. Every read runs on
-/// a worker counted until it really ends, the board having let it go at its deadline or not; with
-/// images::MOST_READERS running, the paste is refused and said (Codex's review 86, 6).
-pub(crate) fn start_read<L>(
+/// Starts a read begun by begin_image_load; what it found comes back on `tx`. A clipboard is
+/// taken now: the board waits, at most `bound`, until what it holds is in hand, so what goes in is
+/// what it held as he pasted, and pastes are taken in the order he made them; past the bound,
+/// nothing from it goes in, and he's told (Codex's review 86, 7). What's taken is then read for
+/// the box (a copied file list's files, a bitmap made a PNG) away from the board. Every read runs
+/// on a worker counted until it really ends; with images::MOST_READERS running, the paste is
+/// refused and said (review 86, 6).
+pub(crate) fn start_read<T, L>(
     app: &mut App,
     tx: &mpsc::Sender<(u64, crate::images::Loading)>,
     (id, room): (u64, crate::images::Room),
     source: crate::images::Source,
-    reading: Reading<'_, L>,
+    reading: Reading<'_, T, L>,
+    drawn: &mut dyn FnMut(&mut App),
 ) where
+    T: FnOnce(crate::images::Room) -> Result<crate::images::Found, String> + Send + 'static,
     L: FnOnce(crate::images::Source, crate::images::Room) -> crate::images::Loading
         + Send
         + 'static,
 {
-    use crate::images::{Loading, MOST_READERS};
-    let Reading { workers, load } = reading;
-    let tx = tx.clone();
-    if !workers.start(MOST_READERS, move || {
-        let _ = tx.send((id, load(source, room)));
-    }) {
+    use crate::images::{Loading, MOST_READERS, Source};
+    use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+    let Reading {
+        workers,
+        bound,
+        take,
+        load,
+    } = reading;
+    let busy = |app: &mut App| {
         let _ = app.images_loaded(
             id,
             Loading::refused(crate::images::too_many_reads(workers.running())),
         );
+    };
+    let tx = tx.clone();
+    if !matches!(source, Source::Clipboard) {
+        if !workers.start(MOST_READERS, move || {
+            let _ = tx.send((id, load(source, room)));
+        }) {
+            busy(app);
+        }
+        return;
+    }
+    // Waiting, then taken in time or too late: whichever comes first holds.
+    const WAITING: u8 = 0;
+    const TAKEN: u8 = 1;
+    const LATE: u8 = 2;
+    let state = std::sync::Arc::new(AtomicU8::new(WAITING));
+    let (taken_tx, taken_rx) = mpsc::channel::<()>();
+    let theirs = state.clone();
+    let started = Instant::now();
+    if !workers.start(MOST_READERS, move || {
+        let found = take(room);
+        if theirs
+            .compare_exchange(WAITING, TAKEN, SeqCst, SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let _ = taken_tx.send(());
+        let _ = tx.send((id, crate::images::loading_of(found, room)));
+    }) {
+        busy(app);
+        return;
+    }
+    let mut shown = false;
+    loop {
+        let left = bound.saturating_sub(started.elapsed());
+        // A clipboard that answers at once is taken before the board is drawn again.
+        let wait = if shown {
+            left
+        } else {
+            left.min(Duration::from_millis(50))
+        };
+        match taken_rx.recv_timeout(wait) {
+            Ok(()) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) if !shown && !left.is_zero() => {
+                shown = true;
+                drawn(app);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if state
+                    .compare_exchange(WAITING, LATE, SeqCst, SeqCst)
+                    .is_ok()
+                {
+                    let _ = app
+                        .images_loaded(id, Loading::refused(crate::images::clipboard_late(bound)));
+                    return;
+                }
+                // Taken just now.
+                let _ = taken_rx.recv();
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if state.load(SeqCst) != TAKEN {
+                    let _ = app.images_loaded(
+                        id,
+                        Loading::refused("Kerdr couldn't read the clipboard: its reader stopped."),
+                    );
+                }
+                return;
+            }
+        }
     }
 }
 
@@ -1967,12 +2054,92 @@ mod tests {
     }
 
     #[test]
+    fn a_paste_is_what_the_clipboard_held_as_he_pasted_or_nothing_and_he_is_told() {
+        // Codex's review 86, 7: a clipboard slow to answer (PowerShell starting, say) while he
+        // copies something else. The board waits for what it holds to be in hand, at most the
+        // bound: past it, nothing from that paste goes in, and he's told, rather than what was
+        // copied after. One that answers is in hand before the paste is taken, so a copy straight
+        // after changes nothing, and pastes go in in the order he made them.
+        use crate::images::{Found, Source, Workers};
+        use std::sync::{Arc, Mutex};
+        let clipboard = Arc::new(Mutex::new("<B>".to_string()));
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let copier = {
+            let clipboard = clipboard.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                *clipboard.lock().unwrap() = "<C>".into();
+            })
+        };
+        let held = clipboard.clone();
+        let slow = Reading {
+            workers: &workers,
+            bound: Duration::from_millis(300),
+            take: move |_room| {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(Found::Text(held.lock().unwrap().clone()))
+            },
+            load: |source: Source, room| source.load(room),
+        };
+        let mut drawn = 0;
+        start_read(&mut app, &tx, read, Source::Clipboard, slow, &mut |_| {
+            drawn += 1
+        });
+        copier.join().unwrap();
+        // The slow reader ends meanwhile, having read what was copied after.
+        take_back(&mut app, &rx, Duration::from_millis(900));
+        assert_eq!(
+            words_in(&app).0,
+            "",
+            "what was copied after the paste went in"
+        );
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("didn't answer within 0.3 seconds"), "{said}");
+        assert_eq!(drawn, 1, "the board shows it's reading while it waits");
+        // One that answers.
+        let quick = |clipboard: &Arc<Mutex<String>>| {
+            let held = clipboard.clone();
+            Reading {
+                workers: &workers,
+                bound: Duration::from_millis(300),
+                take: move |_room| Ok(Found::Text(held.lock().unwrap().clone())),
+                load: |source: Source, room| source.load(room),
+            }
+        };
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            quick(&clipboard),
+            &mut |_| {},
+        );
+        *clipboard.lock().unwrap() = "<D>".into();
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            quick(&clipboard),
+            &mut |_| {},
+        );
+        *clipboard.lock().unwrap() = "<E>".into();
+        take_back(&mut app, &rx, Duration::from_millis(300));
+        assert_eq!(words_in(&app).0, "<C> <D>");
+    }
+
+    #[test]
     fn reads_that_stall_are_counted_until_they_end_and_one_past_the_most_is_refused_and_said() {
         // Codex's review 86, 6: a mount that doesn't answer, and he pastes its image's path again
         // and again. The board stops waiting for each at its deadline, but its read is counted
         // until it really ends: past the most at once, a paste is refused and said, a clipboard
         // paste too, with nothing more left running; once the mount answers, pastes go in again.
-        use crate::images::{Loaded, Loading, MOST_READERS, Source, Workers};
+        use crate::images::{Found, Loaded, Loading, MOST_READERS, Source, Workers};
         use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
         use std::sync::{Arc, Condvar, Mutex};
         let gate = Arc::new((Mutex::new(false), Condvar::new()));
@@ -1995,12 +2162,26 @@ mod tests {
                 Loading::refused("The mount answered at last.")
             }
         };
-        fn reading<L>(workers: &Workers, load: L) -> Reading<'_, L> {
-            Reading { workers, load }
+        /// A paste of a file's path: the clipboard isn't read.
+        type NoClipboard = fn(crate::images::Room) -> Result<Found, String>;
+        fn reading<L>(workers: &Workers, load: L) -> Reading<'_, NoClipboard, L> {
+            Reading {
+                workers,
+                bound: crate::images::CLIPBOARD_BOUND,
+                take: |_room| Err("not the clipboard".into()),
+                load,
+            }
         }
         for _ in 0..MOST_READERS + 3 {
             let read = app.begin_image_load(&path()).unwrap();
-            start_read(&mut app, &tx, read, path(), reading(&workers, stall()));
+            start_read(
+                &mut app,
+                &tx,
+                read,
+                path(),
+                reading(&workers, stall()),
+                &mut |_| {},
+            );
             // Its deadline passes: the board stops waiting for it.
             for r in app.image_reads.iter_mut() {
                 r.started = Instant::now() - Duration::from_secs(60);
@@ -2024,14 +2205,23 @@ mod tests {
         let ran = Arc::new(AtomicBool::new(false));
         let read = app.begin_image_load(&Source::Clipboard).unwrap();
         let took = ran.clone();
-        let clipboard = reading(&workers, move |_source: Source, _room| {
-            took.store(true, SeqCst);
-            Loading {
-                text: Some("words".into()),
-                ..Default::default()
-            }
-        });
-        start_read(&mut app, &tx, read, Source::Clipboard, clipboard);
+        let clipboard = Reading {
+            workers: &workers,
+            bound: crate::images::CLIPBOARD_BOUND,
+            take: move |_room| {
+                took.store(true, SeqCst);
+                Ok(Found::Text("words".into()))
+            },
+            load: |source: Source, room| source.load(room),
+        };
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            clipboard,
+            &mut |_| {},
+        );
         assert!(!ran.load(SeqCst));
         assert!(app.message().unwrap().0.contains("still waiting on"));
         // The mount answers: the reads end, and the count with them.
@@ -2057,7 +2247,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        start_read(&mut app, &tx, read, path(), reading(&workers, png));
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            path(),
+            reading(&workers, png),
+            &mut |_| {},
+        );
         take_back(&mut app, &rx, Duration::from_millis(500));
         assert_eq!(words_in(&app).1, 1, "{:?}", app.message());
     }
