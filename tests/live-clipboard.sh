@@ -1,6 +1,6 @@
 #!/bin/sh
 # Puts a real image on this machine's clipboard and checks the new-intent box reads it back
-# (images.rs's live_clipboard test): under X11 and under Wayland on Linux, and on macOS. CI runs
+# (images.rs's live_clipboard tests): under X11 and under Wayland on Linux, and on macOS. CI runs
 # it before every release; Windows has its own step in .github/workflows/ci.yml.
 #   tests/live-clipboard.sh [image]
 # On Linux it needs xvfb-run and xclip for X11, and sway and wl-clipboard for Wayland; a display
@@ -9,7 +9,8 @@ set -eu
 image=${1:-docs/screenshots/new-intent.png}
 KERDR_LIVE_CLIPBOARD_IMAGE=$(cd "$(dirname "$image")" && pwd)/$(basename "$image")
 export KERDR_LIVE_CLIPBOARD_IMAGE
-TEST="cargo test --locked --lib -- --ignored --exact images::tests::live_clipboard"
+# live_clipboard, and on Linux live_clipboard_own_reader: Kerdr's own reader with no program to run.
+TEST="cargo test --locked --lib -- --ignored --test-threads=1 images::tests::live_clipboard"
 TMP=$(mktemp -d)
 PID=""
 cleanup() {

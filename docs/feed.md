@@ -104,7 +104,7 @@ know rather than guessing.
 | `parent`, `undertaker_for`, `from` | The card this one sits inside (see [Work inside a card](#work-inside-a-card)): its `parent`, for a child; else the card whose agents it sees through, for an undertaker; else the card whose work it came out of, for a follow-up that isn't a child. Each is an `id` in the same feed. Give at most what's true; Kerdr uses the first of the three a card names. |
 | `workspace.own_tab` | The tab the card's own agent runs in, from your record of the pane that agent was started or reopened in, never guessed. `Enter` on the card lands there, never on a tab work inside the card runs in. `tab` keeps its meaning (work confined to one tab, which `X` closes alone); `own_tab` is only for `Enter`. |
 | `no_agent` | `true` for open work in a working column that no agent is at: no workspace on it, and nothing running the conversation that worked it. Kerdr says "no agent" on the card (unless a workspace or agent turns up for it), and its bottom line offers `C` and `x`. Leave it out when you can't tell. With no `state` either, `d` on it sends `reopen` as `Enter` does, so the backend starts it when it never ran and resumes it when it did. |
-| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"`, `"steps"`, `"cancel-backlog"`, `"cancel-workspace"`, `"cancel-conversations"`, `"hold"` and `"forward"`. See [Asking again](#asking-again-op-and-retry), [Each key's step first](#each-keys-step-first-and-questions-with-choices), [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace) and [Holding and sending on a request](#holding-and-sending-on-a-request). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
+| `supports` | Top level, optional: what this backend does beyond feed version 1, a list that can hold `"op"`, `"retry"`, `"follow"`, `"steps"`, `"cancel-backlog"`, `"cancel-workspace"`, `"cancel-conversations"`, `"hold"`, `"forward"` and `"fix-input"`. See [Asking again](#asking-again-op-and-retry), [Each key's step first](#each-keys-step-first-and-questions-with-choices), [Two more stops](#two-more-stops-cancel-backlog-and-cancel-workspace), [Holding and sending on a request](#holding-and-sending-on-a-request) and [Fixing what was typed or pasted](#fixing-what-was-typed-or-pasted). A feed with no `supports`, or one without `"op"`, is never sent a request again by itself: not after an answer that was lost, nor after a `retry` refusal. |
 | `read_failures` | Top level, optional: what this feed couldn't read, as a list of `{"part": "feed" \| "herdr" \| "session", "session": "<name>", "why": "<plain words>"}` (`session` only with `"part": "session"`). `why` is for the board, so no error codes or internal paths. `"part": "feed"` means the whole feed failed and its cards are empty: Kerdr keeps the last good cards and treats it as a failed read. The rest are shown on the session's row, once they've lasted (see [A quiet board](#a-quiet-board)); until they're gone, and from the first read that names them, that session's workspaces are marked out of date, dim on the board, and a card with no workspace says "workspace not known" instead of "no workspace open". Entries of any other shape are ignored: a `session` on a `feed` or `herdr` entry, a `session` entry with none, or a `part` Kerdr doesn't know. An entry whose `why` is empty gets Kerdr's own words. |
 | `rev` | Optional, for a backend that lists `"hold"`: a short hash of what a decision about the card rests on (its state, disposition, status, home, workspace, conversation and text fingerprint), computed from the record alone, so every machine's copy gives the same one. A request that waited before it was sent carries the `rev` the card had when the key was pressed. See [Holding and sending on a request](#holding-and-sending-on-a-request). |
 | `held` | Optional, for a backend that lists `"hold"`: what it holds for this card, `[{"op": "<the request's op>", "action": "dispatch", "pending": "queued in ARK: starts when a place frees", "since": <epoch seconds>, "until": <epoch seconds>}]`, `until` only for one that runs at a set time. Write whole seconds; Kerdr also reads a time with a fraction (`1762873200.5`), as its whole second, and an entry whose time it can't read at all is kept, without that time, never left out for it. Kerdr shows the first on the card ("⧗ queued in ARK: …") and lists them all in its peek (`m`), each with a key to drop it. An entry with no `op` or no `pending` is left out. One whose `action` starts with `account-` (an `account-move` for later) is dropped with `account-drop`. An account one may carry `asks`, a question it waits on (see `pending` under the requests). |
@@ -202,7 +202,9 @@ be available on each machine where you use actions.
 
 The command receives one JSON object on standard input. User text is JSON data, including quotes,
 newlines and shell punctuation. It is never appended to the configured command as shell source.
-Requests are limited to 64 KiB, beyond the images a `create` carries. The `action` field names the
+Requests are limited to 64 KiB, beyond the images a `create` carries; to a backend that fixes input
+(`"fix-input"` in `supports`), a `create` or an `edit` may be up to 32 MiB, and every other request
+stays at 64 KiB (see [Fixing what was typed or pasted](#fixing-what-was-typed-or-pasted)). The `action` field names the
 operation; the backend defines which additional fields that operation needs:
 
 ```json
@@ -1012,6 +1014,41 @@ infrastructure code (or omarchy-config on an Omarchy machine), when a machine wh
 is `ark-sdlc` answers: Kerdr installs nothing itself. Otherwise `u` runs herdr's own setup there, as
 before.
 
+## Fixing what was typed or pasted
+
+A backend that fixes or accepts what was typed or pasted, in place of refusing it, lists
+`"fix-input"` in its feed's `supports` (intent 0591, release 5). To it, and only to it:
+
+- **Sizes.** A `create` or an `edit` may be up to 32 MiB, sent on standard input as any request is.
+  Words have no length limit of Kerdr's beyond the box's megabyte: the backend keeps the first part
+  in the record's words and the whole text in a file beside it. An item's text read for `e`, or
+  saved, may be as long; its answer may be up to three times that, however much of it JSON escapes.
+- **Images.** No count: one request's images together, and each, at most 20 MB. `type` names the
+  kind its bytes are: `image/png`, `image/jpeg`, `image/gif`, `image/webp`, and also `image/bmp`,
+  `image/tiff`, `image/heic`, `image/heif`, `image/avif`, `image/x-icon` and `image/jxl`, which an agent
+  can't show: keep such an image as pasted, with a PNG copy beside it. An image past what's left of
+  the 20 MB is asked about in Kerdr, and a smaller copy (JPEG, or PNG for one with see-through parts)
+  goes only on a yes; the backend is never sent one past the limit.
+- **`fix_input`.** A `create`, an `edit` that saves and an `answer` carry `"fix_input": true`. With it,
+  a line that looks like a token or password is a question, not a refusal: answer with
+  `confirmation`, `confirm` (its token), `redact` (the line numbers) and `message` ("Line 3 looks
+  like a token or password. Save with it replaced by [redacted]?"). Kerdr asks it; the yes is the
+  same request again (a `create` the same send, with its `submission`, words and images) with
+  `confirm` and `"override": true`, and the backend saves with only those values replaced. No
+  saves nothing: a new intent's words open again in the box. An `answer` asked about the same way
+  names the question in its message, the others saved.
+- **Edits.** A save carries `base`, the text its `was` is of. When the text changed meanwhile and the
+  two changes touch different lines, merge them, save, and answer ok with `"merged": true`, saying so.
+  When they touch the same lines, answer `status: "stale"` with the newer `text` and `was` as before,
+  and `"conflict": true`: Kerdr asks whether to open both now, never a red failure. A `#` or `##`
+  heading, an open code block or a NUL is fixed and saved: answer ok with `fixed`,
+  `[{"line": 1, "kind": "heading", "message": "Line 1's # heading is now ###, …"}]`, and the `text`
+  and `was` that were saved; Kerdr says which lines changed and keeps the text as written, so `e`
+  brings it back.
+
+Every other backend is sent what Kerdr 0.35.0 sent, and refused as it refused: 64 KiB, 20 PNG, JPEG,
+GIF or WebP images of at most 10 MB, and no `fix_input` or `base`.
+
 ## A quiet board
 
 A read that fails once says nothing. While a machine has dropped, or a feed or a herdr read is
@@ -1101,13 +1138,14 @@ first `## ` section); it never ends in a newline:
 ```
 
 Kerdr writes it, with one final newline, to `NNNN-text.md` (so the editor treats it as markdown) in
-a folder of its own in the system temp folder, readable only by you (0700, and the file 0600, on
+a folder of its own in the system temp folder (or, when that can't take it, `$XDG_RUNTIME_DIR`, then
+an `edit` folder in Kerdr's state folder), readable only by you (0700, and the file 0600, on
 Unix), opens it in the editor Kerdr's `editor` setting names, else `$VISUAL`, else `$EDITOR`, else
-`nvim`, else `vim`, and removes both when the editor closes. The setting's words are split as a
+`nvim`, `vim`, `vi` or `nano`, and removes both when the editor closes. The setting's words are split as a
 shell would split them, but no shell runs it; the file's path is its own last argument. An editor
 that opens a window of its own (`code`, `codium`, `subl`, `gvim`, `mvim`) named without its
-waiting flag (`--wait`, `-w`, `-f`) isn't started, since Kerdr would be back before you'd written
-anything: Kerdr says which flag to add to its `editor` setting, and keeps the text for `e`. When
+waiting flag (`--wait`, `-w`, `-f`) is given it, right after the program, since Kerdr would
+otherwise be back before you'd written anything, and the board says so in one line. When
 the editor exits with an error (`:cq`), closes without writing the file (`:q`), or leaves the text
 as it was read, nothing is sent and nothing is said. When it dies instead (killed by a signal, or
 crashed, so it has no exit code), what the file held is kept as your version, sent nowhere, and the

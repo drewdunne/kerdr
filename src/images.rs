@@ -2186,6 +2186,32 @@ mod tests {
         }
     }
 
+    /// As live_clipboard, read with Kerdr's own reader alone, every program missing (intent 0591,
+    /// K3-63): `cargo test -- --ignored live_clipboard`.
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    #[ignore]
+    fn live_clipboard_own_reader() {
+        let path = std::env::var("KERDR_LIVE_CLIPBOARD_IMAGE")
+            .expect("KERDR_LIVE_CLIPBOARD_IMAGE names the image put on the clipboard");
+        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
+        let (wayland, x11) = (set("WAYLAND_DISPLAY"), set("DISPLAY"));
+        let no_programs = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        };
+        let found = clipboard_here(
+            wayland,
+            x11,
+            &builtin::readers(wayland, x11),
+            &no_programs,
+            Room::left(&[]),
+        );
+        let Ok(Found::Image(got)) = found else {
+            panic!("Kerdr's own reader didn't read it: {found:?}")
+        };
+        assert_eq!(got.bytes, std::fs::read(&path).unwrap());
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_reader_that_hangs_or_floods_is_stopped() {

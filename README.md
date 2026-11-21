@@ -293,7 +293,7 @@ peek alike:
 - `d` starts it in its recorded machine and session. At the usual work limit, Kerdr asks before
   starting another; the adapter still enforces its hard limit.
 - `e` opens its text, the words that started it, full screen in your own editor: Kerdr's `editor`
-  setting, else `$VISUAL`, else `$EDITOR`, else nvim, else vim. `:wq` and you're back on the board
+  setting, else `$VISUAL`, else `$EDITOR`, else nvim, vim, vi or nano. `:wq` and you're back on the board
   at once, the card already showing the new words with ✎ while the adapter saves them and writes
   the card up again, and you can carry on meanwhile; when the save lands nothing more is said.
   Changes already on their way carry on while the editor is open. `d` on it meanwhile starts it
@@ -306,8 +306,11 @@ peek alike:
   still opens your version so you can copy it, and sends nothing, unless its backend does each
   key's step first, which edits it where it is; so does a machine that isn't answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
   `q` says first when quitting would lose a version only Kerdr keeps, and a second `q` quits. An editor that opens a window of
-  its own needs its waiting form, such as `code --wait`: without it Kerdr doesn't start it, and
-  says which flag to add.
+  its own is given its waiting flag (`code` runs as `code --wait`, `subl -w`, `gvim -f`), and Kerdr says so. When the
+  temp folder can't take the file, it opens in `$XDG_RUNTIME_DIR`, then in Kerdr's state folder, each private to you. To a
+  backend that fixes input (its feed lists `fix-input`), any length of text saves; a `#` heading, an open code block or a NUL
+  is fixed and saved, saying which lines, with your text as you wrote it kept for `e`; a change made meanwhile on other
+  lines is merged and saved, and one on the same lines asks whether to open both.
 - `d` or `⏎` starts it. Background work with questions only you can answer opens its **Kickoff
   Questions** box instead, labelled a background task, since your answers are what let it run on its
   own. It shows each question whole, one at a time, with a recommendation: `⏎` takes that or sends what
@@ -344,11 +347,18 @@ Ctrl+V in the box attaches the image on your clipboard, as Claude Code does: it 
 of your words as an `[Image #1]` tag, numbered within that intent, and travels with them to the
 adapter. Pasting or dropping an image file's path attaches that file, and a file copied in a file
 manager attaches too. Backspace right after a tag takes it out, with its image; only images whose
-tags are still in your words are sent. Kerdr attaches PNG, JPEG, GIF and WebP, up to 10 MB each and
-20 images or 20 MB in one intent, and says which limit an image is past. It reads the clipboard
-with `wl-paste` (from wl-clipboard) under Wayland, `xclip` under X11, `osascript` on macOS and
-PowerShell on Windows; where there's no desktop clipboard (over SSH, say), it says so, and a
-pasted path still works.
+tags are still in your words are sent. A second Ctrl+V (or path) while one is being read is read
+next, its tag in the order you pasted. To a backend that fixes input (its feed lists `fix-input`),
+Kerdr attaches any kind of image (a BMP, TIFF, HEIC and the like is saved as pasted, with a PNG copy
+beside it), as many as fit in 20 MB together; one past that is asked about, and a smaller copy goes in
+only if you say so, the image itself untouched. A folder attaches the images directly in it, each
+named; a file copied in a file manager that isn't an image by its name is read for what it is, and a
+text file's words go into yours. Words of any length go too, up to a megabyte in the box. To an older
+backend, Kerdr attaches PNG, JPEG, GIF and WebP, up to 10 MB each and 20 images or 20 MB in one
+intent, and says which limit an image is past. When the clipboard holds text, Ctrl+V pastes it. Kerdr
+reads the clipboard itself under Wayland and X11, and with `wl-paste` (from wl-clipboard) or `xclip`
+when it can't; `osascript` on macOS and PowerShell on Windows; where there's no desktop clipboard
+(over SSH, say), it says so, and a pasted path still works.
 
 `f` opens the filters. On the owner split its list is the tree of owners and their teams, grouped
 by organization, then the chosen owner's projects and each machine, with how much of each is under
@@ -461,8 +471,12 @@ then on every other machine that needs it, one after another, with no Tab needed
 names them (“⏎ sign in on laptop, then build-box”). On an account already ready there, Enter
 asks instead: it offers all the machines that need a sign-in one after another (when there are
 several), each of them, or signing in again where it's ready.
-`e` renames, `t` tests, and `x` removes after a question. The browser opens using the system’s
-URL handler. `c` copies the visible link through the terminal clipboard and `o` opens it again.
+`e` renames, `t` tests, and `x` removes after a question. The browser opens using `$BROWSER`, then
+Omarchy's launcher, `gio open` and `xdg-open` (the system’s URL handler on macOS and Windows), each
+tried while the one before can't; with none (over SSH, say), the link goes to the terminal clipboard
+by itself. `c` copies the visible link through the terminal clipboard and `o` opens it again. In the
+add form, a code typed in lower case or without its provider's letter is fixed and shown before
+Enter adds it; with no machine ticked, the form's own is.
 
 ![Enter on an account that's ready offers the machines that need a sign-in](docs/screenshots/sign-in-where.png)
 
@@ -651,8 +665,8 @@ Kerdr works with no config: it shows this machine. To add machines and a feed, w
 
 ```toml
 # What e opens a backlog item's text in, with its arguments; it goes above every [section].
-# Without it: $VISUAL, else $EDITOR, else nvim, else vim. One that opens a window of its own needs
-# its waiting flag (code --wait, subl -w, gvim -f), or Kerdr won't start it.
+# Without it: $VISUAL, else $EDITOR, else nvim, vim, vi or nano. One that opens a window of its own
+# is given its waiting flag (code --wait, subl -w, gvim -f).
 # editor = "code --wait"
 
 [feed]
@@ -687,6 +701,11 @@ Backlog and Maintain, each of which has a screen of its own (the backlog, `b`, a
 any stage by its id, on every stage list that has it (`"deploy"`, `"learn"`). `n` still reaches a
 backlog card that needs you, opening the backlog on it, and a hidden stage's card on its own
 screen; `/` finds them too.
+
+A config that doesn't parse never keeps Kerdr from opening: the lines at fault are left out, each
+said in the board's failure box with its line, and everything else in the file counts. A
+`hide_columns` name that would hide work with no screen of its own (`"misc"`) is left showing, and
+said. `kerdr doctor` lists the same. Kerdr never writes the file.
 
 `[board] split` says what the top bar splits the board by: `"owners"` (the default) whenever a
 feed lists owners, else machines; `"machines"` keeps machines and their herdr sessions.
