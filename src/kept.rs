@@ -988,8 +988,7 @@ impl Words {
             }
         }
         for a in other.answers {
-            self.answers.retain(|o| o.key != a.key);
-            self.answers.push(a);
+            merge_answers(&mut self.answers, a);
         }
     }
 }
@@ -1029,6 +1028,22 @@ struct WordSet {
     left_by: Option<String>,
     #[serde(flatten)]
     words: Words,
+}
+
+/// One card's kept Kickoff answers added to what's kept already, by question identity (its
+/// number and wording) rather than by card: another question's answer is added; another answer
+/// to the same question is kept beside the first, as an alternative d shows; the same answer is
+/// kept once (Codex's review 98, 4).
+pub fn merge_answers(into: &mut Vec<KeptAnswers>, other: KeptAnswers) {
+    let Some(kept) = into.iter_mut().find(|k| k.key == other.key) else {
+        into.push(other);
+        return;
+    };
+    for answer in other.answers {
+        if !kept.answers.contains(&answer) {
+            kept.answers.push(answer);
+        }
+    }
 }
 
 /// The answers file: each Kerdr's Kickoff answers not saved yet, with the Kerdr that took them, as
@@ -1505,6 +1520,43 @@ mod tests {
                 key: "ark-sdlc:0042".into(),
                 answers: vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
             }],
+        }
+    }
+
+    #[test]
+    fn two_kerdrs_answers_to_one_card_are_merged_by_question() {
+        // Codex's review 98, 4: two Kerdr windows kept answers to the same card: one to question
+        // 1; the other to question 2, and to question 1 differently. The next Kerdr has all three:
+        // the other question's, and both answers to question 1.
+        let dir = tempfile::tempdir().unwrap();
+        let kept = |answers: Vec<(&str, &str, &str)>| Words {
+            answers: vec![KeptAnswers {
+                key: "ark-sdlc:0042".into(),
+                answers: answers
+                    .into_iter()
+                    .map(|(n, q, w)| (n.to_string(), q.to_string(), w.to_string()))
+                    .collect(),
+            }],
+            ..Words::default()
+        };
+        Kept::at(dir.path(), 1000)
+            .keep_words(&kept(vec![("1", "Whose is it?", "Kibbelz's")]))
+            .unwrap();
+        Kept::at(dir.path(), 1000)
+            .keep_words(&kept(vec![
+                ("2", "Where does it run?", "LAB-Server"),
+                ("1", "Whose is it?", "Arkship's"),
+            ]))
+            .unwrap();
+        let back = Kept::at(dir.path(), 2000).take_words();
+        assert_eq!(back.answers.len(), 1, "one card: {:?}", back.answers);
+        let words: Vec<&str> = back.answers[0]
+            .answers
+            .iter()
+            .map(|(.., w)| w.as_str())
+            .collect();
+        for w in ["Kibbelz's", "LAB-Server", "Arkship's"] {
+            assert!(words.contains(&w), "{w} was dropped: {words:?}");
         }
     }
 

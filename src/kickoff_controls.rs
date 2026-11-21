@@ -33,6 +33,9 @@ const CHANGED: &str =
     "These questions changed since the board last read them. These are the current ones.";
 /// What it adds when it has words typed for a question that has gone or been reworded.
 const CHANGED_KEPT: &str = "What you typed for the old wording:";
+/// Before answers kept for a question beside the one in its box: another Kerdr's, or his own from
+/// another time (Codex's review 98, 4).
+const ALSO_KEPT: &str = "Also kept for these questions:";
 /// When the check behind a box opened from the feed gets no answer.
 const UNCHECKED: &str =
     "Kerdr couldn't check these are still current. Your answers are checked when they're sent.";
@@ -104,6 +107,19 @@ fn as_filled(text: &str) -> String {
         .collect()
 }
 
+/// A note with any other answers kept for its questions after it, each by its question's number.
+fn with_also(note: Option<String>, also: &[KeptAnswer]) -> Option<String> {
+    if also.is_empty() {
+        return note;
+    }
+    let listed: Vec<String> = also
+        .iter()
+        .map(|(num, _, words)| format!("{num}. {}", clean(words)))
+        .collect();
+    let words = format!("{ALSO_KEPT} {}", listed.join(" / "));
+    Some(note.map_or_else(|| words.clone(), |note| format!("{note} {words}")))
+}
+
 /// A note with any words typed against an old wording after it.
 fn with_orphaned(note: Option<String>, orphaned: &[String]) -> Option<String> {
     if orphaned.is_empty() {
@@ -139,6 +155,9 @@ pub struct Kickoff {
     /// Words typed for a question the check found changed: they're no answer to the new one, so
     /// they stay in the note, and go with the rest of what's kept if he leaves (intent 0491).
     pub orphaned: Vec<String>,
+    /// Other answers kept for its questions, beside the ones in its box: shown in its note, and
+    /// kept with them (Codex's review 98, 4).
+    pub also: Vec<KeptAnswer>,
     /// His answers its backend gave back because their questions changed while he answered:
     /// filled in by number, again after a check finds the questions changed (intent 0591).
     pub prefill: Vec<Prefill>,
@@ -178,11 +197,21 @@ impl Kickoff {
         let questions = cleaned(&response.questions);
         let mut drafts = drafts_for(&questions, kept);
         fill_in(&questions, &mut drafts, &response.prefill);
-        let orphaned: Vec<String> = kept
-            .iter()
-            .filter(|(num, ..)| num.is_empty())
-            .map(|(.., words)| words.clone())
-            .collect();
+        // The first kept answer to a question goes in its box; any other kept for it is said and
+        // kept beside it; one for a question no longer asked, or with no question of its own, is
+        // said as typed for an old wording.
+        let mut orphaned: Vec<String> = vec![];
+        let mut also: Vec<KeptAnswer> = vec![];
+        for (i, (num, question, words)) in kept.iter().enumerate() {
+            let asked = questions
+                .iter()
+                .any(|q| q.num == *num && q.question == *question);
+            if num.is_empty() || !asked {
+                orphaned.push(words.clone());
+            } else if kept[..i].iter().any(|(n, q, _)| n == num && q == question) {
+                also.push((num.clone(), question.clone(), words.clone()));
+            }
+        }
         Some(Kickoff {
             machine,
             request,
@@ -198,9 +227,13 @@ impl Kickoff {
             } else {
                 None
             },
-            note: with_orphaned(response.note.as_deref().map(clean), &orphaned),
+            note: with_also(
+                with_orphaned(response.note.as_deref().map(clean), &orphaned),
+                &also,
+            ),
             check: 0,
             orphaned,
+            also,
             prefill: response.prefill.clone(),
             ready_at: Instant::now() + READY_AFTER,
             scroll: Cell::new(0),
@@ -222,7 +255,10 @@ impl Kickoff {
             None
         };
         self.asked = response.asked.clone().unwrap_or_default();
-        self.note = with_orphaned(response.note.as_deref().map(clean), &self.orphaned);
+        self.note = with_also(
+            with_orphaned(response.note.as_deref().map(clean), &self.orphaned),
+            &self.also,
+        );
         let now = cleaned(&response.questions);
         if now != self.questions {
             let kept = self.kept();
@@ -251,7 +287,10 @@ impl Kickoff {
             self.questions = now;
             self.at = 0;
             self.reached = 0;
-            self.note = with_orphaned(Some(CHANGED.into()), &self.orphaned);
+            self.note = with_also(
+                with_orphaned(Some(CHANGED.into()), &self.orphaned),
+                &self.also,
+            );
             self.ready_at = Instant::now() + READY_AFTER;
             self.scroll.set(0);
         }
@@ -522,6 +561,12 @@ impl App {
                 .iter()
                 .map(|words| (String::new(), String::new(), words.clone())),
         );
+        // Other answers kept for its questions stay kept beside his.
+        for answer in &form.also {
+            if !kept.contains(answer) {
+                kept.push(answer.clone());
+            }
+        }
         if kept.is_empty() {
             self.kickoff_kept.remove(&held);
         } else {
@@ -1425,6 +1470,52 @@ mod tests {
         let reopened =
             Kickoff::from_answer(0, &request, &reworded, "#41".into(), "t".into(), &kept).unwrap();
         assert_eq!(reopened.drafts[0], "");
+    }
+
+    #[test]
+    fn two_answers_kept_for_one_question_are_both_shown_and_both_kept() {
+        // Codex's review 98, 4: two Kerdrs kept answers to the same card's questions, one each to
+        // question 1, differing. The box d opens fills in the first, says the other, and keeps
+        // both: closing it loses neither.
+        let kept = vec![
+            (
+                "1".to_string(),
+                "Whose is it?".to_string(),
+                "Kibbelz's".to_string(),
+            ),
+            (
+                "1".to_string(),
+                "Whose is it?".to_string(),
+                "Arkship's".to_string(),
+            ),
+            (
+                "3".to_string(),
+                "Where does it run?".to_string(),
+                "LAB-Server".to_string(),
+            ),
+        ];
+        let request = json!({"action": "dispatch", "id": "41", "override": true, "confirm": "old", "asked": "old", "answers": []});
+        let form =
+            Kickoff::from_answer(0, &request, &answer(), "#41".into(), "t".into(), &kept).unwrap();
+        assert_eq!(form.drafts, ["Kibbelz's", "LAB-Server"]);
+        let note = form.note.clone().unwrap_or_default();
+        assert!(
+            note.contains("1. Arkship's"),
+            "the other answer isn't said: {note}"
+        );
+        let (mut app, _) = open_on(&answer());
+        app.keep_kickoff(&form, None);
+        let back = app
+            .kickoff_kept
+            .get(&held("41"))
+            .cloned()
+            .unwrap_or_default();
+        for words in ["Kibbelz's", "Arkship's", "LAB-Server"] {
+            assert!(
+                back.iter().any(|(.., w)| w == words),
+                "{words} wasn't kept: {back:?}"
+            );
+        }
     }
 
     #[test]

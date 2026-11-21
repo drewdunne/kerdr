@@ -2274,9 +2274,16 @@ impl App {
                 },
             );
         }
-        // Kickoff answers the last Kerdr kept: d opens them again. Ones typed here since stay.
+        // Kickoff answers the last Kerdr kept: d opens them again. Ones typed here since stay,
+        // and an answer to the same question from there is kept beside them (Codex's review 98,
+        // 4).
         for a in words.answers {
-            self.kickoff_kept.entry(a.key).or_insert(a.answers);
+            let kept = self.kickoff_kept.entry(a.key).or_default();
+            for answer in a.answers {
+                if !kept.contains(&answer) {
+                    kept.push(answer);
+                }
+            }
         }
     }
 
