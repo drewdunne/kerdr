@@ -2070,9 +2070,32 @@ impl App {
                     text: mine.text.clone(),
                     from: mine.from.clone(),
                     as_written: self.as_written.contains(key),
+                    in_box: false,
                 })
             })
             .collect();
+        // An edit open in Kerdr's own box: what the box holds now is that card's version, kept
+        // with the text it was read as and its fingerprint (Codex's review 85, 3).
+        if let Some((key, edit)) = self.open_edit_box()
+            && let Some(held) = self.edits.get(&key)
+            && let Some(machine) = self.machines.get(held.machine).map(|m| m.name())
+        {
+            edits.retain(|e| e.key != key);
+            edits.push(KeptEdit {
+                key,
+                id: held.id.clone(),
+                machine,
+                current: held.current.clone(),
+                was: held.was.clone(),
+                text: edit,
+                from: held
+                    .mine
+                    .as_ref()
+                    .map_or_else(|| held.current.clone(), |m| m.from.clone()),
+                as_written: false,
+                in_box: true,
+            });
+        }
         edits.sort_by(|a, b| a.key.cmp(&b.key));
         words.edits = edits;
         words
@@ -2102,6 +2125,42 @@ impl App {
             self.resolver.words_kept();
         }
         kept
+    }
+
+    /// The edit open in Kerdr's own box, if one is: its card's key and the text the box holds, read
+    /// back as a save would read it.
+    pub(crate) fn open_edit_box(&self) -> Option<(String, String)> {
+        let super::Mode::Compose { draft, .. } = &self.mode else {
+            return None;
+        };
+        let edit = draft.edit.as_ref()?;
+        Some((
+            edit.key.clone(),
+            crate::edit::read_back(&draft.words, edit.marker.as_deref()),
+        ))
+    }
+
+    /// While an edit is open in Kerdr's own box, what it holds is in the words file, written again
+    /// when it has changed, every two seconds at most, so a Kerdr killed before ⏎ or Esc brings it
+    /// back as that card's edit (Codex's review 85, 3).
+    pub(crate) fn keep_open_edit(&mut self) {
+        let Some((key, text)) = self.open_edit_box() else {
+            return;
+        };
+        let kept = self.words_kept.as_ref().is_some_and(|w| {
+            w.edits
+                .iter()
+                .any(|e| e.in_box && e.key == key && e.text == text)
+        });
+        if kept
+            || self
+                .words_tried
+                .is_some_and(|at| at.elapsed() < WORDS_AGAIN)
+        {
+            return;
+        }
+        self.words_tried = Some(Instant::now());
+        self.keep_words_now();
     }
 
     /// A new intent waiting for the words file to be written: tried again every two seconds.

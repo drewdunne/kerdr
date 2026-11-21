@@ -865,6 +865,10 @@ pub struct KeptEdit {
     /// can bring it back, and quitting loses nothing (intent 0591, release 5).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub as_written: bool,
+    /// Being edited in Kerdr's own box when it was kept (no editor could start): what the box
+    /// held then, never new-intent words (Codex's review 85, 3).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub in_box: bool,
 }
 
 /// A new intent its backend accepted and is still saving, with no number yet (intent 0591,
@@ -1339,6 +1343,7 @@ mod tests {
             }],
             edits: vec![KeptEdit {
                 as_written: false,
+                in_box: false,
                 key: "ark-sdlc:0041".into(),
                 id: "0041".into(),
                 machine: "LAB-Server".into(),

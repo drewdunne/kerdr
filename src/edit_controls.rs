@@ -766,6 +766,10 @@ impl App {
         // The box says it all, each editor tried with why: nothing more on the message line.
         let back = Box::new(self.mode.clone());
         self.mode = Mode::Compose { draft, back };
+        // Kept at once as that card's edit, so a Kerdr killed now brings it back (Codex's
+        // review 85, 3).
+        self.words_tried = None;
+        self.keep_open_edit();
     }
 
     /// ⏎ in the box holding an item's text: saved as the editor's `:wq` saves it.
@@ -3345,6 +3349,53 @@ mod tests {
             app.mode
         );
         assert!(app.edits.contains_key(&key));
+    }
+
+    #[test]
+    fn an_edit_open_in_kerdrs_own_box_comes_back_as_that_cards_edit_after_a_kill() {
+        // Codex's review 85, 3: killed before ⏎ or Esc, the next Kerdr has what the box held as
+        // that card's version, with the text it was read as and its fingerprint, and never as
+        // new-intent words.
+        let state = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = crate::kept::Kept::at(state.path(), chrono::Local::now().timestamp());
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        app.edit_ended(
+            &key,
+            Ended::NoEditor {
+                skipped: vec!["nvim: not found".into()],
+            },
+        );
+        assert!(matches!(&app.mode, Mode::Compose { draft, .. } if draft.edit.is_some()));
+        for c in " And more.".chars() {
+            press(&mut app, c);
+        }
+        // The board's turn: what changed in the box goes to the words file.
+        app.words_tried = None;
+        app.keep_open_edit();
+        let file = std::fs::read_to_string(state.path().join("words.json")).unwrap();
+        assert!(file.contains("Old words. And more."), "{file}");
+        // Killed here: nothing else runs. The next Kerdr reads what was kept.
+        drop(app);
+        let mut next = super::tests::app();
+        next.kept = crate::kept::Kept::at(state.path(), chrono::Local::now().timestamp());
+        let words = next.kept.take_words();
+        assert!(
+            words.draft.is_none(),
+            "never new-intent words: {:?}",
+            words.draft
+        );
+        next.restore_words(words);
+        assert!(next.draft.is_empty() && next.returned.is_empty());
+        let held = &next.edits[&key];
+        assert_eq!(held.mine.as_ref().unwrap().text, "Old words. And more.");
+        assert_eq!(held.mine.as_ref().unwrap().from, "Old words.");
+        assert_eq!(
+            (held.current.as_str(), held.was.as_str()),
+            ("Old words.", "sha256:aa")
+        );
+        assert!(held.check_first, "e checks the text first");
     }
 
     #[test]

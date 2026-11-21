@@ -1187,6 +1187,8 @@ fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
 fn run_ready(app: &mut App, runner: &Runner) {
     // A new intent waiting for the words file goes once it's written there (Codex's review 63, 2).
     app.keep_waiting_words();
+    // An edit open in Kerdr's own box is kept as it's typed (Codex's review 85, 3).
+    app.keep_open_edit();
     for n in app.resolver.take_dropped() {
         let _ = runner.tx.send(ToRunner::Drop(n));
     }
