@@ -6745,6 +6745,49 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_request_sent_on_to_a_machine_kerdr_doesnt_know_goes_as_to_an_older_backend() {
+        // Codex's review 86, 5: only the machine that sends it on lists fix-input; where it goes
+        // isn't one of Kerdr's machines, so nothing says it takes more than 0.35.0 did.
+        use base64::Engine;
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(crate::images::FIX_INPUT.into());
+        let tiff = base64::engine::general_purpose::STANDARD
+            .encode([b"II*\0".to_vec(), vec![0; 60]].concat());
+        let onward = serde_json::json!({"action": "edit", "id": "0045", "text": "t", "base": "b",
+            "was": "sha256:aa", "forward_to": "far-away"});
+        let sent = app.with_fix_input(0, onward.clone());
+        assert!(
+            sent.get("fix_input").is_none() && sent.get("base").is_none(),
+            "{sent}"
+        );
+        let create = serde_json::json!({"action": "create", "words": "Scan [Image #1]",
+            "session": "default", "submission": "s-far", "forward_to": "far-away",
+            "images": [{"tag": 1, "type": "image/tiff", "data": tiff}]});
+        let why = app.fits_backend(0, &create).unwrap_err();
+        assert!(
+            why.contains("takes only PNG, JPEG, GIF and WebP images"),
+            "{why}"
+        );
+        // Sent on to one Kerdr knows fixes input: as to it.
+        app.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(crate::images::FIX_INPUT.into());
+        let known = app.machines[1].name();
+        let mut there = onward;
+        there["forward_to"] = serde_json::json!(known);
+        assert_eq!(app.with_fix_input(0, there)["fix_input"], true);
+    }
+
+    #[test]
     fn copied_text_that_doesnt_fit_the_box_is_kept_and_stops_a_send() {
         // Codex's review 85, 5: what fits goes in, cut between characters, never inside one; the
         // rest is kept for c, said; and words Enter sent while it was read aren't sent without it.

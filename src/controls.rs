@@ -3304,12 +3304,17 @@ impl App {
     }
 
     /// Whether the request, sent to `machine`, ends at a backend that fixes input: that machine's,
-    /// and the one it's sent on to (`forward_to`) when the board knows it (Codex's review 85, 6).
+    /// and the one it's sent on to (`forward_to`), which must be one the board knows to fix input
+    /// too: one it doesn't know is taken as an older one (Codex's reviews 85, 6, and 86, 5).
     pub(crate) fn fixes_input_at(&self, machine: usize, request: &Value) -> bool {
-        let onward = request["forward_to"]
-            .as_str()
-            .and_then(|host| self.machine_index(host));
-        self.fixes_input(machine) && onward.is_none_or(|m| self.fixes_input(m))
+        let onward = match request.get("forward_to") {
+            None => true,
+            Some(host) => host
+                .as_str()
+                .and_then(|host| self.machine_index(host))
+                .is_some_and(|m| self.fixes_input(m)),
+        };
+        self.fixes_input(machine) && onward
     }
 
     /// Whether a request, as it goes to `machine`, is one its backend takes (Codex's review 85, 6):
