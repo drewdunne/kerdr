@@ -665,7 +665,10 @@ impl Kept {
                     });
                 }
             }
-            file.sets.retain(|s| s.by.as_deref() != Some(me.as_str()));
+            // This Kerdr's own answers, taken before, stay: only an emptied set goes, as in the
+            // words file (Codex's review 99, 1).
+            file.sets
+                .retain(|s| s.by.as_deref() != Some(me.as_str()) || !s.answers.is_empty());
             if !taken.answers.is_empty() {
                 file.sets.push(AnswerSet {
                     by: Some(me.clone()),
@@ -1521,6 +1524,28 @@ mod tests {
                 answers: vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
             }],
         }
+    }
+
+    #[test]
+    fn answers_a_kerdr_took_stay_in_the_file_when_it_takes_again() {
+        // Codex's review 99, 1: a Kerdr takes the answers another left, takes again (a second
+        // read of the words), and ends without keeping its own; the next Kerdr has them.
+        let dir = tempfile::tempdir().unwrap();
+        let answers = vec![KeptAnswers {
+            key: "ark-sdlc:0042".into(),
+            answers: vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
+        }];
+        let left = Words {
+            answers: answers.clone(),
+            ..Words::default()
+        };
+        Kept::at(dir.path(), 1000).keep_words(&left).unwrap();
+        let mut taking = Kept::at(dir.path(), 1000);
+        assert_eq!(taking.take_words().answers, answers);
+        let _ = taking.take_words();
+        drop(taking);
+        let back = Kept::at(dir.path(), 2000).take_words();
+        assert_eq!(back.answers, answers, "a second take dropped them");
     }
 
     #[test]
