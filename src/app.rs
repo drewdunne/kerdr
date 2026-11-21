@@ -6993,6 +6993,79 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn yes_to_a_smaller_copy_keeps_it_where_it_was_pasted_before_what_was_pasted_after_it() {
+        // Codex's review 86, 9: A, too large, then B, ordinary, pasted at the same place. B waits
+        // while A's question is open; yes to A's smaller copy, and A still comes before B.
+        use crate::images::{Loaded, Loading, Source};
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        app.on_paste("See");
+        let big = Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 25_000_000]].concat(),
+            from: "a.png".into(),
+        };
+        let smaller = Loaded {
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![7; 100]].concat(),
+            ..big.clone()
+        };
+        let b = Loaded {
+            from: "b.png".into(),
+            ..a_png()
+        };
+        let (a_read, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        let (b_read, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            a_read,
+            Loading {
+                images: vec![big],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "A asked about");
+        app.images_loaded(
+            b_read,
+            Loading {
+                images: vec![b.clone()],
+                ..Default::default()
+            },
+        );
+        answer_now(&mut app);
+        let Action::LoadImages(source) = press(&mut app, 'y') else {
+            panic!("yes read nothing")
+        };
+        // As the board's loop does: the read begins at once, and what's waiting goes in meanwhile.
+        let (id, _) = app.begin_image_load(&source).unwrap();
+        app.apply_reads();
+        app.images_loaded(
+            id,
+            Loading {
+                images: vec![smaller.clone()],
+                ..Default::default()
+            },
+        );
+        app.apply_reads();
+        assert_eq!(box_words(&app), "See [Image #1] [Image #2] ");
+        let Mode::Compose { draft, .. } = &app.mode else {
+            unreachable!()
+        };
+        let tagged = |n: u32| {
+            draft
+                .images
+                .iter()
+                .find(|i| i.tag == n)
+                .unwrap()
+                .bytes
+                .len()
+        };
+        assert_eq!(
+            (tagged(1), tagged(2)),
+            (smaller.bytes.len(), b.bytes.len()),
+            "B went in before A"
+        );
+    }
+
+    #[test]
     fn an_image_past_what_an_intent_may_carry_is_asked_about_before_a_smaller_copy_goes_in() {
         // Intent 0591, K3-54, K3-55: never shrunk without asking; yes reads a smaller copy, its
         // tag where the image's would have gone, and no leaves it out, the image as it was.

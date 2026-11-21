@@ -2522,7 +2522,7 @@ impl App {
         let after = self.box_loading().is_some();
         self.image_loads += 1;
         let id = self.image_loads;
-        self.image_reads.push_back(crate::app::ImageRead {
+        let read = crate::app::ImageRead {
             id,
             at,
             for_send: false,
@@ -2533,7 +2533,28 @@ impl App {
                 images::Source::Smaller(..) => "Making a smaller copy",
             },
             got: None,
-        });
+        };
+        if let images::Source::Smaller(..) = source {
+            // Yes to a smaller copy: its image went in its turn, so every read for the box still
+            // to come was pasted after it, and the copy goes in before them, in its image's place
+            // (Codex's review 86, 9).
+            let first = self
+                .image_reads
+                .iter()
+                .position(|r| !r.for_send)
+                .unwrap_or(self.image_reads.len());
+            self.image_reads.insert(first, read);
+            if after {
+                self.say(
+                    "Making a smaller copy; it goes in where its image was pasted, before what you pasted after it.",
+                    Tone::Info,
+                );
+            } else {
+                self.say(reading(source), Tone::Info);
+            }
+            return Some((id, room));
+        }
+        self.image_reads.push_back(read);
         if after {
             self.say(
                 format!(
