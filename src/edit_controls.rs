@@ -1467,13 +1467,19 @@ mod tests {
 
     fn send(app: &mut App, machine: usize, request: Value) -> Sent {
         app.queue_action(machine, request.clone());
+        // As it was asked: the `fix_input` a backend that fixes input is told aside.
+        let asked = |r: &Value| {
+            let mut r = crate::actions::without_op(r);
+            if let Some(fields) = r.as_object_mut() {
+                fields.remove("fix_input");
+            }
+            r
+        };
         let n = app
             .resolver
             .ready()
             .into_iter()
-            .find(|(_, m, r, gated)| {
-                *m == machine && crate::actions::without_op(r) == request && !gated
-            })
+            .find(|(_, m, r, gated)| *m == machine && asked(r) == request && !gated)
             .map(|(n, _, r, _)| (n, r))
             .expect("it goes to the runner at once");
         let (n, request) = n;

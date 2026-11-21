@@ -17,8 +17,17 @@ use std::cell::Cell;
 
 /// A new question never takes a key held down, or one pressed before it appeared.
 const READY_AFTER: Duration = Duration::from_millis(500);
-/// As long as the backend takes an answer.
+/// As long as a backend without fix-input takes an answer.
 const ANSWER_MOST: usize = 2000;
+
+/// As long as an answer may be typed for a backend that fixes input, which saves a long one whole
+/// (intent 0591, release 5).
+const FIX_ANSWER_MOST: usize = 100_000;
+
+/// The most one answer may be, for a backend that fixes input or not.
+fn answer_most(fix: bool) -> usize {
+    if fix { FIX_ANSWER_MOST } else { ANSWER_MOST }
+}
 /// When the questions read ahead turned out not to be the ones it asks now.
 const CHANGED: &str =
     "These questions changed since the board last read them. These are the current ones.";
@@ -91,7 +100,7 @@ fn as_filled(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(ANSWER_MOST)
+        .take(FIX_ANSWER_MOST)
         .collect()
 }
 
@@ -488,7 +497,8 @@ impl App {
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && form.typed().chars().count() < ANSWER_MOST =>
+                    && form.typed().chars().count()
+                        < answer_most(self.fixes_input(form.machine)) =>
             {
                 form.drafts[form.at].push(c);
             }
@@ -533,8 +543,8 @@ impl App {
     }
 
     /// Text pasted into the box goes in as one line.
-    pub(super) fn kickoff_paste(form: &mut Kickoff, text: &str) {
-        let room = ANSWER_MOST.saturating_sub(form.typed().chars().count());
+    pub(super) fn kickoff_paste(form: &mut Kickoff, text: &str, fix: bool) {
+        let room = answer_most(fix).saturating_sub(form.typed().chars().count());
         let line: String = text
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -894,6 +904,26 @@ mod tests {
         };
         assert_eq!(form.at, 1, "the Enter counted");
         assert_eq!(form.drafts[0], "mine");
+    }
+
+    #[test]
+    fn a_long_answer_goes_whole_to_a_backend_that_fixes_input() {
+        // Intent 0591, release 5 (B1-111): it saves a long answer whole; an older one keeps its
+        // 2000 characters.
+        let (mut app, _) = open_on(&answer());
+        key(&mut app, KeyCode::Enter);
+        let long = "word ".repeat(1000);
+        app.on_paste(&long);
+        assert_eq!(showing(&app).typed().chars().count(), ANSWER_MOST);
+        let (mut app, _) = open_on(&answer());
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        key(&mut app, KeyCode::Enter);
+        app.on_paste(&long);
+        assert_eq!(showing(&app).typed().chars().count(), long.trim().len());
     }
 
     #[test]
@@ -1512,7 +1542,7 @@ mod tests {
             panic!()
         };
         assert_eq!(form.typed(), "qdy");
-        App::kickoff_paste(form, " two\nlines ");
+        App::kickoff_paste(form, " two\nlines ", false);
         assert_eq!(form.typed(), "qdytwo lines");
         key(&mut app, KeyCode::Backspace);
         let Mode::Kickoff { form, .. } = &app.mode else {

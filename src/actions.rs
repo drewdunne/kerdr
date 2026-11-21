@@ -775,15 +775,11 @@ fn older_most_bytes(request: &Value) -> usize {
     }
 }
 
-/// The most any request is sent as: a new intent or an edit up to FIX_REQUEST_BYTES, which only a
-/// backend that fixes input is ever sent (the board holds any other to too_large first), and any
-/// other request 64 KiB.
-fn most_bytes(request: &Value) -> usize {
-    if matches!(request["action"].as_str(), Some("create" | "edit")) {
-        FIX_REQUEST_BYTES
-    } else {
-        MAX_JSON_BYTES
-    }
+/// The most any request is sent as: FIX_REQUEST_BYTES, what ssh's standard input and a backend
+/// that fixes input take. Only such a backend is ever sent one past 64 KiB: the board holds a new
+/// intent or an edit for any other to too_large first, and nothing else it sends grows past that.
+fn most_bytes(_request: &Value) -> usize {
+    FIX_REQUEST_BYTES
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
@@ -1307,12 +1303,9 @@ fn run_with_deadline(
         }
     };
     if json.len() > most_bytes(request) {
-        let said = if most_bytes(request) > MAX_JSON_BYTES {
-            "the request is too large to send (32 MiB at most), so nothing was sent".to_string()
-        } else {
-            "the request is too large to send (64 KiB at most), so nothing was sent".into()
-        };
-        return Ran::unsent(said);
+        return Ran::unsent(
+            "the request is too large to send (32 MiB at most), so nothing was sent".into(),
+        );
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -3508,14 +3501,14 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         .unwrap_err();
         assert!(error.contains("too large"), "{error}");
         assert!(!sentinel.exists());
-        // Any other request past 64 KiB, whatever the backend.
+        // Any other request too, past 32 MiB.
         let error = run(
             &machine(),
             &command,
-            &json!({"action":"answer","id":"0414","answers":"x".repeat(70_000)}),
+            &json!({"action":"answer","id":"0414","answers":"x".repeat(FIX_REQUEST_BYTES)}),
         )
         .unwrap_err();
-        assert!(error.contains("64 KiB at most"), "{error}");
+        assert!(error.contains("32 MiB at most"), "{error}");
         assert!(!sentinel.exists());
     }
 }

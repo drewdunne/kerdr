@@ -2391,6 +2391,10 @@ impl App {
             Mode::Compose { draft, .. } => self.fixes_input(draft.machine),
             _ => false,
         };
+        let kickoff_fix = match &self.mode {
+            Mode::Kickoff { form, .. } => self.fixes_input(form.machine),
+            _ => false,
+        };
         if matches!(self.mode, Mode::Compose { .. }) {
             // Spaces and blank lines are words; only a paste with nothing in it means an image.
             if text.is_empty() {
@@ -2409,7 +2413,7 @@ impl App {
             return Action::None;
         }
         match &mut self.mode {
-            Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text),
+            Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text, kickoff_fix),
             Mode::Compose { draft, .. } => {
                 let room = max_words(fix).saturating_sub(draft.words.len());
                 let mut end = text.len().min(room);
@@ -3189,16 +3193,11 @@ impl App {
 
     /// Takes a change to a card into the action resolution tool (intent 0416): the board shows it
     /// at once, and its command runs in the background.
-    /// A request as it goes to `machine`: to a backend that fixes input, one carrying what he
-    /// typed says so (`fix_input`), so a line that looks like a secret is asked about and an
-    /// edit's faults fixed, rather than refused (intent 0591, release 5). Any other goes as it is.
+    /// A request as it goes to `machine`: to a backend that fixes input, every one says so
+    /// (`fix_input`), so a line that looks like a secret is asked about and an edit's faults fixed,
+    /// rather than refused (intent 0591, release 5). To any other, it goes as it is.
     pub(crate) fn with_fix_input(&self, machine: usize, mut request: Value) -> Value {
-        let typed = match request["action"].as_str() {
-            Some("create" | "answer") => true,
-            Some("edit") => request.get("text").is_some(),
-            _ => false,
-        };
-        if typed && self.fixes_input(machine) {
+        if self.fixes_input(machine) {
             request["fix_input"] = json!(true);
         }
         request

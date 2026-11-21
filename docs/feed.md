@@ -203,8 +203,8 @@ be available on each machine where you use actions.
 The command receives one JSON object on standard input. User text is JSON data, including quotes,
 newlines and shell punctuation. It is never appended to the configured command as shell source.
 Requests are limited to 64 KiB, beyond the images a `create` carries; to a backend that fixes input
-(`"fix-input"` in `supports`), a `create` or an `edit` may be up to 32 MiB, and every other request
-stays at 64 KiB (see [Fixing what was typed or pasted](#fixing-what-was-typed-or-pasted)). The `action` field names the
+(`"fix-input"` in `supports`), a request may be up to 32 MiB (see [Fixing what was typed or
+pasted](#fixing-what-was-typed-or-pasted)). The `action` field names the
 operation; the backend defines which additional fields that operation needs:
 
 ```json
@@ -1019,7 +1019,8 @@ before.
 A backend that fixes or accepts what was typed or pasted, in place of refusing it, lists
 `"fix-input"` in its feed's `supports` (intent 0591, release 5). To it, and only to it:
 
-- **Sizes.** A `create` or an `edit` may be up to 32 MiB, sent on standard input as any request is.
+- **Sizes.** A request may be up to 32 MiB, sent on standard input as any request is. A Kickoff
+  answer may be 100,000 characters.
   Words have no length limit of Kerdr's beyond the box's megabyte: the backend keeps the first part
   in the record's words and the whole text in a file beside it. An item's text read for `e`, or
   saved, may be as long; its answer may be up to three times that, however much of it JSON escapes.
@@ -1030,7 +1031,7 @@ A backend that fixes or accepts what was typed or pasted, in place of refusing i
   can't show: keep such an image as pasted, with a PNG copy beside it. An image past what's left of
   the 20 MB is asked about in Kerdr, and a smaller copy (JPEG, or PNG for one with see-through parts)
   goes only on a yes; the backend is never sent one past the limit.
-- **`fix_input`.** A `create`, an `edit` that saves and an `answer` carry `"fix_input": true`. With it,
+- **`fix_input`.** Every request to it carries `"fix_input": true`. With it,
   a line that looks like a token or password is a question, not a refusal: answer with
   `confirmation`, `confirm` (its token), `redact` (the line numbers) and `message` ("Line 3 looks
   like a token or password. Save with it replaced by [redacted]?"). Kerdr asks it; the yes is the
