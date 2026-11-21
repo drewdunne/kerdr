@@ -1291,6 +1291,16 @@ fn clipboard_from(reader: &Reader, types: &[String], room: Room) -> Result<Found
     Err(NO_IMAGE.into())
 }
 
+/// The file:// list a Windows file list (CF_HDROP, Explorer's copied files) is read as: each
+/// path as file:///C:\..., its % escaped, which local_path takes back to the path.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn explorer_files(paths: &[String]) -> String {
+    paths
+        .iter()
+        .map(|l| format!("file:///{}\n", l.trim().replace('%', "%25")))
+        .collect()
+}
+
 /// The files a file manager copied, from its list of file:// addresses: the image files, or for
 /// a backend that fixes input every file and folder, each read for what it is (K3-58, K3-60).
 fn copied_files(uri_list: &str, any: bool) -> Result<Found, String> {
@@ -1869,11 +1879,7 @@ fn windows_clipboard(room: Room, pasted: Option<u64>) -> Result<Found, String> {
             },
         )?;
         if !files.is_empty() {
-            let listed: String = files
-                .iter()
-                .map(|l| format!("file:///{}\n", l.trim().replace('%', "%25")))
-                .collect();
-            return copied_files(&listed, room.fix);
+            return copied_files(&explorer_files(&files), room.fix);
         }
     }
     if raw::is_format_avail(formats::CF_UNICODETEXT) {
@@ -2332,10 +2338,20 @@ mod tests {
         std::fs::write(&pdf, b"%PDF-1.7\n...").unwrap();
         let bin = dir.path().join("blob.bin");
         std::fs::write(&bin, [0u8, 159, 146, 150]).unwrap();
-        let listed: String = [&odd, &notes, &pdf, &bin]
-            .iter()
-            .map(|p| format!("file://{}\n", p.display().to_string().replace(' ', "%20")))
-            .collect();
+        // As each system's file manager hands them over: a list of file:// addresses on Linux
+        // and macOS; on Windows, Explorer's list of paths, which Kerdr makes file:///C:\... ones.
+        let listed: String = if cfg!(windows) {
+            let paths: Vec<String> = [&odd, &notes, &pdf, &bin]
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect();
+            explorer_files(&paths)
+        } else {
+            [&odd, &notes, &pdf, &bin]
+                .iter()
+                .map(|p| format!("file://{}\n", p.display().to_string().replace(' ', "%20")))
+                .collect()
+        };
         let Ok(Found::Files(paths)) = copied_files(&listed, true) else {
             panic!("not listed")
         };
@@ -2385,6 +2401,35 @@ mod tests {
                     "{line:?} reads as a heading or a fence"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn explorers_copied_paths_come_back_from_their_file_addresses() {
+        // The list Kerdr makes of a Windows file list: file:///C:\..., a % in a name escaped.
+        let paths = vec![
+            r"C:\Users\a b\shot.png".to_string(),
+            r"D:\100%\x.log".to_string(),
+        ];
+        assert_eq!(
+            explorer_files(&paths),
+            "file:///C:\\Users\\a b\\shot.png\nfile:///D:\\100%25\\x.log\n"
+        );
+        // On Windows each comes back to its path, and so does one with forward slashes.
+        #[cfg(windows)]
+        {
+            assert_eq!(
+                local_path("file:///C:\\Users\\a b\\shot.png"),
+                Some(PathBuf::from(r"C:\Users\a b\shot.png"))
+            );
+            assert_eq!(
+                local_path("file:///D:\\100%25\\x.log"),
+                Some(PathBuf::from(r"D:\100%\x.log"))
+            );
+            assert_eq!(
+                local_path("file:///C:/Users/a/shot.png"),
+                Some(PathBuf::from("C:/Users/a/shot.png"))
+            );
         }
     }
 
