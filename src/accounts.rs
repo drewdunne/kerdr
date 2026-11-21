@@ -729,6 +729,7 @@ pub enum Opened {
 /// How long an opener may take to say it failed before Kerdr takes it as having opened the link:
 /// xdg-open and gio hand the link to a browser and exit at once; a browser named in $BROWSER keeps
 /// running.
+#[cfg(not(windows))]
 const OPENER_WAIT: std::time::Duration = std::time::Duration::from_millis(800);
 
 /// The programs that may open a link on this machine, each its words, tried in order (intent 0591,
