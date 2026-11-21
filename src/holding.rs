@@ -2521,7 +2521,7 @@ mod tests {
             );
             for (path, text) in &files {
                 let name = path.file_name().unwrap().to_string_lossy();
-                if name == "words.json" || name == "held.json" {
+                if name == "words.json" || name == "held.json" || name == "answers.json" {
                     let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
                     assert_eq!(mode, 0o600, "{when}: {name} is {mode:o}");
                 } else {

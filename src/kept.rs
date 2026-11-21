@@ -33,6 +33,10 @@ pub const HOLD_MOST_SECS: i64 = 24 * 60 * 60;
 
 const HELD_FILE: &str = "held.json";
 const WORDS_FILE: &str = "words.json";
+/// Kickoff answers not saved yet, in a file of their own beside the words file, which no older
+/// Kerdr reads or writes, so one still open can't drop them by rewriting the words file (Codex's
+/// review 98, 2, as the lead ruled).
+const ANSWERS_FILE: &str = "answers.json";
 const LOCK_FILE: &str = "kept.lock";
 
 /// One change held for a machine that wasn't answering.
@@ -629,14 +633,12 @@ impl Kept {
         let mut notes = vec![];
         let mut taken = Words::default();
         let result = locked(&dir, || {
+            let free =
+                |by: &Option<String>| by.as_deref().is_none_or(|by| by != me && !alive(&dir, by));
             let mut file: WordsFile = read_or_set_aside(&dir, WORDS_FILE, &mut notes)?;
             file.settle();
             for set in file.sets.iter_mut() {
-                let free = set
-                    .by
-                    .as_deref()
-                    .is_none_or(|by| by != me && !alive(&dir, by));
-                if free {
+                if free(&set.by) {
                     set.by = Some(me.clone());
                     set.left_by = None;
                     taken.merge(std::mem::take(&mut set.words));
@@ -651,7 +653,27 @@ impl Kept {
                     words: taken.clone(),
                 });
             }
-            write_words(&dir, &file)
+            write_words(&dir, &file)?;
+            let mut file: AnswersFile = read_or_set_aside(&dir, ANSWERS_FILE, &mut notes)?;
+            for set in file.sets.iter_mut() {
+                if free(&set.by) {
+                    set.by = Some(me.clone());
+                    set.left_by = None;
+                    taken.merge(Words {
+                        answers: std::mem::take(&mut set.answers),
+                        ..Words::default()
+                    });
+                }
+            }
+            file.sets.retain(|s| s.by.as_deref() != Some(me.as_str()));
+            if !taken.answers.is_empty() {
+                file.sets.push(AnswerSet {
+                    by: Some(me.clone()),
+                    left_by: None,
+                    answers: taken.answers.clone(),
+                });
+            }
+            write_answers(&dir, &file)
         });
         self.notes.extend(notes);
         if let Err(e) = result {
@@ -689,6 +711,8 @@ impl Kept {
         };
         let me = self.me.clone();
         let mut notes = vec![];
+        let (mut words, answers) = (words.clone(), words.answers.clone());
+        words.answers.clear();
         let result = locked(&dir, || {
             let mut file: WordsFile = read_or_set_aside(&dir, WORDS_FILE, &mut notes)?;
             file.settle();
@@ -701,7 +725,18 @@ impl Kept {
                     words: words.clone(),
                 });
             }
-            write_words(&dir, &file)
+            write_words(&dir, &file)?;
+            // His Kickoff answers into a file of their own (Codex's review 98, 2).
+            let mut file: AnswersFile = read_or_set_aside(&dir, ANSWERS_FILE, &mut notes)?;
+            file.sets.retain(|s| !mine(&s.by) && !mine(&s.left_by));
+            if !answers.is_empty() {
+                file.sets.push(AnswerSet {
+                    by: (!leaving).then(|| me.clone()),
+                    left_by: leaving.then(|| me.clone()),
+                    answers: answers.clone(),
+                });
+            }
+            write_answers(&dir, &file)
         });
         self.notes.extend(notes);
         match result {
@@ -899,8 +934,9 @@ pub struct Words {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub saving: Vec<KeptSaving>,
     /// Kickoff answers not saved yet, which d opens again: kept for the next Kerdr too, so a
-    /// failed answer is never held nowhere (intent 0591, K3-34).
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// failed answer is never held nowhere (intent 0591, K3-34). Never in the words file itself:
+    /// they're kept in the answers file (ANSWERS_FILE).
+    #[serde(skip)]
     pub answers: Vec<KeptAnswers>,
 }
 
@@ -993,6 +1029,36 @@ struct WordSet {
     left_by: Option<String>,
     #[serde(flatten)]
     words: Words,
+}
+
+/// The answers file: each Kerdr's Kickoff answers not saved yet, with the Kerdr that took them, as
+/// the words file keeps words.
+#[derive(Default, Deserialize, Serialize)]
+struct AnswersFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    sets: Vec<AnswerSet>,
+}
+
+#[derive(Default, Deserialize, Serialize)]
+struct AnswerSet {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    by: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    left_by: Option<String>,
+    #[serde(default)]
+    answers: Vec<KeptAnswers>,
+}
+
+/// Writes the answers file, readable by him alone, or takes it away when no answers are left.
+fn write_answers(dir: &Path, file: &AnswersFile) -> io::Result<()> {
+    if file.sets.iter().all(|s| s.answers.is_empty()) {
+        return match std::fs::remove_file(dir.join(ANSWERS_FILE)) {
+            Err(e) if e.kind() != io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        };
+    }
+    let text = serde_json::to_string_pretty(file).map_err(io::Error::other)?;
+    write_private(dir, ANSWERS_FILE, &text)
 }
 
 /// Writes the words file, or takes it away when no words are left in it.
@@ -1440,6 +1506,70 @@ mod tests {
                 answers: vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
             }],
         }
+    }
+
+    #[test]
+    fn kickoff_answers_survive_an_older_kerdr_rewriting_the_words_file() {
+        // Codex's review 98, 2, as the lead ruled: Kickoff answers are kept in a file of their
+        // own, private as the words file is. A 0.35.0 still open reads the words file and writes
+        // it back as its own types know it, dropping what they don't; the answers aren't in it,
+        // so the next Kerdr has them.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct OldWordsFile {
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            sets: Vec<OldWordSet>,
+        }
+        // 0.35.0's WordSet and Words, their fields as it has them.
+        #[derive(serde::Deserialize, serde::Serialize)]
+        struct OldWordSet {
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            by: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            left_by: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            draft: Option<Value>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            returned: Vec<Value>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            edits: Vec<Value>,
+            #[serde(default, skip_serializing_if = "Vec::is_empty")]
+            saving: Vec<Value>,
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let answers = vec![KeptAnswers {
+            key: "ark-sdlc:0042".into(),
+            answers: vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
+        }];
+        let words = Words {
+            draft: Some(KeptWords {
+                words: "A draft".into(),
+                ..KeptWords::default()
+            }),
+            answers: answers.clone(),
+            ..Words::default()
+        };
+        Kept::at(dir.path(), 1000).keep_words(&words).unwrap();
+        let file = dir.path().join(WORDS_FILE);
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("Kibbelz's"),
+            "the words file holds the answers: {text}"
+        );
+        let mode = std::fs::metadata(dir.path().join(ANSWERS_FILE))
+            .unwrap()
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(mode.mode() & 0o777, 0o600);
+        }
+        let _ = mode;
+        // The older Kerdr's read and rewrite.
+        let old: OldWordsFile = serde_json::from_str(&text).unwrap();
+        std::fs::write(&file, serde_json::to_string_pretty(&old).unwrap()).unwrap();
+        let back = Kept::at(dir.path(), 2000).take_words();
+        assert_eq!(back.answers, answers, "the answers didn't survive");
+        assert_eq!(back.draft.map(|d| d.words).as_deref(), Some("A draft"));
     }
 
     #[test]

@@ -1438,10 +1438,15 @@ mod tests {
         typed(&mut app, "kept for later");
         key(&mut app, KeyCode::Enter);
         let _ = sent(key(&mut app, KeyCode::Enter));
-        let file = std::fs::read_to_string(dir.path().join("words.json")).unwrap_or_default();
+        let file = std::fs::read_to_string(dir.path().join("answers.json")).unwrap_or_default();
         assert!(
             file.contains("kept for later"),
-            "the answer isn't in the words file: {file}"
+            "the answer isn't in the answers file: {file}"
+        );
+        let words = std::fs::read_to_string(dir.path().join("words.json")).unwrap_or_default();
+        assert!(
+            !words.contains("kept for later"),
+            "an older Kerdr could drop it: {words}"
         );
         app.keep_on_quit().unwrap();
         let mut next = App::new(Config::default(), crate::demo::machines(false));
