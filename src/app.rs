@@ -1103,6 +1103,14 @@ impl App {
         self.message = Some((text, Tone::Fail, Instant::now()));
     }
 
+    /// What Kerdr's config file had that couldn't be used, said where it can't be missed: Kerdr
+    /// opened anyway, with the rest (intent 0591, K3-67, K3-68).
+    pub fn say_config_problems(&mut self) {
+        for problem in std::mem::take(&mut self.cfg.problems) {
+            self.fail(format!("Kerdr's config, {problem}."));
+        }
+    }
+
     /// Whether a failure is up.
     pub fn failing(&self) -> bool {
         matches!(self.message, Some((_, Tone::Fail, _)))
@@ -3604,6 +3612,23 @@ pub fn match_range(query: &str, text: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[test]
+    fn a_config_that_half_parses_opens_the_board_saying_what_was_left_out() {
+        // Intent 0591, K3-67: the board opens, and the failure box says the line at fault.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[board]\nslots = 4\nslotz = 5\n").unwrap();
+        let cfg = Config::load_from(&path).expect("the board opens");
+        assert_eq!(cfg.board.slots, 4);
+        let mut app = App::new(cfg, crate::demo::machines(false));
+        app.say_config_problems();
+        let (said, tone) = app.message().expect("said on the board");
+        assert_eq!(tone, Tone::Fail);
+        assert!(said.starts_with("Kerdr's config, "), "{said}");
+        assert!(said.contains("line 3: unknown field `slotz`"), "{said}");
+        assert!(said.contains("opened with the rest"), "{said}");
+    }
 
     #[test]
     fn a_cycles_provider_directly_even_when_current_filter_leaves_board_empty() {

@@ -20,6 +20,10 @@ pub struct Config {
     pub theme: ThemeConfig,
     #[serde(rename = "machine")]
     pub machine: Vec<MachineConfig>,
+    /// What in the config file couldn't be used, each said as the board says it: Kerdr opens with
+    /// the rest, and these parts at their defaults (intent 0591, K3-67, K3-68). Never written back.
+    #[serde(skip)]
+    pub problems: Vec<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -87,17 +91,28 @@ impl BoardConfig {
         })
     }
 
-    /// A column name that can't be hidden, as the error to show: Misc isn't a column.
-    fn check_hidden(&self) -> Result<(), String> {
-        for c in &self.hide_columns {
+    /// The names in hide_columns that hide nothing a column can lose: Misc, whose cards have no
+    /// screen of their own, and an empty name. Each is left out, so its column shows, and said
+    /// (intent 0591, K3-68): hiding it would hide work.
+    fn drop_unhidable(&mut self) -> Vec<String> {
+        let mut said = vec![];
+        self.hide_columns.retain(|c| {
             let c = c.trim();
-            if c.is_empty() || c.eq_ignore_ascii_case("misc") {
-                return Err(format!(
-                    "[board] hide_columns: \"{c}\" isn't a column; name \"backlog\", \"maintain\" or a stage's id"
-                ));
+            if c.eq_ignore_ascii_case("misc") {
+                said.push(
+                    "[board] hide_columns: \"misc\" is left showing, since its cards have no other screen; name \"backlog\", \"maintain\" or a stage's id.".to_string(),
+                );
+                false
+            } else if c.is_empty() {
+                said.push(
+                    "[board] hide_columns: an empty name hides nothing, so it's left out; name \"backlog\", \"maintain\" or a stage's id.".to_string(),
+                );
+                false
+            } else {
+                true
             }
-        }
-        Ok(())
+        });
+        said
     }
 
     pub fn wants(&self, session: &str) -> bool {
@@ -310,22 +325,36 @@ impl Config {
         Self::load_from(&config_path())
     }
 
+    /// The config at `path`, or the defaults when there's none. A file that can't be read, or
+    /// parts of it that don't parse, never keep Kerdr from opening (intent 0591, K3-67): it opens
+    /// with the parts that do, the rest at their defaults, each problem in `problems` with its line
+    /// for the board to say. The file itself is never written.
     pub fn load_from(path: &Path) -> Result<Config, String> {
-        match std::fs::read_to_string(path) {
+        let shown = path.display();
+        let mut cfg = match std::fs::read_to_string(path) {
             Ok(text) => {
-                let mut cfg: Config =
-                    toml::from_str(&text).map_err(|e| format!("{}: {e}", path.display()))?;
-                cfg.board
-                    .check_hidden()
-                    .map_err(|e| format!("{}: {e}", path.display()))?;
-                if cfg.actions.command.is_none() {
-                    cfg.actions.command = cfg.feed.ark_card_action();
-                }
-                Ok(cfg)
+                let (mut cfg, problems) = parse_leniently(&text);
+                cfg.problems = problems
+                    .into_iter()
+                    .map(|p| format!("{shown}: {p}"))
+                    .collect();
+                cfg
             }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(format!("{}: {e}", path.display())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Config::default(),
+            Err(e) => Config {
+                problems: vec![format!(
+                    "{shown}: couldn't read it ({e}), so Kerdr opened with its defaults"
+                )],
+                ..Config::default()
+            },
+        };
+        for p in cfg.board.drop_unhidable() {
+            cfg.problems.push(format!("{shown}: {p}"));
         }
+        if cfg.actions.command.is_none() {
+            cfg.actions.command = cfg.feed.ark_card_action();
+        }
+        Ok(cfg)
     }
 
     /// The machines to read: this one first, then the config's, then the picker's list.
@@ -413,6 +442,82 @@ pub fn parse_picker(text: &str) -> Vec<String> {
         .collect()
 }
 
+/// A config file's text as Kerdr's settings, keeping every part that parses: a line that doesn't
+/// (an unknown key, a value of the wrong kind) is left out, and a table whose fault is the table
+/// itself goes whole, each said with its line, until the rest reads. Text that isn't TOML at all
+/// leaves every setting at its default, said the same way. Nothing here writes the file.
+pub fn parse_leniently(text: &str) -> (Config, Vec<String>) {
+    let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
+    let mut problems = vec![];
+    // Each round leaves out at least one line, so this ends; the bound is only a guard.
+    for _ in 0..64 {
+        let now = lines.join("\n");
+        let e = match toml::from_str::<Config>(&now) {
+            Ok(cfg) => return (cfg, problems),
+            Err(e) => e,
+        };
+        let line = e
+            .span()
+            .map(|span| now[..span.start.min(now.len())].matches('\n').count());
+        let said = e.message().trim().trim_end_matches('.').to_string();
+        // Not TOML at all: nothing in it can be trusted to mean what it says.
+        if toml::from_str::<toml::Table>(&now).is_err() || line.is_none() {
+            problems.push(match line {
+                Some(n) => format!(
+                    "line {}: {said}, so Kerdr opened with its defaults; fix the file and open Kerdr again",
+                    n + 1
+                ),
+                None => format!(
+                    "{said}, so Kerdr opened with its defaults; fix the file and open Kerdr again"
+                ),
+            });
+            return (Config::default(), problems);
+        }
+        let n = line.unwrap_or(0);
+        let gone = leave_out(&mut lines, n, e.span().unwrap_or(0..0), &now);
+        problems.push(format!(
+            "line {}: {said}, so Kerdr left {gone} out and opened with the rest",
+            n + 1
+        ));
+    }
+    problems.push("too many lines didn't parse, so Kerdr opened with its defaults".into());
+    (Config::default(), problems)
+}
+
+/// Blanks the lines a fault in the config covers, keeping every other line where it was, so the
+/// next fault's line is still its line in the file: the lines of the value or key at fault, or a
+/// whole table from its heading to the next one's when the fault is the table's. What was left
+/// out, in words.
+fn leave_out(lines: &mut [String], at: usize, span: std::ops::Range<usize>, text: &str) -> String {
+    let heading = |l: &str| l.trim_start().starts_with('[');
+    if lines.get(at).is_some_and(|l| heading(l)) {
+        let name = lines[at].trim().to_string();
+        let end = (at + 1..lines.len())
+            .find(|&i| heading(&lines[i]))
+            .unwrap_or(lines.len());
+        for l in &mut lines[at..end] {
+            l.clear();
+        }
+        return format!("{name} and its settings");
+    }
+    let last = text[..span.end.min(text.len())]
+        .matches('\n')
+        .count()
+        .max(at)
+        .min(lines.len().saturating_sub(1));
+    let key = lines[at]
+        .split('=')
+        .next()
+        .map(str::trim)
+        .filter(|k| !k.is_empty() && !k.starts_with('['))
+        .map(|k| format!("`{k}`"))
+        .unwrap_or_else(|| "that line".into());
+    for l in &mut lines[at..=last] {
+        l.clear();
+    }
+    key
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -448,12 +553,89 @@ mod tests {
                 .hides(Stage::work("arkship/marketing", "deploy", "Deploy"))
         );
         assert!(!c.board.hides(Stage::Build));
-        for bad in ["misc", ""] {
-            std::fs::write(&path, format!("[board]\nhide_columns = ['{bad}']\n")).unwrap();
-            let err = Config::load_from(&path).unwrap_err();
-            assert!(err.contains("hide_columns"), "{err}");
-        }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_column_that_cant_be_hidden_is_left_showing_and_said() {
+        // Intent 0591, K3-68: Kerdr opens anyway, every other name still hides its column, and
+        // the board says which name was left out, and why.
+        use crate::model::Stage;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[board]\nhide_columns = ['misc', 'backlog']\n").unwrap();
+        let c = Config::load_from(&path).expect("Kerdr opens with a name it can't hide");
+        assert!(c.board.hides(Stage::Backlog));
+        assert!(!c.board.hides(Stage::Misc));
+        assert_eq!(c.problems.len(), 1, "{:?}", c.problems);
+        assert!(
+            c.problems[0]
+                .contains("\"misc\" is left showing, since its cards have no other screen"),
+            "{:?}",
+            c.problems
+        );
+        std::fs::write(&path, "[board]\nhide_columns = ['']\n").unwrap();
+        let c = Config::load_from(&path).expect("Kerdr opens with an empty name");
+        assert!(
+            c.problems[0].contains("an empty name hides nothing"),
+            "{:?}",
+            c.problems
+        );
+    }
+
+    #[test]
+    fn a_config_that_doesnt_parse_opens_with_the_parts_that_do_and_says_where() {
+        // Intent 0591, K3-67: never a refusal to start. The lines at fault are left out, each said
+        // with its line, and everything else in the file still counts; the file isn't touched.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let text = "editor = \"hx\"\n[board]\nslotz = 4\nslots = 5\nsplit = 'sideways'\n[feed]\nevery = 30\n";
+        std::fs::write(&path, text).unwrap();
+        let c = Config::load_from(&path).expect("Kerdr opens with a config that half parses");
+        assert_eq!(c.editor.as_deref(), Some("hx"));
+        assert_eq!(c.board.slots, 5);
+        assert_eq!(c.board.split, Split::Owners, "the bad value is the default");
+        assert_eq!(c.feed.every, 30);
+        assert_eq!(c.problems.len(), 2, "{:?}", c.problems);
+        assert!(c.problems[0].contains("line 3:"), "{:?}", c.problems);
+        assert!(c.problems[0].contains("slotz"), "{:?}", c.problems);
+        assert!(c.problems[1].contains("line 5:"), "{:?}", c.problems);
+        assert!(c.problems[1].contains("`split`"), "{:?}", c.problems);
+        assert!(c.problems[0].starts_with(&path.display().to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            text,
+            "never rewritten"
+        );
+        // A table Kerdr doesn't know goes whole, with its settings; the rest still reads.
+        std::fs::write(&path, "[bord]\nslots = 9\n[feed]\nevery = 7\n").unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert_eq!((c.board.slots, c.feed.every), (3, 7));
+        assert!(
+            c.problems[0].contains("line 1:") && c.problems[0].contains("[bord]"),
+            "{:?}",
+            c.problems
+        );
+        // Text that isn't TOML at all: the defaults, said with the line.
+        std::fs::write(&path, "[board\nslots = 4\n").unwrap();
+        let c = Config::load_from(&path).unwrap();
+        assert_eq!(c.board.slots, 3);
+        assert!(
+            c.problems[0].contains("line 1:") && c.problems[0].contains("defaults"),
+            "{:?}",
+            c.problems
+        );
+        // One that can't be read at all opens with the defaults too.
+        #[cfg(unix)]
+        {
+            std::fs::create_dir(dir.path().join("dir.toml")).unwrap();
+            let c = Config::load_from(&dir.path().join("dir.toml")).unwrap();
+            assert!(
+                c.problems[0].contains("couldn't read it"),
+                "{:?}",
+                c.problems
+            );
+        }
     }
 
     #[test]
@@ -467,8 +649,11 @@ mod tests {
             Config::load_from(&path).unwrap().board.split,
             Split::Machines
         );
+        // A split it doesn't know: the default, and said (intent 0591, K3-67).
         std::fs::write(&path, "[board]\nsplit = 'sideways'\n").unwrap();
-        assert!(Config::load_from(&path).is_err());
+        let c = Config::load_from(&path).unwrap();
+        assert_eq!(c.board.split, Split::Owners);
+        assert_eq!(c.problems.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
