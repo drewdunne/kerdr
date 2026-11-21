@@ -956,14 +956,17 @@ pub fn take_pasted(room: Room, pasted: Option<Pasted>) -> Result<Found, String> 
 }
 
 /// What `read` took for a paste, unless the watch has numbered another copy since the paste:
-/// then nothing, and he's told. Without a number, as `read` took it.
+/// then nothing, and he's told. A watch that couldn't be brought up to date in time can't say, so
+/// nothing goes in then either, and the next paste is read as one with no watch. Without a
+/// number, as `read` took it.
 pub fn take_since(
     pasted: Option<Pasted>,
     read: impl FnOnce() -> Result<Found, String>,
 ) -> Result<Found, String> {
     let found = read();
-    match pasted.and_then(|p| p.changed()) {
-        Some(true) => Err(COPIED_AGAIN.into()),
+    match pasted.map(|p| p.changed()) {
+        Some(Some(true)) => Err(COPIED_AGAIN.into()),
+        Some(None) => Err(UNCHECKED.into()),
         _ => found,
     }
 }
@@ -1055,6 +1058,9 @@ pub struct Reader<'a> {
 /// Why nothing went in when he copied something else while the clipboard was read.
 pub const COPIED_AGAIN: &str =
     "You copied something else while Kerdr read the clipboard; paste again.";
+
+/// Why nothing went in when Kerdr's watch couldn't say whether he had (Codex's review 90, 2).
+pub const UNCHECKED: &str = "Kerdr couldn't check whether you copied something else while it read the clipboard; paste again.";
 
 /// Linux and the BSDs, with programs only: wl-paste under Wayland, xclip under X11.
 pub fn unix_clipboard(wayland: bool, x11: bool, run: Runner) -> Result<Found, String> {

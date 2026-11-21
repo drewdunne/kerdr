@@ -7,8 +7,9 @@
 //! paste's own worker, the watch is brought up to date, bounded: under X11 by a round trip of its
 //! own (a property changed on Kerdr's window, whose notice comes back after every notice the
 //! server sent before it); under Wayland, which gives no round trip here, by a short wait. Then
-//! the count is compared. Windows numbers copies itself (GetClipboardSequenceNumber), read
-//! directly; macOS has no watch.
+//! the count is compared. A watch that can't be brought up to date in time is retired: its count
+//! becomes unknown, and readers watch from their own start again. Windows numbers copies itself
+//! (GetClipboardSequenceNumber), read directly; macOS has no watch.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::SeqCst};
 use std::sync::{Arc, OnceLock};
@@ -73,6 +74,11 @@ impl Shared {
     /// One copy the desktop told of.
     pub(crate) fn copied(&self) {
         self.copies.fetch_add(1, SeqCst);
+    }
+
+    /// Its count unknown from now.
+    fn retire(&self) {
+        self.known.store(false, SeqCst);
     }
 
     fn sync(&self, bound: Duration) -> bool {
@@ -158,10 +164,11 @@ impl Pasted {
 
     /// After the read, on the paste's worker: whether he's copied anything since the paste,
     /// every notice sent before now brought in first. None when the watch can't be brought up
-    /// to date in time.
+    /// to date in time: then it's retired.
     pub fn changed(&self) -> Option<bool> {
         let shared = &self.watch.shared;
         if !shared.sync(SYNC_BOUND) {
+            shared.retire();
             return None;
         }
         shared.now().map(|now| now != self.copy)
@@ -341,7 +348,8 @@ fn wayland(shared: &Arc<Shared>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::images::{COPIED_AGAIN, Found, take_since};
+    use crate::images::{COPIED_AGAIN, Found, UNCHECKED, take_since};
+    use std::time::Instant;
 
     #[test]
     fn a_paste_is_numbered_at_once_and_a_notice_that_comes_late_is_still_told() {
@@ -399,6 +407,53 @@ mod tests {
         assert_eq!(
             take_since(Some(pasted), read),
             Ok(Found::Text("<C>".into()))
+        );
+    }
+
+    #[test]
+    fn a_watch_that_stops_answering_is_retired_and_pastes_stay_instant() {
+        // Codex's review 90, 2: the watch's server stops answering. A paste's check waits at
+        // most SYNC_BOUND, on the paste's worker, then retires the watch: nothing goes in from
+        // that paste, and he's told. The board's pastes meanwhile take no time at all, and once
+        // it's retired a paste is read as one with no watch.
+        let (watch, notices) = ClipboardWatch::counted();
+        notices.synced_by(|bound| {
+            std::thread::sleep(bound);
+            false
+        });
+        let began = Instant::now();
+        let pasted = watch.pasted();
+        assert!(
+            began.elapsed() < Duration::from_millis(50),
+            "the paste waited on the watch: {:?}",
+            began.elapsed()
+        );
+        let pasted = pasted.expect("numbered");
+        let check = std::thread::spawn(move || {
+            let began = Instant::now();
+            let got = take_since(Some(pasted), || Ok(Found::Text("<B>".into())));
+            (got, began.elapsed())
+        });
+        std::thread::sleep(Duration::from_millis(50));
+        let began = Instant::now();
+        for _ in 0..100 {
+            let _ = watch.pasted();
+        }
+        assert!(
+            began.elapsed() < Duration::from_millis(100),
+            "pastes waited on the watch: {:?}",
+            began.elapsed()
+        );
+        let (got, took) = check.join().unwrap();
+        assert_eq!(got, Err(UNCHECKED.to_string()));
+        assert!(took < SYNC_BOUND + Duration::from_millis(500), "{took:?}");
+        assert!(
+            watch.pasted().is_none(),
+            "a retired watch still numbers pastes"
+        );
+        assert_eq!(
+            take_since(watch.pasted(), || Ok(Found::Text("<B>".into()))),
+            Ok(Found::Text("<B>".into()))
         );
     }
 }
