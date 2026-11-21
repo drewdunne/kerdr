@@ -448,6 +448,10 @@ pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
 /// a smaller copy (intent 0591, release 5): never sent to a backend.
 pub(crate) const SMALLER: &str = "kerdr:attach-smaller-copy";
 
+/// The action of Kerdr's own question, when an item's text changed while he had it open on the
+/// same lines he changed, whether to open both now (intent 0591, K1-100): never sent to a backend.
+pub(crate) const OPEN_BOTH: &str = "kerdr:open-both";
+
 /// Images too large to send, while Kerdr asks whether smaller copies go in their place, and where
 /// in the words their tags go.
 #[derive(Clone, Debug)]
@@ -663,6 +667,10 @@ pub struct App {
     /// What didn't go in with words Enter sent, from each read they waited for, said once the
     /// last is in.
     pub(crate) send_troubles: Vec<String>,
+    /// Cards whose text was saved with lines its backend fixed, by key: the version Kerdr keeps
+    /// for them is the text as he wrote it, for e to bring back, not a save still owed (intent
+    /// 0591, release 5).
+    pub(crate) as_written: std::collections::HashSet<String>,
     /// New intents sent, each while its answer is still owed or unknown (intent 0445).
     pub submissions: Vec<Submission>,
     /// Words (and their images) whose save failed while the box held other words: c offers them,
@@ -982,6 +990,7 @@ impl App {
             image_queue: Default::default(),
             smaller_asks: vec![],
             send_troubles: vec![],
+            as_written: Default::default(),
             new_intent_id: None,
             closed_on_send: false,
             submissions: vec![],
@@ -6280,6 +6289,91 @@ pub(crate) mod tests {
             "{said}"
         );
         assert_eq!(app.draft.chars().count(), 20_000, "the words are kept");
+    }
+
+    #[test]
+    fn a_new_intent_with_a_line_like_a_secret_is_asked_about_and_yes_sends_the_same_words() {
+        // Intent 0591, release 5 (B1-64): its backend asks "Line N looks like a token or
+        // password. Save with it replaced by [redacted]?"; yes sends the same send again, words
+        // and images as kept, with the question's token; no opens the words in the box, unsent.
+        let question = || {
+            Ok(crate::actions::Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("0123456789abcdef".into()),
+                redact: vec![1],
+                message:
+                    "Line 1 looks like a token or password. Save with it replaced by [redacted]?"
+                        .into(),
+                ..Default::default()
+            })
+        };
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        for c in "Use ghp_abcdefghijklmnop".chars() {
+            press(&mut app, c);
+        }
+        app.attach_images(crate::images::Loading {
+            images: vec![a_png()],
+            ..Default::default()
+        });
+        let Action::Mutate { machine, request } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("not sent")
+        };
+        assert_eq!(
+            app.with_fix_input(machine, request.clone())["fix_input"],
+            true
+        );
+        send(&mut app, machine, request.clone());
+        reply_to(
+            &mut app,
+            machine,
+            crate::actions::request_metadata(&request),
+            question(),
+        );
+        let Mode::Confirm { title, message, .. } = app.mode.clone() else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert_eq!(title, "Save your new intent?");
+        assert!(
+            message.starts_with("Line 1 looks like a token or password."),
+            "{message}"
+        );
+        assert!(!app.failing());
+        settle(&mut app);
+        let Action::Mutate { request: yes, .. } = press(&mut app, 'y') else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(yes["confirm"], "0123456789abcdef");
+        assert_eq!(yes["override"], true);
+        assert_eq!(yes["submission"], request["submission"], "the same send");
+        assert_eq!(yes["words"], request["words"]);
+        assert_eq!(
+            yes["images"], request["images"],
+            "its images whole, not counted"
+        );
+        // No: nothing saved, the words open in the box as he left them.
+        send(&mut app, machine, yes.clone());
+        reply_to(
+            &mut app,
+            machine,
+            crate::actions::request_metadata(&yes),
+            question(),
+        );
+        settle(&mut app);
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("the box didn't open: {:?}", app.mode)
+        };
+        assert!(
+            draft.words.starts_with("Use ghp_abcdefghijklmnop"),
+            "{}",
+            draft.words
+        );
+        assert_eq!(draft.images.len(), 1);
     }
 
     #[test]

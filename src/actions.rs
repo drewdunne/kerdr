@@ -153,6 +153,71 @@ pub struct Response {
     /// On a `drop`: false when the held request had already run, or was running.
     #[serde(default)]
     pub dropped: Option<bool>,
+    /// With a saved edit, from a backend that fixes input (intent 0591, release 5): each line it
+    /// fixed rather than refused (a `#` heading, an open code block, a NUL), and how.
+    #[serde(default, deserialize_with = "fixed")]
+    pub fixed: Vec<Fixed>,
+    /// With a saved edit: it was merged with a change made while he had it open.
+    #[serde(default)]
+    pub merged: bool,
+    /// With a stale edit: his change and the change made meanwhile touch the same lines.
+    #[serde(default)]
+    pub conflict: bool,
+    /// With a question about lines that look like a token or password, or with a save that
+    /// replaced them by [redacted] on his yes: those lines, by number.
+    #[serde(default, deserialize_with = "line_numbers")]
+    pub redact: Vec<u32>,
+    #[serde(default, deserialize_with = "line_numbers")]
+    pub redacted: Vec<u32>,
+}
+
+/// One line a backend fixed in a saved edit, as `fixed` gives it: its number, what kind of fix,
+/// and the words saying it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fixed {
+    pub line: u32,
+    pub kind: String,
+    pub message: String,
+}
+
+/// `fixed` as a backend gives it, anything it can't read passed over, never a failed answer.
+fn fixed<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Fixed>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let line = u32::try_from(v["line"].as_u64()?).ok()?;
+            let message: String = v["message"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            Some(Fixed {
+                line,
+                kind: v["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(32)
+                    .collect(),
+                message: message.trim().to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Line numbers as a backend lists them; anything else passed over.
+fn line_numbers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u32>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
+        .collect())
 }
 
 /// A line of words for the board: control characters out, trimmed; nothing left (or not a
@@ -644,10 +709,12 @@ const ANSWER_STATES: &[&str] = &[
 /// text itself until it's saved (intent 0414).
 pub fn request_metadata(request: &Value) -> Value {
     let mut value = request.clone();
-    if value["action"] == "edit"
-        && let Some(text) = value["text"].as_str().map(|t| t.chars().count())
-    {
-        value["text"] = Value::from(text);
+    if value["action"] == "edit" {
+        for field in ["text", "base"] {
+            if let Some(n) = value[field].as_str().map(|t| t.chars().count()) {
+                value[field] = Value::from(n);
+            }
+        }
     }
     if value["action"] == "account-signin"
         && let Some(fields) = value.as_object_mut()
@@ -1183,7 +1250,7 @@ fn beginning(text: &str, most: usize) -> &str {
 
 /// What was typed into a request: a new intent's words, an edit, an answer.
 pub fn typed_in(request: &Value) -> Vec<&str> {
-    let mut typed: Vec<&str> = ["words", "title", "text", "token", "page_code"]
+    let mut typed: Vec<&str> = ["words", "title", "text", "base", "token", "page_code"]
         .iter()
         .filter_map(|field| request[*field].as_str())
         .collect();

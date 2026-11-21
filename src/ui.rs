@@ -3395,6 +3395,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
         Some("cancel") => "stop it",
         Some(crate::app::SEND_WITHOUT) => "send without it",
         Some(crate::app::SMALLER) => "attach a smaller copy",
+        Some(crate::app::OPEN_BOTH) => "open both now",
         Some(crate::app::cancels::STOP_START) => "stop it and put it back",
         _ => "yes",
     };
@@ -3424,6 +3425,7 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
         Some("cancel") => "keep it running",
         Some(crate::app::SEND_WITHOUT) => "keep them unsent",
         Some(crate::app::SMALLER) => "leave it out",
+        Some(crate::app::OPEN_BOTH) => "keep mine for e",
         Some(crate::app::cancels::STOP_START) => "let it start",
         _ if !q.choices.is_empty() => "leave it",
         _ => "cancel",

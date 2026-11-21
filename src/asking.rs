@@ -381,6 +381,8 @@ impl App {
                 "dismiss" => (format!("Won't do {reference}?"), response.message),
                 "cancel" => (format!("Cancel {reference}?"), response.message),
                 "edit" => (format!("Save {reference}'s new words?"), response.message),
+                // Kickoff answers, one looking like a token or password (release 5).
+                "answer" => (format!("Save {reference}'s answer?"), response.message),
                 "reopen" => (
                     format!("Reopen {reference} in {session}?"),
                     response.message,

@@ -897,6 +897,77 @@ mod tests {
     }
 
     #[test]
+    fn an_answer_that_looks_like_a_secret_is_asked_about_and_yes_sends_it_redacted() {
+        // Intent 0591, release 5 (B1-112): the others are saved; its backend asks about that one
+        // answer, and the yes goes back with the question's token and `override`.
+        let (mut app, id) = open_on(&answer());
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        key(&mut app, KeyCode::Enter);
+        typed(&mut app, "the token is ghp_abcdefghijklmnop");
+        let request = sent(key(&mut app, KeyCode::Esc));
+        assert_eq!(request["action"], "answer");
+        let machine = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .map(|c| c.machine_index)
+            .unwrap();
+        assert_eq!(
+            app.with_fix_input(machine, request.clone())["fix_input"],
+            true
+        );
+        app.action_from = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .map(CardSnapshot::of);
+        app.mode = Mode::Board;
+        if let Some(c) = &app.action_from {
+            app.sel.key = Some(c.key.clone());
+        }
+        app.finish_action(
+            machine,
+            request.clone(),
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("aaaabbbbccccdddd".into()),
+                message: "Your answer to question 1 looks like it holds a password or key; the others are saved. Save it with that replaced by [redacted]?".into(),
+                ..Response::default()
+            }),
+        );
+        let Mode::Confirm {
+            title,
+            request: asked,
+            ready_at,
+            ..
+        } = &mut app.mode
+        else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert!(
+            title.starts_with("Save #") && title.ends_with("'s answer?"),
+            "{title}"
+        );
+        assert_eq!(asked["confirm"], "aaaabbbbccccdddd");
+        *ready_at = None;
+        let Action::Mutate { request: yes, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(yes["override"], true);
+        assert_eq!(yes["confirm"], "aaaabbbbccccdddd");
+        assert_eq!(yes["answers"], request["answers"]);
+    }
+
+    #[test]
     fn esc_keeps_what_is_answered_and_starts_nothing() {
         let mut app = open(&answer());
         assert!(

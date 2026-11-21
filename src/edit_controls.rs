@@ -392,6 +392,37 @@ impl App {
         self.open_editor(&card.key, when);
     }
 
+    /// The editor opens on this card's text now, from wherever the board is: what a yes to a
+    /// question that names the card asks for.
+    fn open_now_by_key(&mut self, key: &str) {
+        let from = self
+            .selected()
+            .map(CardSnapshot::of)
+            .or_else(|| self.card(key).map(CardSnapshot::of));
+        match from {
+            Some(from) => self.open_editor(
+                key,
+                OpenWhen {
+                    asked: Instant::now(),
+                    away: self.away,
+                    from,
+                },
+            ),
+            None => {
+                let id = self
+                    .edits
+                    .get(key)
+                    .map(|h| h.id.clone())
+                    .unwrap_or_default();
+                let reference = self.reference_for(&id);
+                self.say(
+                    format!("Your version of {reference}'s text is ready: e opens it."),
+                    Tone::Info,
+                );
+            }
+        }
+    }
+
     /// The editor opens on this card's text at the next turn of the board, if what `when` says
     /// still holds then.
     fn open_editor(&mut self, key: &str, when: OpenWhen) {
@@ -668,10 +699,15 @@ impl App {
                     from: held.current.clone(),
                 });
                 held.check_first = false;
-                let (machine, request) = (
+                let (machine, mut request) = (
                     held.machine,
                     json!({"action":"edit","id":held.id,"text":text,"was":held.was,"from":crate::config::hostname()}),
                 );
+                // The text it was read as, so a change made meanwhile can be merged with his when
+                // they touch different lines (intent 0591, K1-100): to a backend that merges.
+                if self.fixes_input(machine) {
+                    request["base"] = json!(held.current);
+                }
                 self.edits.insert(key.to_string(), held);
                 // A backend that fixes input takes any text he writes, up to 32 MiB (K1-92).
                 let fix = self.fixes_input(machine);
@@ -778,7 +814,11 @@ impl App {
     /// when it holds none.
     pub(super) fn edits_lost(&self) -> Option<String> {
         let (mut saving, mut unsaved): (Vec<String>, Vec<String>) = (vec![], vec![]);
-        for (key, held) in self.edits.iter().filter(|(_, h)| h.mine.is_some()) {
+        for (key, held) in self
+            .edits
+            .iter()
+            .filter(|(k, h)| h.mine.is_some() && !self.as_written.contains(*k))
+        {
             let reference = self.reference_for(&held.id);
             if self.edit_on_its_way(key, &held.id, false) {
                 saving.push(reference);
@@ -833,12 +873,19 @@ impl App {
             }
         };
         match held.and_then(|h| h.mine.as_ref()) {
-            Some(mine) => request["text"] = json!(mine.text),
+            Some(mine) => {
+                request["text"] = json!(mine.text);
+                // The text it was read as goes again too, as it went (K1-100).
+                if request.get("base").is_some() {
+                    request["base"] = json!(mine.from);
+                }
+            }
             // Nothing to send again: ask for the text instead.
             None => {
                 if let Some(fields) = request.as_object_mut() {
                     fields.remove("text");
                     fields.remove("was");
+                    fields.remove("base");
                 }
             }
         }
@@ -1112,6 +1159,53 @@ impl App {
     /// A save's answer. Saved (or unchanged): your version is let go and nothing is said, since
     /// the card already shows it. Anything else: the card is back as it is, your version is kept
     /// for the next `e`, and the red box says so.
+    /// The question when an item's text changed while he had it open, on lines he changed too:
+    /// open both now (his version above, the newer text below), or keep his for e. Asked over the
+    /// board only, where a key meant for something else can't answer it; elsewhere said, yellow.
+    fn ask_open_both(&mut self, key: &str, reference: &str, machine: usize, words: &str) {
+        let card = self.card(key).cloned();
+        let here = self.enter_can_land_here();
+        let message = format!(
+            "{words} Open both now, your version with the newer text below it, to keep what you want of each? n keeps your version: e opens it so."
+        );
+        if !here {
+            self.say(
+                format!("{words} Your version is kept: e opens it, with the newer text below it."),
+                Tone::Warn,
+            );
+            return;
+        }
+        self.mode = Mode::Confirm {
+            machine,
+            request: json!({"action": crate::app::OPEN_BOTH, "key": key}),
+            title: format!("Open both versions of {reference}?"),
+            message,
+            back: Box::new(self.mode.clone()),
+            target: card.as_ref().map(|c| Box::new(CardSnapshot::of(c))),
+            queue: false,
+            ready_at: Some(Instant::now() + Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+    }
+
+    /// The answer to ask_open_both: yes opens the editor on both now; no keeps his version.
+    pub(super) fn open_both_answered(&mut self, key: &str, yes: bool) {
+        let Some(held) = self.edits.get(key) else {
+            return;
+        };
+        let reference = self.reference_for(&held.id);
+        if yes {
+            self.open_now_by_key(key);
+            return;
+        }
+        self.say(
+            format!("Your version of {reference}'s text is kept: e opens it, with the newer text below it."),
+            Tone::Info,
+        );
+    }
+
     fn finish_edit_save(
         &mut self,
         key: &str,
@@ -1124,10 +1218,47 @@ impl App {
             // happen (its write-up couldn't start, or the push failed): saved all the same, and
             // that part is said where it can't be missed.
             Ok(r) if r.ok => {
-                self.edits.remove(key);
+                let held = self.edits.remove(key);
+                self.as_written.remove(key);
                 // Saved somewhere other than the backlog card it shows on (as a new intent made
                 // from done work, or with its agent told): its backend's words say where.
                 let elsewhere = self.card(key).is_some_and(|c| !waiting_work(c));
+                // Saved with lines its backend fixed, merged with a change made meanwhile, or a
+                // line redacted (intent 0591, release 5): said, since what was saved isn't quite
+                // what he wrote. With fixes, his text as written stays for e to bring back.
+                if !r.fixed.is_empty() || r.merged || !r.redacted.is_empty() {
+                    let mut said = r.message.trim().to_string();
+                    if let Some(note) = r.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                        && !said.contains(note)
+                    {
+                        said = format!("{said} {note}");
+                    }
+                    if !r.fixed.is_empty()
+                        && let Some(mut held) = held
+                        && let Some(mine) = held.mine.take()
+                    {
+                        let saved = r.text.as_deref().map(edit::normalise).unwrap_or_default();
+                        if !saved.is_empty() && saved != mine.text {
+                            held.current = saved.clone();
+                            if let Some(was) = r.was.clone() {
+                                held.was = was;
+                            }
+                            held.mine = Some(Mine {
+                                text: mine.text,
+                                from: saved,
+                            });
+                            held.check_first = false;
+                            self.edits.insert(key.to_string(), held);
+                            self.as_written.insert(key.to_string());
+                            said.push_str(" Your text as you wrote it is kept: e opens it.");
+                        }
+                    }
+                    if said.is_empty() {
+                        said = format!("{reference}'s text is saved.");
+                    }
+                    self.say(short(said), Tone::Info);
+                    return;
+                }
                 if partial(&r) {
                     self.fail(partly_saved(reference, r));
                 } else if elsewhere && !r.message.trim().is_empty() {
@@ -1167,6 +1298,7 @@ impl App {
                     ));
                 };
                 held.machine = machine;
+                let conflict = stale && r.conflict;
                 let next = if stale {
                     match (r.text, r.was) {
                         (Some(text), Some(was)) => {
@@ -1174,6 +1306,16 @@ impl App {
                             held.was = was;
                             held.read_at = Instant::now();
                             held.check_first = false;
+                            // Both changed the same lines (intent 0591, K1-100): a question that
+                            // opens both, never a red failure.
+                            if conflict {
+                                let words = what_and_why(
+                                    &format!("{reference}'s text wasn't saved"),
+                                    reference,
+                                    &short(r.message),
+                                );
+                                return self.ask_open_both(key, reference, machine, &words);
+                            }
                             "Your version is kept: e opens it, with the newer text below it."
                         }
                         // Changed, but not said to what: e reads it first.
@@ -1420,6 +1562,196 @@ mod tests {
             card.detail.as_ref().unwrap().words.clone(),
             card.intake() == Some("pending"),
         )
+    }
+
+    /// The demo with every machine's backend fixing input (intent 0591, release 5).
+    fn fixing() -> App {
+        let mut app = app();
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        app
+    }
+
+    /// As send, for a request the board adds to on its way (`fix_input`): the one it handed on.
+    fn send_as_it_goes(app: &mut App, machine: usize, request: Value) -> Sent {
+        app.queue_action(machine, request.clone());
+        let (n, request) = app
+            .resolver
+            .ready()
+            .into_iter()
+            .find(|(_, m, r, gated)| {
+                *m == machine
+                    && r["action"] == request["action"]
+                    && r["id"] == request["id"]
+                    && !gated
+            })
+            .map(|(n, _, r, _)| (n, r))
+            .expect("it goes to the runner at once");
+        app.job_started(n);
+        app.resolver.handed(n);
+        Sent {
+            n,
+            machine,
+            request,
+        }
+    }
+
+    #[test]
+    fn a_save_to_a_backend_that_merges_carries_what_was_read_and_says_a_merge() {
+        // Intent 0591, K1-100: the text it was read as goes with the save (`base`), so a change
+        // made meanwhile on other lines is merged and saved; its backend says so, and nothing is
+        // left to save.
+        let mut app = fixing();
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.\n\nTwo lines.", "sha256:aa");
+        let Action::Mutate { machine, request } =
+            app.edit_ended(&key, wrote("New words.\n\nTwo lines."))
+        else {
+            panic!("not sent: {:?}", app.message())
+        };
+        assert_eq!(request["base"], "Old words.\n\nTwo lines.");
+        let sent = send_as_it_goes(&mut app, machine, request);
+        assert_eq!(sent.request["fix_input"], true);
+        // The board never shows the text, only how long it was.
+        let counted = crate::actions::request_metadata(&sent.request);
+        assert_eq!(counted["base"], "Old words.\n\nTwo lines.".chars().count());
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                merged: true,
+                message: "Saved #21's text, merged with the change made while you had it open."
+                    .into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            said(&app).contains("merged with the change made"),
+            "{}",
+            said(&app)
+        );
+        assert!(!app.failing());
+        assert!(app.edits.is_empty(), "nothing left to save");
+        // An older backend gets no base.
+        let mut older = super::tests::app();
+        let (key, id, _) = waiting(&mut older);
+        opened(&mut older, &key, &id, "Old words.", "sha256:aa");
+        let Action::Mutate { request, .. } = older.edit_ended(&key, wrote("New words.")) else {
+            panic!("not sent")
+        };
+        assert!(request.get("base").is_none());
+        assert!(older.with_fix_input(0, request).get("fix_input").is_none());
+    }
+
+    #[test]
+    fn a_change_on_the_same_lines_is_a_question_that_opens_both_never_a_red_failure() {
+        // Intent 0591, K1-100.
+        let mut app = fixing();
+        let (key, id, reference) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote("Mine.")) else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                status: Some("stale".into()),
+                conflict: true,
+                message: format!(
+                    "{reference}'s text changed while you had it open, in lines you changed too."
+                ),
+                text: Some("Theirs.".into()),
+                was: Some("sha256:bb".into()),
+                ..Default::default()
+            }),
+        );
+        assert!(!app.failing(), "not a red failure: {:?}", app.message());
+        let Mode::Confirm { title, message, .. } = app.mode.clone() else {
+            panic!("not asked: {:?}", app.mode)
+        };
+        assert_eq!(title, format!("Open both versions of {reference}?"));
+        assert!(message.contains("in lines you changed too"), "{message}");
+        // Yes opens the editor on both: his version, the newer text below it.
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        press(&mut app, 'y');
+        assert_eq!(app.edit_open.as_deref(), Some(key.as_str()));
+        let (_, file, _, marker) = app.edit_file(&key).unwrap();
+        assert!(marker.is_some());
+        assert!(file.starts_with("Mine.\n"), "{file}");
+        assert!(file.contains("\nTheirs.\n"), "{file}");
+        // No keeps his version for e, said, not red.
+        app.edit_open = None;
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote("Mine, again."))
+        else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                status: Some("stale".into()),
+                conflict: true,
+                message: format!(
+                    "{reference}'s text changed while you had it open, in lines you changed too."
+                ),
+                text: Some("Theirs, again.".into()),
+                was: Some("sha256:cc".into()),
+                ..Default::default()
+            }),
+        );
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        press(&mut app, 'n');
+        assert!(said(&app).contains("is kept: e opens it, with the newer text below it"));
+        assert!(!app.failing());
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine, again.");
+    }
+
+    #[test]
+    fn a_save_its_backend_fixed_says_which_lines_and_keeps_his_text_as_written_for_e() {
+        // Intent 0591, release 5: a # heading, an open code block or a NUL is fixed and saved;
+        // the lines are said, and e brings back the text as he wrote it. Quitting loses nothing.
+        let mut app = fixing();
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let mine = "# Title\nWords.";
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote(mine)) else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        let response: Response = crate::actions::parse_response(
+            &json!({"ok":true,"message":"Saved #21's text.","note":"Line 1's # heading is now ###, so it isn't read as a section of its own.",
+                "fixed":[{"line":1,"kind":"heading","message":"Line 1's # heading is now ###, so it isn't read as a section of its own."}],
+                "text":"### Title\nWords.","was":"sha256:dd"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(response.fixed.len(), 1);
+        answer(&mut app, &sent, Ok(response));
+        let said = said(&app);
+        assert!(said.contains("Line 1's # heading is now ###"), "{said}");
+        assert!(
+            said.contains("Your text as you wrote it is kept: e opens it."),
+            "{said}"
+        );
+        assert!(!app.failing());
+        assert_eq!(app.edits_lost(), None, "nothing is lost by quitting");
+        let (_, file, ..) = app.edit_file(&key).unwrap();
+        assert_eq!(file, "# Title\nWords.\n");
+        assert_eq!(app.edits[&key].current, "### Title\nWords.");
+        assert_eq!(app.edits[&key].was, "sha256:dd");
     }
 
     #[test]

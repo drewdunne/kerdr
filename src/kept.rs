@@ -861,6 +861,10 @@ pub struct KeptEdit {
     /// Your version, and the text you wrote it from.
     pub text: String,
     pub from: String,
+    /// Saved already, with lines its backend fixed: this is the text as you wrote it, kept so e
+    /// can bring it back, and quitting loses nothing (intent 0591, release 5).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub as_written: bool,
 }
 
 /// A new intent its backend accepted and is still saving, with no number yet (intent 0591,
@@ -1334,6 +1338,7 @@ mod tests {
                 }),
             }],
             edits: vec![KeptEdit {
+                as_written: false,
                 key: "ark-sdlc:0041".into(),
                 id: "0041".into(),
                 machine: "LAB-Server".into(),

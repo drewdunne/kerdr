@@ -281,6 +281,31 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>, fix: 
     out
 }
 
+/// A new intent's `create` request: its words, the images whose tags are in them, where it goes
+/// and who it's filed under, and its submission.
+fn create_request(
+    id: &str,
+    words: &str,
+    images: &[images::Image],
+    session: &str,
+    filed: &crate::app::Filed,
+) -> Value {
+    let mut request = json!({"action":"create","words":words,"session":session,"submission":id});
+    for (field, value) in [
+        ("organization", &filed.organization),
+        ("tenant", &filed.tenant),
+        ("team", &filed.team),
+    ] {
+        if let Some(v) = value {
+            request[field] = json!(v);
+        }
+    }
+    if !images.is_empty() {
+        request["images"] = Value::Array(images::request_images(words, images));
+    }
+    request
+}
+
 /// What the board says while a read goes.
 fn reading(source: &images::Source) -> &'static str {
     match source {
@@ -2276,20 +2301,7 @@ impl App {
             );
             return Action::None;
         }
-        let mut request =
-            json!({"action":"create","words":words,"session":draft.session,"submission":id});
-        for (field, value) in [
-            ("organization", &draft.filed.organization),
-            ("tenant", &draft.filed.tenant),
-            ("team", &draft.filed.team),
-        ] {
-            if let Some(v) = value {
-                request[field] = json!(v);
-            }
-        }
-        if !images.is_empty() {
-            request["images"] = Value::Array(images::request_images(&words, &images));
-        }
+        let request = create_request(&id, &words, &images, &draft.session, &draft.filed);
         // Past what its backend takes: nothing is sent, and the words come back (intent 0591,
         // K1-68). A backend that fixes input takes up to 32 MiB; any other 0.35.0's 64 KiB.
         let fix = self.fixes_input(draft.machine);
@@ -2710,6 +2722,50 @@ impl App {
         }
     }
 
+    /// Yes to a backend's question about a new intent's words: the same send again, its words and
+    /// images as kept with it, with the question's token and `override`.
+    fn create_question_yes(&mut self, machine: usize, submission: &str, token: &str) -> Action {
+        let Some(s) = self
+            .submissions
+            .iter()
+            .find(|s| s.id == submission)
+            .cloned()
+        else {
+            self.say(
+                "Nothing was sent: those words have moved since, and c brings them back.",
+                Tone::Info,
+            );
+            return Action::None;
+        };
+        let mut request = create_request(&s.id, &s.words, &s.images, &s.session, &s.filed);
+        request["confirm"] = json!(token);
+        request["override"] = json!(true);
+        self.closed_on_send = true;
+        self.emit_mutation(machine, request)
+    }
+
+    /// No to it: nothing is saved, and his words open in the box as they were, to change (or,
+    /// when the box holds other words, wait for c).
+    fn create_question_no(&mut self, submission: &str) {
+        let Some(i) = self.submissions.iter().position(|s| s.id == submission) else {
+            return;
+        };
+        let s = self.submissions.remove(i);
+        let into_box = self.give_back(s.words, s.images, None);
+        if into_box && matches!(self.mode, Mode::Board | Mode::Backlog { .. }) {
+            self.new_intent();
+            self.say(
+                "Your new intent wasn't saved: its words are open here, as you left them.",
+                Tone::Info,
+            );
+        } else {
+            self.say(
+                "Your new intent wasn't saved: its words are kept, and c brings them back.",
+                Tone::Info,
+            );
+        }
+    }
+
     /// Asks whether smaller copies of images too large to send go in their place, their tags at
     /// `at`. The images themselves are never changed; no leaves them out.
     fn ask_smaller(&mut self, images: Vec<images::Loaded>, at: usize) {
@@ -2848,6 +2904,40 @@ impl App {
                     }
                     return Some(Action::None);
                 }
+                // A backend's question about a new intent's words (release 5): yes sends them
+                // again, as the same send, with its token; no opens them in the box, unsent.
+                if request["action"] == "create" && request.get("confirm").is_some() {
+                    let submission = request["submission"].as_str().unwrap_or_default();
+                    let token = request["confirm"].as_str().unwrap_or_default();
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            self.create_question_no(submission);
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            return Some(self.create_question_yes(machine, submission, token));
+                        }
+                        _ => {}
+                    }
+                    return Some(Action::None);
+                }
+                // Kerdr's own question whether to open both versions of a text (K1-100).
+                if request["action"] == crate::app::OPEN_BOTH {
+                    let card = request["key"].as_str().unwrap_or_default().to_string();
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            self.open_both_answered(&card, false);
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            self.open_both_answered(&card, true);
+                        }
+                        _ => {}
+                    }
+                    return Some(Action::None);
+                }
                 // Kerdr's own question about smaller copies of images too large to send.
                 if request["action"] == crate::app::SMALLER {
                     let n = request["n"].as_u64().unwrap_or_default();
@@ -2948,7 +3038,7 @@ impl App {
                                 || (request.get("confirm").is_some()
                                     && matches!(
                                         request["action"].as_str(),
-                                        Some("close" | "dismiss" | "cancel" | "edit")
+                                        Some("close" | "dismiss" | "cancel" | "edit" | "answer")
                                     )))
                         {
                             request["override"] = json!(true);
@@ -3091,7 +3181,23 @@ impl App {
 
     /// Takes a change to a card into the action resolution tool (intent 0416): the board shows it
     /// at once, and its command runs in the background.
+    /// A request as it goes to `machine`: to a backend that fixes input, one carrying what he
+    /// typed says so (`fix_input`), so a line that looks like a secret is asked about and an
+    /// edit's faults fixed, rather than refused (intent 0591, release 5). Any other goes as it is.
+    pub(crate) fn with_fix_input(&self, machine: usize, mut request: Value) -> Value {
+        let typed = match request["action"].as_str() {
+            Some("create" | "answer") => true,
+            Some("edit") => request.get("text").is_some(),
+            _ => false,
+        };
+        if typed && self.fixes_input(machine) {
+            request["fix_input"] = json!(true);
+        }
+        request
+    }
+
     pub fn queue_action(&mut self, machine: usize, request: Value) {
+        let request = self.with_fix_input(machine, request);
         // Whether ⏎ asked for it: taken now, sent or not, so a request a check below stops can't
         // leave it for another card's (Codex's sixth look).
         let enter_sent = self.enter_sent.take();
@@ -4681,7 +4787,7 @@ impl App {
                         && response.confirm.is_some()
                         && matches!(
                             request["action"].as_str(),
-                            Some("close" | "dismiss" | "cancel" | "edit")
+                            Some("close" | "dismiss" | "cancel" | "edit" | "answer")
                         )))
                 && (request["override"] != true
                     || response
@@ -4994,6 +5100,38 @@ impl App {
                     message.push_str(" b shows it in the backlog.");
                 }
                 self.say(short(message), Tone::Info);
+            }
+            // A question about his words (a line that looks like a token or password, intent
+            // 0591, release 5): asked, the words kept meanwhile with their send; nothing's made.
+            Ok(response) if response.confirmation && response.confirm.is_some() => {
+                let token = response.confirm.clone().unwrap_or_default();
+                if at.is_none() || !self.enter_can_land_here() {
+                    let into_box = self.give_back(words.0, words.1, None);
+                    return self.say(
+                        short(format!(
+                            "Your new intent wasn't saved yet: {} {}; Enter there asks again.",
+                            response.message,
+                            back(into_box)
+                        )),
+                        Tone::Warn,
+                    );
+                }
+                self.mode = Mode::Confirm {
+                    machine,
+                    request: json!({"action": "create", "submission": submission, "confirm": token}),
+                    title: "Save your new intent?".into(),
+                    message: format!(
+                        "{} n keeps your words unsent, open in the box.",
+                        response.message.trim()
+                    ),
+                    back: Box::new(self.mode.clone()),
+                    target: None,
+                    queue: false,
+                    ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+                    plain: false,
+                    choices: vec![],
+                    enter_queues: false,
+                };
             }
             Ok(response) => {
                 // Nothing made. Settled, unless an earlier send of these words went unheard.

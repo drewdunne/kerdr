@@ -2068,6 +2068,7 @@ impl App {
                     was: held.was.clone(),
                     text: mine.text.clone(),
                     from: mine.from.clone(),
+                    as_written: self.as_written.contains(key),
                 })
             })
             .collect();
@@ -2159,6 +2160,9 @@ impl App {
             let Some(machine) = self.machine_index(&e.machine) else {
                 continue;
             };
+            if e.as_written {
+                self.as_written.insert(e.key.clone());
+            }
             self.edits.insert(
                 e.key,
                 super::edit_controls::Held {
