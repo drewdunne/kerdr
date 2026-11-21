@@ -553,7 +553,7 @@ pub fn from_file(path: &Path, room: Room) -> Result<Loaded, String> {
 const MOST_TEXT_FILE: usize = 256 * 1024;
 
 /// A file, read and checked: an image, or for a backend that fixes input a text file's words
-/// (fenced, under its name), from a file whose name doesn't say it's an image.
+/// (indented, under its name), from a file whose name doesn't say it's an image.
 fn from_file_any(path: &Path, room: Room) -> Result<Got, String> {
     let name = name_of(path);
     let meta = std::fs::metadata(path).map_err(|e| format!("Couldn't read {name}: {e}."))?;
@@ -591,8 +591,11 @@ fn from_file_any(path: &Path, room: Room) -> Result<Got, String> {
     text_file(&name, &bytes).map(Got::Text)
 }
 
-/// A text file's words as they go into a new intent's words: under its name, fenced so nothing
-/// in it reads as the intent's own sections (K3-58). Bytes that aren't text are named instead.
+/// A text file's words as they go into a new intent's words: under "File <name>:", each line
+/// indented four spaces (K3-58). No line of it can then read as a heading or a fence: the backend
+/// takes a line like one of the intent's own headings ("## Constraints") for that section even
+/// inside a code block, so a fence wouldn't keep it apart (r5-b, the lead in round 3). Bytes that
+/// aren't text are named instead.
 fn text_file(name: &str, bytes: &[u8]) -> Result<String, String> {
     if bytes.starts_with(b"%PDF-") {
         return Err(format!(
@@ -613,12 +616,18 @@ fn text_file(name: &str, bytes: &[u8]) -> Result<String, String> {
             ));
         }
     };
-    let longest = text.split(|c| c != '`').map(str::len).max().unwrap_or(0);
-    let fence = "`".repeat((longest + 1).max(3));
-    Ok(format!(
-        "{name}:\n{fence}\n{}\n{fence}",
-        text.trim_end_matches(['\n', '\r'])
-    ))
+    let lines: Vec<String> = text
+        .trim_end_matches(['\n', '\r'])
+        .lines()
+        .map(|line| {
+            if line.trim().is_empty() {
+                String::new()
+            } else {
+                format!("    {line}")
+            }
+        })
+        .collect();
+    Ok(format!("File {name}:\n{}", lines.join("\n")))
 }
 
 /// Whether a file's name says it's an image: PNG, JPEG, GIF or WebP, and with `any`, every other
@@ -2013,7 +2022,7 @@ mod tests {
     #[test]
     fn files_copied_in_a_file_manager_attach_as_what_their_bytes_are() {
         // Intent 0591, K3-58: for a backend that fixes input, an image named oddly attaches, a
-        // text file's words go into his words, fenced under its name, and anything else is named.
+        // text file's words go into his words, indented under its name, and anything else is named.
         let dir = tempfile::tempdir().unwrap();
         let odd = dir.path().join("Screenshot from today");
         std::fs::write(&odd, PNG).unwrap();
@@ -2036,7 +2045,7 @@ mod tests {
         assert_eq!(got.images[0].media_type, "image/png");
         assert_eq!(
             got.text.as_deref(),
-            Some("notes.log:\n````\nboot failed\n```\nat line 3\n````")
+            Some("File notes.log:\n    boot failed\n    ```\n    at line 3")
         );
         let why = got.why.unwrap();
         assert!(why.contains("report.pdf is a PDF"), "{why}");
@@ -2046,6 +2055,37 @@ mod tests {
         );
         // An older backend: only image names, as 0.35.0.
         assert!(copied_files(&listed, false).is_err());
+    }
+
+    #[test]
+    fn a_text_files_lines_go_in_indented_so_none_reads_as_one_of_the_intents_sections() {
+        // The lead, round 3, from r5-b: the backend takes a line like "## Constraints" for the
+        // intent's own section even inside a code block, so a pasted file's words are indented
+        // four spaces under its name. Its patterns (bin/ark-cards' OWN_SECTION and FENCE_OPEN,
+        // bin/ark-card-action's NEW_SECTION) allow at most three spaces before the mark, so no
+        // indented line can match one.
+        let dir = tempfile::tempdir().unwrap();
+        let plan = dir.path().join("plan.txt");
+        let text = "Steps\n## Acceptance criteria\n- it works\n\n## Constraints\n```\ncode\n## Images\n# Title\n";
+        std::fs::write(&plan, text).unwrap();
+        let got = from_files(std::slice::from_ref(&plan), fixing());
+        assert_eq!(got.why, None);
+        let words = got.text.unwrap();
+        assert_eq!(
+            words,
+            "File plan.txt:\n    Steps\n    ## Acceptance criteria\n    - it works\n\n    ## Constraints\n    ```\n    code\n    ## Images\n    # Title"
+        );
+        for line in words.lines().skip(1) {
+            assert!(line.is_empty() || line.starts_with("    "), "{line:?}");
+            let mark = line.trim_start_matches(' ');
+            let indent = line.len() - mark.len();
+            for start in ["#", "```", "~~~"] {
+                assert!(
+                    line.is_empty() || !mark.starts_with(start) || indent > 3,
+                    "{line:?} reads as a heading or a fence"
+                );
+            }
+        }
     }
 
     #[test]
