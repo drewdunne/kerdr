@@ -2237,10 +2237,8 @@ mod tests {
         use std::sync::{Arc, Mutex};
         let copies = Arc::new(AtomicU64::new(1));
         let clipboard = Arc::new(Mutex::new("<B>".to_string()));
-        let watch = {
-            let copies = copies.clone();
-            ClipboardWatch::numbered_by(move || Some(copies.load(SeqCst)))
-        };
+        let (watch, notices) = ClipboardWatch::counted();
+        notices.synced_by(|_| true);
         let workers = Workers::default();
         let (tx, rx) = mpsc::channel();
         let mut app = box_open();
@@ -2255,6 +2253,7 @@ mod tests {
                 take_since(pasted, || {
                     // The reader connects; he copies C meanwhile.
                     seen.store(2, SeqCst);
+                    notices.copied();
                     *held.lock().unwrap() = "<C>".into();
                     let from = std::cell::Cell::new(0);
                     let reader = Reader {

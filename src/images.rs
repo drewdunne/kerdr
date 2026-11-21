@@ -939,7 +939,7 @@ pub fn take_pasted(room: Room, pasted: Option<Pasted>) -> Result<Found, String> 
     };
     // Windows' number is checked once the clipboard is open, which nothing else can change then.
     #[cfg(windows)]
-    let found = windows_clipboard(room, pasted.map(|p| p.copy));
+    let found = windows_clipboard(room, pasted.map(|p| p.number()));
     #[cfg(not(any(target_os = "macos", windows)))]
     let found = take_since(pasted.clone(), || {
         let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
@@ -968,96 +968,8 @@ pub fn take_since(
     }
 }
 
-/// Kerdr's watch on this desktop's clipboard: set up as Kerdr starts, on a thread of its own, and
-/// kept running, so a paste's copy is numbered as the paste is handled, before anything else is
-/// done for it, and a copy made at any point since is known (Codex's review 89). Windows numbers
-/// copies itself (GetClipboardSequenceNumber); under X11 XFixes reports each, under Wayland a
-/// data-control watch. macOS has none, nor a desktop where one can't be set up: then each of
-/// Kerdr's own readers watches from its own start, as before, and a program that reads it can't
-/// tell at all (the known limits).
-#[derive(Clone, Default)]
-pub struct ClipboardWatch {
-    now: Arc<std::sync::OnceLock<WatchNow>>,
-}
-
-/// How a watch numbers the copy the clipboard holds now: None when it can't tell.
-type WatchNow = Box<dyn Fn() -> Option<u64> + Send + Sync>;
-
-/// A paste's copy, as the watch numbered it when the paste was handled.
-#[derive(Clone)]
-pub struct Pasted {
-    watch: ClipboardWatch,
-    copy: u64,
-}
-
-impl ClipboardWatch {
-    /// Sets the watch up away from the board, which doesn't wait for it: a paste before it's
-    /// ready is read as one with no watch.
-    pub fn start() -> ClipboardWatch {
-        let watch = ClipboardWatch::default();
-        let ready = watch.now.clone();
-        let _ = std::thread::Builder::new()
-            .name("kerdr-clipboard-watch".into())
-            .spawn(move || {
-                if let Some(now) = platform_watch() {
-                    let _ = ready.set(now);
-                }
-            });
-        watch
-    }
-
-    /// A watch that numbers copies by `now`.
-    pub fn numbered_by(now: impl Fn() -> Option<u64> + Send + Sync + 'static) -> ClipboardWatch {
-        let watch = ClipboardWatch::default();
-        let _ = watch.now.set(Box::new(now));
-        watch
-    }
-
-    /// The copy the clipboard holds now; None until the watch is set up, or when it can't tell.
-    pub fn now(&self) -> Option<u64> {
-        self.now.get().and_then(|now| now())
-    }
-
-    /// As a paste is handled: the copy it's for.
-    pub fn pasted(&self) -> Option<Pasted> {
-        Some(Pasted {
-            watch: self.clone(),
-            copy: self.now()?,
-        })
-    }
-}
-
-impl Pasted {
-    /// Whether he's copied anything since the paste; None when the watch can't tell now.
-    pub fn changed(&self) -> Option<bool> {
-        self.watch.now().map(|now| now != self.copy)
-    }
-}
-
-/// This desktop's clipboard watch, or None where there's none to be had.
-fn platform_watch() -> Option<WatchNow> {
-    #[cfg(windows)]
-    {
-        Some(Box::new(|| {
-            clipboard_win::raw::seq_num().map(|n| u64::from(n.get()))
-        }))
-    }
-    #[cfg(target_os = "macos")]
-    {
-        None
-    }
-    #[cfg(not(any(target_os = "macos", windows)))]
-    {
-        let set = |name: &str| std::env::var_os(name).is_some_and(|v| !v.is_empty());
-        if set("WAYLAND_DISPLAY") {
-            builtin::wayland_watch()
-        } else if set("DISPLAY") {
-            builtin::x11_watch()
-        } else {
-            None
-        }
-    }
-}
+pub mod watch;
+pub use watch::{ClipboardWatch, Pasted};
 
 /// What was taken from the clipboard, read for the box: a copied file list's files read, a
 /// bitmap made a PNG.
@@ -1550,73 +1462,6 @@ mod builtin {
         }
     }
 
-    /// Kerdr's X11 clipboard watch, kept from its start: XFixes' word of each copy, counted on a
-    /// thread of its own when a paste asks, after a round trip, so every copy the server knew of
-    /// by then is in the count. None where there's no X11 display or no XFixes.
-    pub(super) fn x11_watch() -> Option<super::WatchNow> {
-        let watch = X11Watch::start()?;
-        let (ask, asked) = std::sync::mpsc::channel::<std::sync::mpsc::Sender<u64>>();
-        std::thread::Builder::new()
-            .name("kerdr-x11-watch".into())
-            .spawn(move || {
-                let mut copies = 0u64;
-                for answer in asked {
-                    match watch.copies() {
-                        Some(n) => copies += n,
-                        None => return,
-                    }
-                    let _ = answer.send(copies);
-                }
-            })
-            .ok()?;
-        let ask = std::sync::Mutex::new(ask);
-        Some(Box::new(move || {
-            let (answer, answered) = std::sync::mpsc::channel();
-            ask.lock().ok()?.send(answer).ok()?;
-            answered
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .ok()
-        }))
-    }
-
-    /// Kerdr's Wayland clipboard watch, kept from its start: each selection the desktop offers,
-    /// counted as it comes on a thread of its own. A paste asks after 20 ms, time for one just
-    /// sent to have come. None where data-control can't be had.
-    pub(super) fn wayland_watch() -> Option<super::WatchNow> {
-        use std::sync::Arc;
-        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
-        use wl_clipboard_rs::paste::Seat;
-        use wl_clipboard_rs::watch::{ClipboardType, Watcher};
-        const ENDED: u64 = u64::MAX;
-        let copies = Arc::new(AtomicU64::new(0));
-        let counted = copies.clone();
-        let (ready, started) = std::sync::mpsc::channel();
-        std::thread::Builder::new()
-            .name("kerdr-wayland-watch".into())
-            .spawn(move || {
-                let Ok(mut watcher) = Watcher::new(ClipboardType::Regular, Seat::Unspecified)
-                else {
-                    return;
-                };
-                // The first is the clipboard as the watch began.
-                while let Ok(Some(_)) = watcher.next_event() {
-                    if counted.fetch_add(1, SeqCst) == 0 {
-                        let _ = ready.send(());
-                    }
-                }
-                counted.store(ENDED, SeqCst);
-            })
-            .ok()?;
-        started
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .ok()?;
-        Some(Box::new(move || {
-            std::thread::sleep(std::time::Duration::from_millis(20));
-            let n = copies.load(SeqCst);
-            (n != ENDED).then_some(n)
-        }))
-    }
-
     /// The X11 clipboard's owner as a read began, and XFixes' word of each change of owner since:
     /// a program that copies again sets the selection again, whether or not it owned it.
     pub(super) struct X11Watch {
@@ -1661,29 +1506,6 @@ mod builtin {
                 clipboard,
                 owner,
             })
-        }
-
-        /// How many copies XFixes has reported since this was last asked, after a round trip (the
-        /// owner asked again) so every one the server made before it is in; None if the display
-        /// has gone.
-        pub(super) fn copies(&self) -> Option<u64> {
-            use x11rb::connection::Connection;
-            use x11rb::protocol::Event;
-            use x11rb::protocol::xproto::ConnectionExt as _;
-            self.conn
-                .get_selection_owner(self.clipboard)
-                .ok()?
-                .reply()
-                .ok()?;
-            let mut copies = 0;
-            loop {
-                match self.conn.poll_for_event() {
-                    Ok(Some(Event::XfixesSelectionNotify(_))) => copies += 1,
-                    Ok(Some(_)) => {}
-                    Ok(None) => return Some(copies),
-                    Err(_) => return None,
-                }
-            }
         }
 
         /// Whether the selection was set again, or its owner went, since `start`. The owner asked
