@@ -3058,6 +3058,9 @@ fn tagged(line: String, tags: &[String]) -> Line<'static> {
 }
 
 fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
+    if let Some(edit) = &draft.edit {
+        return edit_box(f, area, draft, edit);
+    }
     let rect = centered(area, 100, 24, Some(4));
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
@@ -3188,6 +3191,112 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
         inner.width,
         fit(hints, w),
     );
+}
+
+/// An item's text in the new-intent box's own look, because no editor could start (intent 0591,
+/// K1-87): EDITING and its number in place of NEW INTENT, his words with the cursor at their end,
+/// each editor tried with why, and the new-intent box's own keys.
+fn edit_box(f: &mut Frame, area: Rect, draft: &Draft, edit: &crate::app::EditInBox) {
+    let rect = centered(area, 100, 24, Some(4));
+    dialog(f, rect, CYAN);
+    let inner = pad(rect, 3, 1);
+    let w = inner.width as usize;
+    let buf = f.buffer_mut();
+    put_lr(
+        buf,
+        inner,
+        inner.y,
+        vec![
+            Span::styled(format!("EDITING {}", edit.reference), bold(CYAN)),
+            Span::styled("   No editor could start, so its text opens here.", fg(FG2)),
+        ],
+        vec![Span::styled("esc keep for later", fg(DIM))],
+    );
+    let boxed = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(7),
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(fg(BORDER))
+            .style(Style::default().bg(BG)),
+        boxed,
+    );
+    let text = pad(boxed, 2, 1);
+    let rows = text.height.max(1) as usize;
+    let lines: Vec<Line> = field_lines(&draft.words, text.width.max(1) as usize, rows, true)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, fg(FG))))
+        .collect();
+    f.render_widget(Paragraph::new(lines), text);
+    let buf = f.buffer_mut();
+    let y = boxed.bottom() + 1;
+    put(
+        buf,
+        inner.x,
+        y,
+        inner.width,
+        vec![Span::styled(
+            trunc(&tried_editors(&edit.skipped), w),
+            fg(FG2),
+        )],
+    );
+    put(
+        buf,
+        inner.x,
+        y + 1,
+        inner.width,
+        vec![Span::styled(
+            trunc(
+                "Your editor comes back once one starts: name it as editor in Kerdr's config, or set $EDITOR.",
+                w,
+            ),
+            fg(DIM),
+        )],
+    );
+    let hints = key_hints(&[
+        ("⏎", "save"),
+        ("shift+⏎ / alt+⏎", "new line"),
+        ("ctrl+u", "clear"),
+        ("esc", "keep for later"),
+    ]);
+    put(
+        buf,
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        fit(hints, w),
+    );
+}
+
+/// Each editor that couldn't start, with why in a word or two: "Tried nvim (not found), vi (not
+/// found) and nano (not found). It saves as e does from your editor."
+fn tried_editors(skipped: &[String]) -> String {
+    let each: Vec<String> = skipped
+        .iter()
+        .map(|s| {
+            let (name, why) = s.split_once(": ").unwrap_or((s.as_str(), ""));
+            let why = if why.contains("No such file") || why.contains("not found") {
+                "not found".to_string()
+            } else if why.contains("ermission denied") {
+                "not allowed to run".to_string()
+            } else if why.is_empty() {
+                "didn't start".to_string()
+            } else {
+                why.split(" (os error").next().unwrap_or(why).to_lowercase()
+            };
+            format!("{name} ({why})")
+        })
+        .collect();
+    let list = match each.as_slice() {
+        [] => return "It saves as e does from your editor.".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("Tried {list}. It saves as e does from your editor.")
 }
 
 /// The filter list (f): who the work is for, or one of their projects.

@@ -563,7 +563,13 @@ impl App {
     /// have with none (intent 0591, K1-82).
     pub fn edit_ended(&mut self, key: &str, ended: Ended) -> Action {
         let action = self.edit_ended_saving(key, ended);
-        self.edit_closed_for(key);
+        // Still being edited, in Kerdr's own box (K1-87): a start that waits for it waits on, until
+        // the box saves or keeps it.
+        let in_box = matches!(&self.mode, Mode::Compose { draft, .. }
+            if draft.edit.as_ref().is_some_and(|e| e.key == key));
+        if !in_box {
+            self.edit_closed_for(key);
+        }
         action
     }
 
@@ -590,14 +596,10 @@ impl App {
                 );
                 Action::None
             }
+            // No editor could start, his own and every fallback: the text opens in a box inside
+            // Kerdr, saved by the same request (intent 0591, K1-87).
             Ended::NoEditor { skipped } => {
-                self.say(
-                    format!(
-                        "No editor could start ({}). Name one as editor in Kerdr's config, or set $EDITOR. {reference} is as it was; e tries again{yours}.",
-                        skipped.join("; ")
-                    ),
-                    Tone::Warn,
-                );
+                self.edit_in_box(key, skipped);
                 Action::None
             }
             // :cq: left as it was, and any version of yours let go. Nothing to say.
@@ -736,6 +738,83 @@ impl App {
                 Action::Mutate { machine, request }
             }
         }
+    }
+
+    /// Opens an item's text in the box, as the editor would have opened it: his version, with any
+    /// newer text below it. Enter saves it through the same request, with the same fingerprint;
+    /// Esc keeps what he wrote as his version, for e.
+    fn edit_in_box(&mut self, key: &str, skipped: Vec<String>) {
+        let Some((_, file, _, marker)) = self.edit_file(key) else {
+            return;
+        };
+        let Some(held) = self.edits.get(key) else {
+            return;
+        };
+        let machine = held.machine;
+        let reference = self.reference_for(&held.id);
+        let draft = Draft {
+            words: file.strip_suffix('\n').unwrap_or(&file).to_string(),
+            machine,
+            edit: Some(crate::app::EditInBox {
+                key: key.to_string(),
+                reference,
+                marker,
+                skipped,
+            }),
+            ..Draft::default()
+        };
+        // The box says it all, each editor tried with why: nothing more on the message line.
+        let back = Box::new(self.mode.clone());
+        self.mode = Mode::Compose { draft, back };
+    }
+
+    /// ⏎ in the box holding an item's text: saved as the editor's `:wq` saves it.
+    pub(super) fn edit_box_saved(&mut self, draft: Draft, back: Mode) -> Action {
+        let Some(edit) = draft.edit else {
+            return Action::None;
+        };
+        self.mode = back;
+        let text = edit::read_back(&draft.words, edit.marker.as_deref());
+        let ended = Ended::Wrote {
+            text,
+            run: Run {
+                editor: Some("Kerdr's own box".into()),
+                ok: true,
+                ..Run::default()
+            },
+            touched: true,
+        };
+        self.edit_ended(&edit.key, ended)
+    }
+
+    /// Esc in it: what he wrote is kept as his version, sent nowhere, for e to open; nothing he
+    /// changed, nothing to keep.
+    pub(super) fn edit_box_left(&mut self, draft: Draft, back: Mode) {
+        let Some(edit) = draft.edit else {
+            return;
+        };
+        self.mode = back;
+        let text = edit::read_back(&draft.words, edit.marker.as_deref());
+        let Some(held) = self.edits.get_mut(&edit.key) else {
+            return;
+        };
+        let mine = held.mine.as_ref().map(|m| m.text.clone());
+        if !text.is_empty() && text != held.current && Some(&text) != mine.as_ref() {
+            held.mine = Some(Mine {
+                text,
+                from: held.current.clone(),
+            });
+            self.say(
+                format!(
+                    "Your version of {}'s text is kept, sent nowhere: e opens it.",
+                    edit.reference
+                ),
+                Tone::Info,
+            );
+        } else if mine.is_none() {
+            self.edits.remove(&edit.key);
+        }
+        self.edit_closed_for(&edit.key);
     }
 
     /// The editor has closed on your unsaved version of an item that can't be edited any more, or
@@ -3259,10 +3338,85 @@ mod tests {
             ),
             Action::None
         );
-        let text = said(&app);
-        assert!(text.contains("nvim: not found; vim: not found"), "{text}");
-        assert!(text.contains("editor in Kerdr's config"), "{text}");
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. }
+                if draft.edit.as_ref().is_some_and(|e| e.skipped.len() == 2)),
+            "{:?}",
+            app.mode
+        );
         assert!(app.edits.contains_key(&key));
+    }
+
+    #[test]
+    fn with_no_editor_at_all_the_text_opens_in_a_box_inside_kerdr_and_saves_as_the_editor_would() {
+        // Intent 0591, K1-87: every editor failed to start; the box holds the text, ⏎ sends the
+        // same save with the fingerprint it was read with, Esc keeps his version for e.
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let none = || Ended::NoEditor {
+            skipped: vec!["nvim: not found".into(), "nano: not found".into()],
+        };
+        assert_eq!(app.edit_ended(&key, none()), Action::None);
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("no box: {:?}", app.mode)
+        };
+        assert_eq!(draft.words, "Old words.");
+        assert_eq!(draft.edit.as_ref().unwrap().reference, reference);
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(
+            screen.contains(&format!(
+                "EDITING {reference}   No editor could start, so its text opens here."
+            )),
+            "{screen}"
+        );
+        assert!(screen.contains("esc keep for later"), "{screen}");
+        assert!(
+            screen.contains(
+                "Tried nvim (not found) and nano (not found). It saves as e does from your editor."
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Your editor comes back once one starts: name it as editor in Kerdr's config, or set $EDITOR."),
+            "{screen}"
+        );
+        assert!(
+            screen
+                .contains("⏎ save   shift+⏎ / alt+⏎ new line   ctrl+u clear   esc keep for later"),
+            "{screen}"
+        );
+        // A pasted path is words here, never an image.
+        app.on_paste(" /tmp/shot.png");
+        for _ in 0..(" /tmp/shot.png".len() + "words.".len()) {
+            app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "text, edited here.".chars() {
+            press(&mut app, c);
+        }
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("⏎ saved nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["text"], "Old text, edited here.");
+        assert_eq!(request["was"], "sha256:aa");
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        // Esc: kept as his version, sent nowhere.
+        app.edits.get_mut(&key).unwrap().mine = None;
+        app.edit_ended(&key, none());
+        press(&mut app, '!');
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Old words.!");
+        assert!(
+            said(&app).contains("kept, sent nowhere: e opens it"),
+            "{}",
+            said(&app)
+        );
     }
 
     #[test]

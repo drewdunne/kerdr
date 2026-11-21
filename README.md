@@ -307,7 +307,9 @@ peek alike:
   key's step first, which edits it where it is; so does a machine that isn't answering. An editor killed or crashed keeps what it had written as your version, sent nowhere.
   `q` says first when quitting would lose a version only Kerdr keeps, and a second `q` quits. An editor that opens a window of
   its own is given its waiting flag (`code` runs as `code --wait`, `subl -w`, `gvim -f`), and Kerdr says so. When the
-  temp folder can't take the file, it opens in `$XDG_RUNTIME_DIR`, then in Kerdr's state folder, each private to you. To a
+  temp folder can't take the file, it opens in `$XDG_RUNTIME_DIR`, then in Kerdr's state folder, each private to you. When no
+  editor starts at all, the text opens in Kerdr's own box, the new-intent box titled **EDITING #N**, naming each editor
+  tried: `⏎` saves it as `e` does from your editor, and `Esc` keeps your version for later. To a
   backend that fixes input (its feed lists `fix-input`), any length of text saves; a `#` heading, an open code block or a NUL
   is fixed and saved, saying which lines, with your text as you wrote it kept for `e`; a change made meanwhile on other
   lines is merged and saved, and one on the same lines asks whether to open both.

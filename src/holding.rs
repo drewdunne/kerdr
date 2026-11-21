@@ -1625,6 +1625,7 @@ impl App {
             came_back: None,
             filed: super::Filed::default(),
             unfiled: None,
+            edit: None,
         };
         let action = self.send_draft(draft);
         if matches!(action, super::Action::Mutate { .. }) {
@@ -3711,6 +3712,7 @@ mod tests {
             came_back: next.draft_came_back.take(),
             filed: super::super::Filed::default(),
             unfiled: None,
+            edit: None,
         };
         let Action::Mutate { machine, request } = next.send_draft(draft) else {
             panic!("not sent: {}", said(&next))

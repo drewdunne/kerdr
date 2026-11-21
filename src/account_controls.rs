@@ -1755,6 +1755,7 @@ impl App {
                 team: None,
             },
             unfiled: None,
+            edit: None,
         };
         let action = self.send_draft(draft);
         if matches!(action, Action::Mutate { .. }) {

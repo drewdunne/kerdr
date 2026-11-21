@@ -66,6 +66,21 @@ pub struct Draft {
     /// What the view wanted to file it under that this machine's backend can't take, said in the
     /// box before it's sent.
     pub unfiled: Option<String>,
+    /// Not a new intent: an item's text, edited in the box because no editor could start (intent
+    /// 0591, K1-87). Enter saves it as the editor's save would.
+    pub edit: Option<EditInBox>,
+}
+
+/// The item whose text the box holds, when it holds one (Draft::edit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditInBox {
+    /// Its card, by key, and how it's named: "#21".
+    pub key: String,
+    pub reference: String,
+    /// The marker of the newer-text block below his version, when there is one.
+    pub marker: Option<String>,
+    /// The editors that couldn't start, each with why.
+    pub skipped: Vec<String>,
 }
 
 /// Who a new intent is filed under, from the view it was made in (intent 0595): on all of Kerdr

@@ -1953,6 +1953,7 @@ impl App {
                 came_back: self.draft_came_back.clone(),
                 filed,
                 unfiled,
+                edit: None,
             },
             back: Box::new(self.mode.clone()),
         };
@@ -2123,6 +2124,42 @@ impl App {
     /// Alt+Enter or Ctrl+J starts a new line; Ctrl+V attaches the clipboard's image as an
     /// `[Image #N]` tag, as Claude Code does; Esc keeps them for the next time it opens.
     fn compose_key(&mut self, key: KeyEvent, mut draft: Draft, back: Box<Mode>) -> Action {
+        // An item's text, edited here because no editor could start (K1-87): ⏎ saves it, Esc
+        // keeps his version, and it holds words only.
+        if draft.edit.is_some() {
+            let newline = key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc => {
+                    self.edit_box_left(draft, *back);
+                    return Action::None;
+                }
+                KeyCode::Enter if !newline => return self.edit_box_saved(draft, *back),
+                KeyCode::Enter => draft.words.push('\n'),
+                KeyCode::Char('j') if ctrl => draft.words.push('\n'),
+                KeyCode::Backspace => {
+                    draft.words.pop();
+                }
+                KeyCode::Char('u') if ctrl => draft.words.clear(),
+                KeyCode::Char('w') if ctrl => {
+                    let kept = draft.words.trim_end().len();
+                    draft.words.truncate(kept);
+                    let cut = draft
+                        .words
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| c.is_whitespace())
+                        .map_or(0, |(i, c)| i + c.len_utf8());
+                    draft.words.truncate(cut);
+                }
+                KeyCode::Char(c) if !ctrl => draft.words.push(c),
+                _ => {}
+            }
+            self.mode = Mode::Compose { draft, back };
+            return Action::None;
+        }
         if key.code == KeyCode::Esc {
             self.draft = draft.words;
             self.draft_images = draft.images;
@@ -2395,7 +2432,8 @@ impl App {
             Mode::Kickoff { form, .. } => self.fixes_input(form.machine),
             _ => false,
         };
-        if matches!(self.mode, Mode::Compose { .. }) {
+        let edit_box = matches!(&self.mode, Mode::Compose { draft, .. } if draft.edit.is_some());
+        if matches!(self.mode, Mode::Compose { .. }) && !edit_box {
             // Spaces and blank lines are words; only a paste with nothing in it means an image.
             if text.is_empty() {
                 return Action::LoadImages(images::Source::Clipboard);
@@ -2414,6 +2452,9 @@ impl App {
         }
         match &mut self.mode {
             Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text, kickoff_fix),
+            Mode::Compose { draft, .. } if draft.edit.is_some() => {
+                draft.words.push_str(&text);
+            }
             Mode::Compose { draft, .. } => {
                 let room = max_words(fix).saturating_sub(draft.words.len());
                 let mut end = text.len().min(room);
