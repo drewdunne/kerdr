@@ -660,6 +660,11 @@ its feed works, and whether Kerdr's keys are in its herdr config. `kerdr doctor 
 where this machine's config lacks them and reloads each running session's config; on another
 machine, run it there.
 
+In a window too small for the board (under 32 columns, or under 10 rows), Kerdr lists the cards
+that need you instead, one to a line: a bar and a word in its colour (yellow asks, red failed,
+blue yours), and with room across, what each wants. `j` and `k` move along it, and a key that acts
+acts on the row selected there; a question open over the board is answered there with its own keys.
+
 ## Configure
 
 Kerdr works with no config: it shows this machine. To add machines and a feed, write

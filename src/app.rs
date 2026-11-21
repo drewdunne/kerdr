@@ -459,6 +459,23 @@ fn holds_peek(mode: &Mode) -> bool {
 /// didn't go in: never sent to a backend.
 pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
 
+/// What a card on the compact list wants of him (intent 0591, K2-43): it asks him something
+/// (yellow), it's stopped (red), or it waits on him (blue).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wants {
+    Asks,
+    Failed,
+    Yours,
+}
+
+/// One row of the compact list: its card, what it wants, and that in its own words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactRow {
+    pub index: usize,
+    pub wants: Wants,
+    pub what: String,
+}
+
 /// The action of Kerdr's own question whether an image past what one intent may carry goes in as
 /// a smaller copy (intent 0591, release 5): never sent to a backend.
 pub(crate) const SMALLER: &str = "kerdr:attach-smaller-copy";
@@ -1716,6 +1733,167 @@ impl App {
         }
     }
 
+    /// Whether the board is shown as the compact list: a window too small for its columns (under
+    /// 32 columns or 10 rows), on the board itself (intent 0591, K2-43).
+    pub fn compact(&self) -> bool {
+        self.width > 0
+            && self.height > 0
+            && (self.width < 32 || self.height < 10)
+            && matches!(self.mode, Mode::Board)
+    }
+
+    /// The compact list's rows: the cards on the board that need you, asking you something or
+    /// stopped, in board order, each with what it wants of you. A question open over the board
+    /// is its card's, first if that card isn't one already.
+    pub fn compact_rows(&self) -> Vec<CompactRow> {
+        let layout = self.layout();
+        let cols = self.columns_in(&layout);
+        let vis = self.visible_in(&layout);
+        let mut out: Vec<CompactRow> = Vec::new();
+        for ci in 0..cols.len() {
+            let col = &layout.columns[ci];
+            let folded = col.band.is_some_and(|b| layout.bands[b].folded);
+            if !vis[ci] && !self.cfg.board.hides(col.stage) && !folded {
+                continue;
+            }
+            for &i in &cols[ci] {
+                let c = &self.board.cards[i];
+                if out.iter().any(|r| r.index == i) {
+                    continue;
+                }
+                let held = self.holds(i);
+                let row = |wants, what: &str| CompactRow {
+                    index: i,
+                    wants,
+                    what: what.trim().to_string(),
+                };
+                if let Some(w) = self.waiting_on(&c.key) {
+                    let what = w.line.strip_prefix("asks you: ").unwrap_or(&w.line);
+                    out.push(row(Wants::Asks, what));
+                    continue;
+                }
+                match crate::family::on_you(c, &held) {
+                    Some(crate::family::OnYou::Blocked) => out.push(row(Wants::Failed, &c.why)),
+                    Some(crate::family::OnYou::Asking) => {
+                        let raw = c
+                            .detail
+                            .as_ref()
+                            .and_then(|d| d.attention.as_deref())
+                            .unwrap_or_default();
+                        let asks = !c.needs_you()
+                            || c.detail.is_none()
+                            || matches!(raw, "asking" | "question" | "needs_input")
+                            || c.why.trim_end().ends_with('?')
+                            || c.why.starts_with("asks");
+                        let what = if c.why.trim().is_empty() && held.needs > 0 {
+                            "something inside it needs you"
+                        } else {
+                            c.why.as_str()
+                        };
+                        out.push(row(if asks { Wants::Asks } else { Wants::Yours }, what));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        if let Mode::Confirm {
+            target: Some(t),
+            message,
+            back,
+            ..
+        } = &self.mode
+            && matches!(**back, Mode::Board)
+            && let Some(i) = self.card_index(&t.key)
+        {
+            let what = message
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+            match out.iter_mut().find(|r| r.index == i) {
+                Some(r) => {
+                    r.wants = Wants::Asks;
+                    r.what = what;
+                }
+                None => out.insert(
+                    0,
+                    CompactRow {
+                        index: i,
+                        wants: Wants::Asks,
+                        what,
+                    },
+                ),
+            }
+        }
+        out
+    }
+
+    /// The compact list's cards, by index.
+    pub fn compact_cards(&self) -> Vec<usize> {
+        self.compact_rows().iter().map(|r| r.index).collect()
+    }
+
+    /// The selection on one of the compact list's cards, or on none: a key that acts only ever
+    /// acts on a card the list shows.
+    fn fix_compact_selection(&mut self) {
+        let list = self.compact_cards();
+        let on = self
+            .sel
+            .key
+            .as_ref()
+            .is_some_and(|k| list.iter().any(|&i| &self.board.cards[i].key == k));
+        if !on {
+            self.sel.key = list.first().map(|&i| self.board.cards[i].key.clone());
+        }
+        if let Some(c) = self.selected() {
+            self.sel.col = self.col_of(c);
+        }
+    }
+
+    /// A key on the compact list: j and k (or the arrows) move along it; keys that move between
+    /// columns have none to move to; every other key is the board's, on the card selected here.
+    fn compact_key(&mut self, key: KeyEvent) -> Action {
+        self.fix_compact_selection();
+        let list = self.compact_cards();
+        let at = self
+            .sel
+            .key
+            .as_ref()
+            .and_then(|k| list.iter().position(|&i| &self.board.cards[i].key == k));
+        let step = |dir: i32| -> Option<usize> {
+            let at = at? as i32 + dir;
+            (0..list.len() as i32)
+                .contains(&at)
+                .then_some(list[at as usize])
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => {
+                if let Some(i) = step(1) {
+                    self.sel.key = Some(self.board.cards[i].key.clone());
+                }
+                Action::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => {
+                if let Some(i) = step(-1) {
+                    self.sel.key = Some(self.board.cards[i].key.clone());
+                }
+                Action::None
+            }
+            KeyCode::Char('h' | 'l' | 'H' | 'L') | KeyCode::Left | KeyCode::Right if !ctrl => {
+                Action::None
+            }
+            _ => {
+                let action = self.board_key(key);
+                if self.compact() {
+                    self.fix_compact_selection();
+                }
+                action
+            }
+        }
+    }
+
     /// Cards that need you, in board order: column by column, top to bottom, each followed by
     /// the pieces inside it that need you.
     pub fn needs_you_order(&self) -> Vec<String> {
@@ -2590,6 +2768,7 @@ impl App {
             return action;
         }
         match self.mode.clone() {
+            Mode::Board if self.compact() => self.compact_key(key),
             Mode::Board => self.board_key(key),
             Mode::Peek { scroll, back } => self.peek_key(key, scroll, back),
             Mode::Search(s) => self.search_key(key, s),
@@ -3674,6 +3853,163 @@ pub fn match_range(query: &str, text: &str) -> Option<(usize, usize)> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The screen as rows of `w` characters.
+    fn rows_of(screen: &str, w: usize) -> Vec<String> {
+        let chars: Vec<char> = screen.chars().collect();
+        chars
+            .chunks(w)
+            .map(|r| r.iter().collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn a_window_too_small_for_the_board_lists_what_needs_you_and_keys_act_only_on_that() {
+        // Intent 0591, K2-43, as the release 5 canvas draws it: under 32 columns, KERDR and the
+        // count, a rule, one row per card that needs you with a bar and a word in its colour, the
+        // words about it, a rule and the keys; a key that acts acts on the row selected there.
+        let mut app = demo_app();
+        app.width = 28;
+        app.height = 12;
+        assert!(app.compact());
+        let rows = app.compact_rows();
+        assert!(rows.len() >= 2, "the demo has work that needs you");
+        let first = app.board.cards[rows[0].index].clone();
+        let second = app.board.cards[rows[1].index].clone();
+        // Selected elsewhere (a card the list doesn't show): any key moves it onto the list first.
+        let elsewhere = app
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                !app.compact_cards()
+                    .contains(&app.card_index(&c.key).unwrap())
+                    && app
+                        .card_index(&c.key)
+                        .is_some_and(|i| app.shown_on_board(i))
+            })
+            .unwrap()
+            .key
+            .clone();
+        app.sel.key = Some(elsewhere);
+        press(&mut app, 'j');
+        assert_eq!(app.sel.key.as_deref(), Some(second.key.as_str()));
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key.as_deref(), Some(first.key.as_str()));
+        press_code(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.sel.key.as_deref(),
+            Some(first.key.as_str()),
+            "no columns to move to"
+        );
+        let screen = rows_of(&crate::ui::tests_render(&app, 28, 12), 28);
+        assert!(screen[0].starts_with("KERDR"), "{screen:?}");
+        assert!(
+            screen[0]
+                .trim_end()
+                .ends_with(&format!("{} need you", rows.len())),
+            "{screen:?}"
+        );
+        assert!(screen[1].starts_with("────"), "{screen:?}");
+        let word = |w: Wants| match w {
+            Wants::Asks => "asks",
+            Wants::Failed => "failed",
+            Wants::Yours => "yours",
+        };
+        assert!(
+            screen[2].starts_with(&format!("▌ {}", first.reference.trim_start_matches('#'))),
+            "{screen:?}"
+        );
+        assert!(
+            screen[2].trim_end().ends_with(word(rows[0].wants)),
+            "{screen:?}"
+        );
+        assert!(screen.iter().all(|r| r.chars().count() == 28));
+        let all = screen.join("\n");
+        assert!(all.contains("The cards that need you."), "{all}");
+        assert!(screen[10].starts_with("────"), "{screen:?}");
+        assert!(
+            screen[11].starts_with("⏎ go in   j k move   ? keys"),
+            "{screen:?}"
+        );
+        // A message takes the keys' place while it's up.
+        app.say("Reading #45's text…", Tone::Info);
+        let screen = rows_of(&crate::ui::tests_render(&app, 28, 12), 28);
+        assert!(screen[11].starts_with("Reading #45's text…"), "{screen:?}");
+        assert!(
+            screen.join("\n").contains("The cards that need you."),
+            "{screen:?}"
+        );
+        app.message = None;
+        // ⏎ acts on the card selected in the list.
+        assert_eq!(
+            press_code(&mut app, KeyCode::Enter),
+            app.jump_action(first.key.clone())
+        );
+        // A bigger window: the board as ever.
+        app.width = 120;
+        app.height = 40;
+        assert!(!app.compact());
+    }
+
+    #[test]
+    fn a_short_window_says_what_each_card_wants_and_a_question_is_answered_there() {
+        // Intent 0591, K2-43: wide but under 10 rows, each row also says what its card wants; a
+        // question open over the board is on its card's row, with its own keys in the hints.
+        let mut app = demo_app();
+        app.width = 90;
+        app.height = 7;
+        let rows = app.compact_rows();
+        let first = app.board.cards[rows[0].index].clone();
+        press(&mut app, 'j');
+        press(&mut app, 'k');
+        let screen = rows_of(&crate::ui::tests_render(&app, 90, 7), 90);
+        assert!(
+            screen[0].starts_with(&format!("KERDR   {} need you", rows.len())),
+            "{screen:?}"
+        );
+        assert!(
+            screen[0].contains("Make the window taller for the board."),
+            "{screen:?}"
+        );
+        let said = match rows[0].wants {
+            Wants::Asks => "asks: ",
+            Wants::Failed => "failed: ",
+            Wants::Yours => "waits on you: ",
+        };
+        assert!(
+            screen[1].starts_with(&format!("▌ {}", first.reference.trim_start_matches('#'))),
+            "{screen:?}"
+        );
+        assert!(screen[1].contains(said), "{screen:?}");
+        assert!(
+            screen[6].starts_with("⏎ go in   j k move   ? keys"),
+            "{screen:?}"
+        );
+        // A question over the board: its card's row asks it, and y and n answer it.
+        app.mode = Mode::Confirm {
+            machine: 0,
+            request: serde_json::json!({"action": "dispatch", "id": "x"}),
+            title: "Start?".into(),
+            message: "Start it past the session's limit, queue it, or shelve the oldest?".into(),
+            back: Box::new(Mode::Board),
+            target: Some(Box::new(crate::model::CardSnapshot::of(&first))),
+            queue: false,
+            ready_at: None,
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+        let screen = rows_of(&crate::ui::tests_render(&app, 90, 7), 90);
+        assert!(
+            screen[1].contains("asks: Start it past the session's limit, queue it,"),
+            "{screen:?}"
+        );
+        assert!(
+            screen[6].starts_with("y n answer the question   ? keys"),
+            "{screen:?}"
+        );
+    }
 
     #[test]
     fn a_config_that_half_parses_opens_the_board_saying_what_was_left_out() {

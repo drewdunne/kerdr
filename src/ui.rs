@@ -33,6 +33,13 @@ fn draw_screen(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     if area.width < 32 || area.height < 10 {
+        // The board in a window too small for its columns: the cards that need you, one to a
+        // line, with the message line (intent 0591, K2-43).
+        let over_board =
+            matches!(&app.mode, Mode::Confirm { back, .. } if matches!(**back, Mode::Board));
+        if matches!(app.mode, Mode::Board) || over_board {
+            return compact_board(f, area, app);
+        }
         let text = trunc("Kerdr needs a bigger window.", area.width as usize);
         let y = area.y + area.height / 2;
         put(
@@ -49,6 +56,206 @@ fn draw_screen(f: &mut Frame, app: &App) {
         failure(f, area, app);
     } else if !matches!(app.mode, Mode::Board) {
         action_status(f, area, app);
+    }
+}
+
+/// The board in a window too small for its columns (intent 0591, K2-43), as the release 5 canvas
+/// draws it: under 32 columns a list of the cards that need you, each with a bar and a word in its
+/// colour (yellow asks, red failed, blue yours); wider but under 10 rows, each line also says what
+/// its card wants. The selected row is on the board's selection colour; a question open over the
+/// board is on its card's row, its keys in the hints.
+fn compact_board(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::Wants;
+    let w = area.width as usize;
+    let rows = app.compact_rows();
+    let asking = match &app.mode {
+        Mode::Confirm {
+            message, target, ..
+        } => Some((message.clone(), target.clone())),
+        _ => None,
+    };
+    let selected = asking
+        .as_ref()
+        .and_then(|(_, t)| t.as_ref().map(|t| t.key.clone()))
+        .or_else(|| app.sel.key.clone());
+    let narrow = area.width < 32;
+    let count = match rows.len() {
+        0 => "Nothing needs you.".to_string(),
+        n => format!("{n} need{} you", if n == 1 { "s" } else { "" }),
+    };
+    let said = app.message().map(|(text, tone)| {
+        let color = match tone {
+            Tone::Fail => RED,
+            Tone::Warn => YELLOW,
+            Tone::Good => GREEN,
+            _ => FG2,
+        };
+        (text.lines().next().unwrap_or_default().to_string(), color)
+    });
+    let mut hints: Vec<(&str, &str)> = vec![("⏎", "go in"), ("j k", "move")];
+    if asking.is_some() {
+        hints = vec![("y n", "answer the question")];
+    }
+    hints.push(("?", "keys"));
+    let color = |wants: Wants| match wants {
+        Wants::Asks => YELLOW,
+        Wants::Failed => RED,
+        Wants::Yours => BLUE,
+    };
+    let word = |wants: Wants| match wants {
+        Wants::Asks => "asks",
+        Wants::Failed => "failed",
+        Wants::Yours => "yours",
+    };
+    let name = |i: usize| {
+        let c = &app.board.cards[i];
+        format!("{} {}", c.reference.trim_start_matches('#'), c.title)
+    };
+    let buf = f.buffer_mut();
+    let bottom = area.bottom();
+    // Rows first, then what's below them: in a narrow window the words about it, a rule and the
+    // keys; in a short one only the keys.
+    let (list_top, list_end) = if narrow {
+        put_lr(
+            buf,
+            area,
+            area.y,
+            vec![Span::styled("KERDR", bold(CYAN))],
+            vec![Span::styled(count.clone(), fg(FG2))],
+        );
+        let rule = |buf: &mut Buffer, y: u16| {
+            put(
+                buf,
+                area.x,
+                y,
+                area.width,
+                vec![Span::styled("─".repeat(w), fg(BORDER))],
+            );
+        };
+        if area.height >= 2 {
+            rule(buf, area.y + 1);
+        }
+        let about = match &asking {
+            Some((message, None)) => (message.clone(), YELLOW),
+            _ => (
+                "The cards that need you. Widen the window for the board.".to_string(),
+                FG2,
+            ),
+        };
+        let about_lines = wrap(&about.0, w.max(1), 3);
+        let mut end = bottom;
+        if area.height >= 5 {
+            end = bottom - 2;
+            rule(buf, bottom - 2);
+            // The keys, or the message line in their place while there is one.
+            let last = match &said {
+                Some((text, color)) => vec![Span::styled(trunc(text, w), fg(*color))],
+                None => fit(key_hints(&hints), w),
+            };
+            put(buf, area.x, bottom - 1, area.width, last);
+            let room = end.saturating_sub(area.y + 2) as usize;
+            if room > about_lines.len() + rows.len().min(1) {
+                let top = end - about_lines.len() as u16;
+                for (n, line) in about_lines.iter().enumerate() {
+                    put(
+                        buf,
+                        area.x,
+                        top + n as u16,
+                        area.width,
+                        vec![Span::styled(line.clone(), fg(about.1))],
+                    );
+                }
+                end = top;
+            }
+        }
+        (area.y + 2, end)
+    } else {
+        let right = match (&said, &asking) {
+            (Some((text, color)), _) => (text.clone(), *color),
+            (None, Some((message, None))) => (message.clone(), YELLOW),
+            _ => (
+                "The cards that need you. Make the window taller for the board.".to_string(),
+                DIM,
+            ),
+        };
+        let left = vec![
+            Span::styled("KERDR", bold(CYAN)),
+            Span::styled(format!("   {count}"), fg(FG2)),
+        ];
+        let room = w.saturating_sub(5 + 3 + count.chars().count() + 3);
+        put_lr(
+            buf,
+            area,
+            area.y,
+            left,
+            vec![Span::styled(trunc(&right.0, room), fg(right.1))],
+        );
+        if area.height >= 3 {
+            put(
+                buf,
+                area.x,
+                bottom - 1,
+                area.width,
+                fit(key_hints(&hints), w),
+            );
+            (area.y + 1, bottom - 1)
+        } else {
+            (area.y + 1, bottom)
+        }
+    };
+    let room = list_end.saturating_sub(list_top) as usize;
+    let at = rows
+        .iter()
+        .position(|r| Some(app.board.cards[r.index].key.as_str()) == selected.as_deref())
+        .unwrap_or(0);
+    let first = at.saturating_sub(room.saturating_sub(1));
+    for (n, row) in rows.iter().skip(first).take(room).enumerate() {
+        let y = list_top + n as u16;
+        let on = Some(app.board.cards[row.index].key.as_str()) == selected.as_deref();
+        let bg = if on { SEL } else { BG };
+        let tint = color(row.wants);
+        let style = |c: Color| Style::default().fg(c).bg(bg);
+        put(
+            buf,
+            area.x,
+            y,
+            area.width,
+            vec![Span::styled(" ".repeat(w), style(FG))],
+        );
+        let mut left = vec![Span::styled("▌ ", style(tint))];
+        if narrow {
+            let status = word(row.wants);
+            let room = w.saturating_sub(2 + status.chars().count() + 1);
+            left.push(Span::styled(trunc(&name(row.index), room), style(FG)));
+            put_lr(
+                buf,
+                Rect {
+                    y,
+                    height: 1,
+                    ..area
+                },
+                y,
+                left,
+                vec![Span::styled(status.to_string(), style(tint))],
+            );
+        } else {
+            let fixed = 30.min(w.saturating_sub(2));
+            let named = trunc(&name(row.index), fixed);
+            let pad = fixed.saturating_sub(width(&named));
+            left.push(Span::styled(
+                format!("{named}{} ", " ".repeat(pad)),
+                style(FG),
+            ));
+            let what = match row.wants {
+                Wants::Asks => format!("asks: {}", row.what),
+                Wants::Failed => format!("failed: {}", row.what),
+                Wants::Yours => format!("waits on you: {}", row.what),
+            };
+            let what = what.trim_end_matches([':', ' ']).to_string();
+            let left_room = w.saturating_sub(2 + fixed + 1);
+            left.push(Span::styled(trunc(&what, left_room), style(tint)));
+            put(buf, area.x, y, area.width, left);
+        }
     }
 }
 
