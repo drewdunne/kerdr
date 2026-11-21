@@ -1100,6 +1100,8 @@ fn start_action(
     // Its own op, kept for Kerdr's own resends of it (intent 0591), or the one it had when it's
     // sent again after its answer was lost (Codex's review 60).
     let request = app.account_op(request);
+    // Every request to a backend that fixes input says so, an account's too (Codex's review 85, 6).
+    let request = app.with_fix_input(machine, request);
     let resends = app.resends_to(machine);
     app.busy = true;
     app.busy_id = request["id"].as_str().map(str::to_string);

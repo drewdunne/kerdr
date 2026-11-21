@@ -740,7 +740,7 @@ pub fn too_large_for(request: &Value, fix: bool) -> bool {
     if !fix {
         return too_large(request);
     }
-    serde_json::to_string(request).map_or(true, |json| json.len() > most_bytes(request))
+    serde_json::to_string(request).map_or(true, |json| json.len() > FIX_REQUEST_BYTES)
 }
 
 /// Why a request too large for a backend without fix-input wasn't sent, in 0.35.0's words.
@@ -775,11 +775,14 @@ fn older_most_bytes(request: &Value) -> usize {
     }
 }
 
-/// The most any request is sent as: FIX_REQUEST_BYTES, what ssh's standard input and a backend
-/// that fixes input take. Only such a backend is ever sent one past 64 KiB: the board holds a new
-/// intent or an edit for any other to too_large first, and nothing else it sends grows past that.
-fn most_bytes(_request: &Value) -> usize {
-    FIX_REQUEST_BYTES
+/// The most a request is sent as: FIX_REQUEST_BYTES to a backend that fixes input (the board puts
+/// `fix_input` on a request only for such a backend), else 0.35.0's limits (Codex's review 85, 6).
+fn most_bytes(request: &Value) -> usize {
+    if request["fix_input"] == true {
+        FIX_REQUEST_BYTES
+    } else {
+        older_most_bytes(request)
+    }
 }
 
 pub fn run(machine: &Machine, command: &str, request: &Value) -> Result<Response, String> {
@@ -1303,9 +1306,11 @@ fn run_with_deadline(
         }
     };
     if json.len() > most_bytes(request) {
-        return Ran::unsent(
-            "the request is too large to send (32 MiB at most), so nothing was sent".into(),
-        );
+        return Ran::unsent(if request["fix_input"] == true {
+            "the request is too large to send (32 MiB at most), so nothing was sent".into()
+        } else {
+            too_large_said(request)
+        });
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -3395,10 +3400,19 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         let error = run(
             &machine(),
             &format!("touch {}", quote(sentinel.to_str().unwrap())),
-            &json!({"action":"create","words":"x","images":[{"data":"x".repeat(FIX_REQUEST_BYTES)}]}),
+            &json!({"action":"create","words":"x","fix_input":true,"images":[{"data":"x".repeat(FIX_REQUEST_BYTES)}]}),
         )
         .unwrap_err();
         assert!(error.contains("32 MiB at most"), "{error}");
+        // Without `fix_input` (sent only to a backend that fixes input): 0.35.0's limit, in its
+        // words (Codex's review 85, 6).
+        let error = run(
+            &machine(),
+            &format!("touch {}", quote(sentinel.to_str().unwrap())),
+            &past,
+        )
+        .unwrap_err();
+        assert!(error.contains("20 MB of images"), "{error}");
         assert!(!sentinel.exists());
     }
 
@@ -3448,7 +3462,7 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         assert!(too_large_for(&big, false));
         assert!(!too_large_for(&big, true));
         assert!(!too_large(&request));
-        let huge = json!({"action":"edit","id":"0414","text":"x".repeat(FIX_REQUEST_BYTES),"was":"sha256:aa"});
+        let huge = json!({"action":"edit","id":"0414","text":"x".repeat(FIX_REQUEST_BYTES),"was":"sha256:aa","fix_input":true});
         assert!(too_large_for(&huge, true));
         let sentinel = dir.path().join("ran");
         let error = run(
@@ -3501,14 +3515,22 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         .unwrap_err();
         assert!(error.contains("too large"), "{error}");
         assert!(!sentinel.exists());
-        // Any other request too, past 32 MiB.
+        // Any other request too: past 32 MiB to a backend that fixes input, past 64 KiB to any
+        // other (Codex's review 85, 6).
         let error = run(
             &machine(),
             &command,
-            &json!({"action":"answer","id":"0414","answers":"x".repeat(FIX_REQUEST_BYTES)}),
+            &json!({"action":"answer","id":"0414","fix_input":true,"answers":"x".repeat(FIX_REQUEST_BYTES)}),
         )
         .unwrap_err();
         assert!(error.contains("32 MiB at most"), "{error}");
+        let error = run(
+            &machine(),
+            &command,
+            &json!({"action":"answer","id":"0414","answers":"x".repeat(70_000)}),
+        )
+        .unwrap_err();
+        assert!(error.contains("64 KiB at most"), "{error}");
         assert!(!sentinel.exists());
     }
 }

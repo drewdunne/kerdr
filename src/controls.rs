@@ -2341,14 +2341,8 @@ impl App {
         }
         let request = create_request(&id, &words, &images, &draft.session, &draft.filed);
         // Past what its backend takes: nothing is sent, and the words come back (intent 0591,
-        // K1-68). A backend that fixes input takes up to 32 MiB; any other 0.35.0's 64 KiB.
-        let fix = self.fixes_input(draft.machine);
-        if crate::actions::too_large_for(&request, fix) {
-            let why = if fix {
-                "the request is too large to send (32 MiB at most), so nothing was sent".into()
-            } else {
-                crate::actions::too_large_said(&request)
-            };
+        // K1-68): words kept for one machine and sent to another included (Codex's review 85, 6).
+        if let Err(why) = self.fits_backend(draft.machine, &request) {
             self.give_back(draft.words, draft.images, draft.came_back);
             self.fail(format!(
                 "Your new intent wasn't saved: {why}. Your words are kept: c opens them."
@@ -3248,10 +3242,97 @@ impl App {
     /// (`fix_input`), so a line that looks like a secret is asked about and an edit's faults fixed,
     /// rather than refused (intent 0591, release 5). To any other, it goes as it is.
     pub(crate) fn with_fix_input(&self, machine: usize, mut request: Value) -> Value {
-        if self.fixes_input(machine) {
+        if self.fixes_input_at(machine, &request) {
             request["fix_input"] = json!(true);
+        } else if let Some(fields) = request.as_object_mut() {
+            // What only a backend that fixes input reads goes nowhere else.
+            fields.remove("fix_input");
+            fields.remove("base");
         }
         request
+    }
+
+    /// Whether the request, sent to `machine`, ends at a backend that fixes input: that machine's,
+    /// and the one it's sent on to (`forward_to`) when the board knows it (Codex's review 85, 6).
+    pub(crate) fn fixes_input_at(&self, machine: usize, request: &Value) -> bool {
+        let onward = request["forward_to"]
+            .as_str()
+            .and_then(|host| self.machine_index(host));
+        self.fixes_input(machine) && onward.is_none_or(|m| self.fixes_input(m))
+    }
+
+    /// Whether a request, as it goes to `machine`, is one its backend takes (Codex's review 85, 6):
+    /// checked at the last moment, whatever sent it (a key, kept words, the hold file, a resend
+    /// on to another machine). A backend that fixes input takes up to 32 MiB and images of any kind
+    /// and number within 20 MB; any other, 0.35.0's 64 KiB and 20 PNG, JPEG, GIF or WebP images
+    /// of at most 10 MB, 20 MB together. Why not, in words that end "so nothing was sent".
+    pub(crate) fn fits_backend(&self, machine: usize, request: &Value) -> Result<(), String> {
+        let fix = self.fixes_input_at(machine, request);
+        let name = self
+            .machines
+            .get(machine)
+            .map(|m| m.name())
+            .unwrap_or_else(|| "its machine".into());
+        if let Some(sent) = request["images"].as_array() {
+            use base64::Engine;
+            let mut total = 0;
+            if !fix && sent.len() > images::MAX_IMAGES {
+                return Err(format!(
+                    "{name}'s backend takes at most {} images in a new intent and this one has {}, so nothing was sent",
+                    images::MAX_IMAGES,
+                    sent.len()
+                ));
+            }
+            for image in sent {
+                let tag = image["tag"].as_u64().unwrap_or_default();
+                let bytes = image["data"]
+                    .as_str()
+                    .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok())
+                    .unwrap_or_default();
+                let kind = images::kind_of(&bytes);
+                if !fix && !kind.is_some_and(images::shown) {
+                    return Err(format!(
+                        "{name}'s backend takes only PNG, JPEG, GIF and WebP images, and [Image #{tag}] is {}, so nothing was sent",
+                        kind.map_or("no kind it knows".to_string(), |k| format!(
+                            "a {} image",
+                            images::kind_name(k)
+                        ))
+                    ));
+                }
+                let most = if fix {
+                    images::FIX_IMAGE_BYTES
+                } else {
+                    images::MAX_IMAGE_BYTES
+                };
+                if bytes.len() > most {
+                    return Err(format!(
+                        "[Image #{tag}] is {}, over the {} {name}'s backend takes for one image, so nothing was sent",
+                        images::size(bytes.len()),
+                        images::size(most)
+                    ));
+                }
+                total += bytes.len();
+            }
+            if total > images::MAX_IMAGES_BYTES {
+                return Err(format!(
+                    "the images are {} together, over the {} {name}'s backend takes, so nothing was sent",
+                    images::size(total),
+                    images::size(images::MAX_IMAGES_BYTES)
+                ));
+            }
+        }
+        let mut sized = request.clone();
+        if fix {
+            sized["fix_input"] = json!(true);
+        }
+        if crate::actions::too_large_for(&sized, fix) {
+            return Err(if fix {
+                "the request is too large to send (32 MiB at most), so nothing was sent".to_string()
+            } else {
+                crate::actions::too_large_said(request)
+            });
+        }
+        Ok(())
     }
 
     pub fn queue_action(&mut self, machine: usize, request: Value) {

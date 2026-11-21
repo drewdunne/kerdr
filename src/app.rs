@@ -6559,6 +6559,99 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn what_a_request_carries_is_checked_against_the_backend_it_reaches_as_it_goes() {
+        // Codex's review 85, 6: images kept from a box made for a backend that fixes input (a TIFF,
+        // and more than twenty) aren't sent to an older one, from the box or at the last moment;
+        // `fix_input` goes to every request for one that fixes input, an account's included, and
+        // never to another.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(crate::images::FIX_INPUT.into());
+        assert!(app.fixes_input(0) && !app.fixes_input(1));
+        let tiff = crate::images::Loaded {
+            media_type: "image/tiff",
+            bytes: [b"II*\0".to_vec(), vec![0; 60]].concat(),
+            ..Default::default()
+        };
+        press(&mut app, 'c');
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = 0;
+        }
+        for c in "Scan:".chars() {
+            press(&mut app, c);
+        }
+        app.attach_images(crate::images::Loading {
+            images: vec![tiff],
+            ..Default::default()
+        });
+        assert_eq!(box_images(&app), 1);
+        // Kept, and opened again for the older machine.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        press(&mut app, 'c');
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = 1;
+        }
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.contains(
+                "takes only PNG, JPEG, GIF and WebP images, and [Image #1] is a TIFF image"
+            ),
+            "{said}"
+        );
+        assert!(app.draft.starts_with("Scan:"), "the words are kept");
+        // A request that reaches its handing-over by another way (the hold file, a resend on to
+        // another machine) is checked there too: nothing is handed over, and it's answered.
+        use base64::Engine;
+        let tiff = base64::engine::general_purpose::STANDARD
+            .encode([b"II*\0".to_vec(), vec![0; 60]].concat());
+        let png =
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR");
+        let images: Vec<serde_json::Value> = (1..=21)
+            .map(|tag| serde_json::json!({"tag": tag, "type": "image/png", "data": png}))
+            .collect();
+        for (n, sent) in [
+            serde_json::json!([{"tag": 1, "type": "image/tiff", "data": tiff}]),
+            serde_json::Value::Array(images),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = serde_json::json!({"action": "create", "words": format!("Late {n} [Image #1]"),
+                "session": "default", "submission": format!("s-late-{n}"), "images": sent});
+            app.queue_action(1, request);
+            let handed = app.hand_over();
+            assert!(handed.is_empty(), "{n}: handed over to an older backend");
+            assert!(
+                app.message().unwrap().0.contains("nothing was sent"),
+                "{:?}",
+                app.message()
+            );
+            app.message = None;
+        }
+        // To the backend that fixes input, the same go, with `fix_input`.
+        let request = serde_json::json!({"action": "create", "words": "Fine [Image #1]",
+            "session": "default", "submission": "s-fine", "images": [{"tag": 1, "type": "image/tiff", "data": tiff}]});
+        app.queue_action(0, request);
+        let handed = app.hand_over();
+        assert_eq!(handed.len(), 1);
+        assert_eq!(handed[0].2["fix_input"], true);
+        // An account's request too; none to an older backend, nor `base`.
+        let account = serde_json::json!({"action": "account-test", "code": "ARK_C"});
+        assert_eq!(app.with_fix_input(0, account.clone())["fix_input"], true);
+        let older = app.with_fix_input(1, serde_json::json!({"action": "edit", "id": "1", "text": "t", "base": "b", "fix_input": true}));
+        assert!(older.get("fix_input").is_none() && older.get("base").is_none());
+    }
+
+    #[test]
     fn copied_text_that_doesnt_fit_the_box_is_kept_and_stops_a_send() {
         // Codex's review 85, 5: what fits goes in, cut between characters, never inside one; the
         // rest is kept for c, said; and words Enter sent while it was read aren't sent without it.

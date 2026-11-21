@@ -827,7 +827,21 @@ impl App {
     /// before its answer comes leaves it saying so; an answer that says it never arrived puts back
     /// what it said before (Codex's review 65, 2).
     pub(crate) fn hand_over(&mut self) -> Vec<(u64, usize, Value, bool)> {
-        let ready = self.resolver.ready();
+        let mut ready = Vec::new();
+        // The last moment: each request as its machine's backend takes it, `fix_input` on it
+        // only for one that fixes input, or not sent at all, said as any refusal before it ran
+        // (Codex's review 85, 6).
+        for (n, machine, request, gated) in self.resolver.ready() {
+            let request = self.with_fix_input(machine, request);
+            match self.fits_backend(machine, &request) {
+                Ok(()) => ready.push((n, machine, request, gated)),
+                Err(why) => {
+                    self.resolver.handed(n);
+                    let metadata = crate::actions::request_metadata(&request);
+                    self.finish_job(n, metadata, Err(why));
+                }
+            }
+        }
         for (n, ..) in &ready {
             let Some(op) = self.held_sending.get(n).cloned() else {
                 continue;
