@@ -457,8 +457,8 @@ pub(crate) mod tests {
             .next()
             .cloned()
             .expect("a copy of the card");
-        for m in 0..2 {
-            let feed = app.machines[m].feed.as_mut().unwrap();
+        for machine in app.machines.iter_mut().take(2) {
+            let feed = machine.feed.as_mut().unwrap();
             let source = feed.source.clone().unwrap_or_else(|| "feed".into());
             if !feed
                 .cards
