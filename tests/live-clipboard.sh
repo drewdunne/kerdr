@@ -10,7 +10,9 @@ image=${1:-docs/screenshots/new-intent.png}
 KERDR_LIVE_CLIPBOARD_IMAGE=$(cd "$(dirname "$image")" && pwd)/$(basename "$image")
 export KERDR_LIVE_CLIPBOARD_IMAGE
 # live_clipboard, and on Linux live_clipboard_own_reader (Kerdr's own reader with no program to
-# run) and live_x11_read_stops_at_its_cap (under X11: a read keeps no more than its cap).
+# run), live_reader_knows_a_copy_made_while_it_read (xclip or wl-copy copies while Kerdr's own
+# reader reads: nothing goes in) and live_x11_read_stops_at_its_cap (under X11: a read keeps no
+# more than its cap).
 TEST="cargo test --locked --lib -- --ignored --test-threads=1 images::tests::live_"
 TMP=$(mktemp -d)
 PID=""

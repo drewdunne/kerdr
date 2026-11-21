@@ -32,7 +32,8 @@ image = { version = "0.25.10", default-features = false, features = ["png", "jpe
 # The clipboard read in Kerdr itself, so no wl-paste or xclip is needed (intent 0591, K3-63).
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
 wl-clipboard-rs = "0.9.5"
-x11rb = "0.13.2"
+# XFixes tells one copy from the next while a paste is read (Codex's review 88, 1).
+x11rb = { version = "0.13.2", features = ["xfixes"] }
 
 [target.'cfg(windows)'.dependencies]
 # The clipboard read in Kerdr itself, at once, rather than by PowerShell, which takes seconds to start

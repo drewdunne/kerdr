@@ -2134,6 +2134,89 @@ mod tests {
     }
 
     #[test]
+    fn a_copy_made_while_the_clipboard_is_read_puts_nothing_in_and_says_so() {
+        // Codex's review 88, 1: he pastes B, and copies C while Kerdr reads it; the read ends
+        // well within the bound, holding C. The desktop's word of a new copy since the read
+        // began (Wayland's offer, X11's owner, Windows' sequence number) says so: nothing goes
+        // in, and he's told. Where nothing can tell (a program reads it), what was read goes in:
+        // the known limit.
+        use crate::images::{Captured, Listing, Reader, Room, Source, Workers, clipboard_here};
+        use std::sync::{Arc, Mutex};
+        // What the clipboard holds, and which copy that is.
+        let clipboard = Arc::new(Mutex::new((1u32, "<B>".to_string())));
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        let reading = |tells: bool| {
+            let clipboard = clipboard.clone();
+            Reading {
+                workers: &workers,
+                bound: Duration::from_millis(500),
+                take: move |room: Room| {
+                    let seen = std::cell::Cell::new(0);
+                    let reader = Reader {
+                        name: "Kerdr's own Wayland reader".into(),
+                        list: Box::new(|| {
+                            seen.set(clipboard.lock().unwrap().0);
+                            Listing::Types(vec!["text/plain".into()])
+                        }),
+                        read: Box::new(|_, _| {
+                            // He copies C while it reads.
+                            *clipboard.lock().unwrap() = (2, "<C>".into());
+                            Ok(clipboard.lock().unwrap().1.clone().into_bytes())
+                        }),
+                        changed: Box::new(|| {
+                            tells.then(|| clipboard.lock().unwrap().0 != seen.get())
+                        }),
+                    };
+                    let none = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+                        Err(std::io::ErrorKind::NotFound.into())
+                    };
+                    clipboard_here(true, false, &[reader], &none, room)
+                },
+                load: |source: Source, room| source.load(room),
+            }
+        };
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let began = Instant::now();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            reading(true),
+            &mut |_| {},
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "past the bound"
+        );
+        take_back(&mut app, &rx, Duration::from_millis(200));
+        assert_eq!(
+            words_in(&app).0,
+            "",
+            "what he copied during the read went in"
+        );
+        assert_eq!(
+            app.message().unwrap().0,
+            "You copied something else while Kerdr read the clipboard; paste again."
+        );
+        // A program reads it, and nothing can check: C goes in.
+        *clipboard.lock().unwrap() = (3, "<B>".into());
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            reading(false),
+            &mut |_| {},
+        );
+        take_back(&mut app, &rx, Duration::from_millis(200));
+        assert_eq!(words_in(&app).0, "<C>");
+    }
+
+    #[test]
     fn reads_that_stall_are_counted_until_they_end_and_one_past_the_most_is_refused_and_said() {
         // Codex's review 86, 6: a mount that doesn't answer, and he pastes its image's path again
         // and again. The board stops waiting for each at its deadline, but its read is counted

@@ -1017,7 +1017,15 @@ pub struct Reader<'a> {
     pub list: Box<dyn Fn() -> Listing + 'a>,
     /// The bytes of one type, at most the given many (a reader stops just past).
     pub read: ReadType<'a>,
+    /// After a read: whether he copied something else since `list` (Some(true)), or not
+    /// (Some(false)), by what the desktop gives to tell one copy from the next; None for a way
+    /// that can't tell, a program (Codex's review 88, 1).
+    pub changed: Box<dyn Fn() -> Option<bool> + 'a>,
 }
+
+/// Why nothing went in when he copied something else while the clipboard was read.
+pub const COPIED_AGAIN: &str =
+    "You copied something else while Kerdr read the clipboard; paste again.";
 
 /// Linux and the BSDs, with programs only: wl-paste under Wayland, xclip under X11.
 pub fn unix_clipboard(wayland: bool, x11: bool, run: Runner) -> Result<Found, String> {
@@ -1042,7 +1050,14 @@ pub fn clipboard_here(
             Listing::Missing(why) => missing.push((reader.name.clone(), why)),
             Listing::Empty => return Err("The clipboard is empty.".into()),
             Listing::Failed(why) => return Err(why),
-            Listing::Types(types) => return clipboard_from(reader, &types, room),
+            Listing::Types(types) => {
+                let found = clipboard_from(reader, &types, room);
+                // What was read may be the next copy's, or a mix: nothing goes in.
+                if (reader.changed)() == Some(true) {
+                    return Err(COPIED_AGAIN.into());
+                }
+                return found;
+            }
         }
     }
     Err(none_reads(wayland, x11, &missing))
@@ -1178,6 +1193,8 @@ fn program_reader<'a>(
                 Err(e) => Err(format!("Couldn't read the clipboard with {program}: {e}.")),
             }
         }),
+        // A program reads it afresh each time: nothing tells one copy from the next.
+        changed: Box::new(|| None),
     }
 }
 
@@ -1272,27 +1289,55 @@ mod builtin {
     use std::io::Read;
 
     pub fn readers(wayland: bool, x11: bool) -> Vec<Reader<'static>> {
+        use std::cell::RefCell;
+        use std::rc::Rc;
         let mut out = vec![];
         if wayland {
+            // The offer listed is watched from the moment it's listed: any other since is a new
+            // copy (Codex's review 88, 1).
+            let watch: Rc<RefCell<Option<wl_clipboard_rs::watch::Watcher>>> = Rc::default();
+            let (listing, checking) = (watch.clone(), watch);
             out.push(Reader {
                 name: "Kerdr's own Wayland reader".into(),
-                list: Box::new(wayland_list),
+                list: Box::new(move || wayland_list(&mut listing.borrow_mut())),
                 read: Box::new(wayland_read),
+                changed: Box::new(move || wayland_changed(checking.borrow_mut().take())),
             });
         }
         if x11 {
+            // The selection's owner, and every change of it XFixes reports, from the moment it's
+            // listed (Codex's review 88, 1).
+            let watch: Rc<RefCell<Option<X11Watch>>> = Rc::default();
+            let (listing, checking) = (watch.clone(), watch);
             out.push(Reader {
                 name: "Kerdr's own X11 reader".into(),
-                list: Box::new(x11_list),
+                list: Box::new(move || {
+                    *listing.borrow_mut() = X11Watch::start();
+                    x11_list()
+                }),
                 read: Box::new(x11_read),
+                changed: Box::new(move || checking.borrow().as_ref().and_then(X11Watch::changed)),
             });
         }
         out
     }
 
-    fn wayland_list() -> Listing {
-        use wl_clipboard_rs::paste::{ClipboardType, Error, Seat, get_mime_types_ordered};
-        match get_mime_types_ordered(ClipboardType::Regular, Seat::Unspecified) {
+    /// What the clipboard offers now, by a watch kept in `watch` from this moment: the offer's
+    /// types, as the desktop gave them with the offer.
+    fn wayland_list(watch: &mut Option<wl_clipboard_rs::watch::Watcher>) -> Listing {
+        use wl_clipboard_rs::paste::{Error, Seat};
+        use wl_clipboard_rs::watch::{self, ClipboardEvent, Watcher};
+        let listed = Watcher::new(watch::ClipboardType::Regular, Seat::Unspecified).and_then(
+            |mut watcher| {
+                let types = match watcher.next_event()? {
+                    Some(ClipboardEvent::Changed { mime_types, .. }) => mime_types,
+                    Some(ClipboardEvent::Cleared { .. }) | None => vec![],
+                };
+                *watch = Some(watcher);
+                Ok(types)
+            },
+        );
+        match listed {
             Ok(types) if types.is_empty() => Listing::Empty,
             Ok(types) => Listing::Types(types),
             Err(Error::ClipboardEmpty | Error::NoMimeType) => Listing::Empty,
@@ -1303,6 +1348,23 @@ mod builtin {
                 | Error::NoSeats),
             ) => Listing::Missing(e.to_string()),
             Err(e) => Listing::Missing(e.to_string()),
+        }
+    }
+
+    /// Whether the desktop has offered anything since the watch began: a new selection, or the
+    /// clipboard cleared. What it sent before this asks has arrived by now; the ask waits 50 ms
+    /// for it at most. None with no watch, or when the desktop can't be asked.
+    fn wayland_changed(watch: Option<wl_clipboard_rs::watch::Watcher>) -> Option<bool> {
+        let mut watcher = watch?;
+        let stop = watcher.cancel_handle();
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            stop.cancel();
+        });
+        match watcher.next_event() {
+            Ok(Some(_)) => Some(true),
+            Ok(None) => Some(false),
+            Err(_) => None,
         }
     }
 
@@ -1362,6 +1424,75 @@ mod builtin {
             if bytes.len() > cap {
                 return Ok(bytes);
             }
+        }
+    }
+
+    /// The X11 clipboard's owner as a read began, and XFixes' word of each change of owner since:
+    /// a program that copies again sets the selection again, whether or not it owned it.
+    pub(super) struct X11Watch {
+        conn: x11rb::rust_connection::RustConnection,
+        clipboard: u32,
+        owner: u32,
+    }
+
+    impl X11Watch {
+        /// None where there's no X11 display or no XFixes: then nothing tells copies apart.
+        pub(super) fn start() -> Option<X11Watch> {
+            use x11rb::connection::Connection;
+            use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
+            use x11rb::protocol::xproto::ConnectionExt as _;
+            let (conn, screen) = x11rb::connect(None).ok()?;
+            conn.xfixes_query_version(5, 0).ok()?.reply().ok()?;
+            let root = conn.setup().roots[screen].root;
+            let clipboard = conn
+                .intern_atom(false, b"CLIPBOARD")
+                .ok()?
+                .reply()
+                .ok()?
+                .atom;
+            conn.xfixes_select_selection_input(
+                root,
+                clipboard,
+                SelectionEventMask::SET_SELECTION_OWNER
+                    | SelectionEventMask::SELECTION_WINDOW_DESTROY
+                    | SelectionEventMask::SELECTION_CLIENT_CLOSE,
+            )
+            .ok()?
+            .check()
+            .ok()?;
+            let owner = conn
+                .get_selection_owner(clipboard)
+                .ok()?
+                .reply()
+                .ok()?
+                .owner;
+            Some(X11Watch {
+                conn,
+                clipboard,
+                owner,
+            })
+        }
+
+        /// Whether the selection was set again, or its owner went, since `start`. The owner asked
+        /// again is a round trip, so every change the server made before it has been reported.
+        pub(super) fn changed(&self) -> Option<bool> {
+            use x11rb::connection::Connection;
+            use x11rb::protocol::Event;
+            use x11rb::protocol::xproto::ConnectionExt as _;
+            let owner = self
+                .conn
+                .get_selection_owner(self.clipboard)
+                .ok()?
+                .reply()
+                .ok()?
+                .owner;
+            let mut changed = owner != self.owner;
+            while let Ok(Some(event)) = self.conn.poll_for_event() {
+                if matches!(event, Event::XfixesSelectionNotify(_)) {
+                    changed = true;
+                }
+            }
+            Some(changed)
         }
     }
 
@@ -1644,8 +1775,15 @@ fn macos_clipboard(room: Room) -> Result<Found, String> {
 fn windows_clipboard(room: Room) -> Result<Found, String> {
     use clipboard_win::{Clipboard, Getter, formats, raw};
     let failed = |e: clipboard_win::ErrorCode| format!("Couldn't read the clipboard: {e}.");
+    // Which copy the clipboard holds as the paste is read. Once Kerdr has it open nothing else can
+    // change it, so a copy made since shows as the number Windows keeps having moved by then
+    // (Codex's review 88, 1).
+    let pasted = raw::seq_num();
     let _open =
         Clipboard::new_attempts(10).map_err(|e| format!("Couldn't open the clipboard: {e}."))?;
+    if raw::seq_num() != pasted {
+        return Err(COPIED_AGAIN.into());
+    }
     let held = |format: u32| raw::size(format).map_or(0, |n| n.get());
     if let Some(png) = raw::register_format("PNG")
         .map(|f| f.get())
@@ -1892,6 +2030,34 @@ mod tests {
                 .unwrap_err()
                 .contains("Couldn't read the names")
         );
+    }
+
+    #[test]
+    fn a_reader_that_can_tell_a_copy_made_while_it_read_puts_nothing_in() {
+        // Codex's review 88, 1: the check runs after the read, so a copy made during it, read
+        // within any deadline, is told; a reader that can't tell (a program) is taken as it read.
+        let version = std::cell::Cell::new(1);
+        let seen = std::cell::Cell::new(0);
+        let (version, seen) = (&version, &seen);
+        let reader = |tells: bool| Reader {
+            name: "Kerdr's own Wayland reader".into(),
+            list: Box::new(move || {
+                seen.set(version.get());
+                Listing::Types(vec!["image/png".into()])
+            }),
+            read: Box::new(move |_, _| {
+                version.set(version.get() + 1);
+                Ok(PNG.to_vec())
+            }),
+            changed: Box::new(move || tells.then(|| version.get() != seen.get())),
+        };
+        let none = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+            Err(std::io::ErrorKind::NotFound.into())
+        };
+        let got = clipboard_here(true, false, &[reader(true)], &none, Room::left(&[]));
+        assert_eq!(got, Err(COPIED_AGAIN.to_string()));
+        let got = clipboard_here(true, false, &[reader(false)], &none, Room::left(&[]));
+        assert!(matches!(got, Ok(Found::Image(_))), "{got:?}");
     }
 
     #[test]
@@ -2194,6 +2360,7 @@ mod tests {
                 assert_eq!(t, "image/png");
                 Ok(PNG.to_vec())
             }),
+            changed: Box::new(|| None),
         };
         let Ok(Found::Image(got)) = clipboard_here(true, false, &[own], &missing, Room::left(&[]))
         else {
@@ -2206,6 +2373,7 @@ mod tests {
             name: "Kerdr's own Wayland reader".into(),
             list: Box::new(|| Listing::Missing("the compositor lacks data-control".into())),
             read: Box::new(|_, _| unreachable!()),
+            changed: Box::new(|| None),
         };
         let run = fake(&calls, |_, args| {
             if args == ["--list-types"] {
@@ -2223,6 +2391,7 @@ mod tests {
             name: "Kerdr's own Wayland reader".into(),
             list: Box::new(|| Listing::Missing("the compositor lacks data-control".into())),
             read: Box::new(|_, _| unreachable!()),
+            changed: Box::new(|| None),
         };
         let why = clipboard_here(true, false, &[unusable], &missing, Room::left(&[])).unwrap_err();
         assert!(
@@ -2753,6 +2922,85 @@ mod tests {
     /// Kerdr's own X11 reader against a real clipboard owner (the image KERDR_LIVE_CLIPBOARD_IMAGE
     /// names, served whole or, when large, in INCR pieces): asked for half of it, it keeps no
     /// more than that and one byte, however the owner sends it (Codex's review 85, 7).
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    #[ignore]
+    fn live_reader_knows_a_copy_made_while_it_read() {
+        // Codex's review 88, 1, against a real desktop: Kerdr's own reader, X11's (XFixes) or
+        // Wayland's (the offer it listed), says whether anything was copied between its list and
+        // its check; a paste whose read is followed by another copy puts nothing in. The copies
+        // are made with xclip or wl-copy (KERDR_LIVE_XCLIP and KERDR_LIVE_WL_COPY name them where
+        // they're not on PATH); the image the other live tests read is put back after.
+        let set = |n: &str| std::env::var_os(n).is_some_and(|v| !v.is_empty());
+        let (wayland, x11) = (set("WAYLAND_DISPLAY"), set("DISPLAY"));
+        if !wayland && !x11 {
+            eprintln!("skipped: no desktop");
+            return;
+        }
+        let program = |var: &str, name: &str| std::env::var_os(var).unwrap_or(name.into());
+        let dir = tempfile::tempdir().unwrap();
+        let copy = |path: &Path, kind: &str| {
+            let status = if wayland {
+                Command::new(program("KERDR_LIVE_WL_COPY", "wl-copy"))
+                    .args(["--type", kind])
+                    .stdin(std::fs::File::open(path).unwrap())
+                    .status()
+            } else {
+                Command::new(program("KERDR_LIVE_XCLIP", "xclip"))
+                    .args(["-selection", "clipboard", "-t", kind, "-i"])
+                    .arg(path)
+                    .status()
+            };
+            assert!(status.unwrap().success(), "couldn't copy");
+            std::thread::sleep(Duration::from_millis(200));
+        };
+        let words = |name: &str| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, format!("{name} words")).unwrap();
+            path
+        };
+        let own = || {
+            builtin::readers(wayland, !wayland)
+                .into_iter()
+                .next()
+                .unwrap()
+        };
+        copy(&words("first"), "text/plain");
+        // Nothing copied between: unchanged.
+        let reader = own();
+        assert!(matches!((reader.list)(), Listing::Types(_)));
+        assert_eq!((reader.changed)(), Some(false), "a change with no copy");
+        // A copy between its list and its check.
+        let reader = own();
+        assert!(matches!((reader.list)(), Listing::Types(_)));
+        copy(&words("second"), "text/plain");
+        assert_eq!((reader.changed)(), Some(true), "a copy not seen");
+        // A paste whose read is followed by another copy.
+        let base = own();
+        let third = words("third");
+        let wrapped = Reader {
+            name: base.name.clone(),
+            list: Box::new(|| (base.list)()),
+            read: Box::new(|t, cap| {
+                let got = (base.read)(t, cap);
+                copy(&third, "text/plain");
+                got
+            }),
+            changed: Box::new(|| (base.changed)()),
+        };
+        let none = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+            Err(std::io::ErrorKind::NotFound.into())
+        };
+        let got = clipboard_here(wayland, !wayland, &[wrapped], &none, Room::left(&[]));
+        assert_eq!(got, Err(COPIED_AGAIN.to_string()));
+        // And one with no copy after it reads its words.
+        let got = clipboard_here(wayland, !wayland, &[own()], &none, Room::left(&[]));
+        assert_eq!(got, Ok(Found::Text("third words".into())));
+        if let Some(image) = std::env::var_os("KERDR_LIVE_CLIPBOARD_IMAGE") {
+            copy(Path::new(&image), "image/png");
+        }
+    }
+
     #[cfg(not(any(target_os = "macos", windows)))]
     #[test]
     #[ignore]
