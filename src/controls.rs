@@ -2417,6 +2417,11 @@ impl App {
     /// In the new-intent box, a paste that is only an image file's path attaches that image,
     /// and an empty one (a terminal pasting a clipboard that holds only an image) looks for one.
     pub fn on_paste(&mut self, text: &str) -> Action {
+        // A window too small to draw this screen takes no paste either, as it takes no key but
+        // Esc: nothing goes into a box he can't see (Codex's review 88, 4).
+        if self.small_window() && !self.small_draws() {
+            return Action::None;
+        }
         self.closed_on_send = false;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.account_paste(&text) {

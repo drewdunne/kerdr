@@ -4054,6 +4054,35 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_screen_a_small_window_cant_draw_takes_neither_keys_nor_a_terminal_paste() {
+        // Codex's review 88, 4: the guard on keys covers a terminal's paste too. The new-intent
+        // box (an edit opened inside Kerdr uses the same one) in a window too small to draw it:
+        // typing and a bracketed paste both leave the words as they were; Esc still goes back.
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        app.on_paste("Before");
+        app.width = 28;
+        app.height = 8;
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert_eq!(box_words(&app), "Before", "a key went in");
+        assert_eq!(app.on_paste(" pasted unseen"), Action::None);
+        assert_eq!(box_words(&app), "Before", "a terminal paste went in");
+        assert_eq!(
+            app.on_paste("/tmp/shot.png"),
+            Action::None,
+            "a pasted path read"
+        );
+        assert!(app.image_reads.is_empty());
+        app.width = 120;
+        app.height = 40;
+        app.on_paste(" seen");
+        assert_eq!(box_words(&app), "Before seen", "a big window takes it");
+        app.width = 28;
+        press_code(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
     fn every_question_in_a_small_window_is_read_whole_before_an_answer_acts_and_a_resize_too() {
         // Codex's review 86, 4: the smaller-copy question is over the new-intent box, not the
         // board; in a small window it's drawn whole and gated as any other. A question that fit a
