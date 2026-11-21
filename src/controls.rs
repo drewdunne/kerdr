@@ -213,11 +213,11 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>, fix: 
         at += piece.len();
         out.said.push(if end < text.len() {
             format!(
-                "Pasted the clipboard's text, up to the {} the box holds.",
+                "Pasted the copied text, up to the {} the box holds.",
                 images::size(max_words(fix))
             )
         } else {
-            "Pasted the clipboard's text.".to_string()
+            "Pasted the copied text.".to_string()
         });
     }
     for image in got.images {

@@ -6279,7 +6279,7 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(box_words(&app), "Error: disk full\nat boot fix it");
-        assert_eq!(app.message().unwrap().0, "Pasted the clipboard's text.");
+        assert_eq!(app.message().unwrap().0, "Pasted the copied text.");
     }
 
     #[test]
