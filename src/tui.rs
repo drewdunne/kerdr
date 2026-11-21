@@ -209,6 +209,8 @@ fn event_loop(
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
     let readers = crate::images::Workers::default();
+    // Watching the clipboard from now, before any paste is taken (Codex's review 89).
+    let clipboard_watch = crate::images::ClipboardWatch::start();
     let holds = RefCell::new(if live.is_some() && !app.demo {
         Holds::on()
     } else {
@@ -516,11 +518,15 @@ fn event_loop(
         match action {
             Action::None => {}
             Action::LoadImages(source) => {
+                // The copy a paste is for, numbered before anything else is done for it.
+                let pasted = matches!(source, crate::images::Source::Clipboard)
+                    .then(|| clipboard_watch.pasted())
+                    .flatten();
                 if let Some(read) = app.begin_image_load(&source) {
                     let reading = Reading {
                         workers: &readers,
                         bound: crate::images::CLIPBOARD_BOUND,
-                        take: crate::images::take_clipboard,
+                        take: move |room| crate::images::take_pasted(room, pasted),
                         load: |source: crate::images::Source, room| source.load(room),
                     };
                     // A clipboard that's slow to answer: the board says it's reading meanwhile.
@@ -2214,6 +2220,71 @@ mod tests {
         );
         take_back(&mut app, &rx, Duration::from_millis(200));
         assert_eq!(words_in(&app).0, "<C>");
+    }
+
+    #[test]
+    fn a_copy_made_while_the_reader_sets_up_puts_nothing_in() {
+        // Codex's review 89: he pastes B, and copies C while Kerdr's reader is still setting up
+        // (connecting to the display), before it could watch for itself. The paste's copy was
+        // numbered as the paste was handled, by the watch Kerdr keeps from its start, so C is
+        // told: nothing goes in, and he's told. A reader watching only from its own start sees no
+        // change, as round 4's did.
+        use crate::images::{
+            Captured, ClipboardWatch, Listing, Reader, Room, Source, Workers, clipboard_here,
+            take_since,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        use std::sync::{Arc, Mutex};
+        let copies = Arc::new(AtomicU64::new(1));
+        let clipboard = Arc::new(Mutex::new("<B>".to_string()));
+        let watch = {
+            let copies = copies.clone();
+            ClipboardWatch::numbered_by(move || Some(copies.load(SeqCst)))
+        };
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        // As the board's loop does: the copy numbered first, then the read begun.
+        let pasted = watch.pasted();
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let (seen, held) = (copies.clone(), clipboard.clone());
+        let reading = Reading {
+            workers: &workers,
+            bound: Duration::from_millis(500),
+            take: move |room: Room| {
+                take_since(pasted, || {
+                    // The reader connects; he copies C meanwhile.
+                    seen.store(2, SeqCst);
+                    *held.lock().unwrap() = "<C>".into();
+                    let from = std::cell::Cell::new(0);
+                    let reader = Reader {
+                        name: "Kerdr's own X11 reader".into(),
+                        list: Box::new(|| {
+                            from.set(seen.load(SeqCst));
+                            Listing::Types(vec!["text/plain".into()])
+                        }),
+                        read: Box::new(|_, _| Ok(held.lock().unwrap().clone().into_bytes())),
+                        changed: Box::new(|| Some(seen.load(SeqCst) != from.get())),
+                    };
+                    let none = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+                        Err(std::io::ErrorKind::NotFound.into())
+                    };
+                    clipboard_here(false, true, &[reader], &none, room)
+                })
+            },
+            load: |source: Source, room| source.load(room),
+        };
+        start_read(&mut app, &tx, read, Source::Clipboard, reading, &mut |_| {});
+        take_back(&mut app, &rx, Duration::from_millis(200));
+        assert_eq!(
+            words_in(&app).0,
+            "",
+            "what he copied as the reader set up went in"
+        );
+        assert_eq!(
+            app.message().unwrap().0,
+            "You copied something else while Kerdr read the clipboard; paste again."
+        );
     }
 
     #[test]
