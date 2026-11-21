@@ -36,6 +36,25 @@ pub const MOST_READ: usize = 200_000_000;
 /// How long a clipboard reader may take before Kerdr gives up on it.
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The most a read for the box may take, whatever it waits on (a clipboard program, a mount that
+/// doesn't answer), before the board lets it go and says so (Codex's review 85, 8): two clipboard
+/// readers' deadlines and some, or PowerShell's on a cold machine; longer for a smaller copy,
+/// which decodes and encodes a picture.
+pub fn read_most(what: &str) -> Duration {
+    if what.starts_with("Making") {
+        Duration::from_secs(60)
+    } else {
+        READ_DEADLINE * 4
+    }
+}
+
+/// The most a pasted list of files is read for, beyond which the rest is left and named.
+const FILES_DEADLINE: Duration = Duration::from_secs(15);
+
+/// The most of a folder's entries looked at for its images, and the most images it gives.
+const FOLDER_ENTRIES: usize = 1000;
+const FOLDER_IMAGES: usize = 100;
+
 /// The kinds every backend takes and an agent can show, by the type sent.
 const KINDS: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 
@@ -193,7 +212,17 @@ pub fn from_files(paths: &[PathBuf], room: Room) -> Loading {
     let paths = expand_folders(paths, room.fix, &mut out);
     let mut used = 0;
     let mut read = 0;
+    let until = Instant::now() + FILES_DEADLINE;
     for path in &paths {
+        // Reading has gone on too long (a mount that's slow to answer): the rest is named, left.
+        if Instant::now() >= until {
+            out.say(format!(
+                "Kerdr stopped at {}: reading the files took longer than {} seconds.",
+                name_of(path),
+                FILES_DEADLINE.as_secs()
+            ));
+            break;
+        }
         if !room.fix && out.images.len() >= room.images {
             out.say(too_many());
             break;
@@ -249,17 +278,27 @@ fn expand_folders(paths: &[PathBuf], any: bool, out: &mut Loading) -> Vec<PathBu
             all.push(path.clone());
             continue;
         }
+        // Bounded: a folder of thousands is never listed whole before its images are chosen.
+        let mut looked = 0;
         let mut inside: Vec<PathBuf> = std::fs::read_dir(path)
             .map(|entries| {
                 entries
                     .flatten()
+                    .take(FOLDER_ENTRIES)
+                    .inspect(|_| looked += 1)
                     .map(|e| e.path())
                     .filter(|p| image_name(p, any) && p.is_file())
+                    .take(FOLDER_IMAGES)
                     .collect()
             })
             .unwrap_or_default();
         inside.sort();
         let folder = name_of(path);
+        if looked >= FOLDER_ENTRIES || inside.len() >= FOLDER_IMAGES {
+            out.notes.push(format!(
+                "{folder} holds more than Kerdr looks through at once ({FOLDER_ENTRIES} entries, {FOLDER_IMAGES} images), so only those were."
+            ));
+        }
         if inside.is_empty() {
             out.say(format!(
                 "{folder} is a folder with no image files directly in it."
@@ -1164,15 +1203,59 @@ mod builtin {
                 MimeType::Specific(&t),
             )
             .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))?;
-            let mut bytes = Vec::new();
-            pipe.take(cap as u64 + 1)
-                .read_to_end(&mut bytes)
-                .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))?;
-            Ok(bytes)
+            read_bounded(pipe, cap, READ_DEADLINE)
+                .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))
         })
         .unwrap_or_else(|| {
             Err("Couldn't read the clipboard: the program that copied it didn't answer.".into())
         })
+    }
+
+    /// Reads a pipe to its end, at most `cap` bytes and one more, and for at most `deadline`: a
+    /// program that copied and never writes can't hold the reader past it (Codex's review 85, 8).
+    pub(super) fn read_bounded(
+        mut pipe: impl Read + std::os::fd::AsRawFd,
+        cap: usize,
+        deadline: std::time::Duration,
+    ) -> std::io::Result<Vec<u8>> {
+        let until = std::time::Instant::now() + deadline;
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the program that copied it didn't answer in time",
+                ));
+            }
+            let mut fd = libc::pollfd {
+                fd: pipe.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one valid pollfd, for the pipe this function holds.
+            let ready = unsafe { libc::poll(&mut fd, 1, left.as_millis().min(1000) as i32) };
+            if ready < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            if ready == 0 {
+                continue;
+            }
+            let room = (cap + 1).saturating_sub(bytes.len()).min(buf.len());
+            let n = pipe.read(&mut buf[..room])?;
+            if n == 0 {
+                return Ok(bytes);
+            }
+            bytes.extend_from_slice(&buf[..n]);
+            if bytes.len() > cap {
+                return Ok(bytes);
+            }
+        }
     }
 
     fn x11_list() -> Listing {
@@ -2344,6 +2427,44 @@ mod tests {
             panic!("Kerdr's own reader didn't read it: {found:?}")
         };
         assert_eq!(got.bytes, std::fs::read(&path).unwrap());
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn a_clipboard_pipe_that_never_writes_is_let_go_at_its_deadline() {
+        // Codex's review 85, 8: the program that copied never writes; the read ends at its
+        // deadline, and one that writes too much stops just past the cap.
+        use std::io::Write;
+        let (quiet, _held_open) = std::os::unix::net::UnixStream::pair().unwrap();
+        let started = Instant::now();
+        let err = builtin::read_bounded(quiet, 100, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        writer.write_all(&[7; 5000]).unwrap();
+        drop(writer);
+        let got = builtin::read_bounded(reader, 1000, Duration::from_secs(2)).unwrap();
+        assert_eq!(got.len(), 1001);
+    }
+
+    #[test]
+    fn a_folder_is_looked_through_only_so_far() {
+        // Codex's review 85, 8: never listed whole before its images are chosen.
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("many");
+        std::fs::create_dir(&folder).unwrap();
+        for n in 0..(FOLDER_ENTRIES + 20) {
+            std::fs::write(folder.join(format!("{n:05}.txt")), "x").unwrap();
+        }
+        let got = from_files(std::slice::from_ref(&folder), Room::left(&[]));
+        assert!(
+            got.notes
+                .iter()
+                .any(|n| n.contains("more than Kerdr looks through at once")),
+            "{:?} {:?}",
+            got.notes,
+            got.why
+        );
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]

@@ -502,6 +502,10 @@ pub(crate) struct ImageRead {
     pub id: u64,
     pub at: usize,
     pub for_send: bool,
+    /// When it began, and what it reads ("Reading the clipboard"): past READ_MOST it's let go,
+    /// said, and nothing waits for it any more (Codex's review 85, 8).
+    pub started: Instant,
+    pub what: &'static str,
     /// What it found, once it has: waiting for the reads before it.
     pub got: Option<crate::images::Loading>,
 }
@@ -4395,6 +4399,8 @@ pub(crate) mod tests {
             id: 1,
             at: 0,
             for_send: false,
+            started: Instant::now(),
+            what: "Reading the clipboard",
             got: None,
         });
         assert_eq!(app.key_wait(), KEY_WAIT_COMING);
@@ -6705,6 +6711,49 @@ pub(crate) mod tests {
         };
         assert!(message.contains("the rest is kept"), "{message}");
         assert!(app.returned.iter().any(|r| euros.ends_with(&r.words)));
+    }
+
+    #[test]
+    fn a_read_that_stalls_is_let_go_at_its_deadline_and_the_next_paste_goes_in() {
+        // Codex's review 85, 8: a read that never ends (a mount that doesn't answer) ends in a
+        // line on the board within its deadline; the box, and the reads after it, never wait on it.
+        use crate::images::Source;
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        for c in "Shots:".chars() {
+            press(&mut app, c);
+        }
+        let (stalled, _) = app
+            .begin_image_load(&Source::Files(vec!["/mnt/slow/shot.png".into()]))
+            .unwrap();
+        let (next, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            next,
+            crate::images::Loading {
+                images: vec![a_png()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Shots:", "waits for the one before it");
+        // Its deadline passes, as the board's next turn sees it.
+        app.image_reads[0].started -= crate::images::read_most("Reading the image");
+        app.apply_reads();
+        assert_eq!(box_words(&app), "Shots: [Image #1] ");
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.contains("Reading the image took longer than 20 seconds"),
+            "{said}"
+        );
+        assert!(app.image_reads.is_empty());
+        // What it finds later goes nowhere.
+        app.images_loaded(
+            stalled,
+            crate::images::Loading {
+                images: vec![a_png()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_images(&app), 1);
     }
 
     #[test]

@@ -2477,6 +2477,8 @@ mod tests {
             id: 7,
             at: "The dock:".len(),
             for_send: true,
+            started: Instant::now(),
+            what: "Reading the clipboard",
             got: None,
         });
         app.send_after_load = Some((

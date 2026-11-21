@@ -2526,6 +2526,12 @@ impl App {
             id,
             at,
             for_send: false,
+            started: Instant::now(),
+            what: match source {
+                images::Source::Clipboard => "Reading the clipboard",
+                images::Source::Files(_) => "Reading the image",
+                images::Source::Smaller(..) => "Making a smaller copy",
+            },
             got: None,
         });
         if after {
@@ -2581,6 +2587,38 @@ impl App {
     /// question about an earlier one's images is up, which they wait for; the words Enter sent go
     /// once every read they waited for is in, the action that sends them (intent 0445).
     pub fn apply_reads(&mut self) -> Action {
+        let mut said: Vec<(String, Tone)> = vec![];
+        let action = self.apply_reads_saying(&mut said);
+        if !said.is_empty() {
+            let tone = if said.iter().any(|(_, t)| *t == Tone::Warn) {
+                Tone::Warn
+            } else {
+                Tone::Good
+            };
+            let text = said
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect::<Vec<_>>()
+                .join(" ");
+            // A question asked meanwhile (a smaller copy) is up already: said under it.
+            self.say(text, tone);
+        }
+        action
+    }
+
+    fn apply_reads_saying(&mut self, said: &mut Vec<(String, Tone)>) -> Action {
+        // A read past its deadline is let go, said as what it found, so the box, and words
+        // waiting to be sent, never wait on it longer (Codex's review 85, 8).
+        for read in self.image_reads.iter_mut().filter(|r| r.got.is_none()) {
+            let most = images::read_most(read.what);
+            if read.started.elapsed() >= most {
+                read.got = Some(images::Loading::refused(format!(
+                    "{} took longer than {} seconds, so Kerdr stopped waiting for it, and nothing from it went in.",
+                    read.what,
+                    most.as_secs()
+                )));
+            }
+        }
         loop {
             let Some(front) = self.image_reads.front() else {
                 return Action::None;
@@ -2598,7 +2636,7 @@ impl App {
             };
             let loading = read.got.unwrap_or_default();
             if !read.for_send {
-                self.attach_images_at(loading, Some(read.at));
+                said.extend(self.attach_quietly(loading, Some(read.at)));
                 continue;
             }
             let Some((load, mut draft)) = self.send_after_load.take() else {
@@ -2742,12 +2780,24 @@ impl App {
     /// what this intent may carry, for a backend that fixes input, are asked about: a smaller copy
     /// of each goes in only if he says so.
     fn attach_images_at(&mut self, got: images::Loading, at: Option<usize>) {
+        if let Some((said, tone)) = self.attach_quietly(got, at) {
+            self.say(said, tone);
+        }
+    }
+
+    /// As attach_images_at, giving back what to say rather than saying it, so what several reads
+    /// found, put in at one turn, is said together (Codex's review 85, 8).
+    fn attach_quietly(
+        &mut self,
+        got: images::Loading,
+        at: Option<usize>,
+    ) -> Option<(String, Tone)> {
         let fix = match &self.mode {
             Mode::Compose { draft, .. } => self.fixes_input(draft.machine),
-            _ => return,
+            _ => return None,
         };
         let Mode::Compose { draft, .. } = &mut self.mode else {
-            return;
+            return None;
         };
         let mut attached = attach_into(draft, got, at, fix);
         let after = attached.at + attached.inserted;
@@ -2755,17 +2805,18 @@ impl App {
             self.keep_left_over(rest);
         }
         self.shift_queued(false, attached.at, attached.inserted);
-        if !attached.said.is_empty() {
+        let said = (!attached.said.is_empty()).then(|| {
             let tone = if attached.refused {
                 Tone::Warn
             } else {
                 Tone::Good
             };
-            self.say(attached.said.join(" "), tone);
-        }
+            (attached.said.join(" "), tone)
+        });
         if !attached.oversized.is_empty() {
             self.ask_smaller(attached.oversized, after);
         }
+        said
     }
 
     /// Yes to a backend's question about a new intent's words: the same send again, its words and
