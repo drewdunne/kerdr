@@ -295,8 +295,9 @@ pub fn tag(n: u32) -> String {
 
 /// The image type its first bytes say it is, for any kind of image Kerdr knows by its bytes
 /// (intent 0591, K3-56): PNG, JPEG, GIF and WebP, which every backend takes, and BMP, TIFF,
-/// HEIC, HEIF, AVIF, ICO and JPEG XL, which only a backend that fixes input takes. None for
-/// bytes that are no image Kerdr knows.
+/// HEIC, HEIF, AVIF, ICO, JPEG XL, JPEG 2000, PSD, QOI, ICNS and DDS, the kinds a backend that
+/// fixes input knows by their bytes too, which only it takes. None for bytes that are no image
+/// Kerdr knows.
 pub fn kind_of(bytes: &[u8]) -> Option<&'static str> {
     let at = |range: std::ops::Range<usize>| bytes.get(range);
     if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
@@ -322,6 +323,18 @@ pub fn kind_of(bytes: &[u8]) -> Option<&'static str> {
         Some("image/x-icon")
     } else if bytes.starts_with(&[0xff, 0x0a]) || bytes.starts_with(b"\0\0\0\x0cJXL \r\n\x87\n") {
         Some("image/jxl")
+    } else if bytes.starts_with(b"\0\0\0\x0cjP  \r\n\x87\n")
+        || bytes.starts_with(&[0xff, 0x4f, 0xff, 0x51])
+    {
+        Some("image/jp2")
+    } else if bytes.starts_with(b"8BPS") {
+        Some("image/vnd.adobe.photoshop")
+    } else if bytes.starts_with(b"qoif") {
+        Some("image/qoi")
+    } else if bytes.starts_with(b"icns") {
+        Some("image/icns")
+    } else if bytes.starts_with(b"DDS ") {
+        Some("image/vnd-ms.dds")
     } else {
         None
     }
@@ -351,6 +364,11 @@ pub fn kind_name(media_type: &str) -> &'static str {
         "image/avif" => "AVIF",
         "image/x-icon" => "ICO",
         "image/jxl" => "JPEG XL",
+        "image/jp2" => "JPEG 2000",
+        "image/vnd.adobe.photoshop" => "PSD",
+        "image/qoi" => "QOI",
+        "image/icns" => "ICNS",
+        "image/vnd-ms.dds" => "DDS",
         _ => "image",
     }
 }
@@ -490,7 +508,20 @@ fn image_name(path: &Path, any: bool) -> bool {
             || (any
                 && matches!(
                     e.as_str(),
-                    "bmp" | "tif" | "tiff" | "heic" | "heif" | "avif" | "ico" | "jxl"
+                    "bmp"
+                        | "tif"
+                        | "tiff"
+                        | "heic"
+                        | "heif"
+                        | "avif"
+                        | "ico"
+                        | "jxl"
+                        | "jp2"
+                        | "j2k"
+                        | "psd"
+                        | "qoi"
+                        | "icns"
+                        | "dds"
                 ))
     })
 }
@@ -1526,6 +1557,8 @@ mod tests {
             "avif" => b"\0\0\0\x1cftypavif\0\0\0\0avifmif1".to_vec(),
             "ico" => vec![0, 0, 1, 0, 1, 0, 16, 16, 0, 0, 1, 0, 32, 0],
             "jxl" => vec![0xff, 0x0a, 0xfa, 0x1f],
+            "psd" => b"8BPS\0\x01".to_vec(),
+            "qoi" => b"qoif\0\0\0\x10".to_vec(),
             _ => panic!("{kind}"),
         };
         b.resize(64, 0);
@@ -1545,6 +1578,8 @@ mod tests {
             ("avif", "image/avif"),
             ("ico", "image/x-icon"),
             ("jxl", "image/jxl"),
+            ("psd", "image/vnd.adobe.photoshop"),
+            ("qoi", "image/qoi"),
         ] {
             let bytes = bytes_of(kind);
             assert_eq!(kind_of(&bytes), Some(media), "{kind}");

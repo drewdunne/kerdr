@@ -1025,7 +1025,8 @@ A backend that fixes or accepts what was typed or pasted, in place of refusing i
   saved, may be as long; its answer may be up to three times that, however much of it JSON escapes.
 - **Images.** No count: one request's images together, and each, at most 20 MB. `type` names the
   kind its bytes are: `image/png`, `image/jpeg`, `image/gif`, `image/webp`, and also `image/bmp`,
-  `image/tiff`, `image/heic`, `image/heif`, `image/avif`, `image/x-icon` and `image/jxl`, which an agent
+  `image/tiff`, `image/heic`, `image/heif`, `image/avif`, `image/x-icon`, `image/jxl`, `image/jp2`,
+  `image/vnd.adobe.photoshop`, `image/qoi`, `image/icns` and `image/vnd-ms.dds`, which an agent
   can't show: keep such an image as pasted, with a PNG copy beside it. An image past what's left of
   the 20 MB is asked about in Kerdr, and a smaller copy (JPEG, or PNG for one with see-through parts)
   goes only on a yes; the backend is never sent one past the limit.
