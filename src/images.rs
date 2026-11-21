@@ -818,8 +818,18 @@ pub fn from_clipboard(room: Room) -> Loading {
 
 const NO_IMAGE: &str = "There's no image on the clipboard. Copy a screenshot or an image first, or paste an image file's path.";
 
-/// The most text a clipboard read puts in the words: what the box holds.
-const MOST_CLIPBOARD_TEXT: usize = 1_000_000;
+/// The most text a clipboard read takes: past what the box holds, which keeps the rest for c, and
+/// read whole, never cut, so no character is split (Codex's review 85, 5). Past this, nothing goes
+/// in, and it's still on the clipboard.
+const MOST_CLIPBOARD_TEXT: usize = 8_000_000;
+
+/// Why copied text past MOST_CLIPBOARD_TEXT didn't go in.
+fn too_much_text() -> String {
+    format!(
+        "The copied text is over {}, more than Kerdr reads at once, so none of it went in; it's still on your clipboard.",
+        size(MOST_CLIPBOARD_TEXT)
+    )
+}
 
 /// What a clipboard offers, as one way of reading it says.
 pub enum Listing {
@@ -1053,7 +1063,10 @@ fn clipboard_from(reader: &Reader, types: &[String], room: Room) -> Result<Found
     }
     if let Some(t) = TEXT_TYPES.iter().find(|t| has(t)) {
         let bytes = (reader.read)(t, MOST_CLIPBOARD_TEXT)?;
-        let text = String::from_utf8_lossy(&bytes[..bytes.len().min(MOST_CLIPBOARD_TEXT)])
+        if bytes.len() > MOST_CLIPBOARD_TEXT {
+            return Err(too_much_text());
+        }
+        let text = String::from_utf8_lossy(&bytes)
             .replace("\r\n", "\n")
             .replace('\r', "\n");
         if !text.is_empty() {
@@ -1380,9 +1393,12 @@ fn macos_clipboard(room: Room) -> Result<Found, String> {
     // Text: it goes into the words, as any paste would (intent 0591, K3-61).
     let mut cmd = Command::new("osascript");
     cmd.args(["-e", "the clipboard as «class utf8»"]);
-    if let Ok(c) = capture(cmd, MOST_CLIPBOARD_TEXT, READ_DEADLINE)
+    if let Ok(c) = capture(cmd, MOST_CLIPBOARD_TEXT + 1, READ_DEADLINE)
         && c.status == Some(0)
     {
+        if c.stdout.len() > MOST_CLIPBOARD_TEXT {
+            return Err(too_much_text());
+        }
         let text = String::from_utf8_lossy(&c.stdout)
             .trim_end_matches('\n')
             .replace("\r\n", "\n")
@@ -1428,7 +1444,7 @@ fn windows_clipboard(room: Room) -> Result<Found, String> {
         &base64::engine::general_purpose::STANDARD.encode(encoded),
     ]);
     // PowerShell takes a few seconds to start on a cold machine.
-    let got = capture(cmd, MOST_CLIPBOARD_TEXT, READ_DEADLINE * 3)
+    let got = capture(cmd, MOST_CLIPBOARD_TEXT + 1, READ_DEADLINE * 3)
         .map_err(|e| format!("Couldn't read the clipboard with PowerShell: {e}."))?;
     match got.status {
         Some(0) => from_file(&file, room).map(Found::Image),
@@ -1441,6 +1457,7 @@ fn windows_clipboard(room: Room) -> Result<Found, String> {
         }
         Some(2) => Err("The clipboard is empty.".into()),
         // Text goes into the words, as any paste would (intent 0591, K3-61).
+        Some(3) if got.stdout.len() > MOST_CLIPBOARD_TEXT => Err(too_much_text()),
         Some(3) if !got.stdout.is_empty() => Ok(Found::Text(
             String::from_utf8_lossy(&got.stdout)
                 .replace("\r\n", "\n")
@@ -1619,6 +1636,40 @@ mod tests {
         let got = from_files(&[shot], fixing());
         assert_eq!(got.images[0].media_type, "image/bmp");
         assert_eq!(got.why, None);
+    }
+
+    #[test]
+    fn copied_text_is_read_whole_never_cut_inside_a_character() {
+        // Codex's review 85, 5: past the box's megabyte, the text is still read whole (the box
+        // keeps what doesn't fit for c), so no character is split at a cap; past 8 MB nothing goes
+        // in, and that's said.
+        let euros = "€".repeat(400_000); // 1.2 MB, three bytes each
+        let calls = RefCell::new(vec![]);
+        let run = fake(&calls, |_, args| {
+            if args == ["--list-types"] {
+                ok(b"text/plain;charset=utf-8\n")
+            } else {
+                ok(euros.as_bytes())
+            }
+        });
+        let Ok(Found::Text(text)) = unix_clipboard(true, false, &run) else {
+            panic!("no text")
+        };
+        assert_eq!(text.len(), euros.len());
+        assert!(!text.contains('\u{fffd}'), "a character was split");
+        let huge = "x".repeat(MOST_CLIPBOARD_TEXT + 10);
+        let run = fake(&calls, |_, args| {
+            if args == ["--list-types"] {
+                ok(b"text/plain;charset=utf-8\n")
+            } else {
+                ok(huge.as_bytes())
+            }
+        });
+        let why = unix_clipboard(true, false, &run).unwrap_err();
+        assert!(
+            why.contains("none of it went in; it's still on your clipboard"),
+            "{why}"
+        );
     }
 
     #[test]

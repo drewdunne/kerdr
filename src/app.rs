@@ -6559,6 +6559,62 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn copied_text_that_doesnt_fit_the_box_is_kept_and_stops_a_send() {
+        // Codex's review 85, 5: what fits goes in, cut between characters, never inside one; the
+        // rest is kept for c, said; and words Enter sent while it was read aren't sent without it.
+        use crate::images::Source;
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        let room = 1_000_000 - 5;
+        app.on_paste(&"w".repeat(room));
+        let euros = "€".repeat(10); // three bytes each: the room ends inside the second
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            id,
+            crate::images::Loading {
+                text: Some(euros.clone()),
+                ..Default::default()
+            },
+        );
+        let words = box_words(&app);
+        assert!(words.ends_with('€'), "cut inside a character?");
+        let went = words.len() - room - 1;
+        assert_eq!(went % 3, 0);
+        let kept = app.returned.back().expect("the rest is kept").words.clone();
+        assert_eq!(format!("{}{kept}", &words[room + 1..]), euros);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.contains("the rest is kept, and c brings it back"),
+            "{said}"
+        );
+        // Sent with Enter while it was read: not sent, asked.
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste(&"w".repeat(room));
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let sent = app.images_loaded(
+            id,
+            crate::images::Loading {
+                text: Some(euros.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(sent, Action::None, "never sent cut short");
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert!(message.contains("the rest is kept"), "{message}");
+        assert!(app.returned.iter().any(|r| euros.ends_with(&r.words)));
+    }
+
+    #[test]
     fn each_paste_reads_what_the_clipboard_held_when_it_was_pasted() {
         // Codex's review 85, 4: while a slow read goes, he copies B and pastes, then copies C and
         // pastes. Each read starts as he pastes, so B's read reads B, and all three go in in order.

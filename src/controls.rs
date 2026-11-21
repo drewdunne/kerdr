@@ -171,6 +171,8 @@ fn take_tag(draft: &mut Draft, past_spaces: bool) -> bool {
 #[derive(Debug, Default)]
 struct Attached {
     said: Vec<String>,
+    /// Copied text that didn't fit the box: kept for c, never dropped (Codex's review 85, 5).
+    left_over: Option<String>,
     /// Something read didn't go in: refused, or past a limit.
     refused: bool,
     oversized: Vec<images::Loaded>,
@@ -211,14 +213,18 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>, fix: 
         piece.push_str(&text[..end]);
         draft.words.insert_str(at, &piece);
         at += piece.len();
-        out.said.push(if end < text.len() {
-            format!(
-                "Pasted the copied text, up to the {} the box holds.",
+        if end < text.len() {
+            // What didn't fit is kept, and said: never cut short and sent unseen.
+            out.said.push(format!(
+                "Only the first {} of the copied text fit the box, which holds {}; the rest is kept, and c brings it back once these words have gone.",
+                images::size(end),
                 images::size(max_words(fix))
-            )
+            ));
+            out.left_over = Some(text[end..].to_string());
+            out.refused = true;
         } else {
-            "Pasted the copied text.".to_string()
-        });
+            out.said.push("Pasted the copied text.".to_string());
+        }
     }
     for image in got.images {
         let total: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
@@ -2460,13 +2466,15 @@ impl App {
                     end -= 1;
                 }
                 draft.words.push_str(&text[..end]);
-                // Never cut short unseen.
+                // Never cut short unseen, nor lost: the rest is kept for c.
                 if end < text.len() {
                     let said = format!(
-                        "Only the first {} of that paste went in: the box holds {}.",
+                        "Only the first {} of that paste went in: the box holds {}. The rest is kept, and c brings it back once these words have gone.",
                         images::size(end),
                         images::size(max_words(fix))
                     );
+                    let rest = text[end..].to_string();
+                    self.keep_left_over(rest);
                     self.say(said, Tone::Warn);
                 }
             }
@@ -2603,7 +2611,10 @@ impl App {
                 continue;
             };
             let fix = self.fixes_input(draft.machine);
-            let got = attach_into(&mut draft, loading, Some(read.at), fix);
+            let mut got = attach_into(&mut draft, loading, Some(read.at), fix);
+            if let Some(rest) = got.left_over.take() {
+                self.keep_left_over(rest);
+            }
             self.shift_queued(true, got.at, got.inserted);
             if got.refused || !got.oversized.is_empty() {
                 self.send_troubles.extend(
@@ -2744,8 +2755,11 @@ impl App {
         let Mode::Compose { draft, .. } = &mut self.mode else {
             return;
         };
-        let attached = attach_into(draft, got, at, fix);
+        let mut attached = attach_into(draft, got, at, fix);
         let after = attached.at + attached.inserted;
+        if let Some(rest) = attached.left_over.take() {
+            self.keep_left_over(rest);
+        }
         self.shift_queued(false, attached.at, attached.inserted);
         if !attached.said.is_empty() {
             let tone = if attached.refused {
@@ -2802,6 +2816,17 @@ impl App {
                 Tone::Info,
             );
         }
+    }
+
+    /// Text that didn't fit the box, kept as words given back: c brings it back once the box is
+    /// free, and the words file keeps it meanwhile (Codex's review 85, 5).
+    fn keep_left_over(&mut self, rest: String) {
+        self.returned.push_back(crate::app::Returned {
+            words: rest,
+            images: vec![],
+            from: None,
+        });
+        self.keep_words_now();
     }
 
     /// Asks whether smaller copies of images too large to send go in their place, their tags at
