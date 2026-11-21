@@ -165,24 +165,48 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
     }
     let _ = execute!(stdout(), ratatui::crossterm::event::DisableBracketedPaste);
     ratatui::restore();
-    print_recovery(&mut app);
+    let printed = print_recovery(&mut app);
     if let Some(l) = live.as_mut() {
         for i in 0..l.pollers.len() {
             l.stop(i);
         }
     }
-    result
+    recovered(result, printed)
+}
+
+/// What Kerdr ends with, once his words it couldn't keep have been printed on his terminal, or
+/// haven't: never the words themselves, since main writes that line to the error log (Codex's
+/// review 99, 3). A quit that loses them ends as a failure, saying so.
+fn recovered(result: anyhow::Result<()>, printed: Option<bool>) -> anyhow::Result<()> {
+    let said = match printed {
+        None => return result,
+        Some(true) => "Your words are printed on your terminal, to copy.",
+        Some(false) => {
+            "Kerdr couldn't print your words on your terminal, so they couldn't be kept."
+        }
+    };
+    match result {
+        Err(e) => Err(anyhow::anyhow!("{e} {said}")),
+        Ok(()) if printed == Some(false) => Err(anyhow::anyhow!("{said}")),
+        Ok(()) => Ok(()),
+    }
 }
 
 /// His words the words file couldn't keep, now the board has gone: on his own terminal only,
 /// never standard error or the error log (intent 0591, K3-34; Codex's review 98, 1).
-pub(crate) fn print_recovery(app: &mut App) {
+/// Whether they were: None with nothing to print, else whether every write reached it.
+pub(crate) fn print_recovery(app: &mut App) -> Option<bool> {
     let texts = std::mem::take(&mut app.print_on_exit);
-    if let Some(mut terminal) = app.recovery_terminal.take() {
-        for text in texts {
-            let _ = to_terminal(&mut terminal, &format!("{text}\n"));
-        }
+    let terminal = app.recovery_terminal.take();
+    if texts.is_empty() {
+        return None;
     }
+    let mut terminal = terminal?;
+    Some(
+        texts
+            .iter()
+            .all(|text| to_terminal(&mut terminal, &format!("{text}\n"))),
+    )
 }
 
 /// Writes `text` on his terminal: on Windows by the console's own wide call (WriteConsoleW), so
@@ -1463,12 +1487,11 @@ fn edit_text(
         let unkept = match app.keep_on_quit() {
             Ok(()) => String::new(),
             Err(why) => {
-                let printed = if !app.print_unkept() {
-                    " There's no terminal to print your words on, so they couldn't be kept."
-                } else if app.print_on_exit.is_empty() {
+                // Whether they reached his terminal is said once they've been printed, or not.
+                let printed = if app.print_unkept() {
                     ""
                 } else {
-                    " Your words are printed below, to copy."
+                    " There's no terminal to print your words on, so they couldn't be kept."
                 };
                 format!(" {why}, so what it keeps for the next Kerdr couldn't be kept.{printed}")
             }
@@ -2137,6 +2160,51 @@ mod tests {
     }
 
     #[test]
+    fn words_that_couldnt_be_written_to_his_terminal_are_never_said_to_be_printed() {
+        // Codex's review 99, 3: his terminal opens, but writing to it fails (here a file opened
+        // only to read). Kerdr's last line says his words couldn't be printed, with none of
+        // them; a quit that loses them ends as a failure, saying so.
+        let mut app = box_open();
+        app.mode = crate::app::Mode::Board;
+        app.draft = "Words that never reached him.".into();
+        app.open_terminal = || std::fs::File::open(std::env::current_exe().ok()?).ok();
+        assert!(app.print_unkept(), "his terminal opened");
+        let printed = print_recovery(&mut app);
+        let stopped = recovered(
+            Err(anyhow::anyhow!(
+                "Kerdr was asked to stop (signal 1) while your editor was open."
+            )),
+            printed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            stopped.contains("couldn't print your words"),
+            "the last line doesn't say so: {stopped}"
+        );
+        assert!(
+            !stopped.contains("Words that never reached him."),
+            "{stopped}"
+        );
+        let quit = recovered(Ok(()), printed);
+        assert!(
+            quit.as_ref()
+                .is_err_and(|e| e.to_string().contains("couldn't print your words")),
+            "a quit that lost them ended as if it hadn't: {quit:?}"
+        );
+        // Written: said so.
+        app.draft = "Words that reached him.".into();
+        app.open_terminal = || tempfile::tempfile().ok();
+        assert!(app.print_unkept());
+        let printed = print_recovery(&mut app);
+        let line = recovered(Err(anyhow::anyhow!("Stopped.")), printed)
+            .unwrap_err()
+            .to_string();
+        assert!(line.contains("printed on your terminal"), "{line}");
+        assert!(recovered(Ok(()), printed).is_ok());
+    }
+
+    #[test]
     fn words_for_a_windows_console_go_as_utf16_whole() {
         // Codex's review 99, 2: on Windows his words reach the console by its wide call, so
         // "café" survives a console whose code page is CP437 or CP850. A real console can't run
@@ -2180,8 +2248,8 @@ mod tests {
         app.mode = crate::app::Mode::Board;
         app.draft = "Words only he should see.".into();
         let kept = app.print_unkept();
-        print_recovery(&mut app);
-        println!("KEPT={kept}");
+        let printed = print_recovery(&mut app);
+        println!("KEPT={kept} PRINTED={printed:?}");
     }
 
     #[cfg(unix)]
@@ -2273,7 +2341,7 @@ mod tests {
             terminal.contains(WORDS),
             "not on his terminal: {terminal:?} {out}"
         );
-        assert!(out.contains("KEPT=true"), "{out}");
+        assert!(out.contains("KEPT=true PRINTED=Some(true)"), "{out}");
         let (out, err, _) = run(false);
         assert!(
             !err.contains(WORDS),

@@ -358,13 +358,15 @@ impl App {
             let reference = app.reference_for(&held.id);
             // Written now: what the line Kerdr ends with says is so.
             if !(app.kept.on_disk() && app.keep_words_now()) {
+                // Whether it then reached his terminal is said once it's been printed, or not
+                // (Codex's review 99, 3).
                 let then = if app.print_unkept() {
-                    "so it's printed below, to copy"
+                    ""
                 } else {
-                    "and there's no terminal to print it on, so it couldn't be kept"
+                    ", and there's no terminal to print it on, so it couldn't be kept"
                 };
                 return Some(format!(
-                    "Your new text for {reference} wasn't saved{why}, and Kerdr couldn't write it to its words file, {then}."
+                    "Your new text for {reference} wasn't saved{why}, and Kerdr couldn't write it to its words file{then}."
                 ));
             }
             let place = app
@@ -718,7 +720,14 @@ pub(crate) mod tests {
             })
             .unwrap();
         std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
-        assert!(went.contains("printed below, to copy"), "{went}");
+        assert!(
+            went.contains("couldn't write it to its words file"),
+            "{went}"
+        );
+        assert!(
+            !went.contains("couldn't be kept"),
+            "it has a terminal: {went}"
+        );
         assert!(!went.contains("Words only the save has."), "{went}");
         let printed = app.print_on_exit.join("\n");
         assert!(printed.contains("Words only the save has."), "{printed}");
