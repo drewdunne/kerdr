@@ -2496,6 +2496,10 @@ mod tests {
     #[test]
     #[ignore]
     fn live_x11_read_stops_at_its_cap() {
+        if std::env::var_os("DISPLAY").is_none_or(|d| d.is_empty()) {
+            eprintln!("skipped: no X11 display");
+            return;
+        }
         let path = std::env::var("KERDR_LIVE_CLIPBOARD_IMAGE").expect("the image on the clipboard");
         let whole = std::fs::read(path).unwrap().len();
         let cap = whole / 2;
