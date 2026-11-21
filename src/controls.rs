@@ -8,8 +8,18 @@ use crate::model::{CardSnapshot, Summary};
 use crate::resolve::Effect;
 use serde_json::{Value, json};
 
-/// The most the new-intent box holds, kept under the actions' 64 KiB request limit.
+/// The most the new-intent box holds for a backend without fix-input, kept under its 64 KiB
+/// request limit.
 const MAX_WORDS: usize = 48_000;
+
+/// The most it holds for a backend that fixes input, which saves long words whole in a file beside
+/// the intent (intent 0591, release 5): a megabyte, well inside a 32 MiB request.
+const FIX_WORDS: usize = 1_000_000;
+
+/// The most the new-intent box holds for a backend that fixes input or not.
+pub(crate) fn max_words(fix: bool) -> usize {
+    if fix { FIX_WORDS } else { MAX_WORDS }
+}
 
 /// The most of an action's answer the board shows: a backend's error can run to thousands of
 /// characters, which would fill the screen (intent 0411).
@@ -155,28 +165,94 @@ fn take_tag(draft: &mut Draft, past_spaces: bool) -> bool {
     true
 }
 
-/// Puts images into a new intent's words, each as the next `[Image #N]` tag at `at` (where the
-/// words ended when the read began), or at the end when the words have since been cut shorter
-/// than that. What went in, and why anything didn't, to say.
-fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>) -> Vec<String> {
+/// What putting a read into a new intent's words did: what to say of it, the images too large to
+/// send (for a backend that fixes input, to ask about smaller copies of), and how much went in at
+/// the place it went.
+#[derive(Debug, Default)]
+struct Attached {
+    said: Vec<String>,
+    /// Copied text that didn't fit the box: kept for c, never dropped (Codex's review 85, 5).
+    left_over: Option<String>,
+    /// Something read didn't go in: refused, or past a limit.
+    refused: bool,
+    oversized: Vec<images::Loaded>,
+    inserted: usize,
+    at: usize,
+}
+
+/// Puts what a read found into a new intent's words at `at` (where the words ended when the read
+/// began), or at the end when the words have since been cut shorter than that: text first, as any
+/// paste would put it (intent 0591, K3-61), then each image as the next `[Image #N]` tag. For a
+/// backend that fixes input (`fix`) there's no count, and no image is refused for the words'
+/// room; one past the 20 MB its images may be together is held back for a question.
+fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>, fix: bool) -> Attached {
     let mut at = at
         .filter(|&a| a <= draft.words.len() && draft.words.is_char_boundary(a))
         .unwrap_or(draft.words.len());
-    let mut said = vec![];
-    for image in got.images {
-        if draft.images.len() >= images::MAX_IMAGES {
-            said.push(images::too_many());
-            break;
+    let before = draft.words.len();
+    let mut out = Attached {
+        at,
+        said: got.notes,
+        ..Attached::default()
+    };
+    if let Some(text) = got.text {
+        let room = max_words(fix).saturating_sub(draft.words.len());
+        let mut end = text.len().min(room);
+        while !text.is_char_boundary(end) {
+            end -= 1;
         }
+        let mut piece = String::new();
+        if draft.words[..at]
+            .chars()
+            .last()
+            .is_some_and(|c| !c.is_whitespace())
+            && !text.starts_with(char::is_whitespace)
+        {
+            piece.push(' ');
+        }
+        piece.push_str(&text[..end]);
+        draft.words.insert_str(at, &piece);
+        at += piece.len();
+        if end < text.len() {
+            // What didn't fit is kept, and said: never cut short and sent unseen.
+            out.said.push(format!(
+                "Only the first {} of the copied text fit the box, which holds {}; the rest is kept, and c brings it back once these words have gone.",
+                images::size(end),
+                images::size(max_words(fix))
+            ));
+            out.left_over = Some(text[end..].to_string());
+            out.refused = true;
+        } else {
+            out.said.push("Pasted the copied text.".to_string());
+        }
+    }
+    for image in got.images {
         let total: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
-        if total + image.bytes.len() > images::MAX_IMAGES_BYTES {
-            said.push(images::too_much());
-            break;
+        if fix {
+            if total + image.bytes.len() > images::MAX_IMAGES_BYTES
+                || image.bytes.len() > images::FIX_IMAGE_BYTES
+            {
+                out.oversized.push(image);
+                continue;
+            }
+        } else {
+            if draft.images.len() >= images::MAX_IMAGES {
+                out.said.push(images::too_many());
+                out.refused = true;
+                break;
+            }
+            if total + image.bytes.len() > images::MAX_IMAGES_BYTES {
+                out.said.push(images::too_much());
+                out.refused = true;
+                break;
+            }
         }
         let n = draft.images.iter().map(|i| i.tag).max().unwrap_or(0) + 1;
         let tag = images::tag(n);
-        if draft.words.len() + tag.len() + 2 > MAX_WORDS {
-            said.push("The box is full; there's no room for another image's tag.".into());
+        if !fix && draft.words.len() + tag.len() + 2 > MAX_WORDS {
+            out.said
+                .push("The box is full; there's no room for another image's tag.".into());
+            out.refused = true;
             break;
         }
         // A space either side keeps the tag apart from the words around it.
@@ -194,7 +270,7 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>) -> Ve
         }
         draft.words.insert_str(at, &piece);
         at += piece.len();
-        said.push(format!(
+        out.said.push(format!(
             "Attached {tag}: a {} image, {}.",
             images::kind_name(image.media_type),
             images::size(image.bytes.len())
@@ -205,8 +281,104 @@ fn attach_into(draft: &mut Draft, got: images::Loading, at: Option<usize>) -> Ve
             bytes: std::sync::Arc::new(image.bytes),
         });
     }
-    said.extend(got.why);
-    said
+    out.refused |= got.why.is_some();
+    out.said.extend(got.why);
+    out.inserted = draft.words.len() - before;
+    out
+}
+
+/// A new intent's `create` request: its words, the images whose tags are in them, where it goes
+/// and who it's filed under, and its submission.
+fn create_request(
+    id: &str,
+    words: &str,
+    images: &[images::Image],
+    session: &str,
+    filed: &crate::app::Filed,
+) -> Value {
+    let mut request = json!({"action":"create","words":words,"session":session,"submission":id});
+    for (field, value) in [
+        ("organization", &filed.organization),
+        ("tenant", &filed.tenant),
+        ("team", &filed.team),
+    ] {
+        if let Some(v) = value {
+            request[field] = json!(v);
+        }
+    }
+    if !images.is_empty() {
+        request["images"] = Value::Array(images::request_images(words, images));
+    }
+    request
+}
+
+/// What the board says while a read goes.
+fn reading(source: &images::Source) -> &'static str {
+    match source {
+        images::Source::Clipboard => "Reading the clipboard…",
+        images::Source::Files(_) => "Reading the image…",
+        images::Source::Smaller(..) => "Making a smaller copy…",
+    }
+}
+
+/// Names as a sentence lists them.
+fn and_names(names: &[String]) -> String {
+    match names {
+        [] => String::new(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
+/// Why images didn't go with words Enter sent: past what one intent may carry, and how to send a
+/// smaller copy.
+fn too_large_to_send(images: &[images::Loaded]) -> String {
+    let each: Vec<String> = images
+        .iter()
+        .map(|i| format!("{} is {}", i.from, images::size(i.bytes.len())))
+        .collect();
+    format!(
+        "{}, past the {} one intent's images may be together; pasted again in the box, Kerdr offers a smaller copy.",
+        and_names(&each),
+        images::size(images::MAX_IMAGES_BYTES)
+    )
+}
+
+/// The question whether smaller copies go in, naming each image, its size and the room left.
+fn smaller_question(images: &[images::Loaded], left: usize) -> String {
+    let each: Vec<String> = images
+        .iter()
+        .map(|i| {
+            format!(
+                "{} ({}, {})",
+                i.from,
+                images::kind_name(i.media_type),
+                images::size(i.bytes.len())
+            )
+        })
+        .collect();
+    let room = if left >= images::MAX_IMAGES_BYTES {
+        format!(
+            "past the {} one intent's images may be together",
+            images::size(images::MAX_IMAGES_BYTES)
+        )
+    } else {
+        format!(
+            "past the {} this intent's images have room for",
+            images::size(left)
+        )
+    };
+    if images.len() == 1 {
+        format!(
+            "{} is {room}. Attach a smaller copy instead? It may lose fine detail; the image itself stays as it is. n leaves it out.",
+            each[0]
+        )
+    } else {
+        format!(
+            "{} are {room}. Attach smaller copies instead? They may lose fine detail; the images themselves stay as they are. n leaves them out.",
+            and_names(&each)
+        )
+    }
 }
 
 /// An id for one new intent's words, so an adapter can tell a resend from new work.
@@ -1787,6 +1959,7 @@ impl App {
                 came_back: self.draft_came_back.clone(),
                 filed,
                 unfiled,
+                edit: None,
             },
             back: Box::new(self.mode.clone()),
         };
@@ -1957,16 +2130,50 @@ impl App {
     /// Alt+Enter or Ctrl+J starts a new line; Ctrl+V attaches the clipboard's image as an
     /// `[Image #N]` tag, as Claude Code does; Esc keeps them for the next time it opens.
     fn compose_key(&mut self, key: KeyEvent, mut draft: Draft, back: Box<Mode>) -> Action {
+        // An item's text, edited here because no editor could start (K1-87): ⏎ saves it, Esc
+        // keeps his version, and it holds words only.
+        if draft.edit.is_some() {
+            let newline = key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Esc => {
+                    self.edit_box_left(draft, *back);
+                    return Action::None;
+                }
+                KeyCode::Enter if !newline => return self.edit_box_saved(draft, *back),
+                KeyCode::Enter => draft.words.push('\n'),
+                KeyCode::Char('j') if ctrl => draft.words.push('\n'),
+                KeyCode::Backspace => {
+                    draft.words.pop();
+                }
+                KeyCode::Char('u') if ctrl => draft.words.clear(),
+                KeyCode::Char('w') if ctrl => {
+                    let kept = draft.words.trim_end().len();
+                    draft.words.truncate(kept);
+                    let cut = draft
+                        .words
+                        .char_indices()
+                        .rev()
+                        .find(|(_, c)| c.is_whitespace())
+                        .map_or(0, |(i, c)| i + c.len_utf8());
+                    draft.words.truncate(cut);
+                }
+                KeyCode::Char(c) if !ctrl => draft.words.push(c),
+                _ => {}
+            }
+            self.mode = Mode::Compose { draft, back };
+            return Action::None;
+        }
         if key.code == KeyCode::Esc {
             self.draft = draft.words;
             self.draft_images = draft.images;
             self.draft_came_back = draft.came_back;
             // Kept as you left them, emptied included.
             self.keep_words_now();
-            // A read for words already sent carries on for them.
-            if self.box_loading().is_some() {
-                self.image_load = None;
-            }
+            // A read for words already sent carries on for them; the box's own stop.
+            self.image_reads.retain(|r| r.for_send);
             self.mode = *back;
             return Action::None;
         }
@@ -1974,7 +2181,7 @@ impl App {
         let newline = key
             .modifiers
             .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT);
-        let room = draft.words.len() < MAX_WORDS;
+        let room = draft.words.len() < max_words(self.fixes_input(draft.machine));
         match key.code {
             KeyCode::Enter if newline => {
                 if room {
@@ -1991,12 +2198,23 @@ impl App {
                     self.say("Write what you want first.", Tone::Info);
                 } else if !self.can_write(draft.machine) {
                     // Said why; the box stays open with the words.
+                } else if self.send_after_load.is_some() && self.box_loading().is_some() {
+                    // His last new intent still waits for its image, and this one's is read after
+                    // it: the box keeps these words until theirs is in.
+                    self.say(
+                        "Your last new intent's image is still being read, and this one's after it: Enter sends these words once it's in.",
+                        Tone::Info,
+                    );
                 } else if let Some(load) = self.box_loading() {
                     // The image still being read goes with them: the box closes now, and they're
-                    // sent once it's in (intent 0445). What the box kept for next time is these
-                    // words, now on their way: it opens empty, and nothing else typed meanwhile
-                    // is cleared when they go.
+                    // sent once it's in (intent 0445), with any read asked after it (intent 0591,
+                    // K1-35). What the box kept for next time is these words, now on their way: it
+                    // opens empty, and nothing else typed meanwhile is cleared when they go.
                     self.clear_kept_draft();
+                    for r in &mut self.image_reads {
+                        r.for_send = true;
+                    }
+                    self.send_troubles.clear();
                     self.send_after_load = Some((load, draft));
                     self.closed_on_send = true;
                     self.enter_backlog(false);
@@ -2121,19 +2339,15 @@ impl App {
             );
             return Action::None;
         }
-        let mut request =
-            json!({"action":"create","words":words,"session":draft.session,"submission":id});
-        for (field, value) in [
-            ("organization", &draft.filed.organization),
-            ("tenant", &draft.filed.tenant),
-            ("team", &draft.filed.team),
-        ] {
-            if let Some(v) = value {
-                request[field] = json!(v);
-            }
-        }
-        if !images.is_empty() {
-            request["images"] = Value::Array(images::request_images(&words, &images));
+        let request = create_request(&id, &words, &images, &draft.session, &draft.filed);
+        // Past what its backend takes: nothing is sent, and the words come back (intent 0591,
+        // K1-68): words kept for one machine and sent to another included (Codex's review 85, 6).
+        if let Err(why) = self.fits_backend(draft.machine, &request) {
+            self.give_back(draft.words, draft.images, draft.came_back);
+            self.fail(format!(
+                "Your new intent wasn't saved: {why}. Your words are kept: c opens them."
+            ));
+            return Action::None;
         }
         self.emit_mutation(draft.machine, request)
     }
@@ -2145,10 +2359,13 @@ impl App {
         self.draft_came_back = None;
     }
 
-    /// The image read for the box that's open, not one for words already sent.
+    /// The last image read for the box that's open, not one for words already sent.
     fn box_loading(&self) -> Option<u64> {
-        self.image_load
-            .filter(|l| self.send_after_load.as_ref().is_none_or(|(s, _)| s != l))
+        self.image_reads
+            .iter()
+            .rev()
+            .find(|r| !r.for_send)
+            .map(|r| r.id)
     }
 
     /// Words a failed save gives back: into the box for the next c when it's free, else kept
@@ -2200,17 +2417,31 @@ impl App {
     /// In the new-intent box, a paste that is only an image file's path attaches that image,
     /// and an empty one (a terminal pasting a clipboard that holds only an image) looks for one.
     pub fn on_paste(&mut self, text: &str) -> Action {
+        // A window too small to draw this screen takes no paste either, as it takes no key but
+        // Esc: nothing goes into a box he can't see (Codex's review 88, 4).
+        if self.small_window() && !self.small_draws() {
+            return Action::None;
+        }
         self.closed_on_send = false;
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         if self.account_paste(&text) {
             return Action::None;
         }
-        if matches!(self.mode, Mode::Compose { .. }) {
+        let fix = match &self.mode {
+            Mode::Compose { draft, .. } => self.fixes_input(draft.machine),
+            _ => false,
+        };
+        let kickoff_fix = match &self.mode {
+            Mode::Kickoff { form, .. } => self.fixes_input(form.machine),
+            _ => false,
+        };
+        let edit_box = matches!(&self.mode, Mode::Compose { draft, .. } if draft.edit.is_some());
+        if matches!(self.mode, Mode::Compose { .. }) && !edit_box {
             // Spaces and blank lines are words; only a paste with nothing in it means an image.
             if text.is_empty() {
                 return Action::LoadImages(images::Source::Clipboard);
             }
-            if let Some(paths) = images::paths_in_paste(&text) {
+            if let Some(paths) = images::paths_in_paste_for(&text, fix) {
                 return Action::LoadImages(images::Source::Files(paths));
             }
         }
@@ -2223,14 +2454,28 @@ impl App {
             return Action::None;
         }
         match &mut self.mode {
-            Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text),
+            Mode::Kickoff { form, .. } => App::kickoff_paste(form, &text, kickoff_fix),
+            Mode::Compose { draft, .. } if draft.edit.is_some() => {
+                draft.words.push_str(&text);
+            }
             Mode::Compose { draft, .. } => {
-                let room = MAX_WORDS.saturating_sub(draft.words.len());
+                let room = max_words(fix).saturating_sub(draft.words.len());
                 let mut end = text.len().min(room);
                 while !text.is_char_boundary(end) {
                     end -= 1;
                 }
                 draft.words.push_str(&text[..end]);
+                // Never cut short unseen, nor lost: the rest is kept for c.
+                if end < text.len() {
+                    let said = format!(
+                        "Only the first {} of that paste went in: the box holds {}. The rest is kept, and c brings it back once these words have gone.",
+                        images::size(end),
+                        images::size(max_words(fix))
+                    );
+                    let rest = text[end..].to_string();
+                    self.keep_left_over(rest);
+                    self.say(said, Tone::Warn);
+                }
             }
             Mode::Search(s) => {
                 s.query.push_str(&text.replace('\n', " "));
@@ -2256,52 +2501,205 @@ impl App {
         Action::None
     }
 
-    /// Starts reading images for the new-intent box: the read's number and the room its draft
-    /// has left, or None (saying why) when there's no box to read them into.
+    /// Whether `machine`'s backend fixes input (images::FIX_INPUT): then the box takes long
+    /// words, any kind and number of images within 20 MB, and a request up to 32 MiB.
+    pub(crate) fn fixes_input(&self, machine: usize) -> bool {
+        self.machines
+            .get(machine)
+            .and_then(|m| m.feed.as_ref())
+            .is_some_and(|f| f.supports(images::FIX_INPUT))
+    }
+
+    /// Starts reading images for the new-intent box at once, so a clipboard read takes what the
+    /// clipboard holds now, whatever reads are still going (Codex's review 85, 4): the read's
+    /// number and the room its draft has left, or None when there's no box to read them into.
+    /// What it finds goes in after what the reads before it found (intent 0591, K1-35).
     pub fn begin_image_load(&mut self, source: &images::Source) -> Option<(u64, images::Room)> {
         let Mode::Compose { draft, .. } = &self.mode else {
             return None;
         };
-        if self.image_load.is_some() {
-            self.say("Still reading the last image.", Tone::Info);
-            return None;
-        }
-        let room = images::Room::left(&draft.images);
-        self.image_at = draft.words.len();
-        self.image_loads += 1;
-        self.image_load = Some(self.image_loads);
-        let what = match source {
-            images::Source::Clipboard => "Reading the clipboard…",
-            images::Source::Files(_) => "Reading the image…",
+        let fix = self.fixes_input(draft.machine);
+        let at = match source {
+            images::Source::Smaller(_, at) => *at,
+            _ => draft.words.len(),
         };
-        self.say(what, Tone::Info);
-        Some((self.image_loads, room))
+        let room = images::Room::for_backend(&draft.images, fix);
+        let after = self.box_loading().is_some();
+        self.image_loads += 1;
+        let id = self.image_loads;
+        let read = crate::app::ImageRead {
+            id,
+            at,
+            for_send: false,
+            started: Instant::now(),
+            what: match source {
+                images::Source::Clipboard => "Reading the clipboard",
+                images::Source::Files(_) => "Reading the image",
+                images::Source::Smaller(..) => "Making a smaller copy",
+            },
+            got: None,
+        };
+        if let images::Source::Smaller(..) = source {
+            // Yes to a smaller copy: its image went in its turn, so every read for the box still
+            // to come was pasted after it, and the copy goes in before them, in its image's place
+            // (Codex's review 86, 9).
+            let first = self
+                .image_reads
+                .iter()
+                .position(|r| !r.for_send)
+                .unwrap_or(self.image_reads.len());
+            self.image_reads.insert(first, read);
+            if after {
+                self.say(
+                    "Making a smaller copy; it goes in where its image was pasted, before what you pasted after it.",
+                    Tone::Info,
+                );
+            } else {
+                self.say(reading(source), Tone::Info);
+            }
+            return Some((id, room));
+        }
+        self.image_reads.push_back(read);
+        if after {
+            self.say(
+                format!(
+                    "{} too; it goes in after the last.",
+                    reading(source).trim_end_matches('…')
+                ),
+                Tone::Info,
+            );
+        } else {
+            self.say(reading(source), Tone::Info);
+        }
+        Some((id, room))
     }
 
-    /// A read started by begin_image_load has ended: its images go in, unless the box it was
-    /// for has closed since. When Enter sent the words while it read, they go now, with it: the
-    /// action that sends them (intent 0445).
-    pub fn images_loaded(&mut self, id: u64, loading: images::Loading) -> Action {
-        if self.image_load != Some(id) {
-            return Action::None;
-        }
-        self.image_load = None;
-        if let Some((load, mut draft)) = self.send_after_load.take() {
-            if load == id {
-                let said = attach_into(&mut draft, loading, Some(self.image_at));
-                if said.iter().any(|s| !s.starts_with("Attached")) {
-                    // Not everything read went in (none found, the box full, too many or too
-                    // big). His words may be about it, so whether they go without it is his
-                    // call (intent 0591, K1-37).
-                    self.ask_send_without(draft, &said);
-                    return Action::None;
-                }
-                return self.send_draft(draft);
+    /// After words and tags went in at `at`, `inserted` long: the reads still to come for the same
+    /// words, and smaller copies still asked about, keep their places after them.
+    fn shift_queued(&mut self, for_send: bool, at: usize, inserted: usize) {
+        for r in self
+            .image_reads
+            .iter_mut()
+            .filter(|r| r.for_send == for_send)
+        {
+            if r.at >= at {
+                r.at += inserted;
             }
-            self.send_after_load = Some((load, draft));
         }
-        self.attach_images_at(loading, Some(self.image_at));
-        Action::None
+        if !for_send {
+            for a in &mut self.smaller_asks {
+                if a.at >= at {
+                    a.at += inserted;
+                }
+            }
+        }
+    }
+
+    /// A read started by begin_image_load has ended: what it found waits for the reads before
+    /// it, then goes in (apply_reads). A read nobody waits for any more (its box closed, or it
+    /// ran past its deadline) is let go.
+    pub fn images_loaded(&mut self, id: u64, loading: images::Loading) -> Action {
+        if let Some(r) = self
+            .image_reads
+            .iter_mut()
+            .find(|r| r.id == id && r.got.is_none())
+        {
+            r.got = Some(loading);
+        }
+        self.apply_reads()
+    }
+
+    /// What reads found, put in in the order they were asked: the box's into the box, unless a
+    /// question about an earlier one's images is up, which they wait for; the words Enter sent go
+    /// once every read they waited for is in, the action that sends them (intent 0445).
+    pub fn apply_reads(&mut self) -> Action {
+        let mut said: Vec<(String, Tone)> = vec![];
+        let action = self.apply_reads_saying(&mut said);
+        if !said.is_empty() {
+            let tone = if said.iter().any(|(_, t)| *t == Tone::Warn) {
+                Tone::Warn
+            } else {
+                Tone::Good
+            };
+            let text = said
+                .into_iter()
+                .map(|(t, _)| t)
+                .collect::<Vec<_>>()
+                .join(" ");
+            // A question asked meanwhile (a smaller copy) is up already: said under it.
+            self.say(text, tone);
+        }
+        action
+    }
+
+    fn apply_reads_saying(&mut self, said: &mut Vec<(String, Tone)>) -> Action {
+        // A read past its deadline is let go, said as what it found, so the box, and words
+        // waiting to be sent, never wait on it longer (Codex's review 85, 8).
+        for read in self.image_reads.iter_mut().filter(|r| r.got.is_none()) {
+            let most = images::read_most(read.what);
+            if read.started.elapsed() >= most {
+                read.got = Some(images::Loading::refused(format!(
+                    "{} took longer than {} seconds, so Kerdr stopped waiting for it, and nothing from it went in.",
+                    read.what,
+                    most.as_secs()
+                )));
+            }
+        }
+        loop {
+            let Some(front) = self.image_reads.front() else {
+                return Action::None;
+            };
+            if front.got.is_none() {
+                return Action::None;
+            }
+            let behind_question = matches!(&self.mode, Mode::Confirm { back, .. }
+                if matches!(**back, Mode::Compose { .. }));
+            if !front.for_send && behind_question {
+                return Action::None;
+            }
+            let Some(read) = self.image_reads.pop_front() else {
+                return Action::None;
+            };
+            let loading = read.got.unwrap_or_default();
+            if !read.for_send {
+                said.extend(self.attach_quietly(loading, Some(read.at)));
+                continue;
+            }
+            let Some((load, mut draft)) = self.send_after_load.take() else {
+                continue;
+            };
+            let fix = self.fixes_input(draft.machine);
+            let mut got = attach_into(&mut draft, loading, Some(read.at), fix);
+            if let Some(rest) = got.left_over.take() {
+                self.keep_left_over(rest);
+            }
+            self.shift_queued(true, got.at, got.inserted);
+            if got.refused || !got.oversized.is_empty() {
+                self.send_troubles.extend(
+                    got.said
+                        .iter()
+                        .filter(|s| !s.starts_with("Attached"))
+                        .cloned(),
+                );
+                if !got.oversized.is_empty() {
+                    self.send_troubles.push(too_large_to_send(&got.oversized));
+                }
+            }
+            // More read for these words: they wait for them too (K1-35).
+            if self.image_reads.iter().any(|r| r.for_send) {
+                self.send_after_load = Some((load, draft));
+                continue;
+            }
+            let troubles = std::mem::take(&mut self.send_troubles);
+            if !troubles.is_empty() {
+                // Not everything read went in (none found, the box full, too many or too big).
+                // His words may be about it, so whether they go without it is his call (intent
+                // 0591, K1-37).
+                self.ask_send_without(draft, &troubles);
+                return Action::None;
+            }
+            return self.send_draft(draft);
+        }
     }
 
     /// Asks whether a new intent's words go without the image that didn't go in. They're given
@@ -2404,17 +2802,168 @@ impl App {
     }
 
     /// As attach_images, with the tags at `at` in the words (where they ended when the read
-    /// began), or at the end when the words have since been cut shorter than that.
+    /// began), or at the end when the words have since been cut shorter than that. Images past
+    /// what this intent may carry, for a backend that fixes input, are asked about: a smaller copy
+    /// of each goes in only if he says so.
     fn attach_images_at(&mut self, got: images::Loading, at: Option<usize>) {
+        if let Some((said, tone)) = self.attach_quietly(got, at) {
+            self.say(said, tone);
+        }
+    }
+
+    /// As attach_images_at, giving back what to say rather than saying it, so what several reads
+    /// found, put in at one turn, is said together (Codex's review 85, 8).
+    fn attach_quietly(
+        &mut self,
+        got: images::Loading,
+        at: Option<usize>,
+    ) -> Option<(String, Tone)> {
+        let fix = match &self.mode {
+            Mode::Compose { draft, .. } => self.fixes_input(draft.machine),
+            _ => return None,
+        };
         let Mode::Compose { draft, .. } = &mut self.mode else {
+            return None;
+        };
+        let mut attached = attach_into(draft, got, at, fix);
+        let after = attached.at + attached.inserted;
+        if let Some(rest) = attached.left_over.take() {
+            self.keep_left_over(rest);
+        }
+        self.shift_queued(false, attached.at, attached.inserted);
+        let said = (!attached.said.is_empty()).then(|| {
+            let tone = if attached.refused {
+                Tone::Warn
+            } else {
+                Tone::Good
+            };
+            (attached.said.join(" "), tone)
+        });
+        if !attached.oversized.is_empty() {
+            self.ask_smaller(attached.oversized, after);
+        }
+        said
+    }
+
+    /// Yes to a backend's question about a new intent's words: the same send again, its words and
+    /// images as kept with it, with the question's token and `override`.
+    fn create_question_yes(&mut self, machine: usize, submission: &str, token: &str) -> Action {
+        let Some(s) = self
+            .submissions
+            .iter()
+            .find(|s| s.id == submission)
+            .cloned()
+        else {
+            self.say(
+                "Nothing was sent: those words have moved since, and c brings them back.",
+                Tone::Info,
+            );
+            return Action::None;
+        };
+        let mut request = create_request(&s.id, &s.words, &s.images, &s.session, &s.filed);
+        request["confirm"] = json!(token);
+        request["override"] = json!(true);
+        self.closed_on_send = true;
+        self.emit_mutation(machine, request)
+    }
+
+    /// No to it: nothing is saved, and his words open in the box as they were, to change (or,
+    /// when the box holds other words, wait for c).
+    fn create_question_no(&mut self, submission: &str) {
+        let Some(i) = self.submissions.iter().position(|s| s.id == submission) else {
             return;
         };
-        let said = attach_into(draft, got, at);
-        if said.is_empty() {
-            return;
+        let s = self.submissions.remove(i);
+        let into_box = self.give_back(s.words, s.images, None);
+        if into_box && matches!(self.mode, Mode::Board | Mode::Backlog { .. }) {
+            self.new_intent();
+            self.say(
+                "Your new intent wasn't saved: its words are open here, as you left them.",
+                Tone::Info,
+            );
+        } else {
+            self.say(
+                "Your new intent wasn't saved: its words are kept, and c brings them back.",
+                Tone::Info,
+            );
         }
-        let good = said.iter().all(|s| s.starts_with("Attached"));
-        self.say(said.join(" "), if good { Tone::Good } else { Tone::Warn });
+    }
+
+    /// Text that didn't fit the box, kept as words given back: c brings it back once the box is
+    /// free, and the words file keeps it meanwhile (Codex's review 85, 5).
+    fn keep_left_over(&mut self, rest: String) {
+        self.returned.push_back(crate::app::Returned {
+            words: rest,
+            images: vec![],
+            from: None,
+        });
+        self.keep_words_now();
+    }
+
+    /// Asks whether smaller copies of images too large to send go in their place, their tags at
+    /// `at`. The images themselves are never changed; no leaves them out.
+    fn ask_smaller(&mut self, images: Vec<images::Loaded>, at: usize) {
+        let Mode::Compose { draft, .. } = &self.mode else {
+            return;
+        };
+        let machine = draft.machine;
+        let used: usize = draft.images.iter().map(|i| i.bytes.len()).sum();
+        let left = images::MAX_IMAGES_BYTES.saturating_sub(used);
+        self.send_without_count += 1;
+        let n = self.send_without_count;
+        let message = smaller_question(&images, left);
+        let one = images.len() == 1;
+        self.smaller_asks
+            .push(crate::app::SmallerAsk { n, images, at });
+        self.mode = Mode::Confirm {
+            machine,
+            request: json!({ "action": crate::app::SMALLER, "n": n }),
+            title: if one {
+                "Attach a smaller copy?".into()
+            } else {
+                "Attach smaller copies?".into()
+            },
+            message,
+            back: Box::new(self.mode.clone()),
+            target: None,
+            queue: false,
+            ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+    }
+
+    /// The answer to ask_smaller: yes reads smaller copies, their tags where the images' would
+    /// have gone; no leaves them out, saying so.
+    fn smaller_answered(&mut self, n: u64, yes: bool) -> Action {
+        let Some(i) = self.smaller_asks.iter().position(|a| a.n == n) else {
+            return Action::None;
+        };
+        let ask = self.smaller_asks.remove(i);
+        if yes {
+            return Action::LoadImages(images::Source::Smaller(ask.images, ask.at));
+        }
+        let names: Vec<String> = ask.images.iter().map(|i| i.from.clone()).collect();
+        let they = if names.len() == 1 {
+            "It stays"
+        } else {
+            "They stay"
+        };
+        self.say(
+            format!(
+                "Left out {}. {they} as {} where you copied {}.",
+                and_names(&names),
+                if names.len() == 1 {
+                    "it was"
+                } else {
+                    "they were"
+                },
+                if names.len() == 1 { "it" } else { "them" }
+            ),
+            Tone::Info,
+        );
+        Action::None
     }
 
     pub(super) fn control_key(&mut self, key: KeyEvent) -> Option<Action> {
@@ -2483,9 +3032,59 @@ impl App {
                 let answers = matches!(key.code, KeyCode::Enter | KeyCode::Char('y' | 'w'))
                     || chosen.is_some();
                 if answers && !early && self.question_view.unseen() {
-                    self.question_view.to_end();
+                    self.question_view.next_page();
                     if let Mode::Confirm { ready_at, .. } = &mut self.mode {
                         *ready_at = Some(Instant::now() + std::time::Duration::from_millis(500));
+                    }
+                    return Some(Action::None);
+                }
+                // A backend's question about a new intent's words (release 5): yes sends them
+                // again, as the same send, with its token; no opens them in the box, unsent.
+                if request["action"] == "create" && request.get("confirm").is_some() {
+                    let submission = request["submission"].as_str().unwrap_or_default();
+                    let token = request["confirm"].as_str().unwrap_or_default();
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            self.create_question_no(submission);
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            return Some(self.create_question_yes(machine, submission, token));
+                        }
+                        _ => {}
+                    }
+                    return Some(Action::None);
+                }
+                // Kerdr's own question whether to open both versions of a text (K1-100).
+                if request["action"] == crate::app::OPEN_BOTH {
+                    let card = request["key"].as_str().unwrap_or_default().to_string();
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            self.open_both_answered(&card, false);
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            self.open_both_answered(&card, true);
+                        }
+                        _ => {}
+                    }
+                    return Some(Action::None);
+                }
+                // Kerdr's own question about smaller copies of images too large to send.
+                if request["action"] == crate::app::SMALLER {
+                    let n = request["n"].as_u64().unwrap_or_default();
+                    match key.code {
+                        KeyCode::Esc | KeyCode::Char('n' | 'q') => {
+                            self.mode = *back;
+                            return Some(self.smaller_answered(n, false));
+                        }
+                        KeyCode::Enter | KeyCode::Char('y') if !early => {
+                            self.mode = *back;
+                            return Some(self.smaller_answered(n, true));
+                        }
+                        _ => {}
                     }
                     return Some(Action::None);
                 }
@@ -2573,7 +3172,7 @@ impl App {
                                 || (request.get("confirm").is_some()
                                     && matches!(
                                         request["action"].as_str(),
-                                        Some("close" | "dismiss" | "cancel" | "edit")
+                                        Some("close" | "dismiss" | "cancel" | "edit" | "answer")
                                     )))
                         {
                             request["override"] = json!(true);
@@ -2716,7 +3315,110 @@ impl App {
 
     /// Takes a change to a card into the action resolution tool (intent 0416): the board shows it
     /// at once, and its command runs in the background.
+    /// A request as it goes to `machine`: to a backend that fixes input, every one says so
+    /// (`fix_input`), so a line that looks like a secret is asked about and an edit's faults fixed,
+    /// rather than refused (intent 0591, release 5). To any other, it goes as it is.
+    pub(crate) fn with_fix_input(&self, machine: usize, mut request: Value) -> Value {
+        if self.fixes_input_at(machine, &request) {
+            request["fix_input"] = json!(true);
+        } else if let Some(fields) = request.as_object_mut() {
+            // What only a backend that fixes input reads goes nowhere else.
+            fields.remove("fix_input");
+            fields.remove("base");
+        }
+        request
+    }
+
+    /// Whether the request, sent to `machine`, ends at a backend that fixes input: that machine's,
+    /// and the one it's sent on to (`forward_to`), which must be one the board knows to fix input
+    /// too: one it doesn't know is taken as an older one (Codex's reviews 85, 6, and 86, 5).
+    pub(crate) fn fixes_input_at(&self, machine: usize, request: &Value) -> bool {
+        let onward = match request.get("forward_to") {
+            None => true,
+            Some(host) => host
+                .as_str()
+                .and_then(|host| self.machine_index(host))
+                .is_some_and(|m| self.fixes_input(m)),
+        };
+        self.fixes_input(machine) && onward
+    }
+
+    /// Whether a request, as it goes to `machine`, is one its backend takes (Codex's review 85, 6):
+    /// checked at the last moment, whatever sent it (a key, kept words, the hold file, a resend
+    /// on to another machine). A backend that fixes input takes up to 32 MiB and images of any kind
+    /// and number within 20 MB; any other, 0.35.0's 64 KiB and 20 PNG, JPEG, GIF or WebP images
+    /// of at most 10 MB, 20 MB together. Why not, in words that end "so nothing was sent".
+    pub(crate) fn fits_backend(&self, machine: usize, request: &Value) -> Result<(), String> {
+        let fix = self.fixes_input_at(machine, request);
+        let name = self
+            .machines
+            .get(machine)
+            .map(|m| m.name())
+            .unwrap_or_else(|| "its machine".into());
+        if let Some(sent) = request["images"].as_array() {
+            use base64::Engine;
+            let mut total = 0;
+            if !fix && sent.len() > images::MAX_IMAGES {
+                return Err(format!(
+                    "{name}'s backend takes at most {} images in a new intent and this one has {}, so nothing was sent",
+                    images::MAX_IMAGES,
+                    sent.len()
+                ));
+            }
+            for image in sent {
+                let tag = image["tag"].as_u64().unwrap_or_default();
+                let bytes = image["data"]
+                    .as_str()
+                    .and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok())
+                    .unwrap_or_default();
+                let kind = images::kind_of(&bytes);
+                if !fix && !kind.is_some_and(images::shown) {
+                    return Err(format!(
+                        "{name}'s backend takes only PNG, JPEG, GIF and WebP images, and [Image #{tag}] is {}, so nothing was sent",
+                        kind.map_or("no kind it knows".to_string(), |k| format!(
+                            "a {} image",
+                            images::kind_name(k)
+                        ))
+                    ));
+                }
+                let most = if fix {
+                    images::FIX_IMAGE_BYTES
+                } else {
+                    images::MAX_IMAGE_BYTES
+                };
+                if bytes.len() > most {
+                    return Err(format!(
+                        "[Image #{tag}] is {}, over the {} {name}'s backend takes for one image, so nothing was sent",
+                        images::size(bytes.len()),
+                        images::size(most)
+                    ));
+                }
+                total += bytes.len();
+            }
+            if total > images::MAX_IMAGES_BYTES {
+                return Err(format!(
+                    "the images are {} together, over the {} {name}'s backend takes, so nothing was sent",
+                    images::size(total),
+                    images::size(images::MAX_IMAGES_BYTES)
+                ));
+            }
+        }
+        let mut sized = request.clone();
+        if fix {
+            sized["fix_input"] = json!(true);
+        }
+        if crate::actions::too_large_for(&sized, fix) {
+            return Err(if fix {
+                "the request is too large to send (32 MiB at most), so nothing was sent".to_string()
+            } else {
+                crate::actions::too_large_said(request)
+            });
+        }
+        Ok(())
+    }
+
     pub fn queue_action(&mut self, machine: usize, request: Value) {
+        let request = self.with_fix_input(machine, request);
         // Whether ⏎ asked for it: taken now, sent or not, so a request a check below stops can't
         // leave it for another card's (Codex's sixth look).
         let enter_sent = self.enter_sent.take();
@@ -4306,7 +5008,7 @@ impl App {
                         && response.confirm.is_some()
                         && matches!(
                             request["action"].as_str(),
-                            Some("close" | "dismiss" | "cancel" | "edit")
+                            Some("close" | "dismiss" | "cancel" | "edit" | "answer")
                         )))
                 && (request["override"] != true
                     || response
@@ -4472,6 +5174,7 @@ impl App {
                 {
                     self.kickoff_kept.remove(held);
                     self.kickoff_prefill.remove(held);
+                    self.keep_words_now();
                 }
                 if !response.ok && response.partial {
                     // Part of it happened, and the backend's words say which: not a change that
@@ -4619,6 +5322,38 @@ impl App {
                     message.push_str(" b shows it in the backlog.");
                 }
                 self.say(short(message), Tone::Info);
+            }
+            // A question about his words (a line that looks like a token or password, intent
+            // 0591, release 5): asked, the words kept meanwhile with their send; nothing's made.
+            Ok(response) if response.confirmation && response.confirm.is_some() => {
+                let token = response.confirm.clone().unwrap_or_default();
+                if at.is_none() || !self.enter_can_land_here() {
+                    let into_box = self.give_back(words.0, words.1, None);
+                    return self.say(
+                        short(format!(
+                            "Your new intent wasn't saved yet: {} {}; Enter there asks again.",
+                            response.message,
+                            back(into_box)
+                        )),
+                        Tone::Warn,
+                    );
+                }
+                self.mode = Mode::Confirm {
+                    machine,
+                    request: json!({"action": "create", "submission": submission, "confirm": token}),
+                    title: "Save your new intent?".into(),
+                    message: format!(
+                        "{} n keeps your words unsent, open in the box.",
+                        response.message.trim()
+                    ),
+                    back: Box::new(self.mode.clone()),
+                    target: None,
+                    queue: false,
+                    ready_at: Some(Instant::now() + std::time::Duration::from_millis(500)),
+                    plain: false,
+                    choices: vec![],
+                    enter_queues: false,
+                };
             }
             Ok(response) => {
                 // Nothing made. Settled, unless an earlier send of these words went unheard.

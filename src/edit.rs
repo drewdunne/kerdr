@@ -179,23 +179,60 @@ fn split_words(value: &str, escapes: bool) -> Vec<String> {
 }
 
 /// The editors to try, in order: Kerdr's `editor` setting when it's set, else `$VISUAL`, else
-/// `$EDITOR`, else nvim, else vim. Each is its words; the file's path goes after them.
+/// `$EDITOR`, else nvim, vim, vi and nano, each found on his own PATH (intent 0591, K1-87). Each
+/// is its words; the file's path goes after them. One that opens a window of its own is given the
+/// flag that has it wait for that window to close, when it lacks it (K1-84).
 pub fn candidates(
     configured: Option<&str>,
     visual: Option<&str>,
     editor: Option<&str>,
 ) -> Vec<Vec<String>> {
     let mut out: Vec<Vec<String>> = Vec::new();
-    for value in [configured, visual, editor, Some("nvim"), Some("vim")]
-        .into_iter()
-        .flatten()
+    for value in [
+        configured,
+        visual,
+        editor,
+        Some("nvim"),
+        Some("vim"),
+        Some("vi"),
+        Some("nano"),
+    ]
+    .into_iter()
+    .flatten()
     {
-        let words = editor_words(value);
+        let mut words = editor_words(value);
+        if let Some(flag) = missing_wait(&words) {
+            words.insert(1, flag.to_string());
+        }
         if !words.is_empty() && !out.contains(&words) {
             out.push(words);
         }
     }
     out
+}
+
+/// The editor set to open a text, by Kerdr's setting, else `$VISUAL`, else `$EDITOR`, as its
+/// words; None when none is set and the built-in list is used.
+pub fn set_editor(
+    configured: Option<&str>,
+    visual: Option<&str>,
+    editor: Option<&str>,
+) -> Option<Vec<String>> {
+    [configured, visual, editor]
+        .into_iter()
+        .flatten()
+        .map(editor_words)
+        .find(|w| !w.is_empty())
+}
+
+/// The editor set on this machine (set_editor).
+pub fn set_editor_here(configured: Option<&str>) -> Option<Vec<String>> {
+    let var = |name: &str| std::env::var(name).ok().filter(|v| !v.trim().is_empty());
+    set_editor(
+        configured.filter(|c| !c.trim().is_empty()),
+        var("VISUAL").as_deref(),
+        var("EDITOR").as_deref(),
+    )
 }
 
 /// The editors to try on this machine: Kerdr's setting, then the environment's.
@@ -335,8 +372,68 @@ pub struct EditFile {
     path: PathBuf,
 }
 
+/// The folders an item's text may open in, in order (intent 0591, K1-86): the system's temp
+/// folder, then `$XDG_RUNTIME_DIR`, then an `edit` folder in Kerdr's state folder. Each is his
+/// alone: the file goes in a 0700 folder of its own there, readable only by him.
+pub fn folders() -> Vec<PathBuf> {
+    let mut out = vec![std::env::temp_dir()];
+    if let Some(run) = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .filter(|p| p.is_absolute())
+    {
+        out.push(run);
+    }
+    out.push(crate::config::state_dir().join("edit"));
+    out.dedup();
+    out
+}
+
+/// Why no folder took the file, each named: "/tmp (No space left on device (os error 28))".
+fn none_took(tried: &[(PathBuf, std::io::Error)]) -> String {
+    let each: Vec<String> = tried
+        .iter()
+        .map(|(dir, e)| format!("{} ({e})", dir.display()))
+        .collect();
+    match each.as_slice() {
+        [] => "no folder to write it in".into(),
+        [one] => format!("couldn't write the file to edit in {one}"),
+        [rest @ .., last] => format!(
+            "couldn't write the file to edit in {} or {last}",
+            rest.join(", ")
+        ),
+    }
+}
+
 impl EditFile {
+    /// The file, in the first of `folders()` that takes it.
     pub fn create(id: &str, text: &str) -> std::io::Result<EditFile> {
+        Self::create_in(&folders(), id, text).map_err(std::io::Error::other)
+    }
+
+    /// The file, in the first of `dirs` that takes it; why none did, naming each.
+    pub fn create_in(dirs: &[PathBuf], id: &str, text: &str) -> Result<EditFile, String> {
+        let mut tried = vec![];
+        for dir in dirs {
+            match Self::create_at(dir, id, text) {
+                Ok(f) => return Ok(f),
+                Err(e) => tried.push((dir.clone(), e)),
+            }
+        }
+        Err(none_took(&tried))
+    }
+
+    fn create_at(base: &Path, id: &str, text: &str) -> std::io::Result<EditFile> {
+        // Kerdr's own state folder may not be there yet; the system's ones always are.
+        if !base.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(base)?;
+        }
         let mut builder = tempfile::Builder::new();
         let prefix = format!("{FOLDER_PREFIX}{}-", std::process::id());
         builder.prefix(&prefix);
@@ -345,7 +442,7 @@ impl EditFile {
             use std::os::unix::fs::PermissionsExt;
             builder.permissions(std::fs::Permissions::from_mode(0o700));
         }
-        let dir = builder.tempdir()?;
+        let dir = builder.tempdir_in(base)?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -526,9 +623,21 @@ pub fn edit_by(
     marker: Option<&str>,
     run: impl FnOnce(&Path) -> Run,
 ) -> Ended {
-    let edit = match EditFile::create(id, file) {
+    edit_in(&folders(), id, file, marker, run)
+}
+
+/// As edit_by, with the file in the first of `dirs` that takes it (intent 0591, K1-86); none
+/// taking it, `Failed` names each and why.
+pub fn edit_in(
+    dirs: &[PathBuf],
+    id: &str,
+    file: &str,
+    marker: Option<&str>,
+    run: impl FnOnce(&Path) -> Run,
+) -> Ended {
+    let edit = match EditFile::create_in(dirs, id, file) {
         Ok(f) => f,
-        Err(e) => return Ended::Failed(format!("couldn't write the file to edit ({e})")),
+        Err(why) => return Ended::Failed(why),
     };
     let before = edit.written_at();
     let run = run(edit.path());
@@ -704,16 +813,103 @@ mod tests {
         };
         assert_eq!(
             candidates(Some("code --wait"), Some("hx"), Some("nano")),
-            words(&[&["code", "--wait"], &["hx"], &["nano"], &["nvim"], &["vim"]])
+            words(&[
+                &["code", "--wait"],
+                &["hx"],
+                &["nano"],
+                &["nvim"],
+                &["vim"],
+                &["vi"]
+            ])
         );
+        // Past nvim and vim, vi and nano (intent 0591, K1-87).
         assert_eq!(
             candidates(None, None, Some("nvim")),
-            words(&[&["nvim"], &["vim"]])
+            words(&[&["nvim"], &["vim"], &["vi"], &["nano"]])
         );
         assert_eq!(
             candidates(Some("  "), None, None),
-            words(&[&["nvim"], &["vim"]])
+            words(&[&["nvim"], &["vim"], &["vi"], &["nano"]])
         );
+    }
+
+    #[test]
+    fn an_editor_that_opens_a_window_is_given_its_wait_flag_and_that_is_said() {
+        // Intent 0591, K1-84: code, subl and gvim get the flag Kerdr knows they need, put right
+        // after the program, so Kerdr waits for the window to close.
+        let first = |s: &str| candidates(Some(s), None, None).remove(0);
+        assert_eq!(first("code"), ["code", "--wait"]);
+        assert_eq!(first("code -n"), ["code", "--wait", "-n"]);
+        assert_eq!(first("subl"), ["subl", "-w"]);
+        assert_eq!(first("gvim"), ["gvim", "-f"]);
+        assert_eq!(first("code --wait"), ["code", "--wait"]);
+        assert_eq!(
+            set_editor(None, Some("code -n"), Some("vim")),
+            Some(vec!["code".to_string(), "-n".to_string()])
+        );
+        assert_eq!(set_editor(Some(""), None, None), None);
+        assert_eq!(
+            candidates(None, Some("subl"), None)[0],
+            ["subl", "-w"],
+            "from the environment too"
+        );
+    }
+
+    #[test]
+    fn the_file_opens_in_the_next_folder_when_one_cant_take_it() {
+        // Intent 0591, K1-86: a folder that can't take it (here, a file stands where it would
+        // be) passes to the next, his alone; when none can, each is named with why.
+        let base = tempfile::tempdir().unwrap();
+        let blocked = base.path().join("full");
+        std::fs::write(&blocked, "not a folder").unwrap();
+        let fallback = base.path().join("state").join("edit");
+        let mut opened = None;
+        let ended = edit_in(
+            &[blocked.clone(), fallback.clone()],
+            "0414",
+            "Words.\n",
+            None,
+            |path| {
+                opened = Some(path.to_path_buf());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mode =
+                        |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode(path.parent().unwrap()), 0o700);
+                    assert_eq!(mode(path), 0o600);
+                    assert_eq!(mode(&fallback), 0o700);
+                }
+                Run {
+                    editor: Some("fake".into()),
+                    ok: true,
+                    ..Default::default()
+                }
+            },
+        );
+        let opened = opened.expect("the editor ran");
+        assert!(opened.starts_with(&fallback), "{}", opened.display());
+        assert!(!opened.exists(), "removed once read back");
+        assert!(
+            matches!(ended, Ended::Wrote { touched: false, .. }),
+            "{ended:?}"
+        );
+        let ended = edit_in(
+            &[blocked.clone(), blocked.join("x")],
+            "0414",
+            "W\n",
+            None,
+            |_| panic!("no editor without a file"),
+        );
+        let Ended::Failed(why) = ended else {
+            panic!("{ended:?}")
+        };
+        assert!(
+            why.starts_with("couldn't write the file to edit in "),
+            "{why}"
+        );
+        assert!(why.contains(&format!("{} (", blocked.display())), "{why}");
+        assert!(why.contains(" or "), "{why}");
     }
 
     #[test]

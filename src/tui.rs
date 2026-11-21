@@ -111,8 +111,10 @@ impl Live {
 }
 
 pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
-    // A backlog item's text a killed Kerdr left in the temp folder (intent 0414).
-    crate::edit::sweep(&std::env::temp_dir());
+    // A backlog item's text a killed Kerdr left in a folder it edits in (intents 0414, 0591).
+    for folder in crate::edit::folders() {
+        crate::edit::sweep(&folder);
+    }
     // One read per machine at most, the newest: while you're inside herdr nobody applies them.
     let inbox = Arc::new(Inbox::default());
     let mut live = live.then(|| Live {
@@ -163,13 +165,105 @@ pub fn run(mut app: App, live: bool) -> anyhow::Result<()> {
     }
     let _ = execute!(stdout(), ratatui::crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+    let printed = print_recovery(&mut app);
     if let Some(l) = live.as_mut() {
         for i in 0..l.pollers.len() {
             l.stop(i);
         }
     }
-    result
+    recovered(result, printed)
 }
+
+/// What Kerdr ends with, once his words it couldn't keep have been printed on his terminal, or
+/// haven't: never the words themselves, since main writes that line to the error log (Codex's
+/// review 99, 3). A quit that loses them ends as a failure, saying so.
+fn recovered(result: anyhow::Result<()>, printed: Option<bool>) -> anyhow::Result<()> {
+    let said = match printed {
+        None => return result,
+        Some(true) => "Your words are printed on your terminal, to copy.",
+        Some(false) => {
+            "Kerdr couldn't print your words on your terminal, so they couldn't be kept."
+        }
+    };
+    match result {
+        Err(e) => Err(anyhow::anyhow!("{e} {said}")),
+        Ok(()) if printed == Some(false) => Err(anyhow::anyhow!("{said}")),
+        Ok(()) => Ok(()),
+    }
+}
+
+/// His words the words file couldn't keep, now the board has gone: on his own terminal only,
+/// never standard error or the error log (intent 0591, K3-34; Codex's review 98, 1).
+/// Whether they were: None with nothing to print, else whether every write reached it.
+pub(crate) fn print_recovery(app: &mut App) -> Option<bool> {
+    let texts = std::mem::take(&mut app.print_on_exit);
+    let terminal = app.recovery_terminal.take();
+    if texts.is_empty() {
+        return None;
+    }
+    let mut terminal = terminal?;
+    Some(
+        texts
+            .iter()
+            .all(|text| to_terminal(&mut terminal, &format!("{text}\n"))),
+    )
+}
+
+/// Writes `text` on his terminal: on Windows by the console's own wide call (WriteConsoleW), so
+/// any character shows whatever the console's code page (CP437, CP850); elsewhere as UTF-8, and
+/// flushed (Codex's review 99, 2). Whether all of it was written.
+fn to_terminal(terminal: &mut std::fs::File, text: &str) -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Console::WriteConsoleW;
+        let handle = terminal.as_raw_handle();
+        write_wide(text, |units| {
+            let mut written = 0u32;
+            // SAFETY: the console handle Kerdr opened (CONOUT$), held for the call, and units
+            // this holds for it.
+            let ok = unsafe {
+                WriteConsoleW(
+                    handle,
+                    units.as_ptr().cast(),
+                    u32::try_from(units.len()).unwrap_or(u32::MAX),
+                    &mut written,
+                    std::ptr::null(),
+                )
+            };
+            (ok != 0).then_some(written as usize)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        use std::io::Write;
+        terminal.write_all(text.as_bytes()).is_ok() && terminal.flush().is_ok()
+    }
+}
+
+/// `text` as UTF-16, written by `write` (the console's wide call on Windows) in pieces of at most
+/// WIDE_PIECE units, a pair never split across two; `write` says how many it wrote. True once
+/// every unit is written.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+fn write_wide(text: &str, mut write: impl FnMut(&[u16]) -> Option<usize>) -> bool {
+    let units: Vec<u16> = text.encode_utf16().collect();
+    let mut at = 0;
+    while at < units.len() {
+        let mut end = (at + WIDE_PIECE).min(units.len());
+        if end < units.len() && end - at > 1 && (0xD800..0xDC00).contains(&units[end - 1]) {
+            end -= 1;
+        }
+        match write(&units[at..end]) {
+            Some(n) if n > 0 => at += n.min(end - at),
+            _ => return false,
+        }
+    }
+    true
+}
+
+/// The most UTF-16 units one console write is given.
+#[cfg_attr(not(any(windows, test)), allow(dead_code))]
+const WIDE_PIECE: usize = 8192;
 
 fn event_loop(
     terminal: &mut DefaultTerminal,
@@ -206,6 +300,9 @@ fn event_loop(
         });
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
+    let readers = crate::images::Workers::default();
+    // Watching the clipboard from now, before any paste is taken (Codex's review 89).
+    let clipboard_watch = crate::images::ClipboardWatch::start();
     let holds = RefCell::new(if live.is_some() && !app.demo {
         Holds::on()
     } else {
@@ -513,11 +610,22 @@ fn event_loop(
         match action {
             Action::None => {}
             Action::LoadImages(source) => {
-                if let Some((id, room)) = app.begin_image_load(&source) {
-                    let tx = image_tx.clone();
-                    std::thread::spawn(move || {
-                        let _ = tx.send((id, source.load(room)));
-                    });
+                // The copy a paste is for, numbered before anything else is done for it.
+                let pasted = matches!(source, crate::images::Source::Clipboard)
+                    .then(|| clipboard_watch.pasted())
+                    .flatten();
+                if let Some(read) = app.begin_image_load(&source) {
+                    let reading = Reading {
+                        workers: &readers,
+                        bound: crate::images::CLIPBOARD_BOUND,
+                        take: move |room| crate::images::take_pasted(room, pasted),
+                        load: |source: crate::images::Source, room| source.load(room),
+                    };
+                    // A clipboard that's slow to answer: the board says it's reading meanwhile.
+                    let mut drawn = |app: &mut App| {
+                        let _ = terminal.draw(|f| crate::ui::draw(f, app));
+                    };
+                    start_read(app, &image_tx, read, source, reading, &mut drawn);
                 }
             }
             Action::CopyLink(url) => {
@@ -1034,10 +1142,130 @@ fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
             _ => bg.images.try_recv().ok(),
         };
         let Some((id, loading)) = got else {
+            // What waited for a question's answer, or for a read past its deadline, goes now
+            // (K1-35; Codex's review 85, 8).
+            if let Action::Mutate { machine, request } = app.apply_reads() {
+                start_action(app, bg.answers, bg.runner, machine, request);
+            }
             return;
         };
         if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {
             start_action(app, bg.answers, bg.runner, machine, request);
+        }
+    }
+}
+
+/// How a read for the box is done: on `workers`, at most images::MOST_READERS at once; the
+/// clipboard taken with `take` within `bound`; anything else read with `load`.
+pub(crate) struct Reading<'a, T, L> {
+    pub workers: &'a crate::images::Workers,
+    pub bound: Duration,
+    pub take: T,
+    pub load: L,
+}
+
+/// Starts a read begun by begin_image_load; what it found comes back on `tx`. A clipboard is
+/// taken now: the board waits, at most `bound`, until what it holds is in hand, so what goes in is
+/// what it held as he pasted, and pastes are taken in the order he made them; past the bound,
+/// nothing from it goes in, and he's told (Codex's review 86, 7). What's taken is then read for
+/// the box (a copied file list's files, a bitmap made a PNG) away from the board. Every read runs
+/// on a worker counted until it really ends; with images::MOST_READERS running, the paste is
+/// refused and said (review 86, 6).
+pub(crate) fn start_read<T, L>(
+    app: &mut App,
+    tx: &mpsc::Sender<(u64, crate::images::Loading)>,
+    (id, room): (u64, crate::images::Room),
+    source: crate::images::Source,
+    reading: Reading<'_, T, L>,
+    drawn: &mut dyn FnMut(&mut App),
+) where
+    T: FnOnce(crate::images::Room) -> Result<crate::images::Found, String> + Send + 'static,
+    L: FnOnce(crate::images::Source, crate::images::Room) -> crate::images::Loading
+        + Send
+        + 'static,
+{
+    use crate::images::{Loading, MOST_READERS, Source};
+    use std::sync::atomic::{AtomicU8, Ordering::SeqCst};
+    let Reading {
+        workers,
+        bound,
+        take,
+        load,
+    } = reading;
+    let busy = |app: &mut App| {
+        let _ = app.images_loaded(
+            id,
+            Loading::refused(crate::images::too_many_reads(workers.running())),
+        );
+    };
+    let tx = tx.clone();
+    if !matches!(source, Source::Clipboard) {
+        if !workers.start(MOST_READERS, move || {
+            let _ = tx.send((id, load(source, room)));
+        }) {
+            busy(app);
+        }
+        return;
+    }
+    // Waiting, then taken in time or too late: whichever comes first holds.
+    const WAITING: u8 = 0;
+    const TAKEN: u8 = 1;
+    const LATE: u8 = 2;
+    let state = std::sync::Arc::new(AtomicU8::new(WAITING));
+    let (taken_tx, taken_rx) = mpsc::channel::<()>();
+    let theirs = state.clone();
+    let started = Instant::now();
+    if !workers.start(MOST_READERS, move || {
+        let found = take(room);
+        if theirs
+            .compare_exchange(WAITING, TAKEN, SeqCst, SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        let _ = taken_tx.send(());
+        let _ = tx.send((id, crate::images::loading_of(found, room)));
+    }) {
+        busy(app);
+        return;
+    }
+    let mut shown = false;
+    loop {
+        let left = bound.saturating_sub(started.elapsed());
+        // A clipboard that answers at once is taken before the board is drawn again.
+        let wait = if shown {
+            left
+        } else {
+            left.min(Duration::from_millis(50))
+        };
+        match taken_rx.recv_timeout(wait) {
+            Ok(()) => return,
+            Err(mpsc::RecvTimeoutError::Timeout) if !shown && !left.is_zero() => {
+                shown = true;
+                drawn(app);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if state
+                    .compare_exchange(WAITING, LATE, SeqCst, SeqCst)
+                    .is_ok()
+                {
+                    let _ = app
+                        .images_loaded(id, Loading::refused(crate::images::clipboard_late(bound)));
+                    return;
+                }
+                // Taken just now.
+                let _ = taken_rx.recv();
+                return;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if state.load(SeqCst) != TAKEN {
+                    let _ = app.images_loaded(
+                        id,
+                        Loading::refused("Kerdr couldn't read the clipboard: its reader stopped."),
+                    );
+                }
+                return;
+            }
         }
     }
 }
@@ -1083,6 +1311,8 @@ fn start_action(
     // Its own op, kept for Kerdr's own resends of it (intent 0591), or the one it had when it's
     // sent again after its answer was lost (Codex's review 60).
     let request = app.account_op(request);
+    // Every request to a backend that fixes input says so, an account's too (Codex's review 85, 6).
+    let request = app.with_fix_input(machine, request);
     let resends = app.resends_to(machine);
     app.busy = true;
     app.busy_id = request["id"].as_str().map(str::to_string);
@@ -1165,6 +1395,8 @@ fn ask_update(app: &mut App, tx: &mpsc::Sender<Answer>) {
 fn run_ready(app: &mut App, runner: &Runner) {
     // A new intent waiting for the words file goes once it's written there (Codex's review 63, 2).
     app.keep_waiting_words();
+    // An edit open in Kerdr's own box is kept as it's typed (Codex's review 85, 3).
+    app.keep_open_edit();
     for n in app.resolver.take_dropped() {
         let _ = runner.tx.send(ToRunner::Drop(n));
     }
@@ -1220,11 +1452,10 @@ fn edit_text(
     let Some((id, file, intro, marker)) = app.edit_file(key) else {
         return Ok(());
     };
+    // One that opens a window of its own is told to wait for it, and that's said (K1-84).
     let candidates = crate::edit::candidates_here(app.cfg.editor.as_deref());
-    // One that opens a window of its own and isn't told to wait would be back at once.
-    if app.editor_wont_wait(key, &candidates) {
-        return Ok(());
-    }
+    let set = crate::edit::set_editor_here(app.cfg.editor.as_deref());
+    app.editor_note(key, set.as_deref());
     send_before_leaving(
         terminal,
         app,
@@ -1252,11 +1483,19 @@ fn edit_text(
             (Some(command), Some(target)) => crate::actions::run(target, command, request),
             _ => Err(crate::actions::NO_BACKEND.into()),
         });
-        let unkept = app
-            .keep_on_quit()
-            .err()
-            .map(|why| format!(" {why}, so what it keeps for the next Kerdr was lost."))
-            .unwrap_or_default();
+        // What can't be kept for the next Kerdr is printed once the board has gone (K3-34).
+        let unkept = match app.keep_on_quit() {
+            Ok(()) => String::new(),
+            Err(why) => {
+                // Whether they reached his terminal is said once they've been printed, or not.
+                let printed = if app.print_unkept() {
+                    ""
+                } else {
+                    " There's no terminal to print your words on, so they couldn't be kept."
+                };
+                format!(" {why}, so what it keeps for the next Kerdr couldn't be kept.{printed}")
+            }
+        };
         let went = went.map(|w| format!(" {w}")).unwrap_or_default() + &unkept;
         anyhow::bail!(
             "Kerdr was asked to stop (signal {signal}) while your editor was open.{went}"
@@ -1856,18 +2095,636 @@ fn open_signin(app: &mut App, url: &str) {
         app.say("Demo sign-in: no browser opened.", Tone::Info);
         return;
     }
-    match crate::accounts::open_signin_url(url) {
-        Ok(()) => {}
-        Err(error) => app.say(
-            format!("Could not open the browser: {error}. Copy the link instead (c, or l where the page takes a code)."),
-            Tone::Warn,
-        ),
+    if let Err(why) = crate::accounts::open_signin_url(url) {
+        app.say(no_browser(&why, to_clipboard(url)), Tone::Warn);
+    }
+}
+
+/// What the board says when no browser took a sign-in link: it went to the terminal's clipboard by
+/// itself, as c sends it (intent 0591, K3-30), and the link isn't in the words, which the error log
+/// keeps.
+fn no_browser(why: &str, copied: bool) -> String {
+    if copied {
+        format!("No browser here ({why}); the sign-in link is on your clipboard.")
+    } else {
+        format!(
+            "No browser here ({why}). Copy the link instead (c, or l where the page takes a code)."
+        )
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demo's new-intent box, open, as a paste finds it.
+    fn box_open() -> App {
+        let mut app = App::new(
+            crate::config::Config::machine_split(),
+            crate::demo::machines(false),
+        );
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, crate::app::Mode::Compose { .. }));
+        app
+    }
+
+    fn words_in(app: &App) -> (String, usize) {
+        match &app.mode {
+            crate::app::Mode::Compose { draft, .. } => (draft.words.clone(), draft.images.len()),
+            m => panic!("the box isn't open: {m:?}"),
+        }
+    }
+
+    /// What the reads send back, put in as the board's loop puts it, until none comes for `wait`.
+    fn take_back(
+        app: &mut App,
+        rx: &mpsc::Receiver<(u64, crate::images::Loading)>,
+        wait: Duration,
+    ) {
+        while let Ok((id, loading)) = rx.recv_timeout(wait) {
+            let _ = app.images_loaded(id, loading);
+        }
+    }
+
+    /// Waits up to five seconds for `done`.
+    fn soon(done: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn words_that_couldnt_be_written_to_his_terminal_are_never_said_to_be_printed() {
+        // Codex's review 99, 3: his terminal opens, but writing to it fails (here a file opened
+        // only to read). Kerdr's last line says his words couldn't be printed, with none of
+        // them; a quit that loses them ends as a failure, saying so.
+        let mut app = box_open();
+        app.mode = crate::app::Mode::Board;
+        app.draft = "Words that never reached him.".into();
+        app.open_terminal = || std::fs::File::open(std::env::current_exe().ok()?).ok();
+        assert!(app.print_unkept(), "his terminal opened");
+        let printed = print_recovery(&mut app);
+        let stopped = recovered(
+            Err(anyhow::anyhow!(
+                "Kerdr was asked to stop (signal 1) while your editor was open."
+            )),
+            printed,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            stopped.contains("couldn't print your words"),
+            "the last line doesn't say so: {stopped}"
+        );
+        assert!(
+            !stopped.contains("Words that never reached him."),
+            "{stopped}"
+        );
+        let quit = recovered(Ok(()), printed);
+        assert!(
+            quit.as_ref()
+                .is_err_and(|e| e.to_string().contains("couldn't print your words")),
+            "a quit that lost them ended as if it hadn't: {quit:?}"
+        );
+        // Written: said so. A file stands in for his terminal, which only works where words go
+        // to it as bytes: on Windows they go by the console's own call, which a file isn't (that
+        // call is tested through a stand-in, below).
+        #[cfg(not(windows))]
+        {
+            app.draft = "Words that reached him.".into();
+            app.open_terminal = || tempfile::tempfile().ok();
+            assert!(app.print_unkept());
+            let printed = print_recovery(&mut app);
+            let line = recovered(Err(anyhow::anyhow!("Stopped.")), printed)
+                .unwrap_err()
+                .to_string();
+            assert!(line.contains("printed on your terminal"), "{line}");
+            assert!(recovered(Ok(()), printed).is_ok());
+        }
+        let written = recovered(Err(anyhow::anyhow!("Stopped.")), Some(true))
+            .unwrap_err()
+            .to_string();
+        assert!(written.contains("printed on your terminal"), "{written}");
+    }
+
+    #[test]
+    fn words_for_a_windows_console_go_as_utf16_whole() {
+        // Codex's review 99, 2: on Windows his words reach the console by its wide call, so
+        // "café" survives a console whose code page is CP437 or CP850. A real console can't run
+        // here; this is the UTF-16 Kerdr hands that call, through a stand-in for it that takes a
+        // few units at a time, across a piece's end with a pair at it.
+        let mut text = "café, naïve, 日本語, 😀\n".to_string();
+        text.push_str(&"x".repeat(WIDE_PIECE - 1));
+        text.push_str("😀 and the rest");
+        let mut console: Vec<u16> = vec![];
+        let written = write_wide(&text, |units| {
+            let n = units.len().min(7);
+            console.extend_from_slice(&units[..n]);
+            Some(n)
+        });
+        assert!(written);
+        assert_eq!(String::from_utf16(&console).unwrap(), text);
+        // Every piece it was handed ends on a whole character.
+        let mut ends = vec![];
+        write_wide(&text, |units| {
+            ends.push(*units.last().unwrap());
+            Some(units.len())
+        });
+        assert!(
+            ends.iter().all(|u| !(0xD800..0xDC00).contains(u)),
+            "a pair split"
+        );
+        // A console that takes nothing: not written.
+        assert!(!write_wide("café", |_| Some(0)));
+        assert!(!write_wide("café", |_| None));
+    }
+
+    /// Run only by the test below, in a child of its own: his words printed as Kerdr ends.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a child of recovery_text_reaches_his_terminal_and_never_a_redirected_stderr"]
+    fn recovery_child() {
+        if std::env::var_os("KERDR_RECOVERY_CHILD").is_none() {
+            return;
+        }
+        let mut app = box_open();
+        app.mode = crate::app::Mode::Board;
+        app.draft = "Words only he should see.".into();
+        let kept = app.print_unkept();
+        let printed = print_recovery(&mut app);
+        println!("KEPT={kept} PRINTED={printed:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_text_reaches_his_terminal_and_never_a_redirected_stderr() {
+        // Codex's review 98, 1: Kerdr run with standard error to a file (kerdr 2>errors.log), its
+        // words file unwritable as it ends. His words reach his own terminal, and nothing of them
+        // is in that file; with no terminal at all, they're nowhere, and never said to be kept.
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        use std::os::unix::process::CommandExt;
+        const WORDS: &str = "Words only he should see.";
+        let dir = tempfile::tempdir().unwrap();
+        let run = |with_terminal: bool| -> (String, String, String) {
+            let err = dir.path().join(format!("stderr-{with_terminal}.log"));
+            // A terminal of the child's own: a pty, its controlling terminal.
+            let pty = with_terminal.then(|| {
+                // SAFETY: a new pty master, set up for its slave to be opened by path.
+                unsafe {
+                    let master = libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY);
+                    assert!(master >= 0);
+                    assert_eq!(libc::grantpt(master), 0);
+                    assert_eq!(libc::unlockpt(master), 0);
+                    let name = std::ffi::CStr::from_ptr(libc::ptsname(master)).to_owned();
+                    (master, name)
+                }
+            });
+            let slave = pty.as_ref().map(|(_, name)| name.clone());
+            let mut cmd = Command::new(std::env::current_exe().unwrap());
+            cmd.args([
+                "--ignored",
+                "--exact",
+                "tui::tests::recovery_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("KERDR_RECOVERY_CHILD", "1")
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::fs::File::create(&err).unwrap());
+            // SAFETY: only async-signal-safe calls, in the child before it runs: a session of its
+            // own, so no terminal but the pty given is its.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setsid() < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if let Some(name) = &slave {
+                        let fd = libc::open(name.as_ptr(), libc::O_RDWR);
+                        if fd < 0 || libc::ioctl(fd, libc::TIOCSCTTY as _, 0) < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
+                });
+            }
+            let reader = pty.map(|(master, _)| {
+                std::thread::spawn(move || {
+                    // SAFETY: the master is this test's own, read and closed here alone.
+                    let mut master = unsafe { std::fs::File::from_raw_fd(master) };
+                    let mut seen = vec![];
+                    let mut buf = [0u8; 4096];
+                    while let Ok(n) = master.read(&mut buf) {
+                        if n == 0 {
+                            break;
+                        }
+                        seen.extend_from_slice(&buf[..n]);
+                        if String::from_utf8_lossy(&seen).contains(WORDS) {
+                            break;
+                        }
+                    }
+                    String::from_utf8_lossy(&seen).into_owned()
+                })
+            });
+            let out = cmd.spawn().unwrap().wait_with_output().unwrap();
+            let terminal = reader.map(|r| r.join().unwrap()).unwrap_or_default();
+            (
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                std::fs::read_to_string(&err).unwrap(),
+                terminal,
+            )
+        };
+        let (out, err, terminal) = run(true);
+        assert!(
+            !err.contains(WORDS),
+            "his words went to a redirected stderr: {err}"
+        );
+        assert!(
+            terminal.contains(WORDS),
+            "not on his terminal: {terminal:?} {out}"
+        );
+        assert!(out.contains("KEPT=true PRINTED=Some(true)"), "{out}");
+        let (out, err, _) = run(false);
+        assert!(
+            !err.contains(WORDS),
+            "his words went to a redirected stderr: {err}"
+        );
+        assert!(
+            out.contains("KEPT=false"),
+            "said to be kept with no terminal: {out}"
+        );
+    }
+
+    #[test]
+    fn a_paste_is_what_the_clipboard_held_as_he_pasted_or_nothing_and_he_is_told() {
+        // Codex's review 86, 7: a clipboard slow to answer (PowerShell starting, say) while he
+        // copies something else. The board waits for what it holds to be in hand, at most the
+        // bound: past it, nothing from that paste goes in, and he's told, rather than what was
+        // copied after. One that answers is in hand before the paste is taken, so a copy straight
+        // after changes nothing, and pastes go in in the order he made them.
+        use crate::images::{Found, Source, Workers};
+        use std::sync::{Arc, Mutex};
+        let clipboard = Arc::new(Mutex::new("<B>".to_string()));
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let copier = {
+            let clipboard = clipboard.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(100));
+                *clipboard.lock().unwrap() = "<C>".into();
+            })
+        };
+        let held = clipboard.clone();
+        let slow = Reading {
+            workers: &workers,
+            bound: Duration::from_millis(300),
+            take: move |_room| {
+                std::thread::sleep(Duration::from_millis(600));
+                Ok(Found::Text(held.lock().unwrap().clone()))
+            },
+            load: |source: Source, room| source.load(room),
+        };
+        let mut drawn = 0;
+        start_read(&mut app, &tx, read, Source::Clipboard, slow, &mut |_| {
+            drawn += 1
+        });
+        copier.join().unwrap();
+        // The slow reader ends meanwhile, having read what was copied after.
+        take_back(&mut app, &rx, Duration::from_millis(900));
+        assert_eq!(
+            words_in(&app).0,
+            "",
+            "what was copied after the paste went in"
+        );
+        let (said, _) = app.message().unwrap();
+        assert!(said.contains("didn't answer within 0.3 seconds"), "{said}");
+        assert_eq!(drawn, 1, "the board shows it's reading while it waits");
+        // One that answers.
+        let quick = |clipboard: &Arc<Mutex<String>>| {
+            let held = clipboard.clone();
+            Reading {
+                workers: &workers,
+                bound: Duration::from_millis(300),
+                take: move |_room| Ok(Found::Text(held.lock().unwrap().clone())),
+                load: |source: Source, room| source.load(room),
+            }
+        };
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            quick(&clipboard),
+            &mut |_| {},
+        );
+        *clipboard.lock().unwrap() = "<D>".into();
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            quick(&clipboard),
+            &mut |_| {},
+        );
+        *clipboard.lock().unwrap() = "<E>".into();
+        take_back(&mut app, &rx, Duration::from_millis(300));
+        assert_eq!(words_in(&app).0, "<C> <D>");
+    }
+
+    #[test]
+    fn a_copy_made_while_the_clipboard_is_read_puts_nothing_in_and_says_so() {
+        // Codex's review 88, 1: he pastes B, and copies C while Kerdr reads it; the read ends
+        // well within the bound, holding C. The desktop's word of a new copy since the read
+        // began (Wayland's offer, X11's owner, Windows' sequence number) says so: nothing goes
+        // in, and he's told. Where nothing can tell (a program reads it), what was read goes in:
+        // the known limit.
+        use crate::images::{Captured, Listing, Reader, Room, Source, Workers, clipboard_here};
+        use std::sync::{Arc, Mutex};
+        // What the clipboard holds, and which copy that is.
+        let clipboard = Arc::new(Mutex::new((1u32, "<B>".to_string())));
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        let reading = |tells: bool| {
+            let clipboard = clipboard.clone();
+            Reading {
+                workers: &workers,
+                bound: Duration::from_millis(500),
+                take: move |room: Room| {
+                    let seen = std::cell::Cell::new(0);
+                    let reader = Reader {
+                        name: "Kerdr's own Wayland reader".into(),
+                        list: Box::new(|| {
+                            seen.set(clipboard.lock().unwrap().0);
+                            Listing::Types(vec!["text/plain".into()])
+                        }),
+                        read: Box::new(|_, _| {
+                            // He copies C while it reads.
+                            *clipboard.lock().unwrap() = (2, "<C>".into());
+                            Ok(clipboard.lock().unwrap().1.clone().into_bytes())
+                        }),
+                        changed: Box::new(|| {
+                            tells.then(|| clipboard.lock().unwrap().0 != seen.get())
+                        }),
+                    };
+                    let none = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+                        Err(std::io::ErrorKind::NotFound.into())
+                    };
+                    clipboard_here(true, false, &[reader], &none, room)
+                },
+                load: |source: Source, room| source.load(room),
+            }
+        };
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let began = Instant::now();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            reading(true),
+            &mut |_| {},
+        );
+        assert!(
+            began.elapsed() < Duration::from_millis(500),
+            "past the bound"
+        );
+        take_back(&mut app, &rx, Duration::from_millis(200));
+        assert_eq!(
+            words_in(&app).0,
+            "",
+            "what he copied during the read went in"
+        );
+        assert_eq!(
+            app.message().unwrap().0,
+            "You copied something else while Kerdr read the clipboard; paste again."
+        );
+        // A program reads it, and nothing can check: C goes in.
+        *clipboard.lock().unwrap() = (3, "<B>".into());
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            reading(false),
+            &mut |_| {},
+        );
+        take_back(&mut app, &rx, Duration::from_millis(200));
+        assert_eq!(words_in(&app).0, "<C>");
+    }
+
+    #[test]
+    fn a_copy_made_while_the_reader_sets_up_puts_nothing_in() {
+        // Codex's review 89: he pastes B, and copies C while Kerdr's reader is still setting up
+        // (connecting to the display), before it could watch for itself. The paste's copy was
+        // numbered as the paste was handled, by the watch Kerdr keeps from its start, so C is
+        // told: nothing goes in, and he's told. A reader watching only from its own start sees no
+        // change, as round 4's did.
+        use crate::images::{
+            Captured, ClipboardWatch, Listing, Reader, Room, Source, Workers, clipboard_here,
+            take_since,
+        };
+        use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+        use std::sync::{Arc, Mutex};
+        let copies = Arc::new(AtomicU64::new(1));
+        let clipboard = Arc::new(Mutex::new("<B>".to_string()));
+        let (watch, notices) = ClipboardWatch::counted();
+        notices.synced_by(|_| true);
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        // As the board's loop does: the copy numbered first, then the read begun.
+        let pasted = watch.pasted();
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let (seen, held) = (copies.clone(), clipboard.clone());
+        let reading = Reading {
+            workers: &workers,
+            bound: Duration::from_millis(500),
+            take: move |room: Room| {
+                take_since(pasted, || {
+                    // The reader connects; he copies C meanwhile.
+                    seen.store(2, SeqCst);
+                    notices.copied();
+                    *held.lock().unwrap() = "<C>".into();
+                    let from = std::cell::Cell::new(0);
+                    let reader = Reader {
+                        name: "Kerdr's own X11 reader".into(),
+                        list: Box::new(|| {
+                            from.set(seen.load(SeqCst));
+                            Listing::Types(vec!["text/plain".into()])
+                        }),
+                        read: Box::new(|_, _| Ok(held.lock().unwrap().clone().into_bytes())),
+                        changed: Box::new(|| Some(seen.load(SeqCst) != from.get())),
+                    };
+                    let none = |_: &str, _: &[&str]| -> std::io::Result<Captured> {
+                        Err(std::io::ErrorKind::NotFound.into())
+                    };
+                    clipboard_here(false, true, &[reader], &none, room)
+                })
+            },
+            load: |source: Source, room| source.load(room),
+        };
+        start_read(&mut app, &tx, read, Source::Clipboard, reading, &mut |_| {});
+        take_back(&mut app, &rx, Duration::from_millis(200));
+        assert_eq!(
+            words_in(&app).0,
+            "",
+            "what he copied as the reader set up went in"
+        );
+        assert_eq!(
+            app.message().unwrap().0,
+            "You copied something else while Kerdr read the clipboard; paste again."
+        );
+    }
+
+    #[test]
+    fn reads_that_stall_are_counted_until_they_end_and_one_past_the_most_is_refused_and_said() {
+        // Codex's review 86, 6: a mount that doesn't answer, and he pastes its image's path again
+        // and again. The board stops waiting for each at its deadline, but its read is counted
+        // until it really ends: past the most at once, a paste is refused and said, a clipboard
+        // paste too, with nothing more left running; once the mount answers, pastes go in again.
+        use crate::images::{Found, Loaded, Loading, MOST_READERS, Source, Workers};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::{Arc, Condvar, Mutex};
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (stalled, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        let path = || Source::Files(vec!["/mnt/slow/shot.png".into()]);
+        let stall = || {
+            let (gate, stalled, most) = (gate.clone(), stalled.clone(), most.clone());
+            move |_source: Source, _room| {
+                let now = stalled.fetch_add(1, SeqCst) + 1;
+                most.fetch_max(now, SeqCst);
+                let (open, opened) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+                stalled.fetch_sub(1, SeqCst);
+                Loading::refused("The mount answered at last.")
+            }
+        };
+        /// A paste of a file's path: the clipboard isn't read.
+        type NoClipboard = fn(crate::images::Room) -> Result<Found, String>;
+        fn reading<L>(workers: &Workers, load: L) -> Reading<'_, NoClipboard, L> {
+            Reading {
+                workers,
+                bound: crate::images::CLIPBOARD_BOUND,
+                take: |_room| Err("not the clipboard".into()),
+                load,
+            }
+        }
+        for _ in 0..MOST_READERS + 3 {
+            let read = app.begin_image_load(&path()).unwrap();
+            start_read(
+                &mut app,
+                &tx,
+                read,
+                path(),
+                reading(&workers, stall()),
+                &mut |_| {},
+            );
+            // Its deadline passes: the board stops waiting for it.
+            for r in app.image_reads.iter_mut() {
+                r.started = Instant::now() - Duration::from_secs(60);
+            }
+            let _ = app.apply_reads();
+            assert!(app.image_reads.is_empty());
+        }
+        assert!(soon(|| stalled.load(SeqCst) >= MOST_READERS));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            most.load(SeqCst),
+            MOST_READERS,
+            "more stalled reads ran at once than the most"
+        );
+        let (said, _) = app.message().unwrap();
+        assert!(
+            said.contains(&format!("still waiting on {MOST_READERS} earlier reads")),
+            "{said}"
+        );
+        // A clipboard paste: refused too, its reader never run.
+        let ran = Arc::new(AtomicBool::new(false));
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let took = ran.clone();
+        let clipboard = Reading {
+            workers: &workers,
+            bound: crate::images::CLIPBOARD_BOUND,
+            take: move |_room| {
+                took.store(true, SeqCst);
+                Ok(Found::Text("words".into()))
+            },
+            load: |source: Source, room| source.load(room),
+        };
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            Source::Clipboard,
+            clipboard,
+            &mut |_| {},
+        );
+        assert!(!ran.load(SeqCst));
+        assert!(app.message().unwrap().0.contains("still waiting on"));
+        // The mount answers: the reads end, and the count with them.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(
+            soon(|| workers.running() == 0),
+            "{} still counted",
+            workers.running()
+        );
+        take_back(&mut app, &rx, Duration::from_millis(100));
+        assert_eq!(
+            words_in(&app),
+            (String::new(), 0),
+            "a read let go put nothing in"
+        );
+        let read = app.begin_image_load(&path()).unwrap();
+        let png = |_source: Source, _room| Loading {
+            images: vec![Loaded {
+                media_type: "image/png",
+                bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+                from: "shot.png".into(),
+            }],
+            ..Default::default()
+        };
+        start_read(
+            &mut app,
+            &tx,
+            read,
+            path(),
+            reading(&workers, png),
+            &mut |_| {},
+        );
+        take_back(&mut app, &rx, Duration::from_millis(500));
+        assert_eq!(words_in(&app).1, 1, "{:?}", app.message());
+    }
+
+    #[test]
+    fn no_browser_puts_the_link_on_the_clipboard_and_says_so_without_it() {
+        // Intent 0591, K3-30.
+        let said = no_browser("no desktop here to open a browser on", true);
+        assert_eq!(
+            said,
+            "No browser here (no desktop here to open a browser on); the sign-in link is on your clipboard."
+        );
+        assert!(no_browser("xdg-open isn't installed", false).contains("Copy the link instead"));
+    }
 
     #[test]
     fn a_save_from_a_closed_editor_goes_by_what_its_machine_said_while_the_editor_was_open() {
@@ -2433,7 +3290,14 @@ mod tests {
             inbox: &inbox,
             holds: &holds,
         };
-        app.image_load = Some(7);
+        app.image_reads.push_back(crate::app::ImageRead {
+            id: 7,
+            at: "The dock:".len(),
+            for_send: true,
+            started: Instant::now(),
+            what: "Reading the clipboard",
+            got: None,
+        });
         app.send_after_load = Some((
             7,
             crate::app::Draft {
@@ -2442,16 +3306,19 @@ mod tests {
                 ..Default::default()
             },
         ));
+        let sender = image_tx.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(200));
             let loading = crate::images::Loading {
                 images: vec![crate::images::Loaded {
                     media_type: "image/png",
                     bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+                    ..Default::default()
                 }],
                 why: None,
+                ..Default::default()
             };
-            let _ = image_tx.send((7, loading));
+            let _ = sender.send((7, loading));
         });
         send_loaded_images(&mut app, &bg, Some(Duration::from_secs(5)));
         assert!(app.send_after_load.is_none());

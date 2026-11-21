@@ -392,6 +392,37 @@ impl App {
         self.open_editor(&card.key, when);
     }
 
+    /// The editor opens on this card's text now, from wherever the board is: what a yes to a
+    /// question that names the card asks for.
+    fn open_now_by_key(&mut self, key: &str) {
+        let from = self
+            .selected()
+            .map(CardSnapshot::of)
+            .or_else(|| self.card(key).map(CardSnapshot::of));
+        match from {
+            Some(from) => self.open_editor(
+                key,
+                OpenWhen {
+                    asked: Instant::now(),
+                    away: self.away,
+                    from,
+                },
+            ),
+            None => {
+                let id = self
+                    .edits
+                    .get(key)
+                    .map(|h| h.id.clone())
+                    .unwrap_or_default();
+                let reference = self.reference_for(&id);
+                self.say(
+                    format!("Your version of {reference}'s text is ready: e opens it."),
+                    Tone::Info,
+                );
+            }
+        }
+    }
+
     /// The editor opens on this card's text at the next turn of the board, if what `when` says
     /// still holds then.
     fn open_editor(&mut self, key: &str, when: OpenWhen) {
@@ -468,35 +499,27 @@ impl App {
         Some((held.id.clone(), file, intro, marker))
     }
 
-    /// Before the editor starts: one that opens a window of its own and wouldn't be waited for
-    /// (`code` without `--wait`) isn't started, since Kerdr would never see what you write there.
-    /// Says which flag to add, keeps the text, and whether it stopped it.
-    pub fn editor_wont_wait(&mut self, key: &str, candidates: &[Vec<String>]) -> bool {
-        let Some(words) = candidates.first() else {
-            return false;
+    /// Before the editor starts: when the editor set (`set`, before Kerdr's flag) opens a window
+    /// of its own and lacks the flag that has it wait for that window, Kerdr adds it
+    /// (edit::candidates) and says so in one line, so it's no surprise (intent 0591, K1-84).
+    pub fn editor_note(&mut self, key: &str, set: Option<&[String]>) {
+        let Some(words) = set else {
+            return;
         };
         let Some(flag) = edit::missing_wait(words) else {
-            return false;
+            return;
         };
-        let Some(held) = self.edits.get_mut(key) else {
-            return false;
+        let Some(held) = self.edits.get(key) else {
+            return;
         };
-        held.read_only = None;
-        let (id, mine) = (held.id.clone(), held.mine.is_some());
-        let reference = self.reference_for(&id);
-        let named = words.join(" ");
-        let kept = if mine {
-            "Your version is kept: e opens it once that's set."
-        } else {
-            "Nothing changed; e opens it once that's set."
-        };
+        let reference = self.reference_for(&held.id);
         self.say(
             format!(
-                "Didn't open {reference}'s text: {named} opens a window of its own, and without {flag} Kerdr can't wait for you to close it. Add {flag} to editor in Kerdr's config (editor = \"{named} {flag}\"). {kept}"
+                "Kerdr opened {reference}'s text in {} with {flag}, so it waits for you to close its window.",
+                words.join(" ")
             ),
-            Tone::Warn,
+            Tone::Info,
         );
-        true
     }
 
     /// Says that the editor you named couldn't start and which one opened instead, when so: your
@@ -540,7 +563,17 @@ impl App {
     /// have with none (intent 0591, K1-82).
     pub fn edit_ended(&mut self, key: &str, ended: Ended) -> Action {
         let action = self.edit_ended_saving(key, ended);
-        self.edit_closed_for(key);
+        // Still being edited, in Kerdr's own box (K1-87): a start that waits for it waits on, until
+        // the box saves or keeps it.
+        let in_box = matches!(&self.mode, Mode::Compose { draft, .. }
+            if draft.edit.as_ref().is_some_and(|e| e.key == key));
+        if !in_box {
+            self.edit_closed_for(key);
+        }
+        // His version into the words file now, before its save is answered, or while no save
+        // goes (his editor died): a Kerdr ended meanwhile never leaves it held nowhere (intent
+        // 0591, K3-34).
+        self.keep_words_now();
         action
     }
 
@@ -567,14 +600,10 @@ impl App {
                 );
                 Action::None
             }
+            // No editor could start, his own and every fallback: the text opens in a box inside
+            // Kerdr, saved by the same request (intent 0591, K1-87).
             Ended::NoEditor { skipped } => {
-                self.say(
-                    format!(
-                        "No editor could start ({}). Name one as editor in Kerdr's config, or set $EDITOR. {reference} is as it was; e tries again{yours}.",
-                        skipped.join("; ")
-                    ),
-                    Tone::Warn,
-                );
+                self.edit_in_box(key, skipped);
                 Action::None
             }
             // :cq: left as it was, and any version of yours let go. Nothing to say.
@@ -676,14 +705,22 @@ impl App {
                     from: held.current.clone(),
                 });
                 held.check_first = false;
-                let (machine, request) = (
+                let (machine, mut request) = (
                     held.machine,
                     json!({"action":"edit","id":held.id,"text":text,"was":held.was,"from":crate::config::hostname()}),
                 );
+                // The text it was read as, so a change made meanwhile can be merged with his when
+                // they touch different lines (intent 0591, K1-100): to a backend that merges.
+                if self.fixes_input(machine) {
+                    request["base"] = json!(held.current);
+                }
                 self.edits.insert(key.to_string(), held);
-                if crate::actions::too_large(&request) {
+                // A backend that fixes input takes any text he writes, up to 32 MiB (K1-92).
+                let fix = self.fixes_input(machine);
+                if crate::actions::too_large_for(&request, fix) {
+                    let most = if fix { "32 MiB" } else { "64 KiB" };
                     self.fail(format!(
-                        "{reference}'s text is too large to send: a request is at most 64 KiB. Your version is kept: e opens it to make it shorter.{note}"
+                        "{reference}'s text is too large to send: a request is at most {most}. Your version is kept: e opens it to make it shorter.{note}"
                     ));
                     return Action::None;
                 }
@@ -705,6 +742,89 @@ impl App {
                 Action::Mutate { machine, request }
             }
         }
+    }
+
+    /// Opens an item's text in the box, as the editor would have opened it: his version, with any
+    /// newer text below it. Enter saves it through the same request, with the same fingerprint;
+    /// Esc keeps what he wrote as his version, for e.
+    fn edit_in_box(&mut self, key: &str, skipped: Vec<String>) {
+        let Some((_, file, _, marker)) = self.edit_file(key) else {
+            return;
+        };
+        let Some(held) = self.edits.get(key) else {
+            return;
+        };
+        let machine = held.machine;
+        let reference = self.reference_for(&held.id);
+        let draft = Draft {
+            words: file.strip_suffix('\n').unwrap_or(&file).to_string(),
+            machine,
+            edit: Some(crate::app::EditInBox {
+                key: key.to_string(),
+                reference,
+                marker,
+                skipped,
+            }),
+            ..Draft::default()
+        };
+        // The box says it all, each editor tried with why: nothing more on the message line.
+        let back = Box::new(self.mode.clone());
+        self.mode = Mode::Compose { draft, back };
+        // Kept at once as that card's edit, so a Kerdr killed now brings it back (Codex's
+        // review 85, 3).
+        self.words_tried = None;
+        self.keep_open_edit();
+    }
+
+    /// ⏎ in the box holding an item's text: saved as the editor's `:wq` saves it.
+    pub(super) fn edit_box_saved(&mut self, draft: Draft, back: Mode) -> Action {
+        let Some(edit) = draft.edit else {
+            return Action::None;
+        };
+        self.mode = back;
+        let text = edit::read_back(&draft.words, edit.marker.as_deref());
+        let ended = Ended::Wrote {
+            text,
+            run: Run {
+                editor: Some("Kerdr's own box".into()),
+                ok: true,
+                ..Run::default()
+            },
+            touched: true,
+        };
+        self.edit_ended(&edit.key, ended)
+    }
+
+    /// Esc in it: what he wrote is kept as his version, sent nowhere, for e to open; nothing he
+    /// changed, nothing to keep.
+    pub(super) fn edit_box_left(&mut self, draft: Draft, back: Mode) {
+        let Some(edit) = draft.edit else {
+            return;
+        };
+        self.mode = back;
+        let text = edit::read_back(&draft.words, edit.marker.as_deref());
+        let Some(held) = self.edits.get_mut(&edit.key) else {
+            return;
+        };
+        let mine = held.mine.as_ref().map(|m| m.text.clone());
+        if !text.is_empty() && text != held.current && Some(&text) != mine.as_ref() {
+            held.mine = Some(Mine {
+                text,
+                from: held.current.clone(),
+            });
+            self.say(
+                format!(
+                    "Your version of {}'s text is kept, sent nowhere: e opens it.",
+                    edit.reference
+                ),
+                Tone::Info,
+            );
+        } else if mine.is_none() {
+            self.edits.remove(&edit.key);
+        }
+        self.edit_closed_for(&edit.key);
+        // Into the words file now (intent 0591, K3-34).
+        self.keep_words_now();
     }
 
     /// The editor has closed on your unsaved version of an item that can't be edited any more, or
@@ -783,7 +903,11 @@ impl App {
     /// when it holds none.
     pub(super) fn edits_lost(&self) -> Option<String> {
         let (mut saving, mut unsaved): (Vec<String>, Vec<String>) = (vec![], vec![]);
-        for (key, held) in self.edits.iter().filter(|(_, h)| h.mine.is_some()) {
+        for (key, held) in self
+            .edits
+            .iter()
+            .filter(|(k, h)| h.mine.is_some() && !self.as_written.contains(*k))
+        {
             let reference = self.reference_for(&held.id);
             if self.edit_on_its_way(key, &held.id, false) {
                 saving.push(reference);
@@ -838,12 +962,19 @@ impl App {
             }
         };
         match held.and_then(|h| h.mine.as_ref()) {
-            Some(mine) => request["text"] = json!(mine.text),
+            Some(mine) => {
+                request["text"] = json!(mine.text);
+                // The text it was read as goes again too, as it went (K1-100).
+                if request.get("base").is_some() {
+                    request["base"] = json!(mine.from);
+                }
+            }
             // Nothing to send again: ask for the text instead.
             None => {
                 if let Some(fields) = request.as_object_mut() {
                     fields.remove("text");
                     fields.remove("was");
+                    fields.remove("base");
                 }
             }
         }
@@ -1117,6 +1248,53 @@ impl App {
     /// A save's answer. Saved (or unchanged): your version is let go and nothing is said, since
     /// the card already shows it. Anything else: the card is back as it is, your version is kept
     /// for the next `e`, and the red box says so.
+    /// The question when an item's text changed while he had it open, on lines he changed too:
+    /// open both now (his version above, the newer text below), or keep his for e. Asked over the
+    /// board only, where a key meant for something else can't answer it; elsewhere said, yellow.
+    fn ask_open_both(&mut self, key: &str, reference: &str, machine: usize, words: &str) {
+        let card = self.card(key).cloned();
+        let here = self.enter_can_land_here();
+        let message = format!(
+            "{words} Open both now, your version with the newer text below it, to keep what you want of each? n keeps your version: e opens it so."
+        );
+        if !here {
+            self.say(
+                format!("{words} Your version is kept: e opens it, with the newer text below it."),
+                Tone::Warn,
+            );
+            return;
+        }
+        self.mode = Mode::Confirm {
+            machine,
+            request: json!({"action": crate::app::OPEN_BOTH, "key": key}),
+            title: format!("Open both versions of {reference}?"),
+            message,
+            back: Box::new(self.mode.clone()),
+            target: card.as_ref().map(|c| Box::new(CardSnapshot::of(c))),
+            queue: false,
+            ready_at: Some(Instant::now() + Duration::from_millis(500)),
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+    }
+
+    /// The answer to ask_open_both: yes opens the editor on both now; no keeps his version.
+    pub(super) fn open_both_answered(&mut self, key: &str, yes: bool) {
+        let Some(held) = self.edits.get(key) else {
+            return;
+        };
+        let reference = self.reference_for(&held.id);
+        if yes {
+            self.open_now_by_key(key);
+            return;
+        }
+        self.say(
+            format!("Your version of {reference}'s text is kept: e opens it, with the newer text below it."),
+            Tone::Info,
+        );
+    }
+
     fn finish_edit_save(
         &mut self,
         key: &str,
@@ -1129,10 +1307,55 @@ impl App {
             // happen (its write-up couldn't start, or the push failed): saved all the same, and
             // that part is said where it can't be missed.
             Ok(r) if r.ok => {
-                self.edits.remove(key);
+                let held = self.edits.remove(key);
+                self.as_written.remove(key);
                 // Saved somewhere other than the backlog card it shows on (as a new intent made
                 // from done work, or with its agent told): its backend's words say where.
                 let elsewhere = self.card(key).is_some_and(|c| !waiting_work(c));
+                // Saved with lines its backend fixed, merged with a change made meanwhile, or a
+                // line redacted (intent 0591, release 5): said, since what was saved isn't quite
+                // what he wrote. With fixes, his text as written stays for e to bring back.
+                if !r.fixed.is_empty() || r.merged || !r.redacted.is_empty() {
+                    let mut said = r.message.trim().to_string();
+                    if let Some(note) = r.note.as_deref().map(str::trim).filter(|n| !n.is_empty())
+                        && !said.contains(note)
+                    {
+                        said = format!("{said} {note}");
+                    }
+                    // Each fix in its own words, as the backend gave them, unless already said
+                    // (Codex's review 85, 9).
+                    for fix in &r.fixed {
+                        let fix = fix.message.trim();
+                        if !fix.is_empty() && !said.contains(fix) {
+                            said = format!("{said} {fix}");
+                        }
+                    }
+                    if !r.fixed.is_empty()
+                        && let Some(mut held) = held
+                        && let Some(mine) = held.mine.take()
+                    {
+                        let saved = r.text.as_deref().map(edit::normalise).unwrap_or_default();
+                        if !saved.is_empty() && saved != mine.text {
+                            held.current = saved.clone();
+                            if let Some(was) = r.was.clone() {
+                                held.was = was;
+                            }
+                            held.mine = Some(Mine {
+                                text: mine.text,
+                                from: saved,
+                            });
+                            held.check_first = false;
+                            self.edits.insert(key.to_string(), held);
+                            self.as_written.insert(key.to_string());
+                            said.push_str(" Your text as you wrote it is kept: e opens it.");
+                        }
+                    }
+                    if said.is_empty() {
+                        said = format!("{reference}'s text is saved.");
+                    }
+                    self.say(short(said), Tone::Info);
+                    return;
+                }
                 if partial(&r) {
                     self.fail(partly_saved(reference, r));
                 } else if elsewhere && !r.message.trim().is_empty() {
@@ -1172,6 +1395,7 @@ impl App {
                     ));
                 };
                 held.machine = machine;
+                let conflict = stale && r.conflict;
                 let next = if stale {
                     match (r.text, r.was) {
                         (Some(text), Some(was)) => {
@@ -1179,6 +1403,16 @@ impl App {
                             held.was = was;
                             held.read_at = Instant::now();
                             held.check_first = false;
+                            // Both changed the same lines (intent 0591, K1-100): a question that
+                            // opens both, never a red failure.
+                            if conflict {
+                                let words = what_and_why(
+                                    &format!("{reference}'s text wasn't saved"),
+                                    reference,
+                                    &short(r.message),
+                                );
+                                return self.ask_open_both(key, reference, machine, &words);
+                            }
                             "Your version is kept: e opens it, with the newer text below it."
                         }
                         // Changed, but not said to what: e reads it first.
@@ -1320,6 +1554,47 @@ mod tests {
         }
     }
 
+    #[test]
+    fn his_version_is_in_the_words_file_as_the_editor_closes_before_any_answer() {
+        // Intent 0591, K3-34: written as the editor closes, so a Kerdr ended before its save is
+        // answered, or after his editor died with nothing sent, never leaves it held nowhere.
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = crate::kept::Kept::at(dir.path(), 1000);
+        let (key, id, _) = waiting(&mut app);
+        let machine = app.card(&key).unwrap().machine_index;
+        let held = Held {
+            id,
+            machine,
+            current: "Old words.".into(),
+            was: "sha256:aa".into(),
+            read_at: Instant::now(),
+            mine: None,
+            check_first: false,
+            read_only: None,
+        };
+        let words = || std::fs::read_to_string(dir.path().join("words.json")).unwrap_or_default();
+        app.edits.insert(key.clone(), held.clone());
+        let action = app.edit_ended(&key, wrote("Saved, not yet answered."));
+        assert!(matches!(action, Action::Mutate { .. }), "{action:?}");
+        assert!(words().contains("Saved, not yet answered."), "{}", words());
+        app.edits.insert(key.clone(), held);
+        let action = app.edit_ended(
+            &key,
+            Ended::Died {
+                text: "What the editor had when it died.".into(),
+                run: nvim(),
+                touched: true,
+            },
+        );
+        assert!(matches!(action, Action::None), "{action:?}");
+        assert!(
+            words().contains("What the editor had when it died."),
+            "{}",
+            words()
+        );
+    }
+
     /// A request on its way, as the board sends it: into the action resolution tool, handed to
     /// the runner, its command started with the whole request (intent 0445).
     struct Sent {
@@ -1330,13 +1605,19 @@ mod tests {
 
     fn send(app: &mut App, machine: usize, request: Value) -> Sent {
         app.queue_action(machine, request.clone());
+        // As it was asked: the `fix_input` a backend that fixes input is told aside.
+        let asked = |r: &Value| {
+            let mut r = crate::actions::without_op(r);
+            if let Some(fields) = r.as_object_mut() {
+                fields.remove("fix_input");
+            }
+            r
+        };
         let n = app
             .resolver
             .ready()
             .into_iter()
-            .find(|(_, m, r, gated)| {
-                *m == machine && crate::actions::without_op(r) == request && !gated
-            })
+            .find(|(_, m, r, gated)| *m == machine && asked(r) == request && !gated)
             .map(|(n, _, r, _)| (n, r))
             .expect("it goes to the runner at once");
         let (n, request) = n;
@@ -1425,6 +1706,226 @@ mod tests {
             card.detail.as_ref().unwrap().words.clone(),
             card.intake() == Some("pending"),
         )
+    }
+
+    /// The demo with every machine's backend fixing input (intent 0591, release 5).
+    fn fixing() -> App {
+        let mut app = app();
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        app
+    }
+
+    /// As send, for a request the board adds to on its way (`fix_input`): the one it handed on.
+    fn send_as_it_goes(app: &mut App, machine: usize, request: Value) -> Sent {
+        app.queue_action(machine, request.clone());
+        let (n, request) = app
+            .resolver
+            .ready()
+            .into_iter()
+            .find(|(_, m, r, gated)| {
+                *m == machine
+                    && r["action"] == request["action"]
+                    && r["id"] == request["id"]
+                    && !gated
+            })
+            .map(|(n, _, r, _)| (n, r))
+            .expect("it goes to the runner at once");
+        app.job_started(n);
+        app.resolver.handed(n);
+        Sent {
+            n,
+            machine,
+            request,
+        }
+    }
+
+    #[test]
+    fn a_save_to_a_backend_that_merges_carries_what_was_read_and_says_a_merge() {
+        // Intent 0591, K1-100: the text it was read as goes with the save (`base`), so a change
+        // made meanwhile on other lines is merged and saved; its backend says so, and nothing is
+        // left to save.
+        let mut app = fixing();
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.\n\nTwo lines.", "sha256:aa");
+        let Action::Mutate { machine, request } =
+            app.edit_ended(&key, wrote("New words.\n\nTwo lines."))
+        else {
+            panic!("not sent: {:?}", app.message())
+        };
+        assert_eq!(request["base"], "Old words.\n\nTwo lines.");
+        let sent = send_as_it_goes(&mut app, machine, request);
+        assert_eq!(sent.request["fix_input"], true);
+        // The board never shows the text, only how long it was.
+        let counted = crate::actions::request_metadata(&sent.request);
+        assert_eq!(counted["base"], "Old words.\n\nTwo lines.".chars().count());
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: true,
+                merged: true,
+                message: "Saved #21's text, merged with the change made while you had it open."
+                    .into(),
+                ..Default::default()
+            }),
+        );
+        assert!(
+            said(&app).contains("merged with the change made"),
+            "{}",
+            said(&app)
+        );
+        assert!(!app.failing());
+        assert!(app.edits.is_empty(), "nothing left to save");
+        // An older backend gets no base.
+        let mut older = super::tests::app();
+        let (key, id, _) = waiting(&mut older);
+        opened(&mut older, &key, &id, "Old words.", "sha256:aa");
+        let Action::Mutate { request, .. } = older.edit_ended(&key, wrote("New words.")) else {
+            panic!("not sent")
+        };
+        assert!(request.get("base").is_none());
+        assert!(older.with_fix_input(0, request).get("fix_input").is_none());
+    }
+
+    #[test]
+    fn a_change_on_the_same_lines_is_a_question_that_opens_both_never_a_red_failure() {
+        // Intent 0591, K1-100.
+        let mut app = fixing();
+        let (key, id, reference) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote("Mine.")) else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                status: Some("stale".into()),
+                conflict: true,
+                message: format!(
+                    "{reference}'s text changed while you had it open, in lines you changed too."
+                ),
+                text: Some("Theirs.".into()),
+                was: Some("sha256:bb".into()),
+                ..Default::default()
+            }),
+        );
+        assert!(!app.failing(), "not a red failure: {:?}", app.message());
+        let Mode::Confirm { title, message, .. } = app.mode.clone() else {
+            panic!("not asked: {:?}", app.mode)
+        };
+        assert_eq!(title, format!("Open both versions of {reference}?"));
+        assert!(message.contains("in lines you changed too"), "{message}");
+        // Yes opens the editor on both: his version, the newer text below it.
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        press(&mut app, 'y');
+        assert_eq!(app.edit_open.as_deref(), Some(key.as_str()));
+        let (_, file, _, marker) = app.edit_file(&key).unwrap();
+        assert!(marker.is_some());
+        assert!(file.starts_with("Mine.\n"), "{file}");
+        assert!(file.contains("\nTheirs.\n"), "{file}");
+        // No keeps his version for e, said, not red.
+        app.edit_open = None;
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote("Mine, again."))
+        else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        answer(
+            &mut app,
+            &sent,
+            Ok(Response {
+                ok: false,
+                status: Some("stale".into()),
+                conflict: true,
+                message: format!(
+                    "{reference}'s text changed while you had it open, in lines you changed too."
+                ),
+                text: Some("Theirs, again.".into()),
+                was: Some("sha256:cc".into()),
+                ..Default::default()
+            }),
+        );
+        if let Mode::Confirm { ready_at, .. } = &mut app.mode {
+            *ready_at = None;
+        }
+        press(&mut app, 'n');
+        assert!(said(&app).contains("is kept: e opens it, with the newer text below it"));
+        assert!(!app.failing());
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Mine, again.");
+    }
+
+    #[test]
+    fn a_fixed_save_says_each_fix_in_its_own_words_when_the_message_doesnt() {
+        // Codex's review 85, 9: the answer's message is only "Saved.", no note; the fixes'
+        // explanations are what say which lines changed, and they're shown.
+        let mut app = fixing();
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote("# Title\n```\ncode"))
+        else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        let response = crate::actions::parse_response(
+            &json!({"ok":true,"status":"saved","message":"Saved.",
+                "fixed":[{"line":1,"kind":"heading","message":"Line 1's # heading is now ###."},
+                         {"line":4,"kind":"fence","message":"Line 4 closes the code block line 2 opened."}],
+                "text":"### Title\n```\ncode\n```","was":"sha256:ee"})
+            .to_string(),
+        )
+        .unwrap();
+        answer(&mut app, &sent, Ok(response));
+        let said = said(&app);
+        assert!(said.starts_with("Saved."), "{said}");
+        assert!(said.contains("Line 1's # heading is now ###."), "{said}");
+        assert!(
+            said.contains("Line 4 closes the code block line 2 opened."),
+            "{said}"
+        );
+    }
+
+    #[test]
+    fn a_save_its_backend_fixed_says_which_lines_and_keeps_his_text_as_written_for_e() {
+        // Intent 0591, release 5: a # heading, an open code block or a NUL is fixed and saved;
+        // the lines are said, and e brings back the text as he wrote it. Quitting loses nothing.
+        let mut app = fixing();
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let mine = "# Title\nWords.";
+        let Action::Mutate { machine, request } = app.edit_ended(&key, wrote(mine)) else {
+            panic!("not sent")
+        };
+        let sent = send_as_it_goes(&mut app, machine, request);
+        let response: Response = crate::actions::parse_response(
+            &json!({"ok":true,"message":"Saved #21's text.","note":"Line 1's # heading is now ###, so it isn't read as a section of its own.",
+                "fixed":[{"line":1,"kind":"heading","message":"Line 1's # heading is now ###, so it isn't read as a section of its own."}],
+                "text":"### Title\nWords.","was":"sha256:dd"})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(response.fixed.len(), 1);
+        answer(&mut app, &sent, Ok(response));
+        let said = said(&app);
+        assert!(said.contains("Line 1's # heading is now ###"), "{said}");
+        assert!(
+            said.contains("Your text as you wrote it is kept: e opens it."),
+            "{said}"
+        );
+        assert!(!app.failing());
+        assert_eq!(app.edits_lost(), None, "nothing is lost by quitting");
+        let (_, file, ..) = app.edit_file(&key).unwrap();
+        assert_eq!(file, "# Title\nWords.\n");
+        assert_eq!(app.edits[&key].current, "### Title\nWords.");
+        assert_eq!(app.edits[&key].was, "sha256:dd");
     }
 
     #[test]
@@ -2926,10 +3427,132 @@ mod tests {
             ),
             Action::None
         );
-        let text = said(&app);
-        assert!(text.contains("nvim: not found; vim: not found"), "{text}");
-        assert!(text.contains("editor in Kerdr's config"), "{text}");
+        assert!(
+            matches!(&app.mode, Mode::Compose { draft, .. }
+                if draft.edit.as_ref().is_some_and(|e| e.skipped.len() == 2)),
+            "{:?}",
+            app.mode
+        );
         assert!(app.edits.contains_key(&key));
+    }
+
+    #[test]
+    fn an_edit_open_in_kerdrs_own_box_comes_back_as_that_cards_edit_after_a_kill() {
+        // Codex's review 85, 3: killed before ⏎ or Esc, the next Kerdr has what the box held as
+        // that card's version, with the text it was read as and its fingerprint, and never as
+        // new-intent words.
+        let state = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = crate::kept::Kept::at(state.path(), chrono::Local::now().timestamp());
+        let (key, id, _) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        app.edit_ended(
+            &key,
+            Ended::NoEditor {
+                skipped: vec!["nvim: not found".into()],
+            },
+        );
+        assert!(matches!(&app.mode, Mode::Compose { draft, .. } if draft.edit.is_some()));
+        for c in " And more.".chars() {
+            press(&mut app, c);
+        }
+        // The board's turn: what changed in the box goes to the words file.
+        app.words_tried = None;
+        app.keep_open_edit();
+        let file = std::fs::read_to_string(state.path().join("words.json")).unwrap();
+        assert!(file.contains("Old words. And more."), "{file}");
+        // Killed here: nothing else runs. The next Kerdr reads what was kept.
+        drop(app);
+        let mut next = super::tests::app();
+        next.kept = crate::kept::Kept::at(state.path(), chrono::Local::now().timestamp());
+        let words = next.kept.take_words();
+        assert!(
+            words.draft.is_none(),
+            "never new-intent words: {:?}",
+            words.draft
+        );
+        next.restore_words(words);
+        assert!(next.draft.is_empty() && next.returned.is_empty());
+        let held = &next.edits[&key];
+        assert_eq!(held.mine.as_ref().unwrap().text, "Old words. And more.");
+        assert_eq!(held.mine.as_ref().unwrap().from, "Old words.");
+        assert_eq!(
+            (held.current.as_str(), held.was.as_str()),
+            ("Old words.", "sha256:aa")
+        );
+        assert!(held.check_first, "e checks the text first");
+    }
+
+    #[test]
+    fn with_no_editor_at_all_the_text_opens_in_a_box_inside_kerdr_and_saves_as_the_editor_would() {
+        // Intent 0591, K1-87: every editor failed to start; the box holds the text, ⏎ sends the
+        // same save with the fingerprint it was read with, Esc keeps his version for e.
+        let mut app = app();
+        let (key, id, reference) = waiting(&mut app);
+        opened(&mut app, &key, &id, "Old words.", "sha256:aa");
+        let none = || Ended::NoEditor {
+            skipped: vec!["nvim: not found".into(), "nano: not found".into()],
+        };
+        assert_eq!(app.edit_ended(&key, none()), Action::None);
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("no box: {:?}", app.mode)
+        };
+        assert_eq!(draft.words, "Old words.");
+        assert_eq!(draft.edit.as_ref().unwrap().reference, reference);
+        let screen = crate::ui::tests_render(&app, 120, 40);
+        assert!(
+            screen.contains(&format!(
+                "EDITING {reference}   No editor could start, so its text opens here."
+            )),
+            "{screen}"
+        );
+        assert!(screen.contains("esc keep for later"), "{screen}");
+        assert!(
+            screen.contains(
+                "Tried nvim (not found) and nano (not found). It saves as e does from your editor."
+            ),
+            "{screen}"
+        );
+        assert!(
+            screen.contains("Your editor comes back once one starts: name it as editor in Kerdr's config, or set $EDITOR."),
+            "{screen}"
+        );
+        assert!(
+            screen
+                .contains("⏎ save   shift+⏎ / alt+⏎ new line   ctrl+u clear   esc keep for later"),
+            "{screen}"
+        );
+        // A pasted path is words here, never an image.
+        app.on_paste(" /tmp/shot.png");
+        for _ in 0..(" /tmp/shot.png".len() + "words.".len()) {
+            app.on_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE));
+        }
+        for c in "text, edited here.".chars() {
+            press(&mut app, c);
+        }
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("⏎ saved nothing: {:?}", app.message())
+        };
+        assert_eq!(request["action"], "edit");
+        assert_eq!(request["text"], "Old text, edited here.");
+        assert_eq!(request["was"], "sha256:aa");
+        assert!(matches!(app.mode, Mode::Board), "{:?}", app.mode);
+        // Esc: kept as his version, sent nowhere.
+        app.edits.get_mut(&key).unwrap().mine = None;
+        app.edit_ended(&key, none());
+        press(&mut app, '!');
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(app.edits[&key].mine.as_ref().unwrap().text, "Old words.!");
+        assert!(
+            said(&app).contains("kept, sent nowhere: e opens it"),
+            "{}",
+            said(&app)
+        );
     }
 
     #[test]
@@ -3333,7 +3956,7 @@ mod tests {
     }
 
     #[test]
-    fn a_quick_quit_is_quiet_and_a_window_editor_without_its_wait_flag_isnt_started() {
+    fn a_quick_quit_is_quiet_and_a_window_editor_without_its_wait_flag_is_given_it() {
         let mut app = app();
         let (key, id, reference) = waiting(&mut app);
         opened(&mut app, &key, &id, "Old words.", "sha256:aa");
@@ -3341,32 +3964,22 @@ mod tests {
         assert_eq!(app.edit_ended(&key, left("Old words.")), Action::None);
         assert_eq!(app.message(), None);
         assert!(app.edits.is_empty());
-        // code without --wait: not started, the flag named, and the text kept for e.
+        // code without --wait: started with it, and that said in one line (intent 0591, K1-84).
         opened(&mut app, &key, &id, "Old words.", "sha256:aa");
-        let code = |s: &str| vec![edit::editor_words(s), vec!["nvim".to_string()]];
-        assert!(app.editor_wont_wait(&key, &code("code")));
+        app.editor_note(&key, Some(&edit::editor_words("code")));
         let (text, tone) = app.message().unwrap();
-        assert_eq!(tone, Tone::Warn);
-        assert!(
-            text.contains(&format!("Didn't open {reference}'s text")),
-            "{text}"
-        );
-        assert!(
-            text.contains("Add --wait to editor in Kerdr's config"),
-            "{text}"
-        );
-        assert!(text.contains(r#"editor = "code --wait""#), "{text}");
-        assert!(app.edits.contains_key(&key), "the text is kept");
-        press(&mut app, 'e');
+        assert_eq!(tone, Tone::Info);
         assert_eq!(
-            app.edit_open.take().as_deref(),
-            Some(key.as_str()),
-            "e opens it with no read"
+            text,
+            format!(
+                "Kerdr opened {reference}'s text in code with --wait, so it waits for you to close its window."
+            )
         );
-        // With its flag, or a terminal editor, it starts.
+        // With its flag, or a terminal editor, nothing to say.
         app.message = None;
-        assert!(!app.editor_wont_wait(&key, &code("code --wait")));
-        assert!(!app.editor_wont_wait(&key, &code("nvim")));
+        app.editor_note(&key, Some(&edit::editor_words("code --wait")));
+        app.editor_note(&key, Some(&edit::editor_words("nvim")));
+        app.editor_note(&key, None);
         assert_eq!(app.message(), None);
     }
 

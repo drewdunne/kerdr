@@ -66,6 +66,21 @@ pub struct Draft {
     /// What the view wanted to file it under that this machine's backend can't take, said in the
     /// box before it's sent.
     pub unfiled: Option<String>,
+    /// Not a new intent: an item's text, edited in the box because no editor could start (intent
+    /// 0591, K1-87). Enter saves it as the editor's save would.
+    pub edit: Option<EditInBox>,
+}
+
+/// The item whose text the box holds, when it holds one (Draft::edit).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct EditInBox {
+    /// Its card, by key, and how it's named: "#21".
+    pub key: String,
+    pub reference: String,
+    /// The marker of the newer-text block below his version, when there is one.
+    pub marker: Option<String>,
+    /// The editors that couldn't start, each with why.
+    pub skipped: Vec<String>,
 }
 
 /// Who a new intent is filed under, from the view it was made in (intent 0595): on all of Kerdr
@@ -444,6 +459,57 @@ fn holds_peek(mode: &Mode) -> bool {
 /// didn't go in: never sent to a backend.
 pub(crate) const SEND_WITHOUT: &str = "kerdr:send-without-image";
 
+/// What a card on the compact list wants of him (intent 0591, K2-43): it asks him something
+/// (yellow), it's stopped (red), or it waits on him (blue).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Wants {
+    Asks,
+    Failed,
+    Yours,
+}
+
+/// One row of the compact list: its card, what it wants, and that in its own words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompactRow {
+    pub index: usize,
+    pub wants: Wants,
+    pub what: String,
+}
+
+/// The action of Kerdr's own question whether an image past what one intent may carry goes in as
+/// a smaller copy (intent 0591, release 5): never sent to a backend.
+pub(crate) const SMALLER: &str = "kerdr:attach-smaller-copy";
+
+/// The action of Kerdr's own question, when an item's text changed while he had it open on the
+/// same lines he changed, whether to open both now (intent 0591, K1-100): never sent to a backend.
+pub(crate) const OPEN_BOTH: &str = "kerdr:open-both";
+
+/// Images too large to send, while Kerdr asks whether smaller copies go in their place, and where
+/// in the words their tags go.
+#[derive(Clone, Debug)]
+pub(crate) struct SmallerAsk {
+    pub n: u64,
+    pub images: Vec<crate::images::Loaded>,
+    pub at: usize,
+}
+
+/// An image read for the box, started the moment it was asked for, so what it reads is what the
+/// clipboard held then (Codex's review 85, 4); what it found goes in in the order they were asked
+/// (intent 0591, K1-35), its tags where the words ended then: for the box, or for the words Enter
+/// sent while it read.
+#[derive(Clone, Debug)]
+pub(crate) struct ImageRead {
+    pub id: u64,
+    pub at: usize,
+    pub for_send: bool,
+    /// When it began, and what it reads ("Reading the clipboard"): past READ_MOST it's let go,
+    /// said, and nothing waits for it any more (Codex's review 85, 8).
+    pub started: Instant,
+    pub what: &'static str,
+    /// What it found, once it has: waiting for the reads before it.
+    pub got: Option<crate::images::Loading>,
+}
+
 /// Words whose image didn't go in, and the question about them: its number goes in the question's
 /// request, so its answer finds these words and no others (Codex's review).
 #[derive(Clone, Debug)]
@@ -510,6 +576,8 @@ pub struct QuestionView {
     scroll: std::cell::Cell<u16>,
     /// Its lines below what the box shows when scrolled to its top: 0 when all of it shows.
     most: std::cell::Cell<u16>,
+    /// The rows the box gives its text: how far a yes that isn't taken yet moves it on.
+    page: std::cell::Cell<u16>,
 }
 
 impl QuestionView {
@@ -527,6 +595,11 @@ impl QuestionView {
     pub fn to_end(&self) {
         self.scroll.set(self.most.get());
     }
+    /// A page further on, so every part of the question is on screen before an answer acts
+    /// (Codex's review 85, 2): no further when the box has no rows for it at all.
+    pub fn next_page(&self) {
+        self.down(self.page.get());
+    }
     /// As it's drawn: this question, its lines and the rows the box gives them. Where its text
     /// starts.
     pub fn fit(&self, title: &str, message: &str, lines: u16, rows: u16) -> u16 {
@@ -540,6 +613,7 @@ impl QuestionView {
         }
         let most = lines.saturating_sub(rows);
         self.most.set(most);
+        self.page.set(rows);
         self.scroll.set(self.scroll.get().min(most));
         self.scroll.get()
     }
@@ -586,6 +660,17 @@ pub struct PendingJump {
 /// stuck (intent 0591).
 pub const STUCK_WAIT: Duration = Duration::from_secs(60);
 
+/// His own terminal, for words only he should see: /dev/tty, or the console on Windows. None when
+/// Kerdr has none (it runs with no controlling terminal, say): standard error is never used for
+/// them, since it may be redirected (Codex's review 98, 1).
+pub fn own_terminal() -> Option<std::fs::File> {
+    #[cfg(windows)]
+    let path = "CONOUT$";
+    #[cfg(not(windows))]
+    let path = "/dev/tty";
+    std::fs::OpenOptions::new().write(true).open(path).ok()
+}
+
 pub struct App {
     pub cfg: Config,
     pub machines: Vec<MachineState>,
@@ -628,11 +713,18 @@ pub struct App {
     pub draft_came_back: Option<Submission>,
     /// The images being read for the new-intent box, by the number of that read; a read whose
     /// box closed meanwhile is dropped when it ends.
-    pub image_load: Option<u64>,
+    /// The reads for the new-intent box not yet in, oldest first (ImageRead).
+    pub(crate) image_reads: std::collections::VecDeque<ImageRead>,
     image_loads: u64,
-    /// Where in the words that read's tags go: where the words ended when it began, so words
-    /// typed while it reads come after them.
-    image_at: usize,
+    /// Images too large to send, while Kerdr asks about smaller copies of them.
+    pub(crate) smaller_asks: Vec<SmallerAsk>,
+    /// What didn't go in with words Enter sent, from each read they waited for, said once the
+    /// last is in.
+    pub(crate) send_troubles: Vec<String>,
+    /// Cards whose text was saved with lines its backend fixed, by key: the version Kerdr keeps
+    /// for them is the text as he wrote it, for e to bring back, not a save still owed (intent
+    /// 0591, release 5).
+    pub(crate) as_written: std::collections::HashSet<String>,
     /// New intents sent, each while its answer is still owed or unknown (intent 0445).
     pub submissions: Vec<Submission>,
     /// Words (and their images) whose save failed while the box held other words: c offers them,
@@ -675,6 +767,10 @@ pub struct App {
     /// among the rows, and its card's number. Once that piece leaves the card, ⏎ goes to the row
     /// nearest where it was (intent 0591, K3-32).
     pub(crate) card_row_at: Option<(String, usize, String)>,
+    /// When a card's screen last chose a row for him, its own row having left the card: keys
+    /// that act on a row wait half a second after it, so none lands on a row he didn't see
+    /// (intent 0591, K2-56).
+    pub(crate) card_row_moved: Option<Instant>,
     /// The card or workspace whose jump already waited once for herdr, or its machine, to answer
     /// again: a second jump there that gets no answer says so, rather than wait again (intent 0591,
     /// K3-12). Any other way a jump ends forgets it.
@@ -715,6 +811,14 @@ pub struct App {
     /// What's typed in a Kickoff Questions box and not saved yet, by its card's key: never another
     /// source's card with the same number (Codex's fifth look).
     pub kickoff_kept: std::collections::HashMap<String, Vec<kickoff_controls::KeptAnswer>>,
+    /// What to print to his terminal once the board has gone: his words, when the words file
+    /// couldn't keep them as Kerdr ended (intent 0591, K3-34). Never written to the error log.
+    pub print_on_exit: Vec<String>,
+    /// His own terminal, opened when there's something to print on it: never standard error,
+    /// which may be redirected to a file others can read (Codex's review 98, 1).
+    pub recovery_terminal: Option<std::fs::File>,
+    /// How his terminal is opened: /dev/tty, or the console on Windows. A test gives its own.
+    pub open_terminal: fn() -> Option<std::fs::File>,
     /// Kickoff answers its backend gave back because their questions changed while he answered,
     /// by its card's key: filled in on the next box d opens (intent 0591, B1-108).
     pub kickoff_prefill: std::collections::HashMap<String, Vec<crate::actions::Prefill>>,
@@ -942,9 +1046,11 @@ impl App {
             draft: String::new(),
             draft_images: vec![],
             draft_came_back: None,
-            image_load: None,
+            image_reads: Default::default(),
             image_loads: 0,
-            image_at: 0,
+            smaller_asks: vec![],
+            send_troubles: vec![],
+            as_written: Default::default(),
             new_intent_id: None,
             closed_on_send: false,
             submissions: vec![],
@@ -962,6 +1068,7 @@ impl App {
             held: vec![],
             pending_jump: None,
             card_row_at: None,
+            card_row_moved: None,
             answer_waited: None,
             open_after: None,
             started: None,
@@ -971,6 +1078,9 @@ impl App {
             resent: vec![],
             moved_home: vec![],
             kickoff_kept: Default::default(),
+            print_on_exit: vec![],
+            recovery_terminal: None,
+            open_terminal: own_terminal,
             kickoff_prefill: Default::default(),
             stop_starts: Vec::new(),
             answer_job: None,
@@ -1103,6 +1213,14 @@ impl App {
         self.message = Some((text, Tone::Fail, Instant::now()));
     }
 
+    /// What Kerdr's config file had that couldn't be used, said where it can't be missed: Kerdr
+    /// opened anyway, with the rest (intent 0591, K3-67, K3-68).
+    pub fn say_config_problems(&mut self) {
+        for problem in std::mem::take(&mut self.cfg.problems) {
+            self.fail(format!("Kerdr's config, {problem}."));
+        }
+    }
+
     /// Whether a failure is up.
     pub fn failing(&self) -> bool {
         matches!(self.message, Some((_, Tone::Fail, _)))
@@ -1126,7 +1244,8 @@ impl App {
             Mode::Kickoff { form, .. } => Instant::now() < form.ready_at,
             _ => false,
         } || matches!(&self.message, Some((_, Tone::Fail, at)) if at.elapsed() < FAIL_SEEN);
-        if answer_coming || guard_up || self.image_load.is_some() || self.pending_jump.is_some() {
+        if answer_coming || guard_up || !self.image_reads.is_empty() || self.pending_jump.is_some()
+        {
             KEY_WAIT_COMING
         } else {
             KEY_WAIT
@@ -1642,6 +1761,144 @@ impl App {
                 // An empty view: its columns may be fewer than the last view's.
                 self.sel.key = None;
                 self.sel.col = self.sel.col.min(cols.len().saturating_sub(1));
+            }
+        }
+    }
+
+    /// Whether the board is shown as the compact list: a window too small for its columns (under
+    /// 32 columns or 10 rows), on the board itself (intent 0591, K2-43).
+    pub fn compact(&self) -> bool {
+        self.small_window() && matches!(self.mode, Mode::Board)
+    }
+
+    /// A window too small for the board's columns: under 32 columns or 10 rows.
+    pub fn small_window(&self) -> bool {
+        self.width > 0 && self.height > 0 && (self.width < 32 || self.height < 10)
+    }
+
+    /// Whether this screen is drawn in a small window: the board as the compact list, and a
+    /// question, whatever it's over, whole (Codex's review 86, 4). Every other says it needs a
+    /// bigger window.
+    pub fn small_draws(&self) -> bool {
+        matches!(self.mode, Mode::Board | Mode::Confirm { .. })
+    }
+
+    /// The compact list's rows: the cards on the board that need you, asking you something or
+    /// stopped, in board order, each with what it wants of you.
+    pub fn compact_rows(&self) -> Vec<CompactRow> {
+        let layout = self.layout();
+        let cols = self.columns_in(&layout);
+        let vis = self.visible_in(&layout);
+        let mut out: Vec<CompactRow> = Vec::new();
+        for ci in 0..cols.len() {
+            let col = &layout.columns[ci];
+            let folded = col.band.is_some_and(|b| layout.bands[b].folded);
+            if !vis[ci] && !self.cfg.board.hides(col.stage) && !folded {
+                continue;
+            }
+            for &i in &cols[ci] {
+                let c = &self.board.cards[i];
+                if out.iter().any(|r| r.index == i) {
+                    continue;
+                }
+                let held = self.holds(i);
+                let row = |wants, what: &str| CompactRow {
+                    index: i,
+                    wants,
+                    what: what.trim().to_string(),
+                };
+                if let Some(w) = self.waiting_on(&c.key) {
+                    let what = w.line.strip_prefix("asks you: ").unwrap_or(&w.line);
+                    out.push(row(Wants::Asks, what));
+                    continue;
+                }
+                match crate::family::on_you(c, &held) {
+                    Some(crate::family::OnYou::Blocked) => out.push(row(Wants::Failed, &c.why)),
+                    Some(crate::family::OnYou::Asking) => {
+                        let raw = c
+                            .detail
+                            .as_ref()
+                            .and_then(|d| d.attention.as_deref())
+                            .unwrap_or_default();
+                        let asks = !c.needs_you()
+                            || c.detail.is_none()
+                            || matches!(raw, "asking" | "question" | "needs_input")
+                            || c.why.trim_end().ends_with('?')
+                            || c.why.starts_with("asks");
+                        let what = if c.why.trim().is_empty() && held.needs > 0 {
+                            "something inside it needs you"
+                        } else {
+                            c.why.as_str()
+                        };
+                        out.push(row(if asks { Wants::Asks } else { Wants::Yours }, what));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        out
+    }
+
+    /// The compact list's cards, by index.
+    pub fn compact_cards(&self) -> Vec<usize> {
+        self.compact_rows().iter().map(|r| r.index).collect()
+    }
+
+    /// The selection on one of the compact list's cards, or on none: a key that acts only ever
+    /// acts on a card the list shows.
+    fn fix_compact_selection(&mut self) {
+        let list = self.compact_cards();
+        let on = self
+            .sel
+            .key
+            .as_ref()
+            .is_some_and(|k| list.iter().any(|&i| &self.board.cards[i].key == k));
+        if !on {
+            self.sel.key = list.first().map(|&i| self.board.cards[i].key.clone());
+        }
+        if let Some(c) = self.selected() {
+            self.sel.col = self.col_of(c);
+        }
+    }
+
+    /// A key on the compact list: j and k (or the arrows) move along it; keys that move between
+    /// columns have none to move to; every other key is the board's, on the card selected here.
+    fn compact_key(&mut self, key: KeyEvent) -> Action {
+        self.fix_compact_selection();
+        let list = self.compact_cards();
+        let at = self
+            .sel
+            .key
+            .as_ref()
+            .and_then(|k| list.iter().position(|&i| &self.board.cards[i].key == k));
+        // Past either end there's nowhere to go: the selection stays (Codex's review 85, 1).
+        let step = |dir: i32| -> Option<usize> {
+            let at = usize::try_from(at? as i64 + dir as i64).ok()?;
+            list.get(at).copied()
+        };
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down if !ctrl => {
+                if let Some(i) = step(1) {
+                    self.sel.key = Some(self.board.cards[i].key.clone());
+                }
+                Action::None
+            }
+            KeyCode::Char('k') | KeyCode::Up if !ctrl => {
+                if let Some(i) = step(-1) {
+                    self.sel.key = Some(self.board.cards[i].key.clone());
+                }
+                Action::None
+            }
+            KeyCode::Char('h' | 'l' | 'H' | 'L') | KeyCode::Left | KeyCode::Right if !ctrl => {
+                Action::None
+            }
+            _ => {
+                let action = self.board_key(key);
+                if self.compact() {
+                    self.fix_compact_selection();
+                }
+                action
             }
         }
     }
@@ -2448,6 +2705,13 @@ impl App {
         if self.seen_failure(&key) {
             return Action::None;
         }
+        // A window too small to draw this screen: only Esc, back towards one it can (Codex's
+        // review 86, 4), so no key acts on what he can't see.
+        let ctrl_c =
+            key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL);
+        if self.small_window() && !self.small_draws() && key.code != KeyCode::Esc && !ctrl_c {
+            return Action::None;
+        }
         // Esc on the board lets a running action's answer go: it still finishes, but neither asks
         // nor takes you anywhere, and a reopen or ⏎ waiting its turn is dropped. Anywhere else Esc
         // has its own job (no to a question, back from a peek), so waiting work keeps waiting,
@@ -2520,6 +2784,7 @@ impl App {
             return action;
         }
         match self.mode.clone() {
+            Mode::Board if self.compact() => self.compact_key(key),
             Mode::Board => self.board_key(key),
             Mode::Peek { scroll, back } => self.peek_key(key, scroll, back),
             Mode::Search(s) => self.search_key(key, s),
@@ -3605,6 +3870,387 @@ pub fn match_range(query: &str, text: &str) -> Option<(usize, usize)> {
 pub(crate) mod tests {
     use super::*;
 
+    /// The screen as rows of `w` characters.
+    fn rows_of(screen: &str, w: usize) -> Vec<String> {
+        let chars: Vec<char> = screen.chars().collect();
+        chars
+            .chunks(w)
+            .map(|r| r.iter().collect::<String>())
+            .collect()
+    }
+
+    #[test]
+    fn a_window_too_small_for_the_board_lists_what_needs_you_and_keys_act_only_on_that() {
+        // Intent 0591, K2-43, as the release 5 canvas draws it: under 32 columns, KERDR and the
+        // count, a rule, one row per card that needs you with a bar and a word in its colour, the
+        // words about it, a rule and the keys; a key that acts acts on the row selected there.
+        let mut app = demo_app();
+        app.width = 28;
+        app.height = 12;
+        assert!(app.compact());
+        let rows = app.compact_rows();
+        assert!(rows.len() >= 2, "the demo has work that needs you");
+        let first = app.board.cards[rows[0].index].clone();
+        let second = app.board.cards[rows[1].index].clone();
+        // Selected elsewhere (a card the list doesn't show): any key moves it onto the list first.
+        let elsewhere = app
+            .board
+            .cards
+            .iter()
+            .find(|c| {
+                !app.compact_cards()
+                    .contains(&app.card_index(&c.key).unwrap())
+                    && app
+                        .card_index(&c.key)
+                        .is_some_and(|i| app.shown_on_board(i))
+            })
+            .unwrap()
+            .key
+            .clone();
+        app.sel.key = Some(elsewhere);
+        press(&mut app, 'j');
+        assert_eq!(app.sel.key.as_deref(), Some(second.key.as_str()));
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key.as_deref(), Some(first.key.as_str()));
+        press_code(&mut app, KeyCode::Right);
+        assert_eq!(
+            app.sel.key.as_deref(),
+            Some(first.key.as_str()),
+            "no columns to move to"
+        );
+        let screen = rows_of(&crate::ui::tests_render(&app, 28, 12), 28);
+        assert!(screen[0].starts_with("KERDR"), "{screen:?}");
+        assert!(
+            screen[0]
+                .trim_end()
+                .ends_with(&format!("{} need you", rows.len())),
+            "{screen:?}"
+        );
+        assert!(screen[1].starts_with("────"), "{screen:?}");
+        let word = |w: Wants| match w {
+            Wants::Asks => "asks",
+            Wants::Failed => "failed",
+            Wants::Yours => "yours",
+        };
+        assert!(
+            screen[2].starts_with(&format!("▌ {}", first.reference.trim_start_matches('#'))),
+            "{screen:?}"
+        );
+        assert!(
+            screen[2].trim_end().ends_with(word(rows[0].wants)),
+            "{screen:?}"
+        );
+        assert!(screen.iter().all(|r| r.chars().count() == 28));
+        let all = screen.join("\n");
+        assert!(all.contains("The cards that need you."), "{all}");
+        assert!(screen[10].starts_with("────"), "{screen:?}");
+        assert!(
+            screen[11].starts_with("⏎ go in   j k move   ? keys"),
+            "{screen:?}"
+        );
+        // A message takes the keys' place while it's up.
+        app.say("Reading #45's text…", Tone::Info);
+        let screen = rows_of(&crate::ui::tests_render(&app, 28, 12), 28);
+        assert!(screen[11].starts_with("Reading #45's text…"), "{screen:?}");
+        assert!(
+            screen.join("\n").contains("The cards that need you."),
+            "{screen:?}"
+        );
+        app.message = None;
+        // ⏎ acts on the card selected in the list.
+        assert_eq!(
+            press_code(&mut app, KeyCode::Enter),
+            app.jump_action(first.key.clone())
+        );
+        // A bigger window: the board as ever.
+        app.width = 120;
+        app.height = 40;
+        assert!(!app.compact());
+    }
+
+    #[test]
+    fn j_and_k_past_either_end_of_the_compact_list_stay_where_they_are() {
+        // Codex's review 85, 1: k on the first row, j on the last, and either on a list of one.
+        let mut app = demo_app();
+        app.width = 28;
+        app.height = 12;
+        let list = app.compact_cards();
+        let key = |app: &App, i: usize| app.board.cards[i].key.clone();
+        let (first, last) = (key(&app, list[0]), key(&app, *list.last().unwrap()));
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key, Some(first.clone()));
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key, Some(first.clone()), "k on the first row");
+        for _ in 0..list.len() + 2 {
+            press(&mut app, 'j');
+        }
+        assert_eq!(app.sel.key, Some(last), "j on the last row");
+        // A list of one: only the first card still needs you.
+        for (n, i) in list.iter().enumerate().skip(1) {
+            app.board.cards[*i].attention = crate::model::Attention::Idle;
+            app.board.cards[*i].why = format!("quiet {n}");
+        }
+        app.waiting.clear();
+        let list = app.compact_cards();
+        assert_eq!(list.len(), 1, "one card left: {list:?}");
+        press_code(&mut app, KeyCode::Down);
+        press_code(&mut app, KeyCode::Up);
+        press(&mut app, 'j');
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key, Some(key(&app, list[0])));
+    }
+
+    #[test]
+    fn in_a_small_window_no_answer_acts_on_a_question_before_all_of_it_was_on_screen() {
+        // Codex's review 85, 2: the question is the window, its words and its answers; y and ⏎
+        // show the next page until every part has been shown, and only then answer it. With no
+        // room for any of it, they never do.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.width = 28;
+        app.height = 8;
+        let words: Vec<String> = (1..=90).map(|n| format!("word{n}")).collect();
+        let message = format!("Start it past the session's limit? {}", words.join(" "));
+        let card = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.is_some() && crate::app::controls::waiting_work(c))
+            .unwrap()
+            .clone();
+        let (machine, id) = (card.machine_index, card.detail.as_ref().unwrap().id.clone());
+        let asking = |app: &mut App| {
+            app.mode = Mode::Confirm {
+                machine,
+                request: serde_json::json!({"action": "dispatch", "id": id, "confirm": "0123456789abcdef"}),
+                title: "Start it?".into(),
+                message: message.clone(),
+                back: Box::new(Mode::Board),
+                target: None,
+                queue: false,
+                ready_at: None,
+                plain: false,
+                choices: vec![],
+                enter_queues: false,
+            };
+        };
+        asking(&mut app);
+        let mut seen = String::new();
+        let mut presses = 0;
+        let answered = loop {
+            seen.push_str(&crate::ui::tests_render(&app, 28, 8));
+            // Past the half second a new page holds its answers back for.
+            settle(&mut app);
+            let action = press(&mut app, 'y');
+            presses += 1;
+            if !matches!(app.mode, Mode::Confirm { .. }) {
+                break action;
+            }
+            assert_eq!(action, Action::None);
+            assert!(presses < 50, "never answered");
+        };
+        assert!(presses > 2, "it took a page at a time: {presses}");
+        for w in &words {
+            assert!(seen.contains(w.as_str()), "{w} was never on screen");
+        }
+        assert!(
+            seen.contains("Enter / y: start anyway"),
+            "its answers were shown"
+        );
+        assert!(
+            matches!(answered, Action::Mutate { .. }),
+            "{answered:?} {:?}",
+            app.message()
+        );
+        // A window with no row for its words: y never answers; n still leaves.
+        app.height = 1;
+        asking(&mut app);
+        for _ in 0..5 {
+            crate::ui::tests_render(&app, 28, 1);
+            settle(&mut app);
+            assert_eq!(press(&mut app, 'y'), Action::None);
+        }
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn a_screen_a_small_window_cant_draw_takes_neither_keys_nor_a_terminal_paste() {
+        // Codex's review 88, 4: the guard on keys covers a terminal's paste too. The new-intent
+        // box (an edit opened inside Kerdr uses the same one) in a window too small to draw it:
+        // typing and a bracketed paste both leave the words as they were; Esc still goes back.
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        app.on_paste("Before");
+        app.width = 28;
+        app.height = 8;
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert_eq!(box_words(&app), "Before", "a key went in");
+        assert_eq!(app.on_paste(" pasted unseen"), Action::None);
+        assert_eq!(box_words(&app), "Before", "a terminal paste went in");
+        assert_eq!(
+            app.on_paste("/tmp/shot.png"),
+            Action::None,
+            "a pasted path read"
+        );
+        assert!(app.image_reads.is_empty());
+        app.width = 120;
+        app.height = 40;
+        app.on_paste(" seen");
+        assert_eq!(box_words(&app), "Before seen", "a big window takes it");
+        app.width = 28;
+        press_code(&mut app, KeyCode::Esc);
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn every_question_in_a_small_window_is_read_whole_before_an_answer_acts_and_a_resize_too() {
+        // Codex's review 86, 4: the smaller-copy question is over the new-intent box, not the
+        // board; in a small window it's drawn whole and gated as any other. A question that fit a
+        // big window, resized small while it's open, is gated again. A screen the window can't
+        // draw takes only Esc.
+        let big = crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 25_000_000]].concat(),
+            from: "The clipboard's image".into(),
+        };
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        app.attach_images(crate::images::Loading {
+            images: vec![big.clone()],
+            ..Default::default()
+        });
+        assert!(
+            matches!(&app.mode, Mode::Confirm { back, .. } if matches!(**back, Mode::Compose { .. }))
+        );
+        app.width = 28;
+        app.height = 8;
+        let mut presses = 0;
+        let answered = loop {
+            crate::ui::tests_render(&app, 28, 8);
+            settle(&mut app);
+            let action = press(&mut app, 'y');
+            presses += 1;
+            if !matches!(app.mode, Mode::Confirm { .. }) {
+                break action;
+            }
+            assert!(presses < 30, "never answered");
+        };
+        assert!(presses > 1, "answered before its words were shown");
+        assert!(matches!(answered, Action::LoadImages(_)), "{answered:?}");
+        // Asked in a big window, where it fits whole; the window shrinks while it's open.
+        if let Mode::Compose { .. } = app.mode {
+        } else {
+            panic!("{:?}", app.mode)
+        }
+        app.image_reads.clear();
+        app.width = 120;
+        app.height = 40;
+        app.attach_images(crate::images::Loading {
+            images: vec![big],
+            ..Default::default()
+        });
+        crate::ui::tests_render(&app, 120, 40);
+        assert!(!app.question_view.unseen(), "whole in the big window");
+        app.width = 28;
+        app.height = 6;
+        crate::ui::tests_render(&app, 28, 6);
+        settle(&mut app);
+        assert_eq!(
+            press(&mut app, 'y'),
+            Action::None,
+            "not taken unseen after the resize"
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        // Typing into a box he can't see does nothing; Esc still leaves it.
+        press(&mut app, 'n');
+        assert!(matches!(app.mode, Mode::Compose { .. }));
+        let before = box_words(&app);
+        assert_eq!(press(&mut app, 'x'), Action::None);
+        assert_eq!(box_words(&app), before);
+        let shown = crate::ui::tests_render(&app, 28, 6);
+        assert!(
+            shown.contains("needs a bigger") && shown.contains("Esc goes back."),
+            "{shown}"
+        );
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(matches!(app.mode, Mode::Board));
+    }
+
+    #[test]
+    fn a_short_window_says_what_each_card_wants_and_a_question_is_answered_there() {
+        // Intent 0591, K2-43: wide but under 10 rows, each row also says what its card wants; a
+        // question open over the board is on its card's row, with its own keys in the hints.
+        let mut app = demo_app();
+        app.width = 90;
+        app.height = 7;
+        let rows = app.compact_rows();
+        let first = app.board.cards[rows[0].index].clone();
+        press(&mut app, 'j');
+        press(&mut app, 'k');
+        let screen = rows_of(&crate::ui::tests_render(&app, 90, 7), 90);
+        assert!(
+            screen[0].starts_with(&format!("KERDR   {} need you", rows.len())),
+            "{screen:?}"
+        );
+        assert!(
+            screen[0].contains("Make the window taller for the board."),
+            "{screen:?}"
+        );
+        let said = match rows[0].wants {
+            Wants::Asks => "asks: ",
+            Wants::Failed => "failed: ",
+            Wants::Yours => "waits on you: ",
+        };
+        assert!(
+            screen[1].starts_with(&format!("▌ {}", first.reference.trim_start_matches('#'))),
+            "{screen:?}"
+        );
+        assert!(screen[1].contains(said), "{screen:?}");
+        assert!(
+            screen[6].starts_with("⏎ go in   j k move   ? keys"),
+            "{screen:?}"
+        );
+        // A question over the board takes the whole window (Codex's review 85, 2).
+        app.mode = Mode::Confirm {
+            machine: 0,
+            request: serde_json::json!({"action": "dispatch", "id": "x"}),
+            title: "Start?".into(),
+            message: "Start it past the session's limit, queue it, or shelve the oldest?".into(),
+            back: Box::new(Mode::Board),
+            target: Some(Box::new(crate::model::CardSnapshot::of(&first))),
+            queue: false,
+            ready_at: None,
+            plain: true,
+            choices: vec![],
+            enter_queues: false,
+        };
+        let screen = rows_of(&crate::ui::tests_render(&app, 90, 7), 90).join("\n");
+        assert!(
+            screen.contains("Start it past the session's limit, queue it, or shelve the oldest?"),
+            "{screen}"
+        );
+        assert!(screen.contains("Enter / y: start anyway"), "{screen}");
+    }
+
+    #[test]
+    fn a_config_that_half_parses_opens_the_board_saying_what_was_left_out() {
+        // Intent 0591, K3-67: the board opens, and the failure box says the line at fault.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[board]\nslots = 4\nslotz = 5\n").unwrap();
+        let cfg = Config::load_from(&path).expect("the board opens");
+        assert_eq!(cfg.board.slots, 4);
+        let mut app = App::new(cfg, crate::demo::machines(false));
+        app.say_config_problems();
+        let (said, tone) = app.message().expect("said on the board");
+        assert_eq!(tone, Tone::Fail);
+        assert!(said.starts_with("Kerdr's config, "), "{said}");
+        assert!(said.contains("line 3: unknown field `slotz`"), "{said}");
+        assert!(said.contains("opened with the rest"), "{said}");
+    }
+
     #[test]
     fn a_cycles_provider_directly_even_when_current_filter_leaves_board_empty() {
         let mut app = App::new(Config::default(), crate::demo::machines(false));
@@ -3890,9 +4536,16 @@ pub(crate) mod tests {
         let mut app = demo_app();
         assert_eq!(app.key_wait(), KEY_WAIT);
         // An image being read.
-        app.image_load = Some(1);
+        app.image_reads.push_back(crate::app::ImageRead {
+            id: 1,
+            at: 0,
+            for_send: false,
+            started: Instant::now(),
+            what: "Reading the clipboard",
+            got: None,
+        });
         assert_eq!(app.key_wait(), KEY_WAIT_COMING);
-        app.image_load = None;
+        app.image_reads.clear();
         // An answer on its way, until it comes.
         let (key, id) = waiting_backlog_card(&app);
         let request = serde_json::json!({"action": "move", "id": id, "delta": 1});
@@ -5130,6 +5783,7 @@ pub(crate) mod tests {
         let none = || crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         let type_in = |app: &mut App, words: &str| {
             press(app, 'c');
@@ -5440,8 +6094,10 @@ pub(crate) mod tests {
             images: vec![crate::images::Loaded {
                 media_type: "image/png",
                 bytes: png.clone(),
+                ..Default::default()
             }],
             why: None,
+            ..Default::default()
         };
         let mut app = demo_app();
         app.cfg.actions.command = Some("test-adapter".into());
@@ -5461,8 +6117,6 @@ pub(crate) mod tests {
         let (id, room) = app.begin_image_load(&Source::Clipboard).unwrap();
         assert_eq!(room, crate::images::Room::left(&[]));
         assert_eq!(app.message().unwrap().0, "Reading the clipboard…");
-        // While it reads, a second read waits its turn.
-        assert!(app.begin_image_load(&Source::Clipboard).is_none());
         // Words typed while it reads come after the tag, where it was pasted.
         for c in " again".chars() {
             press(&mut app, c);
@@ -5635,8 +6289,10 @@ pub(crate) mod tests {
             images: vec![crate::images::Loaded {
                 media_type: "image/png",
                 bytes: png,
+                ..Default::default()
             }],
             why: None,
+            ..Default::default()
         };
         let Action::Mutate { request, .. } = app.images_loaded(id, loaded) else {
             panic!("the words weren't sent once the image was in")
@@ -5653,6 +6309,7 @@ pub(crate) mod tests {
         let none = crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
         // Whether they go without it is his call (intent 0591, K1-37); they're kept meanwhile.
@@ -5695,6 +6352,7 @@ pub(crate) mod tests {
         let none = crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
         assert_eq!(
@@ -5728,6 +6386,7 @@ pub(crate) mod tests {
         let none = crate::images::Loading {
             images: vec![],
             why: Some("The clipboard holds no image.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, none), Action::None);
         // Never asked over the words he's typing, where a y or ⏎ meant for them would send these
@@ -5772,6 +6431,7 @@ pub(crate) mod tests {
         crate::images::Loaded {
             media_type: "image/png",
             bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+            ..Default::default()
         }
     }
 
@@ -5798,6 +6458,7 @@ pub(crate) mod tests {
         let loading = crate::images::Loading {
             images: vec![a_png()],
             why: None,
+            ..Default::default()
         };
         let Action::Mutate { request, .. } = app.images_loaded(id, loading) else {
             panic!("the words weren't sent once the image was in")
@@ -5875,6 +6536,7 @@ pub(crate) mod tests {
         let loading = crate::images::Loading {
             images: vec![a_png()],
             why: None,
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
         let Mode::Confirm { message, .. } = &app.mode else {
@@ -5893,6 +6555,7 @@ pub(crate) mod tests {
         let loading = crate::images::Loading {
             images: vec![a_png()],
             why: Some("photo.heic isn't an image Kerdr can send.".into()),
+            ..Default::default()
         };
         assert_eq!(app.images_loaded(id, loading), Action::None);
         let Mode::Confirm { message, .. } = &app.mode else {
@@ -5954,6 +6617,739 @@ pub(crate) mod tests {
         assert_eq!(app.resolver.unanswered(), 0);
     }
 
+    /// The demo with every machine's backend fixing input (intent 0591, release 5).
+    fn fixing_app() -> App {
+        let mut app = demo_app();
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        app
+    }
+
+    fn box_words(app: &App) -> String {
+        match &app.mode {
+            Mode::Compose { draft, .. } => draft.words.clone(),
+            m => panic!("the box isn't open: {m:?}"),
+        }
+    }
+
+    fn box_images(app: &App) -> usize {
+        match &app.mode {
+            Mode::Compose { draft, .. } => draft.images.len(),
+            m => panic!("the box isn't open: {m:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_read_asked_while_one_goes_is_read_next_and_both_go_in_in_order() {
+        // Intent 0591, K1-35: never "still reading"; each read starts at once, so it reads what
+        // the clipboard held when it was asked (Codex's review 85, 4), and what they found goes in
+        // in the order they were asked, each tag where the words ended when it was pasted,
+        // whichever comes back first.
+        use crate::images::Source;
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        for c in "Shots:".chars() {
+            press(&mut app, c);
+        }
+        let (first, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        for c in " one".chars() {
+            press(&mut app, c);
+        }
+        let (second, _) = app
+            .begin_image_load(&Source::Clipboard)
+            .expect("the second read starts at once");
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("it goes in after the last"),
+            "{:?}",
+            app.message()
+        );
+        for c in " two".chars() {
+            press(&mut app, c);
+        }
+        let png = || crate::images::Loading {
+            images: vec![a_png()],
+            ..Default::default()
+        };
+        // The second's answer comes first: it waits for the first.
+        app.images_loaded(second, png());
+        assert_eq!(box_words(&app), "Shots: one two");
+        app.images_loaded(first, png());
+        assert_eq!(box_words(&app), "Shots: [Image #1] one [Image #2] two");
+        // Enter while both are still to come: the words go once both are in.
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.on_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL));
+        for c in "Again:".chars() {
+            press(&mut app, c);
+        }
+        let (a, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        let (b, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        assert_eq!(
+            app.images_loaded(a, png()),
+            Action::None,
+            "the second is still to come"
+        );
+        let Action::Mutate { request, .. } = app.images_loaded(b, png()) else {
+            panic!("not sent once both were in")
+        };
+        assert_eq!(request["words"], "Again: [Image #1] [Image #2]");
+        assert_eq!(request["images"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn what_a_request_carries_is_checked_against_the_backend_it_reaches_as_it_goes() {
+        // Codex's review 85, 6: images kept from a box made for a backend that fixes input (a TIFF,
+        // and more than twenty) aren't sent to an older one, from the box or at the last moment;
+        // `fix_input` goes to every request for one that fixes input, an account's included, and
+        // never to another.
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(crate::images::FIX_INPUT.into());
+        assert!(app.fixes_input(0) && !app.fixes_input(1));
+        let tiff = crate::images::Loaded {
+            media_type: "image/tiff",
+            bytes: [b"II*\0".to_vec(), vec![0; 60]].concat(),
+            ..Default::default()
+        };
+        press(&mut app, 'c');
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = 0;
+        }
+        for c in "Scan:".chars() {
+            press(&mut app, c);
+        }
+        app.attach_images(crate::images::Loading {
+            images: vec![tiff],
+            ..Default::default()
+        });
+        assert_eq!(box_images(&app), 1);
+        // Kept, and opened again for the older machine.
+        app.on_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        press(&mut app, 'c');
+        if let Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = 1;
+        }
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.contains(
+                "takes only PNG, JPEG, GIF and WebP images, and [Image #1] is a TIFF image"
+            ),
+            "{said}"
+        );
+        assert!(app.draft.starts_with("Scan:"), "the words are kept");
+        // A request that reaches its handing-over by another way (the hold file, a resend on to
+        // another machine) is checked there too: nothing is handed over, and it's answered.
+        use base64::Engine;
+        let tiff = base64::engine::general_purpose::STANDARD
+            .encode([b"II*\0".to_vec(), vec![0; 60]].concat());
+        let png =
+            base64::engine::general_purpose::STANDARD.encode(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR");
+        let images: Vec<serde_json::Value> = (1..=21)
+            .map(|tag| serde_json::json!({"tag": tag, "type": "image/png", "data": png}))
+            .collect();
+        for (n, sent) in [
+            serde_json::json!([{"tag": 1, "type": "image/tiff", "data": tiff}]),
+            serde_json::Value::Array(images),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let request = serde_json::json!({"action": "create", "words": format!("Late {n} [Image #1]"),
+                "session": "default", "submission": format!("s-late-{n}"), "images": sent});
+            app.queue_action(1, request);
+            let handed = app.hand_over();
+            assert!(handed.is_empty(), "{n}: handed over to an older backend");
+            assert!(
+                app.message().unwrap().0.contains("nothing was sent"),
+                "{:?}",
+                app.message()
+            );
+            app.message = None;
+        }
+        // To the backend that fixes input, the same go, with `fix_input`.
+        let request = serde_json::json!({"action": "create", "words": "Fine [Image #1]",
+            "session": "default", "submission": "s-fine", "images": [{"tag": 1, "type": "image/tiff", "data": tiff}]});
+        app.queue_action(0, request);
+        let handed = app.hand_over();
+        assert_eq!(handed.len(), 1);
+        assert_eq!(handed[0].2["fix_input"], true);
+        // An account's request too; none to an older backend, nor `base`.
+        let account = serde_json::json!({"action": "account-test", "code": "ARK_C"});
+        assert_eq!(app.with_fix_input(0, account.clone())["fix_input"], true);
+        let older = app.with_fix_input(1, serde_json::json!({"action": "edit", "id": "1", "text": "t", "base": "b", "fix_input": true}));
+        assert!(older.get("fix_input").is_none() && older.get("base").is_none());
+    }
+
+    #[test]
+    fn a_request_sent_on_to_a_machine_kerdr_doesnt_know_goes_as_to_an_older_backend() {
+        // Codex's review 86, 5: only the machine that sends it on lists fix-input; where it goes
+        // isn't one of Kerdr's machines, so nothing says it takes more than 0.35.0 did.
+        use base64::Engine;
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        app.machines[0]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(crate::images::FIX_INPUT.into());
+        let tiff = base64::engine::general_purpose::STANDARD
+            .encode([b"II*\0".to_vec(), vec![0; 60]].concat());
+        let onward = serde_json::json!({"action": "edit", "id": "0045", "text": "t", "base": "b",
+            "was": "sha256:aa", "forward_to": "far-away"});
+        let sent = app.with_fix_input(0, onward.clone());
+        assert!(
+            sent.get("fix_input").is_none() && sent.get("base").is_none(),
+            "{sent}"
+        );
+        let create = serde_json::json!({"action": "create", "words": "Scan [Image #1]",
+            "session": "default", "submission": "s-far", "forward_to": "far-away",
+            "images": [{"tag": 1, "type": "image/tiff", "data": tiff}]});
+        let why = app.fits_backend(0, &create).unwrap_err();
+        assert!(
+            why.contains("takes only PNG, JPEG, GIF and WebP images"),
+            "{why}"
+        );
+        // Sent on to one Kerdr knows fixes input: as to it.
+        app.machines[1]
+            .feed
+            .as_mut()
+            .unwrap()
+            .supports
+            .push(crate::images::FIX_INPUT.into());
+        let known = app.machines[1].name();
+        let mut there = onward;
+        there["forward_to"] = serde_json::json!(known);
+        assert_eq!(app.with_fix_input(0, there)["fix_input"], true);
+    }
+
+    #[test]
+    fn a_folder_cut_short_by_its_limits_asks_before_words_sent_with_enter_go_without_the_rest() {
+        // Codex's review 86, 8: a folder of 101 images, one more than Kerdr reads from a folder,
+        // pasted, and Enter pressed before it's all read. What didn't go in is said, and whether
+        // the words go without it is his call, as for any image that didn't go in.
+        use crate::images::Source;
+        let dir = tempfile::tempdir().unwrap();
+        let folder = dir.path().join("shots");
+        std::fs::create_dir(&folder).unwrap();
+        for n in 0..101 {
+            std::fs::write(folder.join(format!("{n:03}.png")), &a_png().bytes).unwrap();
+        }
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste("Look at these");
+        let source = Source::Files(vec![folder]);
+        let (id, room) = app.begin_image_load(&source).unwrap();
+        assert_eq!(press_code(&mut app, KeyCode::Enter), Action::None);
+        assert!(app.send_after_load.is_some(), "{:?}", app.message());
+        let action = app.images_loaded(id, source.load(room));
+        assert!(
+            !matches!(action, Action::Mutate { .. }),
+            "sent without asking: {action:?}"
+        );
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("no question: {:?} {:?}", app.mode, app.message());
+        };
+        assert!(
+            message.contains("holds more than Kerdr looks through at once"),
+            "{message}"
+        );
+        assert!(message.contains("without it?"), "{message}");
+    }
+
+    #[test]
+    fn copied_text_that_doesnt_fit_the_box_is_kept_and_stops_a_send() {
+        // Codex's review 85, 5: what fits goes in, cut between characters, never inside one; the
+        // rest is kept for c, said; and words Enter sent while it was read aren't sent without it.
+        use crate::images::Source;
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        let room = 1_000_000 - 5;
+        app.on_paste(&"w".repeat(room));
+        let euros = "€".repeat(10); // three bytes each: the room ends inside the second
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            id,
+            crate::images::Loading {
+                text: Some(euros.clone()),
+                ..Default::default()
+            },
+        );
+        let words = box_words(&app);
+        assert!(words.ends_with('€'), "cut inside a character?");
+        let went = words.len() - room - 1;
+        assert_eq!(went % 3, 0);
+        let kept = app.returned.back().expect("the rest is kept").words.clone();
+        assert_eq!(format!("{}{kept}", &words[room + 1..]), euros);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Warn);
+        assert!(
+            said.contains("the rest is kept, and c brings it back"),
+            "{said}"
+        );
+        // Sent with Enter while it was read: not sent, asked.
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste(&"w".repeat(room));
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let sent = app.images_loaded(
+            id,
+            crate::images::Loading {
+                text: Some(euros.clone()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(sent, Action::None, "never sent cut short");
+        let Mode::Confirm { message, .. } = &app.mode else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert!(message.contains("the rest is kept"), "{message}");
+        assert!(app.returned.iter().any(|r| euros.ends_with(&r.words)));
+    }
+
+    #[test]
+    fn a_read_that_stalls_is_let_go_at_its_deadline_and_the_next_paste_goes_in() {
+        // Codex's review 85, 8: a read that never ends (a mount that doesn't answer) ends in a
+        // line on the board within its deadline; the box, and the reads after it, never wait on it.
+        use crate::images::Source;
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        for c in "Shots:".chars() {
+            press(&mut app, c);
+        }
+        let (stalled, _) = app
+            .begin_image_load(&Source::Files(vec!["/mnt/slow/shot.png".into()]))
+            .unwrap();
+        let (next, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            next,
+            crate::images::Loading {
+                images: vec![a_png()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Shots:", "waits for the one before it");
+        // Its deadline passes, as the board's next turn sees it.
+        app.image_reads[0].started -= crate::images::read_most("Reading the image");
+        app.apply_reads();
+        assert_eq!(box_words(&app), "Shots: [Image #1] ");
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.contains("Reading the image took longer than 20 seconds"),
+            "{said}"
+        );
+        assert!(app.image_reads.is_empty());
+        // What it finds later goes nowhere.
+        app.images_loaded(
+            stalled,
+            crate::images::Loading {
+                images: vec![a_png()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_images(&app), 1);
+    }
+
+    #[test]
+    fn each_paste_reads_what_the_clipboard_held_when_it_was_pasted() {
+        // Codex's review 85, 4: while a slow read goes, he copies B and pastes, then copies C and
+        // pastes. Each read starts as he pastes, so B's read reads B, and all three go in in order.
+        use crate::images::Source;
+        let clipboard = std::cell::RefCell::new("A".to_string());
+        // As the board's loop does: a read that begins starts its reader at once, and what the
+        // reader finds is what the clipboard holds as it starts.
+        let started: std::cell::RefCell<Vec<(u64, String)>> = Default::default();
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        let paste = |app: &mut App| {
+            let (id, _) = app
+                .begin_image_load(&Source::Clipboard)
+                .expect("a read starts as he pastes");
+            started.borrow_mut().push((id, clipboard.borrow().clone()));
+        };
+        paste(&mut app);
+        *clipboard.borrow_mut() = "B".into();
+        paste(&mut app);
+        *clipboard.borrow_mut() = "C".into();
+        paste(&mut app);
+        // The readers finish, the slow first one last.
+        let finished: Vec<(u64, String)> = started.borrow().iter().rev().cloned().collect();
+        for (id, text) in finished {
+            app.images_loaded(
+                id,
+                crate::images::Loading {
+                    text: Some(format!("<{text}>")),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(box_words(&app), "<A> <B> <C>");
+    }
+
+    #[test]
+    fn a_backend_that_fixes_input_takes_more_than_twenty_images_and_long_words() {
+        // Intent 0591, K1-36, K3-53: no count, and no tag refused for the words' room, while the
+        // images fit 20 MB together; the box takes words past 0.35.0's 48,000 characters.
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        let image = |n: usize| crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; n]].concat(),
+            ..Default::default()
+        };
+        let long = "x".repeat(60_000);
+        app.on_paste(&long);
+        assert_eq!(box_words(&app).len(), 60_000);
+        app.attach_images(crate::images::Loading {
+            images: (0..30).map(|_| image(10)).collect(),
+            ..Default::default()
+        });
+        assert_eq!(box_images(&app), 30);
+        let (said, tone) = app.message().unwrap();
+        assert_eq!(tone, Tone::Good, "{said}");
+        assert!(box_words(&app).ends_with("[Image #30] "));
+        // An older backend keeps 0.35.0's limits, and says when a paste is cut.
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        app.on_paste(&long);
+        assert_eq!(box_words(&app).len(), 48_000);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .contains("Only the first 48 KB of that paste went in")
+        );
+    }
+
+    #[test]
+    fn yes_to_a_smaller_copy_keeps_it_where_it_was_pasted_before_what_was_pasted_after_it() {
+        // Codex's review 86, 9: A, too large, then B, ordinary, pasted at the same place. B waits
+        // while A's question is open; yes to A's smaller copy, and A still comes before B.
+        use crate::images::{Loaded, Loading, Source};
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        app.on_paste("See");
+        let big = Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 25_000_000]].concat(),
+            from: "a.png".into(),
+        };
+        let smaller = Loaded {
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![7; 100]].concat(),
+            ..big.clone()
+        };
+        let b = Loaded {
+            from: "b.png".into(),
+            ..a_png()
+        };
+        let (a_read, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        let (b_read, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            a_read,
+            Loading {
+                images: vec![big],
+                ..Default::default()
+            },
+        );
+        assert!(matches!(app.mode, Mode::Confirm { .. }), "A asked about");
+        app.images_loaded(
+            b_read,
+            Loading {
+                images: vec![b.clone()],
+                ..Default::default()
+            },
+        );
+        answer_now(&mut app);
+        let Action::LoadImages(source) = press(&mut app, 'y') else {
+            panic!("yes read nothing")
+        };
+        // As the board's loop does: the read begins at once, and what's waiting goes in meanwhile.
+        let (id, _) = app.begin_image_load(&source).unwrap();
+        app.apply_reads();
+        app.images_loaded(
+            id,
+            Loading {
+                images: vec![smaller.clone()],
+                ..Default::default()
+            },
+        );
+        app.apply_reads();
+        assert_eq!(box_words(&app), "See [Image #1] [Image #2] ");
+        let Mode::Compose { draft, .. } = &app.mode else {
+            unreachable!()
+        };
+        let tagged = |n: u32| {
+            draft
+                .images
+                .iter()
+                .find(|i| i.tag == n)
+                .unwrap()
+                .bytes
+                .len()
+        };
+        assert_eq!(
+            (tagged(1), tagged(2)),
+            (smaller.bytes.len(), b.bytes.len()),
+            "B went in before A"
+        );
+    }
+
+    #[test]
+    fn an_image_past_what_an_intent_may_carry_is_asked_about_before_a_smaller_copy_goes_in() {
+        // Intent 0591, K3-54, K3-55: never shrunk without asking; yes reads a smaller copy, its
+        // tag where the image's would have gone, and no leaves it out, the image as it was.
+        use crate::images::Source;
+        let mut app = fixing_app();
+        press(&mut app, 'c');
+        for c in "Look:".chars() {
+            press(&mut app, c);
+        }
+        let big = crate::images::Loaded {
+            media_type: "image/png",
+            bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; 25_000_000]].concat(),
+            from: "The clipboard's image".into(),
+        };
+        app.attach_images(crate::images::Loading {
+            images: vec![big.clone()],
+            ..Default::default()
+        });
+        let Mode::Confirm { title, message, .. } = app.mode.clone() else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert_eq!(title, "Attach a smaller copy?");
+        assert!(
+            message.contains("The clipboard's image (PNG, 25 MB) is past the 20 MB one intent's images may be together"),
+            "{message}"
+        );
+        assert!(message.contains("It may lose fine detail"), "{message}");
+        answer_now(&mut app);
+        let Action::LoadImages(source) = press(&mut app, 'y') else {
+            panic!("yes read nothing")
+        };
+        assert_eq!(source, Source::Smaller(vec![big.clone()], "Look:".len()));
+        assert_eq!(box_images(&app), 0, "nothing went in yet");
+        // The copy goes in where the image would have gone, words typed since after it.
+        for c in " again".chars() {
+            press(&mut app, c);
+        }
+        let (id, _) = app.begin_image_load(&source).unwrap();
+        assert_eq!(app.message().unwrap().0, "Making a smaller copy…");
+        app.images_loaded(
+            id,
+            crate::images::Loading {
+                images: vec![a_png()],
+                notes: vec!["The clipboard's image went in as a smaller copy.".into()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Look: [Image #1] again");
+        // A read after one that's asked about waits for the answer, then goes in (K1-35).
+        let first = app.begin_image_load(&Source::Clipboard).unwrap().0;
+        let (second, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            second,
+            crate::images::Loading {
+                text: Some("after".into()),
+                ..Default::default()
+            },
+        );
+        app.images_loaded(
+            first,
+            crate::images::Loading {
+                images: vec![big.clone()],
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(app.mode, Mode::Confirm { .. }),
+            "asked about the first"
+        );
+        assert_eq!(app.image_reads.len(), 1, "the second waits for the answer");
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        app.apply_reads();
+        assert!(app.image_reads.is_empty(), "and goes once it's answered");
+        assert!(box_words(&app).ends_with("after"), "{}", box_words(&app));
+        // No: left out, said.
+        app.attach_images(crate::images::Loading {
+            images: vec![big],
+            ..Default::default()
+        });
+        assert!(matches!(app.mode, Mode::Confirm { .. }));
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        assert_eq!(box_images(&app), 1);
+        assert!(
+            app.message()
+                .unwrap()
+                .0
+                .starts_with("Left out The clipboard's image.")
+        );
+    }
+
+    #[test]
+    fn the_clipboards_text_goes_into_the_words_where_it_was_pasted() {
+        // Intent 0591, K3-61.
+        use crate::images::Source;
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        for c in "Error:".chars() {
+            press(&mut app, c);
+        }
+        let (id, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        for c in " fix it".chars() {
+            press(&mut app, c);
+        }
+        app.images_loaded(
+            id,
+            crate::images::Loading {
+                text: Some("disk full\nat boot".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(box_words(&app), "Error: disk full\nat boot fix it");
+        assert_eq!(app.message().unwrap().0, "Pasted the copied text.");
+    }
+
+    #[test]
+    fn a_new_intent_past_64_kib_goes_to_a_backend_that_fixes_input_and_comes_back_from_one_that_doesnt()
+     {
+        // Intent 0591, K1-68: up to 32 MiB to a backend that fixes input; an older one keeps
+        // 0.35.0's limit, the words given back and said.
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste(&"word ".repeat(40_000));
+        let Action::Mutate { request, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("not sent: {:?}", app.message())
+        };
+        assert!(request["words"].as_str().unwrap().len() > 64 * 1024);
+        let mut app = demo_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        app.on_paste(&"\u{1}".repeat(20_000));
+        assert_eq!(
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+            Action::None
+        );
+        let said = app.message().unwrap().0.to_string();
+        assert!(
+            said.contains("too large to send (64 KiB at most)"),
+            "{said}"
+        );
+        assert_eq!(app.draft.chars().count(), 20_000, "the words are kept");
+    }
+
+    #[test]
+    fn a_new_intent_with_a_line_like_a_secret_is_asked_about_and_yes_sends_the_same_words() {
+        // Intent 0591, release 5 (B1-64): its backend asks "Line N looks like a token or
+        // password. Save with it replaced by [redacted]?"; yes sends the same send again, words
+        // and images as kept, with the question's token; no opens the words in the box, unsent.
+        let question = || {
+            Ok(crate::actions::Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("0123456789abcdef".into()),
+                redact: vec![1],
+                message:
+                    "Line 1 looks like a token or password. Save with it replaced by [redacted]?"
+                        .into(),
+                ..Default::default()
+            })
+        };
+        let mut app = fixing_app();
+        app.cfg.actions.command = Some("test-adapter".into());
+        press(&mut app, 'c');
+        for c in "Use ghp_abcdefghijklmnop".chars() {
+            press(&mut app, c);
+        }
+        app.attach_images(crate::images::Loading {
+            images: vec![a_png()],
+            ..Default::default()
+        });
+        let Action::Mutate { machine, request } =
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+        else {
+            panic!("not sent")
+        };
+        assert_eq!(
+            app.with_fix_input(machine, request.clone())["fix_input"],
+            true
+        );
+        send(&mut app, machine, request.clone());
+        reply_to(
+            &mut app,
+            machine,
+            crate::actions::request_metadata(&request),
+            question(),
+        );
+        let Mode::Confirm { title, message, .. } = app.mode.clone() else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert_eq!(title, "Save your new intent?");
+        assert!(
+            message.starts_with("Line 1 looks like a token or password."),
+            "{message}"
+        );
+        assert!(!app.failing());
+        settle(&mut app);
+        let Action::Mutate { request: yes, .. } = press(&mut app, 'y') else {
+            panic!("yes sent nothing")
+        };
+        assert_eq!(yes["confirm"], "0123456789abcdef");
+        assert_eq!(yes["override"], true);
+        assert_eq!(yes["submission"], request["submission"], "the same send");
+        assert_eq!(yes["words"], request["words"]);
+        assert_eq!(
+            yes["images"], request["images"],
+            "its images whole, not counted"
+        );
+        // No: nothing saved, the words open in the box as he left them.
+        send(&mut app, machine, yes.clone());
+        reply_to(
+            &mut app,
+            machine,
+            crate::actions::request_metadata(&yes),
+            question(),
+        );
+        settle(&mut app);
+        assert_eq!(press(&mut app, 'n'), Action::None);
+        let Mode::Compose { draft, .. } = &app.mode else {
+            panic!("the box didn't open: {:?}", app.mode)
+        };
+        assert!(
+            draft.words.starts_with("Use ghp_abcdefghijklmnop"),
+            "{}",
+            draft.words
+        );
+        assert_eq!(draft.images.len(), 1);
+    }
+
     #[test]
     fn images_past_the_limits_are_refused_by_name() {
         let mut app = demo_app();
@@ -5961,8 +7357,13 @@ pub(crate) mod tests {
         let image = |n: usize| crate::images::Loaded {
             media_type: "image/png",
             bytes: [b"\x89PNG\r\n\x1a\n".to_vec(), vec![0; n]].concat(),
+            ..Default::default()
         };
-        let some = |images| crate::images::Loading { images, why: None };
+        let some = |images| crate::images::Loading {
+            images,
+            why: None,
+            ..Default::default()
+        };
         app.attach_images(some(vec![
             image(9_000_000),
             image(9_000_000),

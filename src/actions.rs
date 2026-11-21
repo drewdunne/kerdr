@@ -10,6 +10,11 @@ use crate::transport::{self, Target};
 
 const MAX_JSON_BYTES: usize = 64 * 1024;
 
+/// The most a new intent or an edit may be for a backend that fixes input (intent 0591, release 5,
+/// "fix-input" in its feed's `supports`): it goes over ssh's standard input, so a ceiling it can
+/// carry, and one generous enough that any words he writes fit.
+pub const FIX_REQUEST_BYTES: usize = 32 * 1024 * 1024;
+
 /// One of your open questions on background work, for the Kickoff Questions box (intent 0409).
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub struct Question {
@@ -148,6 +153,71 @@ pub struct Response {
     /// On a `drop`: false when the held request had already run, or was running.
     #[serde(default)]
     pub dropped: Option<bool>,
+    /// With a saved edit, from a backend that fixes input (intent 0591, release 5): each line it
+    /// fixed rather than refused (a `#` heading, an open code block, a NUL), and how.
+    #[serde(default, deserialize_with = "fixed")]
+    pub fixed: Vec<Fixed>,
+    /// With a saved edit: it was merged with a change made while he had it open.
+    #[serde(default)]
+    pub merged: bool,
+    /// With a stale edit: his change and the change made meanwhile touch the same lines.
+    #[serde(default)]
+    pub conflict: bool,
+    /// With a question about lines that look like a token or password, or with a save that
+    /// replaced them by [redacted] on his yes: those lines, by number.
+    #[serde(default, deserialize_with = "line_numbers")]
+    pub redact: Vec<u32>,
+    #[serde(default, deserialize_with = "line_numbers")]
+    pub redacted: Vec<u32>,
+}
+
+/// One line a backend fixed in a saved edit, as `fixed` gives it: its number, what kind of fix,
+/// and the words saying it.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Fixed {
+    pub line: u32,
+    pub kind: String,
+    pub message: String,
+}
+
+/// `fixed` as a backend gives it, anything it can't read passed over, never a failed answer.
+fn fixed<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<Fixed>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| {
+            let line = u32::try_from(v["line"].as_u64()?).ok()?;
+            let message: String = v["message"]
+                .as_str()
+                .unwrap_or_default()
+                .chars()
+                .map(|c| if c.is_control() { ' ' } else { c })
+                .collect();
+            Some(Fixed {
+                line,
+                kind: v["kind"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(32)
+                    .collect(),
+                message: message.trim().to_string(),
+            })
+        })
+        .collect())
+}
+
+/// Line numbers as a backend lists them; anything else passed over.
+fn line_numbers<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Vec<u32>, D::Error> {
+    let value = Value::deserialize(d)?;
+    Ok(value
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_u64().and_then(|n| u32::try_from(n).ok()))
+        .collect())
 }
 
 /// A line of words for the board: control characters out, trimmed; nothing left (or not a
@@ -639,10 +709,12 @@ const ANSWER_STATES: &[&str] = &[
 /// text itself until it's saved (intent 0414).
 pub fn request_metadata(request: &Value) -> Value {
     let mut value = request.clone();
-    if value["action"] == "edit"
-        && let Some(text) = value["text"].as_str().map(|t| t.chars().count())
-    {
-        value["text"] = Value::from(text);
+    if value["action"] == "edit" {
+        for field in ["text", "base"] {
+            if let Some(n) = value[field].as_str().map(|t| t.chars().count()) {
+                value[field] = Value::from(n);
+            }
+        }
     }
     if value["action"] == "account-signin"
         && let Some(fields) = value.as_object_mut()
@@ -656,27 +728,60 @@ pub fn request_metadata(request: &Value) -> Value {
     value
 }
 
-/// Whether a request is past what Kerdr sends: 64 KiB, and room for a new intent's images.
+/// Whether a request is past what Kerdr sends a backend without fix-input: 64 KiB, and room for
+/// a new intent's images.
 pub fn too_large(request: &Value) -> bool {
-    serde_json::to_string(request).map_or(true, |json| json.len() > most_bytes(request))
+    serde_json::to_string(request).map_or(true, |json| json.len() > older_most_bytes(request))
 }
 
-/// The most an answer may be: 64 KiB, and for an edit room for an item's text (at most 48 KiB)
-/// however much of it JSON escapes.
+/// Whether a request is past what Kerdr sends this backend: one that fixes input (`fix`) takes a
+/// new intent or an edit up to FIX_REQUEST_BYTES (intent 0591, K1-68, K1-92); any other, 0.35.0's.
+pub fn too_large_for(request: &Value, fix: bool) -> bool {
+    if !fix {
+        return too_large(request);
+    }
+    serde_json::to_string(request).map_or(true, |json| json.len() > FIX_REQUEST_BYTES)
+}
+
+/// Why a request too large for a backend without fix-input wasn't sent, in 0.35.0's words.
+pub fn too_large_said(request: &Value) -> String {
+    if older_most_bytes(request) > MAX_JSON_BYTES {
+        format!(
+            "the request is too large to send (64 KiB at most, and {} of images), so nothing was sent",
+            crate::images::size(crate::images::MAX_IMAGES_BYTES)
+        )
+    } else {
+        "the request is too large to send (64 KiB at most), so nothing was sent".into()
+    }
+}
+
+/// The most an answer may be: 64 KiB, and for an edit room for an item's text, which a backend
+/// that fixes input keeps whole however long, however much of it JSON escapes.
 fn most_answer_bytes(request: &Value) -> usize {
     if request["action"] == "edit" {
-        3 * MAX_JSON_BYTES
+        3 * FIX_REQUEST_BYTES
     } else {
         MAX_JSON_BYTES
     }
 }
 
-/// The most a request may be: 64 KiB, and room for the images a new intent may carry.
-fn most_bytes(request: &Value) -> usize {
+/// The most a request may be for a backend without fix-input: 64 KiB, and room for the images a
+/// new intent may carry.
+fn older_most_bytes(request: &Value) -> usize {
     if request["action"] == "create" && request["images"].is_array() {
         MAX_JSON_BYTES + crate::images::REQUEST_ALLOWANCE
     } else {
         MAX_JSON_BYTES
+    }
+}
+
+/// The most a request is sent as: FIX_REQUEST_BYTES to a backend that fixes input (the board puts
+/// `fix_input` on a request only for such a backend), else 0.35.0's limits (Codex's review 85, 6).
+fn most_bytes(request: &Value) -> usize {
+    if request["fix_input"] == true {
+        FIX_REQUEST_BYTES
+    } else {
+        older_most_bytes(request)
     }
 }
 
@@ -1144,7 +1249,7 @@ fn beginning(text: &str, most: usize) -> &str {
 
 /// What was typed into a request: a new intent's words, an edit, an answer.
 pub fn typed_in(request: &Value) -> Vec<&str> {
-    let mut typed: Vec<&str> = ["words", "title", "text", "token", "page_code"]
+    let mut typed: Vec<&str> = ["words", "title", "text", "base", "token", "page_code"]
         .iter()
         .filter_map(|field| request[*field].as_str())
         .collect();
@@ -1201,15 +1306,11 @@ fn run_with_deadline(
         }
     };
     if json.len() > most_bytes(request) {
-        let said = if most_bytes(request) > MAX_JSON_BYTES {
-            format!(
-                "the request is too large to send (64 KiB at most, and {} of images), so nothing was sent",
-                crate::images::size(crate::images::MAX_IMAGES_BYTES)
-            )
+        return Ran::unsent(if request["fix_input"] == true {
+            "the request is too large to send (32 MiB at most), so nothing was sent".into()
         } else {
-            "the request is too large to send (64 KiB at most), so nothing was sent".into()
-        };
-        return Ran::unsent(said);
+            too_large_said(request)
+        });
     }
     let target = match &machine.ssh {
         Some(host) => Target::Ssh(host.clone()),
@@ -3288,13 +3389,27 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
             request
         );
         assert_eq!(request_metadata(&request)["images"], 1);
-        // Images beyond what a new intent may carry are still refused before anything runs.
-        let sentinel = dir.path().join("ran");
+        // Past what a backend without fix-input takes, the board holds it back in 0.35.0's words;
+        // past 32 MiB, nothing runs whatever the backend (intent 0591, K1-68).
         let too_many = "x".repeat(crate::images::REQUEST_ALLOWANCE + MAX_JSON_BYTES);
+        let past = json!({"action":"create","words":"x","images":[{"data":too_many}]});
+        assert!(too_large_for(&past, false));
+        assert!(too_large_said(&past).contains("20 MB of images"));
+        assert!(!too_large_for(&past, true));
+        let sentinel = dir.path().join("ran");
         let error = run(
             &machine(),
             &format!("touch {}", quote(sentinel.to_str().unwrap())),
-            &json!({"action":"create","words":"x","images":[{"data":too_many}]}),
+            &json!({"action":"create","words":"x","fix_input":true,"images":[{"data":"x".repeat(FIX_REQUEST_BYTES)}]}),
+        )
+        .unwrap_err();
+        assert!(error.contains("32 MiB at most"), "{error}");
+        // Without `fix_input` (sent only to a backend that fixes input): 0.35.0's limit, in its
+        // words (Codex's review 85, 6).
+        let error = run(
+            &machine(),
+            &format!("touch {}", quote(sentinel.to_str().unwrap())),
+            &past,
         )
         .unwrap_err();
         assert!(error.contains("20 MB of images"), "{error}");
@@ -3340,15 +3455,20 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         for status in ["saved", "unchanged", "partial", "stale"] {
             assert!(KNOWN_STATUSES.contains(&status), "{status}");
         }
-        // A save past 64 KiB is refused before anything runs, and said to be too large.
+        // A save past 64 KiB is too large for a backend without fix-input; one that fixes input
+        // takes it, up to 32 MiB, past which it's refused before anything runs (K1-92).
         let big = json!({"action":"edit","id":"0414","text":"x".repeat(70_000),"was":"sha256:aa"});
         assert!(too_large(&big));
+        assert!(too_large_for(&big, false));
+        assert!(!too_large_for(&big, true));
         assert!(!too_large(&request));
+        let huge = json!({"action":"edit","id":"0414","text":"x".repeat(FIX_REQUEST_BYTES),"was":"sha256:aa","fix_input":true});
+        assert!(too_large_for(&huge, true));
         let sentinel = dir.path().join("ran");
         let error = run(
             &machine(),
             &format!("touch {}", quote(sentinel.to_str().unwrap())),
-            &big,
+            &huge,
         )
         .unwrap_err();
         assert!(error.contains("too large"), "{error}");
@@ -3390,10 +3510,27 @@ printf '%s' '{{"ok":false,"retry":50,"message":"#41 is still locked by a pull un
         let error = run(
             &machine(),
             &command,
-            &json!({"action":"create","words":"x".repeat(70_000)}),
+            &json!({"action":"create","words":"x".repeat(FIX_REQUEST_BYTES)}),
         )
         .unwrap_err();
         assert!(error.contains("too large"), "{error}");
+        assert!(!sentinel.exists());
+        // Any other request too: past 32 MiB to a backend that fixes input, past 64 KiB to any
+        // other (Codex's review 85, 6).
+        let error = run(
+            &machine(),
+            &command,
+            &json!({"action":"answer","id":"0414","fix_input":true,"answers":"x".repeat(FIX_REQUEST_BYTES)}),
+        )
+        .unwrap_err();
+        assert!(error.contains("32 MiB at most"), "{error}");
+        let error = run(
+            &machine(),
+            &command,
+            &json!({"action":"answer","id":"0414","answers":"x".repeat(70_000)}),
+        )
+        .unwrap_err();
+        assert!(error.contains("64 KiB at most"), "{error}");
         assert!(!sentinel.exists());
     }
 }

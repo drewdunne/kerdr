@@ -1,6 +1,6 @@
 #!/bin/sh
 # Puts a real image on this machine's clipboard and checks the new-intent box reads it back
-# (images.rs's live_clipboard test): under X11 and under Wayland on Linux, and on macOS. CI runs
+# (images.rs's live_clipboard tests): under X11 and under Wayland on Linux, and on macOS. CI runs
 # it before every release; Windows has its own step in .github/workflows/ci.yml.
 #   tests/live-clipboard.sh [image]
 # On Linux it needs xvfb-run and xclip for X11, and sway and wl-clipboard for Wayland; a display
@@ -9,7 +9,14 @@ set -eu
 image=${1:-docs/screenshots/new-intent.png}
 KERDR_LIVE_CLIPBOARD_IMAGE=$(cd "$(dirname "$image")" && pwd)/$(basename "$image")
 export KERDR_LIVE_CLIPBOARD_IMAGE
-TEST="cargo test --locked --lib -- --ignored --exact images::tests::live_clipboard"
+# live_clipboard, and on Linux live_clipboard_own_reader (Kerdr's own reader with no program to
+# run), live_reader_knows_a_copy_made_while_it_read (xclip or wl-copy copies while Kerdr's own
+# reader reads: nothing goes in), live_watch_knows_a_copy_made_as_the_reader_set_up (Kerdr's watch,
+# kept from before the paste, knows a copy made before the reader set up),
+# live_watch_retires_when_its_display_stops_answering_and_stops_when_dropped (under X11, given
+# the X server's pid as KERDR_LIVE_XVFB_PID, which xvfb-run doesn't give, so skipped here) and
+# live_x11_read_stops_at_its_cap (under X11: a read keeps no more than its cap).
+TEST="cargo test --locked --lib -- --ignored --test-threads=1 images::tests::live_"
 TMP=$(mktemp -d)
 PID=""
 cleanup() {

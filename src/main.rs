@@ -150,6 +150,7 @@ fn open_board() -> anyhow::Result<()> {
     app.restore_words(words);
     app.words_dir = Some(state);
     app.say_kept_notes();
+    app.say_config_problems();
     app.rebuild();
     kerdr::tui::run(app, true)
 }
@@ -217,6 +218,11 @@ fn doctor(fix: bool) -> anyhow::Result<()> {
     let states = read_all(&cfg);
     let now = chrono::Local::now();
     let mut all_ok = true;
+    // What couldn't be used is said, and the rest read as Kerdr would (intent 0591, K3-67).
+    for problem in &cfg.problems {
+        all_ok = false;
+        println!("  {problem}");
+    }
     for s in &states {
         let how = s
             .machine
@@ -379,6 +385,9 @@ fn fix_keys_here(s: &MachineState) -> bool {
 
 fn cards() -> anyhow::Result<()> {
     let cfg = load_config()?;
+    for problem in &cfg.problems {
+        eprintln!("kerdr: {problem}");
+    }
     let states = read_all(&cfg);
     let board = board::build(&states, &cfg);
     let cards: Vec<serde_json::Value> = board

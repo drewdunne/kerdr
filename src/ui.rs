@@ -33,15 +33,57 @@ fn draw_screen(f: &mut Frame, app: &App) {
     let area = f.area();
     f.render_widget(Block::default().style(Style::default().bg(BG).fg(FG)), area);
     if area.width < 32 || area.height < 10 {
-        let text = trunc("Kerdr needs a bigger window.", area.width as usize);
+        // The board in a window too small for its columns: the cards that need you, one to a
+        // line, with the message line (intent 0591, K2-43).
+        // A question, whatever it's over, is the whole window, all of it read before an answer
+        // acts (Codex's reviews 85, 2, and 86, 4).
+        if let Mode::Confirm {
+            title,
+            message,
+            request,
+            queue,
+            ready_at,
+            choices,
+            enter_queues,
+            ..
+        } = &app.mode
+        {
+            return small_question(
+                f,
+                area,
+                &app.question_view,
+                Question {
+                    title,
+                    message,
+                    action: request["action"].as_str(),
+                    queue: *queue,
+                    choices,
+                    enter_queues: *enter_queues,
+                    too_soon: ready_at.is_some_and(|at| Instant::now() < at),
+                },
+            );
+        }
+        if matches!(app.mode, Mode::Board) {
+            return compact_board(f, area, app);
+        }
+        // Nothing but Esc acts here (App::on_key), and Esc goes back towards the board.
         let y = area.y + area.height / 2;
-        put(
-            f.buffer_mut(),
-            area.x,
-            y,
-            area.width,
-            vec![Span::styled(text, fg(FG2))],
-        );
+        for (i, line) in ["Kerdr needs a bigger window.", "Esc goes back."]
+            .into_iter()
+            .enumerate()
+        {
+            let y = y + i as u16;
+            if y < area.y + area.height {
+                let text = trunc(line, area.width as usize);
+                put(
+                    f.buffer_mut(),
+                    area.x,
+                    y,
+                    area.width,
+                    vec![Span::styled(text, fg(FG2))],
+                );
+            }
+        }
         return;
     }
     draw_mode(f, area, app, &app.mode);
@@ -49,6 +91,284 @@ fn draw_screen(f: &mut Frame, app: &App) {
         failure(f, area, app);
     } else if !matches!(app.mode, Mode::Board) {
         action_status(f, area, app);
+    }
+}
+
+/// A question in a window too small for its box (Codex's review 85, 2): the window is the question,
+/// its title, its words and every answer it offers wrapped into one text that scrolls, and the
+/// last row what to press. An answer acts only once all of it has been on screen: until then ⏎
+/// and its keys show the next page; with no room for its text at all, they never act.
+fn small_question(f: &mut Frame, area: Rect, view: &crate::app::QuestionView, q: Question) {
+    let w = area.width.max(1) as usize;
+    // Every line of it, however many, and every character: never cut to a box's most.
+    let all = |text: &str, style: Style| -> Vec<Line<'static>> {
+        wrap_whole(text, w)
+            .into_iter()
+            .map(|l| Line::from(Span::styled(l, style)))
+            .collect()
+    };
+    let mut lines = all(q.title, bold(YELLOW));
+    lines.extend(all(q.message, fg(FG)));
+    for (k, what) in question_keys(&q) {
+        lines.extend(all(&format!("{k}: {what}"), fg(FG2)));
+    }
+    let rows = area.height.saturating_sub(1);
+    let scroll = view.fit(q.title, q.message, lines.len() as u16, rows);
+    f.render_widget(
+        Paragraph::new(lines).scroll((scroll, 0)),
+        Rect {
+            height: rows,
+            ..area
+        },
+    );
+    let last = if view.unseen() {
+        key_hints(&[("⏎ PgDn", "the rest of it"), ("Esc", "leave it")])
+    } else {
+        vec![Span::styled("The keys above answer it.", fg(DIM))]
+    };
+    if area.height > 0 {
+        put(
+            f.buffer_mut(),
+            area.x,
+            area.bottom() - 1,
+            area.width,
+            fit(last, w),
+        );
+    }
+}
+
+/// Text wrapped to `w` columns losing nothing: its line breaks kept, a word wider than a line
+/// broken across lines rather than cut.
+fn wrap_whole(text: &str, w: usize) -> Vec<String> {
+    let w = w.max(1);
+    let mut out = Vec::new();
+    for paragraph in text.split('\n') {
+        let mut line = String::new();
+        for word in paragraph.split_whitespace() {
+            let mut word = word.to_string();
+            loop {
+                let room = if line.is_empty() {
+                    w
+                } else {
+                    w.saturating_sub(width(&line) + 1)
+                };
+                if width(&word) <= room {
+                    if !line.is_empty() {
+                        line.push(' ');
+                    }
+                    line.push_str(&word);
+                    break;
+                }
+                if !line.is_empty() {
+                    out.push(std::mem::take(&mut line));
+                    continue;
+                }
+                // Wider than a whole line: as much as fits, the rest on the next.
+                let mut cut = 0;
+                let mut used = 0;
+                for (i, c) in word.char_indices() {
+                    let cw = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+                    if used + cw > w && cut > 0 {
+                        break;
+                    }
+                    used += cw;
+                    cut = i + c.len_utf8();
+                }
+                out.push(word[..cut].to_string());
+                word = word[cut..].to_string();
+                if word.is_empty() {
+                    break;
+                }
+            }
+        }
+        out.push(line);
+    }
+    while out.last().is_some_and(|l| l.is_empty()) && out.len() > 1 {
+        out.pop();
+    }
+    out
+}
+
+/// The board in a window too small for its columns (intent 0591, K2-43), as the release 5 canvas
+/// draws it: under 32 columns a list of the cards that need you, each with a bar and a word in its
+/// colour (yellow asks, red failed, blue yours); wider but under 10 rows, each line also says what
+/// its card wants. The selected row is on the board's selection colour; a question open over the
+/// board takes the whole window (small_question).
+fn compact_board(f: &mut Frame, area: Rect, app: &App) {
+    use crate::app::Wants;
+    let w = area.width as usize;
+    let rows = app.compact_rows();
+    let selected = app.sel.key.clone();
+    let narrow = area.width < 32;
+    let count = match rows.len() {
+        0 => "Nothing needs you.".to_string(),
+        n => format!("{n} need{} you", if n == 1 { "s" } else { "" }),
+    };
+    let said = app.message().map(|(text, tone)| {
+        let color = match tone {
+            Tone::Fail => RED,
+            Tone::Warn => YELLOW,
+            Tone::Good => GREEN,
+            _ => FG2,
+        };
+        (text.lines().next().unwrap_or_default().to_string(), color)
+    });
+    let hints: Vec<(&str, &str)> = vec![("⏎", "go in"), ("j k", "move"), ("?", "keys")];
+    let color = |wants: Wants| match wants {
+        Wants::Asks => YELLOW,
+        Wants::Failed => RED,
+        Wants::Yours => BLUE,
+    };
+    let word = |wants: Wants| match wants {
+        Wants::Asks => "asks",
+        Wants::Failed => "failed",
+        Wants::Yours => "yours",
+    };
+    let name = |i: usize| {
+        let c = &app.board.cards[i];
+        format!("{} {}", c.reference.trim_start_matches('#'), c.title)
+    };
+    let buf = f.buffer_mut();
+    let bottom = area.bottom();
+    // Rows first, then what's below them: in a narrow window the words about it, a rule and the
+    // keys; in a short one only the keys.
+    let (list_top, list_end) = if narrow {
+        put_lr(
+            buf,
+            area,
+            area.y,
+            vec![Span::styled("KERDR", bold(CYAN))],
+            vec![Span::styled(count.clone(), fg(FG2))],
+        );
+        let rule = |buf: &mut Buffer, y: u16| {
+            put(
+                buf,
+                area.x,
+                y,
+                area.width,
+                vec![Span::styled("─".repeat(w), fg(BORDER))],
+            );
+        };
+        if area.height >= 2 {
+            rule(buf, area.y + 1);
+        }
+        let about = (
+            "The cards that need you. Widen the window for the board.".to_string(),
+            FG2,
+        );
+        let about_lines = wrap(&about.0, w.max(1), 3);
+        let mut end = bottom;
+        if area.height >= 5 {
+            end = bottom - 2;
+            rule(buf, bottom - 2);
+            // The keys, or the message line in their place while there is one.
+            let last = match &said {
+                Some((text, color)) => vec![Span::styled(trunc(text, w), fg(*color))],
+                None => fit(key_hints(&hints), w),
+            };
+            put(buf, area.x, bottom - 1, area.width, last);
+            let room = end.saturating_sub(area.y + 2) as usize;
+            if room > about_lines.len() + rows.len().min(1) {
+                let top = end - about_lines.len() as u16;
+                for (n, line) in about_lines.iter().enumerate() {
+                    put(
+                        buf,
+                        area.x,
+                        top + n as u16,
+                        area.width,
+                        vec![Span::styled(line.clone(), fg(about.1))],
+                    );
+                }
+                end = top;
+            }
+        }
+        (area.y + 2, end)
+    } else {
+        let right = match &said {
+            Some((text, color)) => (text.clone(), *color),
+            None => (
+                "The cards that need you. Make the window taller for the board.".to_string(),
+                DIM,
+            ),
+        };
+        let left = vec![
+            Span::styled("KERDR", bold(CYAN)),
+            Span::styled(format!("   {count}"), fg(FG2)),
+        ];
+        let room = w.saturating_sub(5 + 3 + count.chars().count() + 3);
+        put_lr(
+            buf,
+            area,
+            area.y,
+            left,
+            vec![Span::styled(trunc(&right.0, room), fg(right.1))],
+        );
+        if area.height >= 3 {
+            put(
+                buf,
+                area.x,
+                bottom - 1,
+                area.width,
+                fit(key_hints(&hints), w),
+            );
+            (area.y + 1, bottom - 1)
+        } else {
+            (area.y + 1, bottom)
+        }
+    };
+    let room = list_end.saturating_sub(list_top) as usize;
+    let at = rows
+        .iter()
+        .position(|r| Some(app.board.cards[r.index].key.as_str()) == selected.as_deref())
+        .unwrap_or(0);
+    let first = at.saturating_sub(room.saturating_sub(1));
+    for (n, row) in rows.iter().skip(first).take(room).enumerate() {
+        let y = list_top + n as u16;
+        let on = Some(app.board.cards[row.index].key.as_str()) == selected.as_deref();
+        let bg = if on { SEL } else { BG };
+        let tint = color(row.wants);
+        let style = |c: Color| Style::default().fg(c).bg(bg);
+        put(
+            buf,
+            area.x,
+            y,
+            area.width,
+            vec![Span::styled(" ".repeat(w), style(FG))],
+        );
+        let mut left = vec![Span::styled("▌ ", style(tint))];
+        if narrow {
+            let status = word(row.wants);
+            let room = w.saturating_sub(2 + status.chars().count() + 1);
+            left.push(Span::styled(trunc(&name(row.index), room), style(FG)));
+            put_lr(
+                buf,
+                Rect {
+                    y,
+                    height: 1,
+                    ..area
+                },
+                y,
+                left,
+                vec![Span::styled(status.to_string(), style(tint))],
+            );
+        } else {
+            let fixed = 30.min(w.saturating_sub(2));
+            let named = trunc(&name(row.index), fixed);
+            let pad = fixed.saturating_sub(width(&named));
+            left.push(Span::styled(
+                format!("{named}{} ", " ".repeat(pad)),
+                style(FG),
+            ));
+            let what = match row.wants {
+                Wants::Asks => format!("asks: {}", row.what),
+                Wants::Failed => format!("failed: {}", row.what),
+                Wants::Yours => format!("waits on you: {}", row.what),
+            };
+            let what = what.trim_end_matches([':', ' ']).to_string();
+            let left_room = w.saturating_sub(2 + fixed + 1);
+            left.push(Span::styled(trunc(&what, left_room), style(tint)));
+            put(buf, area.x, y, area.width, left);
+        }
     }
 }
 
@@ -2982,6 +3302,13 @@ fn palette(f: &mut Frame, area: Rect, app: &App) {
 }
 
 fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) -> Vec<String> {
+    // Typing shows the words' end: only that much is wrapped, so a box of a megabyte's words
+    // (intent 0591, release 5) draws as fast as a line's.
+    let value = if active {
+        shown_tail(value, max_width, max_lines)
+    } else {
+        value
+    };
     let mut lines = Vec::new();
     let mut line = String::new();
     for ch in value.chars().chain(active.then_some('▏')) {
@@ -3011,6 +3338,24 @@ fn field_lines(value: &str, max_width: usize, max_lines: usize, active: bool) ->
     lines
 }
 
+/// The end of `value` that holds at least its last `max_lines` lines `max_width` wide: from just
+/// after a line break when one is near enough, else as many characters as those lines could hold.
+fn shown_tail(value: &str, max_width: usize, max_lines: usize) -> &str {
+    let most = (max_lines + 1) * (max_width + 1) * 4;
+    if value.len() <= most {
+        return value;
+    }
+    let mut start = value.len() - most;
+    while !value.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &value[start..];
+    match tail.rmatch_indices('\n').nth(max_lines) {
+        Some((at, _)) => &tail[at + 1..],
+        None => tail,
+    }
+}
+
 /// One line of the new-intent box, its attached images' tags set apart from the words.
 fn tagged(line: String, tags: &[String]) -> Line<'static> {
     let mut spans = vec![];
@@ -3033,6 +3378,9 @@ fn tagged(line: String, tags: &[String]) -> Line<'static> {
 }
 
 fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
+    if let Some(edit) = &draft.edit {
+        return edit_box(f, area, draft, edit);
+    }
     let rect = centered(area, 100, 24, Some(4));
     dialog(f, rect, CYAN);
     let inner = pad(rect, 3, 1);
@@ -3163,6 +3511,112 @@ fn compose(f: &mut Frame, area: Rect, app: &App, draft: &Draft) {
         inner.width,
         fit(hints, w),
     );
+}
+
+/// An item's text in the new-intent box's own look, because no editor could start (intent 0591,
+/// K1-87): EDITING and its number in place of NEW INTENT, his words with the cursor at their end,
+/// each editor tried with why, and the new-intent box's own keys.
+fn edit_box(f: &mut Frame, area: Rect, draft: &Draft, edit: &crate::app::EditInBox) {
+    let rect = centered(area, 100, 24, Some(4));
+    dialog(f, rect, CYAN);
+    let inner = pad(rect, 3, 1);
+    let w = inner.width as usize;
+    let buf = f.buffer_mut();
+    put_lr(
+        buf,
+        inner,
+        inner.y,
+        vec![
+            Span::styled(format!("EDITING {}", edit.reference), bold(CYAN)),
+            Span::styled("   No editor could start, so its text opens here.", fg(FG2)),
+        ],
+        vec![Span::styled("esc keep for later", fg(DIM))],
+    );
+    let boxed = Rect {
+        x: inner.x,
+        y: inner.y + 2,
+        width: inner.width,
+        height: inner.height.saturating_sub(7),
+    };
+    f.render_widget(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(fg(BORDER))
+            .style(Style::default().bg(BG)),
+        boxed,
+    );
+    let text = pad(boxed, 2, 1);
+    let rows = text.height.max(1) as usize;
+    let lines: Vec<Line> = field_lines(&draft.words, text.width.max(1) as usize, rows, true)
+        .into_iter()
+        .map(|l| Line::from(Span::styled(l, fg(FG))))
+        .collect();
+    f.render_widget(Paragraph::new(lines), text);
+    let buf = f.buffer_mut();
+    let y = boxed.bottom() + 1;
+    put(
+        buf,
+        inner.x,
+        y,
+        inner.width,
+        vec![Span::styled(
+            trunc(&tried_editors(&edit.skipped), w),
+            fg(FG2),
+        )],
+    );
+    put(
+        buf,
+        inner.x,
+        y + 1,
+        inner.width,
+        vec![Span::styled(
+            trunc(
+                "Your editor comes back once one starts: name it as editor in Kerdr's config, or set $EDITOR.",
+                w,
+            ),
+            fg(DIM),
+        )],
+    );
+    let hints = key_hints(&[
+        ("⏎", "save"),
+        ("shift+⏎ / alt+⏎", "new line"),
+        ("ctrl+u", "clear"),
+        ("esc", "keep for later"),
+    ]);
+    put(
+        buf,
+        inner.x,
+        inner.bottom().saturating_sub(1),
+        inner.width,
+        fit(hints, w),
+    );
+}
+
+/// Each editor that couldn't start, with why in a word or two: "Tried nvim (not found), vi (not
+/// found) and nano (not found). It saves as e does from your editor."
+fn tried_editors(skipped: &[String]) -> String {
+    let each: Vec<String> = skipped
+        .iter()
+        .map(|s| {
+            let (name, why) = s.split_once(": ").unwrap_or((s.as_str(), ""));
+            let why = if why.contains("No such file") || why.contains("not found") {
+                "not found".to_string()
+            } else if why.contains("ermission denied") {
+                "not allowed to run".to_string()
+            } else if why.is_empty() {
+                "didn't start".to_string()
+            } else {
+                why.split(" (os error").next().unwrap_or(why).to_lowercase()
+            };
+            format!("{name} ({why})")
+        })
+        .collect();
+    let list = match each.as_slice() {
+        [] => return "It saves as e does from your editor.".to_string(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    };
+    format!("Tried {list}. It saves as e does from your editor.")
 }
 
 /// The filter list (f): who the work is for, or one of their projects.
@@ -3369,6 +3823,8 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
         Some("reopen") => "go ahead",
         Some("cancel") => "stop it",
         Some(crate::app::SEND_WITHOUT) => "send without it",
+        Some(crate::app::SMALLER) => "attach a smaller copy",
+        Some(crate::app::OPEN_BOTH) => "open both now",
         Some(crate::app::cancels::STOP_START) => "stop it and put it back",
         _ => "yes",
     };
@@ -3397,6 +3853,8 @@ fn question_keys(q: &Question) -> Vec<(String, String)> {
     let no = match q.action {
         Some("cancel") => "keep it running",
         Some(crate::app::SEND_WITHOUT) => "keep them unsent",
+        Some(crate::app::SMALLER) => "leave it out",
+        Some(crate::app::OPEN_BOTH) => "keep mine for e",
         Some(crate::app::cancels::STOP_START) => "let it start",
         _ if !q.choices.is_empty() => "leave it",
         _ => "cancel",
@@ -5488,6 +5946,21 @@ pub(crate) fn tests_render(a: &App, w: u16, h: u16) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_box_of_a_megabytes_words_shows_its_end_as_a_short_one_would() {
+        // Intent 0591, release 5: only the end is wrapped, and it reads the same.
+        let short = "first line\nsecond, a longer line that wraps at forty columns or so\nlast";
+        let long = format!("{}{short}", "filler line\n".repeat(90_000));
+        let started = std::time::Instant::now();
+        let shown = field_lines(&long, 40, 3, true);
+        assert_eq!(shown, field_lines(short, 40, 3, true));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let one = "y".repeat(1_000_000);
+        let shown = field_lines(&one, 40, 3, true);
+        assert_eq!(shown.len(), 3);
+        assert!(shown[2].ends_with('▏'));
+    }
     use crate::app::{Search, SearchFilter, Selection};
     use crate::config::Config;
     use chrono::TimeZone;

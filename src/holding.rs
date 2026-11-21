@@ -827,7 +827,21 @@ impl App {
     /// before its answer comes leaves it saying so; an answer that says it never arrived puts back
     /// what it said before (Codex's review 65, 2).
     pub(crate) fn hand_over(&mut self) -> Vec<(u64, usize, Value, bool)> {
-        let ready = self.resolver.ready();
+        let mut ready = Vec::new();
+        // The last moment: each request as its machine's backend takes it, `fix_input` on it
+        // only for one that fixes input, or not sent at all, said as any refusal before it ran
+        // (Codex's review 85, 6).
+        for (n, machine, request, gated) in self.resolver.ready() {
+            let request = self.with_fix_input(machine, request);
+            match self.fits_backend(machine, &request) {
+                Ok(()) => ready.push((n, machine, request, gated)),
+                Err(why) => {
+                    self.resolver.handed(n);
+                    let metadata = crate::actions::request_metadata(&request);
+                    self.finish_job(n, metadata, Err(why));
+                }
+            }
+        }
         for (n, ..) in &ready {
             let Some(op) = self.held_sending.get(n).cloned() else {
                 continue;
@@ -1625,6 +1639,7 @@ impl App {
             came_back: None,
             filed: super::Filed::default(),
             unfiled: None,
+            edit: None,
         };
         let action = self.send_draft(draft);
         if matches!(action, super::Action::Mutate { .. }) {
@@ -1694,7 +1709,11 @@ impl App {
     /// it says so and stays, and a second q quits anyway (Codex's review 60).
     pub fn quit_key(&mut self) -> bool {
         if self.quit_unsaved && self.quitting.is_some() {
-            let _ = self.keep_on_quit();
+            // Quitting anyway: what couldn't be kept is printed once the board has gone, so his
+            // words are never held nowhere (intent 0591, K3-34).
+            if self.keep_on_quit().is_err() {
+                let _ = self.print_unkept();
+            }
             return true;
         }
         let Some(what) = self.quit_waits_for() else {
@@ -1755,9 +1774,14 @@ impl App {
         };
         self.quitting = Some(Instant::now());
         self.quit_unsaved = true;
+        let anyway = if (self.open_terminal)().is_some() {
+            "q again quits anyway and prints your words to copy"
+        } else {
+            "q again quits anyway, and with no terminal to print your words on they'd be lost"
+        };
         self.say(
             format!(
-                "{why}, so quitting now would lose what Kerdr keeps for the next one: your words, and changes it holds. q again quits anyway, Esc stays."
+                "{why}, so quitting now would lose what Kerdr keeps for the next one: your words, and changes it holds. {anyway}, Esc stays."
             ),
             Tone::Warn,
         );
@@ -2068,11 +2092,46 @@ impl App {
                     was: held.was.clone(),
                     text: mine.text.clone(),
                     from: mine.from.clone(),
+                    as_written: self.as_written.contains(key),
+                    in_box: false,
                 })
             })
             .collect();
+        // An edit open in Kerdr's own box: what the box holds now is that card's version, kept
+        // with the text it was read as and its fingerprint (Codex's review 85, 3).
+        if let Some((key, edit)) = self.open_edit_box()
+            && let Some(held) = self.edits.get(&key)
+            && let Some(machine) = self.machines.get(held.machine).map(|m| m.name())
+        {
+            edits.retain(|e| e.key != key);
+            edits.push(KeptEdit {
+                key,
+                id: held.id.clone(),
+                machine,
+                current: held.current.clone(),
+                was: held.was.clone(),
+                text: edit,
+                from: held
+                    .mine
+                    .as_ref()
+                    .map_or_else(|| held.current.clone(), |m| m.from.clone()),
+                as_written: false,
+                in_box: true,
+            });
+        }
         edits.sort_by(|a, b| a.key.cmp(&b.key));
         words.edits = edits;
+        // Kickoff answers not saved yet, which d opens again (intent 0591, K3-34).
+        let mut answers: Vec<crate::kept::KeptAnswers> = self
+            .kickoff_kept
+            .iter()
+            .map(|(key, answers)| crate::kept::KeptAnswers {
+                key: key.clone(),
+                answers: answers.clone(),
+            })
+            .collect();
+        answers.sort_by(|a, b| a.key.cmp(&b.key));
+        words.answers = answers;
         words
     }
 
@@ -2100,6 +2159,42 @@ impl App {
             self.resolver.words_kept();
         }
         kept
+    }
+
+    /// The edit open in Kerdr's own box, if one is: its card's key and the text the box holds, read
+    /// back as a save would read it.
+    pub(crate) fn open_edit_box(&self) -> Option<(String, String)> {
+        let super::Mode::Compose { draft, .. } = &self.mode else {
+            return None;
+        };
+        let edit = draft.edit.as_ref()?;
+        Some((
+            edit.key.clone(),
+            crate::edit::read_back(&draft.words, edit.marker.as_deref()),
+        ))
+    }
+
+    /// While an edit is open in Kerdr's own box, what it holds is in the words file, written again
+    /// when it has changed, every two seconds at most, so a Kerdr killed before ⏎ or Esc brings it
+    /// back as that card's edit (Codex's review 85, 3).
+    pub(crate) fn keep_open_edit(&mut self) {
+        let Some((key, text)) = self.open_edit_box() else {
+            return;
+        };
+        let kept = self.words_kept.as_ref().is_some_and(|w| {
+            w.edits
+                .iter()
+                .any(|e| e.in_box && e.key == key && e.text == text)
+        });
+        if kept
+            || self
+                .words_tried
+                .is_some_and(|at| at.elapsed() < WORDS_AGAIN)
+        {
+            return;
+        }
+        self.words_tried = Some(Instant::now());
+        self.keep_words_now();
     }
 
     /// A new intent waiting for the words file to be written: tried again every two seconds.
@@ -2159,6 +2254,9 @@ impl App {
             let Some(machine) = self.machine_index(&e.machine) else {
                 continue;
             };
+            if e.as_written {
+                self.as_written.insert(e.key.clone());
+            }
             self.edits.insert(
                 e.key,
                 super::edit_controls::Held {
@@ -2176,7 +2274,138 @@ impl App {
                 },
             );
         }
+        // Kickoff answers the last Kerdr kept: d opens them again. Ones typed here since stay,
+        // and an answer to the same question from there is kept beside them (Codex's review 98,
+        // 4).
+        for a in words.answers {
+            let kept = self.kickoff_kept.entry(a.key).or_default();
+            for answer in a.answers {
+                if !kept.contains(&answer) {
+                    kept.push(answer);
+                }
+            }
+        }
     }
+
+    /// Everything the words file would keep for the next Kerdr, as text he can copy: for when it
+    /// can't be written and Kerdr ends anyway, printed to the terminal once the board has gone,
+    /// never to the error log (intent 0591, K3-34). Empty when there's nothing of his to keep.
+    pub(crate) fn unkept_texts(&self) -> String {
+        let words = self.words();
+        let images = |n: usize| match n {
+            0 => String::new(),
+            1 => " (and an image, which can't be shown here)".into(),
+            n => format!(" (and {n} images, which can't be shown here)"),
+        };
+        let mut parts = vec![];
+        let mut escaped = false;
+        let mut shown = |text: &str| {
+            let (text, any) = shown_escaped(text);
+            escaped |= any;
+            text
+        };
+        for e in &words.edits {
+            let reference = self.reference_for(&e.id);
+            parts.push(format!(
+                "Your new text for {reference}:\n{}",
+                shown(&e.text)
+            ));
+        }
+        if let Some(d) = &words.draft {
+            parts.push(format!(
+                "Your new intent's words, not sent{}:\n{}",
+                images(d.images.len()),
+                shown(&d.words)
+            ));
+        }
+        for r in &words.returned {
+            parts.push(format!(
+                "Words given back to you, not saved{}:\n{}",
+                images(r.images.len()),
+                shown(&r.words)
+            ));
+        }
+        for a in &words.answers {
+            let id = a.key.rsplit(':').next().unwrap_or(&a.key);
+            let reference = self.reference_for(id);
+            let lines: Vec<String> = a
+                .answers
+                .iter()
+                .map(|(n, question, answer)| {
+                    if question.is_empty() {
+                        shown(answer)
+                    } else {
+                        format!("{n}. {}\n{}", shown(question), shown(answer))
+                    }
+                })
+                .collect();
+            parts.push(format!(
+                "Your answers to {reference}'s questions:\n{}",
+                lines.join("\n")
+            ));
+        }
+        if parts.is_empty() {
+            return String::new();
+        }
+        let note = if escaped {
+            "\nControl characters in them are shown escaped, so none acts on your terminal: \\x1b is an escape, \\\\ a backslash."
+        } else {
+            ""
+        };
+        format!(
+            "Kerdr couldn't keep these for the next Kerdr, so here they are to copy:{note}\n\n{}\n",
+            parts.join("\n\n")
+        )
+    }
+
+    /// When the words file can't be written as Kerdr ends: his words to print on his own terminal
+    /// once the board has gone, replacing any said before. Whether they will be: false when
+    /// there's no terminal to print them on, and then nothing is said to have kept them (Codex's
+    /// review 98, 1).
+    pub(crate) fn print_unkept(&mut self) -> bool {
+        let text = self.unkept_texts();
+        if text.is_empty() {
+            return true;
+        }
+        let Some(terminal) = (self.open_terminal)() else {
+            self.print_on_exit.clear();
+            self.recovery_terminal = None;
+            return false;
+        };
+        self.print_on_exit = vec![text];
+        self.recovery_terminal = Some(terminal);
+        true
+    }
+}
+
+/// His text as it's printed for him to copy: control characters other than new lines and tabs as
+/// \xNN (\u{NNNN} past ASCII), and a backslash doubled, so nothing in it acts on the terminal
+/// (clears it, hides what came before, sets its clipboard) and each can be turned back (Codex's
+/// review 98, 3). Whether anything was escaped.
+pub(crate) fn shown_escaped(text: &str) -> (String, bool) {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(text.len());
+    let mut any = false;
+    for c in text.chars() {
+        match c {
+            '\\' => {
+                out.push_str("\\\\");
+                any = true;
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {
+                any = true;
+                let n = u32::from(c);
+                if n < 0x80 {
+                    let _ = write!(out, "\\x{n:02x}");
+                } else {
+                    let _ = write!(out, "\\u{{{n:04x}}}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    (out, any)
 }
 
 #[cfg(test)]
@@ -2193,6 +2422,121 @@ mod tests {
         let mut app = App::new(Config::default(), crate::demo::machines(false));
         app.cfg.actions.command = Some("test-adapter".into());
         app
+    }
+
+    #[test]
+    fn printed_words_show_control_characters_escaped_and_turn_back_to_his() {
+        // Codex's review 98, 3: an edit holding escape sequences (one clears the screen, one
+        // sets the terminal's clipboard, a carriage return writes over its line) is printed with
+        // each shown escaped, a backslash doubled, and said; turned back, it's his text exactly.
+        let mut app = app();
+        let card = app.board.cards[0].clone();
+        let text = "Danger \x1b[2J\x1b]52;c;ZXZpbA==\x07 over\r and a \\ backslash\nnext\u{9b}line";
+        app.edits.insert(
+            card.key.clone(),
+            crate::app::edit_controls::Held {
+                id: card.detail.as_ref().unwrap().id.clone(),
+                machine: card.machine_index,
+                current: "Old words.".into(),
+                was: "sha256:aa".into(),
+                read_at: Instant::now(),
+                mine: Some(crate::app::edit_controls::Mine {
+                    text: text.into(),
+                    from: "Old words.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        let printed = app.unkept_texts();
+        assert!(
+            !printed
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "a control character would reach the terminal: {printed:?}"
+        );
+        assert!(printed.contains("shown escaped"), "{printed}");
+        let shown = r"Danger \x1b[2J\x1b]52;c;ZXZpbA==\x07 over\x0d and a \\ backslash";
+        assert!(printed.contains(shown), "{printed}");
+        // Turned back.
+        let unescape = |shown: &str| {
+            let mut out = String::new();
+            let mut chars = shown.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('x') => {
+                        let hex: String = chars.by_ref().take(2).collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                    }
+                    Some('u') => {
+                        let hex: String =
+                            chars.by_ref().skip(1).take_while(|c| *c != '}').collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                    }
+                    other => panic!("not an escape: {other:?}"),
+                }
+            }
+            out
+        };
+        let start = printed.find("Danger").unwrap();
+        let end = printed[start..].find("line").unwrap() + start + "line".len();
+        assert_eq!(unescape(&printed[start..end]), text);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn quitting_anyway_without_the_words_file_prints_his_words() {
+        // Intent 0591, K3-34: the words file can't be written, and he quits anyway (q again).
+        // His words, a new intent's and his version of an item's text and a Kickoff answer, are
+        // printed once the board has gone, rather than held nowhere.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("kerdr");
+        std::fs::create_dir(&state).unwrap();
+        let mut app = app();
+        app.open_terminal = || tempfile::tempfile().ok();
+        app.kept = Kept::at(&state, 1000);
+        app.draft = "A new intent, not sent.".into();
+        let card = app.board.cards[0].clone();
+        app.edits.insert(
+            card.key.clone(),
+            crate::app::edit_controls::Held {
+                id: card.detail.as_ref().unwrap().id.clone(),
+                machine: card.machine_index,
+                current: "Old words.".into(),
+                was: "sha256:aa".into(),
+                read_at: Instant::now(),
+                mine: Some(crate::app::edit_controls::Mine {
+                    text: "His version of it.".into(),
+                    from: "Old words.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        app.kickoff_kept.insert(
+            "demo:41".into(),
+            vec![("1".into(), "Whose is it?".into(), "Kibbelz's".into())],
+        );
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o500)).unwrap();
+        assert!(!app.quit_key(), "{:?}", app.message());
+        assert!(app.message().unwrap().0.contains("prints your words"));
+        assert!(app.quit_key());
+        std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let printed = app.print_on_exit.join("\n");
+        for words in [
+            "A new intent, not sent.",
+            "His version of it.",
+            "Whose is it?",
+            "Kibbelz's",
+        ] {
+            assert!(printed.contains(words), "{words} not printed: {printed}");
+        }
     }
 
     /// A card waiting in the backlog, selected, with `rev` "r1" in its feed: its key, id,
@@ -2215,6 +2559,131 @@ mod tests {
         app.rebuild();
         select(app, &card.key);
         (card.key, id, card.reference, m)
+    }
+
+    /// Every file under `dir`, with its text, however deep.
+    #[cfg(unix)]
+    fn every_file(dir: &std::path::Path) -> Vec<(std::path::PathBuf, String)> {
+        let mut out = vec![];
+        for entry in std::fs::read_dir(dir).unwrap().flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                out.extend(every_file(&path));
+            } else {
+                let text = String::from_utf8_lossy(&std::fs::read(&path).unwrap()).into_owned();
+                out.push((path, text));
+            }
+        }
+        out
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_token_typed_while_offline_is_kept_only_in_kerdrs_private_files_and_sent_whole() {
+        // Codex's reviews 85 and 86, secrets: a new intent, a text and a Kickoff answer, each with
+        // a line like a token, made while their machine doesn't answer: the change and the answer
+        // are held, the new intent's words kept in the box. Every file Kerdr writes (the hold
+        // file, the words file, the error log, its locks and state) is read: the token is only in
+        // Kerdr's own private files (the words file and the hold file, 0600 in a 0700 folder),
+        // never the error log, another file, or what the board says; every request goes whole
+        // once its machine answers.
+        use std::os::unix::fs::PermissionsExt;
+        const TOKEN: &str = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+        let state = tempfile::tempdir().unwrap();
+        let mut app = app();
+        app.kept = Kept::at(state.path(), app.now().timestamp());
+        app.error_log = crate::errlog::ErrorLog::at(state.path().join("errors.log"));
+        let (_key, id, _reference, m) = waiting(&mut app);
+        supports(&mut app, m, HOLD);
+        supports(&mut app, m, crate::images::FIX_INPUT);
+        away(&mut app, m, 30);
+        // The text and the answer are held for it.
+        let edit = json!({"action":"edit","id":id,"text":format!("Deploy it.\ntoken = {TOKEN}"),
+            "was":"sha256:aa","base":"Deploy it.","from":"here"});
+        app.queue_action(m, edit);
+        let answer = json!({"action":"answer","id":id,"asked":"fedcba9876543210",
+            "answers":[{"num":"1","text":format!("the key is {TOKEN}")}]});
+        app.queue_action(m, answer);
+        assert!(app.resolver.ready().is_empty());
+        assert_eq!(app.kept.held.len(), 2, "both held: {:?}", app.message());
+        // The new intent's words stay in the box, kept in the words file when it closes.
+        press(&mut app, 'c');
+        if let super::super::Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = m;
+        }
+        for c in format!("Use {TOKEN} to deploy").chars() {
+            press(&mut app, c);
+        }
+        press_code(&mut app, KeyCode::Enter);
+        press_code(&mut app, KeyCode::Esc);
+        assert!(app.draft.contains(TOKEN));
+        app.keep_words_now();
+        let only_in_words = |app: &App, when: &str| {
+            let folder = std::fs::metadata(state.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(folder, 0o700, "{when}: the state folder is {folder:o}");
+            let files = every_file(state.path());
+            assert!(
+                files.iter().any(|(p, _)| p.ends_with("held.json")),
+                "{when}: no hold file"
+            );
+            assert!(
+                files.iter().any(|(p, _)| p.ends_with("errors.log")),
+                "{when}: no error log"
+            );
+            for (path, text) in &files {
+                let name = path.file_name().unwrap().to_string_lossy();
+                if name == "words.json" || name == "held.json" || name == "answers.json" {
+                    let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+                    assert_eq!(mode, 0o600, "{when}: {name} is {mode:o}");
+                } else {
+                    assert!(
+                        !text.contains(TOKEN),
+                        "{when}: the token is in {}",
+                        path.display()
+                    );
+                }
+            }
+            let said = app
+                .message()
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default();
+            assert!(!said.contains(TOKEN), "{when}: said on the board: {said}");
+        };
+        // Something for the error log meanwhile: what the board says while it's away.
+        app.say(
+            "build-box isn't answering, so the change is held for it.",
+            crate::app::Tone::Warn,
+        );
+        only_in_words(&app, "while offline");
+        // Back: what was held goes whole, and so do the new intent's words.
+        back(&mut app, m);
+        let handed = app.hand_over();
+        let texts: Vec<String> = handed.iter().map(|(_, _, r, _)| r.to_string()).collect();
+        assert_eq!(handed.len(), 2, "{texts:?}");
+        assert!(
+            texts.iter().all(|t| t.contains(TOKEN)),
+            "sent whole: {texts:?}"
+        );
+        press(&mut app, 'c');
+        if let super::super::Mode::Compose { draft, .. } = &mut app.mode {
+            draft.machine = m;
+        }
+        let Action::Mutate { machine, request } = press_code(&mut app, KeyCode::Enter) else {
+            panic!("the new intent wasn't sent: {:?}", app.message())
+        };
+        app.queue_action(machine, request);
+        let handed = app.hand_over();
+        assert!(
+            handed
+                .iter()
+                .any(|(_, _, r, _)| r["words"].as_str().is_some_and(|w| w.contains(TOKEN)))
+        );
+        app.keep_words_now();
+        only_in_words(&app, "once sent");
     }
 
     fn select(app: &mut App, key: &str) {
@@ -3707,6 +4176,7 @@ mod tests {
             came_back: next.draft_came_back.take(),
             filed: super::super::Filed::default(),
             unfiled: None,
+            edit: None,
         };
         let Action::Mutate { machine, request } = next.send_draft(draft) else {
             panic!("not sent: {}", said(&next))
@@ -3721,6 +4191,7 @@ mod tests {
         // Codex's review 60, 9.
         let dir = tempfile::tempdir().unwrap();
         let mut app = app();
+        app.open_terminal = || tempfile::tempfile().ok();
         app.kept = Kept::at(dir.path(), app.now().timestamp());
         app.words_dir = Some(dir.path().to_path_buf());
         app.draft = "Words not yet sent".into();
@@ -3729,7 +4200,7 @@ mod tests {
         assert!(!app.quit_key(), "it doesn't quit as if they were kept");
         assert!(said(&app).contains("words.json"), "{}", said(&app));
         assert!(
-            said(&app).ends_with("q again quits anyway, Esc stays."),
+            said(&app).ends_with("q again quits anyway and prints your words to copy, Esc stays."),
             "{}",
             said(&app)
         );

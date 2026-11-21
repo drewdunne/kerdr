@@ -17,13 +17,25 @@ use std::cell::Cell;
 
 /// A new question never takes a key held down, or one pressed before it appeared.
 const READY_AFTER: Duration = Duration::from_millis(500);
-/// As long as the backend takes an answer.
+/// As long as a backend without fix-input takes an answer.
 const ANSWER_MOST: usize = 2000;
+
+/// As long as an answer may be typed for a backend that fixes input, which saves a long one whole
+/// (intent 0591, release 5).
+const FIX_ANSWER_MOST: usize = 100_000;
+
+/// The most one answer may be, for a backend that fixes input or not.
+fn answer_most(fix: bool) -> usize {
+    if fix { FIX_ANSWER_MOST } else { ANSWER_MOST }
+}
 /// When the questions read ahead turned out not to be the ones it asks now.
 const CHANGED: &str =
     "These questions changed since the board last read them. These are the current ones.";
 /// What it adds when it has words typed for a question that has gone or been reworded.
 const CHANGED_KEPT: &str = "What you typed for the old wording:";
+/// Before answers kept for a question beside the one in its box: another Kerdr's, or his own from
+/// another time (Codex's review 98, 4).
+const ALSO_KEPT: &str = "Also kept for these questions:";
 /// When the check behind a box opened from the feed gets no answer.
 const UNCHECKED: &str =
     "Kerdr couldn't check these are still current. Your answers are checked when they're sent.";
@@ -91,8 +103,21 @@ fn as_filled(text: &str) -> String {
         .collect::<Vec<_>>()
         .join(" ")
         .chars()
-        .take(ANSWER_MOST)
+        .take(FIX_ANSWER_MOST)
         .collect()
+}
+
+/// A note with any other answers kept for its questions after it, each by its question's number.
+fn with_also(note: Option<String>, also: &[KeptAnswer]) -> Option<String> {
+    if also.is_empty() {
+        return note;
+    }
+    let listed: Vec<String> = also
+        .iter()
+        .map(|(num, _, words)| format!("{num}. {}", clean(words)))
+        .collect();
+    let words = format!("{ALSO_KEPT} {}", listed.join(" / "));
+    Some(note.map_or_else(|| words.clone(), |note| format!("{note} {words}")))
 }
 
 /// A note with any words typed against an old wording after it.
@@ -130,6 +155,9 @@ pub struct Kickoff {
     /// Words typed for a question the check found changed: they're no answer to the new one, so
     /// they stay in the note, and go with the rest of what's kept if he leaves (intent 0491).
     pub orphaned: Vec<String>,
+    /// Other answers kept for its questions, beside the ones in its box: shown in its note, and
+    /// kept with them (Codex's review 98, 4).
+    pub also: Vec<KeptAnswer>,
     /// His answers its backend gave back because their questions changed while he answered:
     /// filled in by number, again after a check finds the questions changed (intent 0591).
     pub prefill: Vec<Prefill>,
@@ -169,11 +197,21 @@ impl Kickoff {
         let questions = cleaned(&response.questions);
         let mut drafts = drafts_for(&questions, kept);
         fill_in(&questions, &mut drafts, &response.prefill);
-        let orphaned: Vec<String> = kept
-            .iter()
-            .filter(|(num, ..)| num.is_empty())
-            .map(|(.., words)| words.clone())
-            .collect();
+        // The first kept answer to a question goes in its box; any other kept for it is said and
+        // kept beside it; one for a question no longer asked, or with no question of its own, is
+        // said as typed for an old wording.
+        let mut orphaned: Vec<String> = vec![];
+        let mut also: Vec<KeptAnswer> = vec![];
+        for (i, (num, question, words)) in kept.iter().enumerate() {
+            let asked = questions
+                .iter()
+                .any(|q| q.num == *num && q.question == *question);
+            if num.is_empty() || !asked {
+                orphaned.push(words.clone());
+            } else if kept[..i].iter().any(|(n, q, _)| n == num && q == question) {
+                also.push((num.clone(), question.clone(), words.clone()));
+            }
+        }
         Some(Kickoff {
             machine,
             request,
@@ -189,9 +227,13 @@ impl Kickoff {
             } else {
                 None
             },
-            note: with_orphaned(response.note.as_deref().map(clean), &orphaned),
+            note: with_also(
+                with_orphaned(response.note.as_deref().map(clean), &orphaned),
+                &also,
+            ),
             check: 0,
             orphaned,
+            also,
             prefill: response.prefill.clone(),
             ready_at: Instant::now() + READY_AFTER,
             scroll: Cell::new(0),
@@ -213,7 +255,10 @@ impl Kickoff {
             None
         };
         self.asked = response.asked.clone().unwrap_or_default();
-        self.note = with_orphaned(response.note.as_deref().map(clean), &self.orphaned);
+        self.note = with_also(
+            with_orphaned(response.note.as_deref().map(clean), &self.orphaned),
+            &self.also,
+        );
         let now = cleaned(&response.questions);
         if now != self.questions {
             let kept = self.kept();
@@ -242,7 +287,10 @@ impl Kickoff {
             self.questions = now;
             self.at = 0;
             self.reached = 0;
-            self.note = with_orphaned(Some(CHANGED.into()), &self.orphaned);
+            self.note = with_also(
+                with_orphaned(Some(CHANGED.into()), &self.orphaned),
+                &self.also,
+            );
             self.ready_at = Instant::now() + READY_AFTER;
             self.scroll.set(0);
         }
@@ -488,7 +536,8 @@ impl App {
                 if !key
                     .modifiers
                     .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
-                    && form.typed().chars().count() < ANSWER_MOST =>
+                    && form.typed().chars().count()
+                        < answer_most(self.fixes_input(form.machine)) =>
             {
                 form.drafts[form.at].push(c);
             }
@@ -512,11 +561,19 @@ impl App {
                 .iter()
                 .map(|words| (String::new(), String::new(), words.clone())),
         );
+        // Other answers kept for its questions stay kept beside his.
+        for answer in &form.also {
+            if !kept.contains(answer) {
+                kept.push(answer.clone());
+            }
+        }
         if kept.is_empty() {
             self.kickoff_kept.remove(&held);
         } else {
             self.kickoff_kept.insert(held, kept);
         }
+        // In the words file too, so the next Kerdr has them (intent 0591, K3-34).
+        self.keep_words_now();
     }
 
     /// What a failure adds when it has words of yours in hand: where they went. `held` is its
@@ -533,8 +590,8 @@ impl App {
     }
 
     /// Text pasted into the box goes in as one line.
-    pub(super) fn kickoff_paste(form: &mut Kickoff, text: &str) {
-        let room = ANSWER_MOST.saturating_sub(form.typed().chars().count());
+    pub(super) fn kickoff_paste(form: &mut Kickoff, text: &str, fix: bool) {
+        let room = answer_most(fix).saturating_sub(form.typed().chars().count());
         let line: String = text
             .split_whitespace()
             .collect::<Vec<_>>()
@@ -894,6 +951,97 @@ mod tests {
         };
         assert_eq!(form.at, 1, "the Enter counted");
         assert_eq!(form.drafts[0], "mine");
+    }
+
+    #[test]
+    fn a_long_answer_goes_whole_to_a_backend_that_fixes_input() {
+        // Intent 0591, release 5 (B1-111): it saves a long answer whole; an older one keeps its
+        // 2000 characters.
+        let (mut app, _) = open_on(&answer());
+        key(&mut app, KeyCode::Enter);
+        let long = "word ".repeat(1000);
+        app.on_paste(&long);
+        assert_eq!(showing(&app).typed().chars().count(), ANSWER_MOST);
+        let (mut app, _) = open_on(&answer());
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        key(&mut app, KeyCode::Enter);
+        app.on_paste(&long);
+        assert_eq!(showing(&app).typed().chars().count(), long.trim().len());
+    }
+
+    #[test]
+    fn an_answer_that_looks_like_a_secret_is_asked_about_and_yes_sends_it_redacted() {
+        // Intent 0591, release 5 (B1-112): the others are saved; its backend asks about that one
+        // answer, and the yes goes back with the question's token and `override`.
+        let (mut app, id) = open_on(&answer());
+        for m in &mut app.machines {
+            if let Some(f) = m.feed.as_mut() {
+                f.supports.push(crate::images::FIX_INPUT.into());
+            }
+        }
+        key(&mut app, KeyCode::Enter);
+        typed(&mut app, "the token is ghp_abcdefghijklmnop");
+        let request = sent(key(&mut app, KeyCode::Esc));
+        assert_eq!(request["action"], "answer");
+        let machine = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .map(|c| c.machine_index)
+            .unwrap();
+        assert_eq!(
+            app.with_fix_input(machine, request.clone())["fix_input"],
+            true
+        );
+        app.action_from = app
+            .board
+            .cards
+            .iter()
+            .find(|c| c.detail.as_ref().is_some_and(|d| d.id == id))
+            .map(CardSnapshot::of);
+        app.mode = Mode::Board;
+        if let Some(c) = &app.action_from {
+            app.sel.key = Some(c.key.clone());
+        }
+        app.finish_action(
+            machine,
+            request.clone(),
+            Ok(Response {
+                ok: false,
+                confirmation: true,
+                confirm: Some("aaaabbbbccccdddd".into()),
+                message: "Your answer to question 1 looks like it holds a password or key; the others are saved. Save it with that replaced by [redacted]?".into(),
+                ..Response::default()
+            }),
+        );
+        let Mode::Confirm {
+            title,
+            request: asked,
+            ready_at,
+            ..
+        } = &mut app.mode
+        else {
+            panic!("not asked: {:?}", app.message())
+        };
+        assert!(
+            title.starts_with("Save #") && title.ends_with("'s answer?"),
+            "{title}"
+        );
+        assert_eq!(asked["confirm"], "aaaabbbbccccdddd");
+        *ready_at = None;
+        let Action::Mutate { request: yes, .. } =
+            app.on_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+        else {
+            panic!("yes sent nothing: {:?}", app.message())
+        };
+        assert_eq!(yes["override"], true);
+        assert_eq!(yes["confirm"], "aaaabbbbccccdddd");
+        assert_eq!(yes["answers"], request["answers"]);
     }
 
     #[test]
@@ -1325,6 +1473,79 @@ mod tests {
     }
 
     #[test]
+    fn two_answers_kept_for_one_question_are_both_shown_and_both_kept() {
+        // Codex's review 98, 4: two Kerdrs kept answers to the same card's questions, one each to
+        // question 1, differing. The box d opens fills in the first, says the other, and keeps
+        // both: closing it loses neither.
+        let kept = vec![
+            (
+                "1".to_string(),
+                "Whose is it?".to_string(),
+                "Kibbelz's".to_string(),
+            ),
+            (
+                "1".to_string(),
+                "Whose is it?".to_string(),
+                "Arkship's".to_string(),
+            ),
+            (
+                "3".to_string(),
+                "Where does it run?".to_string(),
+                "LAB-Server".to_string(),
+            ),
+        ];
+        let request = json!({"action": "dispatch", "id": "41", "override": true, "confirm": "old", "asked": "old", "answers": []});
+        let form =
+            Kickoff::from_answer(0, &request, &answer(), "#41".into(), "t".into(), &kept).unwrap();
+        assert_eq!(form.drafts, ["Kibbelz's", "LAB-Server"]);
+        let note = form.note.clone().unwrap_or_default();
+        assert!(
+            note.contains("1. Arkship's"),
+            "the other answer isn't said: {note}"
+        );
+        let (mut app, _) = open_on(&answer());
+        app.keep_kickoff(&form, None);
+        let back = app
+            .kickoff_kept
+            .get(&held("41"))
+            .cloned()
+            .unwrap_or_default();
+        for words in ["Kibbelz's", "Arkship's", "LAB-Server"] {
+            assert!(
+                back.iter().any(|(.., w)| w == words),
+                "{words} wasn't kept: {back:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn answers_not_saved_are_kept_for_the_next_kerdr() {
+        // Intent 0591, K3-34: a Kickoff answer that didn't go is kept for d to open again; it's
+        // kept in the words file too, so quitting never leaves it held nowhere, and the next
+        // Kerdr's d opens it.
+        let dir = tempfile::tempdir().unwrap();
+        let (mut app, id) = open_on(&answer());
+        app.kept = crate::kept::Kept::at(dir.path(), 1000);
+        typed(&mut app, "kept for later");
+        key(&mut app, KeyCode::Enter);
+        let _ = sent(key(&mut app, KeyCode::Enter));
+        let file = std::fs::read_to_string(dir.path().join("answers.json")).unwrap_or_default();
+        assert!(
+            file.contains("kept for later"),
+            "the answer isn't in the answers file: {file}"
+        );
+        let words = std::fs::read_to_string(dir.path().join("words.json")).unwrap_or_default();
+        assert!(
+            !words.contains("kept for later"),
+            "an older Kerdr could drop it: {words}"
+        );
+        app.keep_on_quit().unwrap();
+        let mut next = App::new(Config::default(), crate::demo::machines(false));
+        next.restore_words(crate::kept::Kept::at(dir.path(), 2000).take_words());
+        assert_eq!(next.kickoff_kept[&held(&id)][0].2, "kept for later");
+    }
+
+    #[test]
     fn esc_with_nothing_answered_still_keeps_what_was_typed() {
         let (mut app, id) = open_on(&answer());
         typed(&mut app, "half a thought");
@@ -1441,7 +1662,7 @@ mod tests {
             panic!()
         };
         assert_eq!(form.typed(), "qdy");
-        App::kickoff_paste(form, " two\nlines ");
+        App::kickoff_paste(form, " two\nlines ", false);
         assert_eq!(form.typed(), "qdytwo lines");
         key(&mut app, KeyCode::Backspace);
         let Mode::Kickoff { form, .. } = &app.mode else {
