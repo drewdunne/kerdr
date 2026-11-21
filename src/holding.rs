@@ -2313,12 +2313,14 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_token_typed_while_offline_is_kept_only_in_the_private_words_file_and_sent_whole() {
-        // Codex's review 85, secrets: a new intent, a text and a Kickoff answer, each with a line
-        // like a token, made while their machine doesn't answer: the change and the answer are
-        // held, the new intent's words kept in the box. Every file Kerdr writes (the hold file,
-        // the words file, the error log, its locks and state) is read: the token is in the words
-        // file alone, readable by him alone, and every request goes whole once it answers.
+    fn a_token_typed_while_offline_is_kept_only_in_kerdrs_private_files_and_sent_whole() {
+        // Codex's reviews 85 and 86, secrets: a new intent, a text and a Kickoff answer, each with
+        // a line like a token, made while their machine doesn't answer: the change and the answer
+        // are held, the new intent's words kept in the box. Every file Kerdr writes (the hold
+        // file, the words file, the error log, its locks and state) is read: the token is only in
+        // Kerdr's own private files (the words file and the hold file, 0600 in a 0700 folder),
+        // never the error log, another file, or what the board says; every request goes whole
+        // once its machine answers.
         use std::os::unix::fs::PermissionsExt;
         const TOKEN: &str = "ghp_A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
         let state = tempfile::tempdir().unwrap();
@@ -2350,21 +2352,27 @@ mod tests {
         press_code(&mut app, KeyCode::Esc);
         assert!(app.draft.contains(TOKEN));
         app.keep_words_now();
-        let only_in_words = |when: &str| {
+        let only_in_words = |app: &App, when: &str| {
+            let folder = std::fs::metadata(state.path())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(folder, 0o700, "{when}: the state folder is {folder:o}");
             let files = every_file(state.path());
             assert!(
                 files.iter().any(|(p, _)| p.ends_with("held.json")),
                 "{when}: no hold file"
             );
+            assert!(
+                files.iter().any(|(p, _)| p.ends_with("errors.log")),
+                "{when}: no error log"
+            );
             for (path, text) in &files {
                 let name = path.file_name().unwrap().to_string_lossy();
-                if name == "words.json" {
+                if name == "words.json" || name == "held.json" {
                     let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
-                    assert_eq!(mode, 0o600, "{when}: words.json is {mode:o}");
-                    assert!(
-                        text.contains(TOKEN),
-                        "{when}: the words file keeps his words"
-                    );
+                    assert_eq!(mode, 0o600, "{when}: {name} is {mode:o}");
                 } else {
                     assert!(
                         !text.contains(TOKEN),
@@ -2373,8 +2381,18 @@ mod tests {
                     );
                 }
             }
+            let said = app
+                .message()
+                .map(|(m, _)| m.to_string())
+                .unwrap_or_default();
+            assert!(!said.contains(TOKEN), "{when}: said on the board: {said}");
         };
-        only_in_words("while offline");
+        // Something for the error log meanwhile: what the board says while it's away.
+        app.say(
+            "build-box isn't answering, so the change is held for it.",
+            crate::app::Tone::Warn,
+        );
+        only_in_words(&app, "while offline");
         // Back: what was held goes whole, and so do the new intent's words.
         back(&mut app, m);
         let handed = app.hand_over();
@@ -2399,7 +2417,7 @@ mod tests {
                 .any(|(_, _, r, _)| r["words"].as_str().is_some_and(|w| w.contains(TOKEN)))
         );
         app.keep_words_now();
-        only_in_words("once sent");
+        only_in_words(&app, "once sent");
     }
 
     fn select(app: &mut App, key: &str) {
