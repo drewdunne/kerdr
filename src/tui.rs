@@ -215,7 +215,6 @@ fn event_loop(
     });
     let bg = Bg {
         images: &image_rx,
-        image_tx: &image_tx,
         answers: &action_tx,
         runner: &runner,
         inbox,
@@ -1011,7 +1010,6 @@ impl Runner {
 /// What the board's thread hands work on through, which a jump into herdr needs too.
 struct Bg<'a> {
     images: &'a mpsc::Receiver<(u64, crate::images::Loading)>,
-    image_tx: &'a mpsc::Sender<(u64, crate::images::Loading)>,
     answers: &'a mpsc::Sender<Answer>,
     runner: &'a Runner,
     inbox: &'a Inbox,
@@ -1035,18 +1033,15 @@ fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
             _ => bg.images.try_recv().ok(),
         };
         let Some((id, loading)) = got else {
-            // A read that waited for a question's answer goes once it's answered (K1-35).
-            if let Some((id, source, room)) = app.next_image_read() {
-                read_images(bg.image_tx, id, source, room);
+            // What waited for a question's answer, or for a read past its deadline, goes now
+            // (K1-35; Codex's review 85, 8).
+            if let Action::Mutate { machine, request } = app.apply_reads() {
+                start_action(app, bg.answers, bg.runner, machine, request);
             }
             return;
         };
         if let Action::Mutate { machine, request } = app.images_loaded(id, loading) {
             start_action(app, bg.answers, bg.runner, machine, request);
-        }
-        // A read asked for while that one went goes next (intent 0591, K1-35).
-        if let Some((id, source, room)) = app.next_image_read() {
-            read_images(bg.image_tx, id, source, room);
         }
     }
 }
@@ -2471,13 +2466,17 @@ mod tests {
         let holds = RefCell::new(Holds::off());
         let bg = Bg {
             images: &image_rx,
-            image_tx: &image_tx,
             answers: &answers,
             runner: &runner,
             inbox: &inbox,
             holds: &holds,
         };
-        app.image_load = Some(7);
+        app.image_reads.push_back(crate::app::ImageRead {
+            id: 7,
+            at: "The dock:".len(),
+            for_send: true,
+            got: None,
+        });
         app.send_after_load = Some((
             7,
             crate::app::Draft {

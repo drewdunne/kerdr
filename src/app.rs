@@ -493,14 +493,17 @@ pub(crate) struct SmallerAsk {
     pub at: usize,
 }
 
-/// A read asked for while another was still going (intent 0591, K1-35): read next, in the order
-/// pasted, its tags where the words ended when it was asked; for the words Enter sent, or for the
-/// box.
+/// An image read for the box, started the moment it was asked for, so what it reads is what the
+/// clipboard held then (Codex's review 85, 4); what it found goes in in the order they were asked
+/// (intent 0591, K1-35), its tags where the words ended then: for the box, or for the words Enter
+/// sent while it read.
 #[derive(Clone, Debug)]
-pub(crate) struct QueuedRead {
-    pub source: crate::images::Source,
+pub(crate) struct ImageRead {
+    pub id: u64,
     pub at: usize,
     pub for_send: bool,
+    /// What it found, once it has: waiting for the reads before it.
+    pub got: Option<crate::images::Loading>,
 }
 
 /// Words whose image didn't go in, and the question about them: its number goes in the question's
@@ -695,13 +698,9 @@ pub struct App {
     pub draft_came_back: Option<Submission>,
     /// The images being read for the new-intent box, by the number of that read; a read whose
     /// box closed meanwhile is dropped when it ends.
-    pub image_load: Option<u64>,
+    /// The reads for the new-intent box not yet in, oldest first (ImageRead).
+    pub(crate) image_reads: std::collections::VecDeque<ImageRead>,
     image_loads: u64,
-    /// Where in the words that read's tags go: where the words ended when it began, so words
-    /// typed while it reads come after them.
-    image_at: usize,
-    /// Reads asked for while one was going, read next in that order (intent 0591, K1-35).
-    pub(crate) image_queue: std::collections::VecDeque<QueuedRead>,
     /// Images too large to send, while Kerdr asks about smaller copies of them.
     pub(crate) smaller_asks: Vec<SmallerAsk>,
     /// What didn't go in with words Enter sent, from each read they waited for, said once the
@@ -1024,10 +1023,8 @@ impl App {
             draft: String::new(),
             draft_images: vec![],
             draft_came_back: None,
-            image_load: None,
+            image_reads: Default::default(),
             image_loads: 0,
-            image_at: 0,
-            image_queue: Default::default(),
             smaller_asks: vec![],
             send_troubles: vec![],
             as_written: Default::default(),
@@ -1221,7 +1218,8 @@ impl App {
             Mode::Kickoff { form, .. } => Instant::now() < form.ready_at,
             _ => false,
         } || matches!(&self.message, Some((_, Tone::Fail, at)) if at.elapsed() < FAIL_SEEN);
-        if answer_coming || guard_up || self.image_load.is_some() || self.pending_jump.is_some() {
+        if answer_coming || guard_up || !self.image_reads.is_empty() || self.pending_jump.is_some()
+        {
             KEY_WAIT_COMING
         } else {
             KEY_WAIT
@@ -4393,9 +4391,14 @@ pub(crate) mod tests {
         let mut app = demo_app();
         assert_eq!(app.key_wait(), KEY_WAIT);
         // An image being read.
-        app.image_load = Some(1);
+        app.image_reads.push_back(crate::app::ImageRead {
+            id: 1,
+            at: 0,
+            for_send: false,
+            got: None,
+        });
         assert_eq!(app.key_wait(), KEY_WAIT_COMING);
-        app.image_load = None;
+        app.image_reads.clear();
         // An answer on its way, until it comes.
         let (key, id) = waiting_backlog_card(&app);
         let request = serde_json::json!({"action": "move", "id": id, "delta": 1});
@@ -5967,8 +5970,6 @@ pub(crate) mod tests {
         let (id, room) = app.begin_image_load(&Source::Clipboard).unwrap();
         assert_eq!(room, crate::images::Room::left(&[]));
         assert_eq!(app.message().unwrap().0, "Reading the clipboard…");
-        // While it reads, a second read waits its turn.
-        assert!(app.begin_image_load(&Source::Clipboard).is_none());
         // Words typed while it reads come after the tag, where it was pasted.
         for c in " again".chars() {
             press(&mut app, c);
@@ -6496,8 +6497,10 @@ pub(crate) mod tests {
 
     #[test]
     fn a_second_read_asked_while_one_goes_is_read_next_and_both_go_in_in_order() {
-        // Intent 0591, K1-35: never "still reading"; the second waits its turn, and each tag goes
-        // where the words ended when it was pasted.
+        // Intent 0591, K1-35: never "still reading"; each read starts at once, so it reads what
+        // the clipboard held when it was asked (Codex's review 85, 4), and what they found goes in
+        // in the order they were asked, each tag where the words ended when it was pasted,
+        // whichever comes back first.
         use crate::images::Source;
         let mut app = demo_app();
         press(&mut app, 'c');
@@ -6508,33 +6511,28 @@ pub(crate) mod tests {
         for c in " one".chars() {
             press(&mut app, c);
         }
-        assert!(app.begin_image_load(&Source::Clipboard).is_none());
+        let (second, _) = app
+            .begin_image_load(&Source::Clipboard)
+            .expect("the second read starts at once");
         assert!(
-            app.message().unwrap().0.contains("this one is read next"),
+            app.message()
+                .unwrap()
+                .0
+                .contains("it goes in after the last"),
             "{:?}",
             app.message()
         );
         for c in " two".chars() {
             press(&mut app, c);
         }
-        assert_eq!(app.next_image_read(), None, "not while the first goes");
-        app.images_loaded(
-            first,
-            crate::images::Loading {
-                images: vec![a_png()],
-                ..Default::default()
-            },
-        );
-        assert_eq!(box_words(&app), "Shots: [Image #1] one two");
-        let (second, source, _) = app.next_image_read().expect("the second goes next");
-        assert_eq!(source, Source::Clipboard);
-        app.images_loaded(
-            second,
-            crate::images::Loading {
-                images: vec![a_png()],
-                ..Default::default()
-            },
-        );
+        let png = || crate::images::Loading {
+            images: vec![a_png()],
+            ..Default::default()
+        };
+        // The second's answer comes first: it waits for the first.
+        app.images_loaded(second, png());
+        assert_eq!(box_words(&app), "Shots: one two");
+        app.images_loaded(first, png());
         assert_eq!(box_words(&app), "Shots: [Image #1] one [Image #2] two");
         // Enter while both are still to come: the words go once both are in.
         app.cfg.actions.command = Some("test-adapter".into());
@@ -6543,28 +6541,57 @@ pub(crate) mod tests {
             press(&mut app, c);
         }
         let (a, _) = app.begin_image_load(&Source::Clipboard).unwrap();
-        assert!(app.begin_image_load(&Source::Clipboard).is_none());
+        let (b, _) = app.begin_image_load(&Source::Clipboard).unwrap();
         assert_eq!(
             app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
             Action::None
         );
-        let png = || crate::images::Loading {
-            images: vec![a_png()],
-            ..Default::default()
-        };
         assert_eq!(
             app.images_loaded(a, png()),
             Action::None,
             "the second is still to come"
         );
-        let (b, ..) = app
-            .next_image_read()
-            .expect("read for the words Enter sent");
         let Action::Mutate { request, .. } = app.images_loaded(b, png()) else {
             panic!("not sent once both were in")
         };
         assert_eq!(request["words"], "Again: [Image #1] [Image #2]");
         assert_eq!(request["images"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn each_paste_reads_what_the_clipboard_held_when_it_was_pasted() {
+        // Codex's review 85, 4: while a slow read goes, he copies B and pastes, then copies C and
+        // pastes. Each read starts as he pastes, so B's read reads B, and all three go in in order.
+        use crate::images::Source;
+        let clipboard = std::cell::RefCell::new("A".to_string());
+        // As the board's loop does: a read that begins starts its reader at once, and what the
+        // reader finds is what the clipboard holds as it starts.
+        let started: std::cell::RefCell<Vec<(u64, String)>> = Default::default();
+        let mut app = demo_app();
+        press(&mut app, 'c');
+        let paste = |app: &mut App| {
+            let (id, _) = app
+                .begin_image_load(&Source::Clipboard)
+                .expect("a read starts as he pastes");
+            started.borrow_mut().push((id, clipboard.borrow().clone()));
+        };
+        paste(&mut app);
+        *clipboard.borrow_mut() = "B".into();
+        paste(&mut app);
+        *clipboard.borrow_mut() = "C".into();
+        paste(&mut app);
+        // The readers finish, the slow first one last.
+        let finished: Vec<(u64, String)> = started.borrow().iter().rev().cloned().collect();
+        for (id, text) in finished {
+            app.images_loaded(
+                id,
+                crate::images::Loading {
+                    text: Some(format!("<{text}>")),
+                    ..Default::default()
+                },
+            );
+        }
+        assert_eq!(box_words(&app), "<A> <B> <C>");
     }
 
     #[test]
@@ -6651,9 +6678,16 @@ pub(crate) mod tests {
             },
         );
         assert_eq!(box_words(&app), "Look: [Image #1] again");
-        // A read queued behind one that's asked about waits for the answer, then goes (K1-35).
+        // A read after one that's asked about waits for the answer, then goes in (K1-35).
         let first = app.begin_image_load(&Source::Clipboard).unwrap().0;
-        assert!(app.begin_image_load(&Source::Clipboard).is_none(), "queued");
+        let (second, _) = app.begin_image_load(&Source::Clipboard).unwrap();
+        app.images_loaded(
+            second,
+            crate::images::Loading {
+                text: Some("after".into()),
+                ..Default::default()
+            },
+        );
         app.images_loaded(
             first,
             crate::images::Loading {
@@ -6665,14 +6699,11 @@ pub(crate) mod tests {
             matches!(app.mode, Mode::Confirm { .. }),
             "asked about the first"
         );
-        assert_eq!(
-            app.next_image_read(),
-            None,
-            "the second waits for the answer"
-        );
+        assert_eq!(app.image_reads.len(), 1, "the second waits for the answer");
         assert_eq!(press(&mut app, 'n'), Action::None);
-        let (second, ..) = app.next_image_read().expect("and goes once it's answered");
-        app.images_loaded(second, crate::images::Loading::default());
+        app.apply_reads();
+        assert!(app.image_reads.is_empty(), "and goes once it's answered");
+        assert!(box_words(&app).ends_with("after"), "{}", box_words(&app));
         // No: left out, said.
         app.attach_images(crate::images::Loading {
             images: vec![big],

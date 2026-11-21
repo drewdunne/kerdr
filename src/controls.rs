@@ -2167,10 +2167,7 @@ impl App {
             // Kept as you left them, emptied included.
             self.keep_words_now();
             // A read for words already sent carries on for them; the box's own stop.
-            if self.box_loading().is_some() {
-                self.image_load = None;
-            }
-            self.image_queue.retain(|q| q.for_send);
+            self.image_reads.retain(|r| r.for_send);
             self.mode = *back;
             return Action::None;
         }
@@ -2195,9 +2192,7 @@ impl App {
                     self.say("Write what you want first.", Tone::Info);
                 } else if !self.can_write(draft.machine) {
                     // Said why; the box stays open with the words.
-                } else if self.send_after_load.is_some()
-                    && self.image_queue.iter().any(|q| !q.for_send)
-                {
+                } else if self.send_after_load.is_some() && self.box_loading().is_some() {
                     // His last new intent still waits for its image, and this one's is read after
                     // it: the box keeps these words until theirs is in.
                     self.say(
@@ -2210,8 +2205,8 @@ impl App {
                     // K1-35). What the box kept for next time is these words, now on their way: it
                     // opens empty, and nothing else typed meanwhile is cleared when they go.
                     self.clear_kept_draft();
-                    for q in &mut self.image_queue {
-                        q.for_send = true;
+                    for r in &mut self.image_reads {
+                        r.for_send = true;
                     }
                     self.send_troubles.clear();
                     self.send_after_load = Some((load, draft));
@@ -2364,10 +2359,13 @@ impl App {
         self.draft_came_back = None;
     }
 
-    /// The image read for the box that's open, not one for words already sent.
+    /// The last image read for the box that's open, not one for words already sent.
     fn box_loading(&self) -> Option<u64> {
-        self.image_load
-            .filter(|l| self.send_after_load.as_ref().is_none_or(|(s, _)| s != l))
+        self.image_reads
+            .iter()
+            .rev()
+            .find(|r| !r.for_send)
+            .map(|r| r.id)
     }
 
     /// Words a failed save gives back: into the box for the next c when it's free, else kept
@@ -2505,9 +2503,10 @@ impl App {
             .is_some_and(|f| f.supports(images::FIX_INPUT))
     }
 
-    /// Starts reading images for the new-intent box: the read's number and the room its draft
-    /// has left, or None when there's no box to read them into, or another read is going: then
-    /// this one is read next, its tags where the words end now (intent 0591, K1-35).
+    /// Starts reading images for the new-intent box at once, so a clipboard read takes what the
+    /// clipboard holds now, whatever reads are still going (Codex's review 85, 4): the read's
+    /// number and the room its draft has left, or None when there's no box to read them into.
+    /// What it finds goes in after what the reads before it found (intent 0591, K1-35).
     pub fn begin_image_load(&mut self, source: &images::Source) -> Option<(u64, images::Room)> {
         let Mode::Compose { draft, .. } = &self.mode else {
             return None;
@@ -2518,80 +2517,39 @@ impl App {
             _ => draft.words.len(),
         };
         let room = images::Room::for_backend(&draft.images, fix);
-        if self.image_load.is_some() {
-            self.image_queue.push_back(crate::app::QueuedRead {
-                source: source.clone(),
-                at,
-                for_send: false,
-            });
+        let after = self.box_loading().is_some();
+        self.image_loads += 1;
+        let id = self.image_loads;
+        self.image_reads.push_back(crate::app::ImageRead {
+            id,
+            at,
+            for_send: false,
+            got: None,
+        });
+        if after {
             self.say(
-                "Still reading the last image: this one is read next, and goes in after it.",
+                format!(
+                    "{} too; it goes in after the last.",
+                    reading(source).trim_end_matches('…')
+                ),
                 Tone::Info,
             );
-            return None;
+        } else {
+            self.say(reading(source), Tone::Info);
         }
-        self.image_at = at;
-        self.image_loads += 1;
-        self.image_load = Some(self.image_loads);
-        self.say(reading(source), Tone::Info);
-        Some((self.image_loads, room))
-    }
-
-    /// The next read asked for while another went (K1-35), once none is going: for the words
-    /// Enter sent, or for the box while it's open. Its number, what it reads and its room.
-    pub fn next_image_read(&mut self) -> Option<(u64, images::Source, images::Room)> {
-        if self.image_load.is_some() {
-            return None;
-        }
-        while let Some(q) = self.image_queue.pop_front() {
-            // The box behind a question about the last read's images: this one waits for the
-            // answer, so it never lands while the box can't take it.
-            if !q.for_send
-                && matches!(&self.mode, Mode::Confirm { back, .. } if matches!(**back, Mode::Compose { .. }))
-            {
-                self.image_queue.push_front(q);
-                return None;
-            }
-            let draft = if q.for_send {
-                self.send_after_load.as_ref().map(|(_, d)| d)
-            } else {
-                match &self.mode {
-                    Mode::Compose { draft, .. } => Some(draft),
-                    _ => None,
-                }
-            };
-            // Its words have gone (the box closed): nothing to read it for.
-            let Some(draft) = draft else {
-                continue;
-            };
-            let room = images::Room::for_backend(&draft.images, self.fixes_input(draft.machine));
-            self.image_loads += 1;
-            let id = self.image_loads;
-            self.image_load = Some(id);
-            self.image_at = q.at;
-            if q.for_send
-                && let Some((load, _)) = self.send_after_load.as_mut()
-            {
-                *load = id;
-            }
-            if !q.for_send {
-                self.say(reading(&q.source), Tone::Info);
-            }
-            return Some((id, q.source, room));
-        }
-        None
+        Some((id, room))
     }
 
     /// After words and tags went in at `at`, `inserted` long: the reads still to come for the same
     /// words, and smaller copies still asked about, keep their places after them.
     fn shift_queued(&mut self, for_send: bool, at: usize, inserted: usize) {
-        for q in self
-            .image_queue
+        for r in self
+            .image_reads
             .iter_mut()
-            .filter(|q| q.for_send == for_send)
+            .filter(|r| r.for_send == for_send)
         {
-            if q.at >= at {
-                q.at += inserted;
+            if r.at >= at {
+                r.at += inserted;
             }
         }
         if !for_send {
@@ -2603,49 +2561,76 @@ impl App {
         }
     }
 
-    /// A read started by begin_image_load has ended: its images go in, unless the box it was
-    /// for has closed since. When Enter sent the words while it read, they go now, with it: the
-    /// action that sends them (intent 0445), once every read asked before Enter is in.
+    /// A read started by begin_image_load has ended: what it found waits for the reads before
+    /// it, then goes in (apply_reads). A read nobody waits for any more (its box closed, or it
+    /// ran past its deadline) is let go.
     pub fn images_loaded(&mut self, id: u64, loading: images::Loading) -> Action {
-        if self.image_load != Some(id) {
-            return Action::None;
+        if let Some(r) = self
+            .image_reads
+            .iter_mut()
+            .find(|r| r.id == id && r.got.is_none())
+        {
+            r.got = Some(loading);
         }
-        self.image_load = None;
-        if let Some((load, mut draft)) = self.send_after_load.take() {
-            if load == id {
-                let fix = self.fixes_input(draft.machine);
-                let got = attach_into(&mut draft, loading, Some(self.image_at), fix);
-                self.shift_queued(true, got.at, got.inserted);
-                if got.refused || !got.oversized.is_empty() {
-                    self.send_troubles.extend(
-                        got.said
-                            .iter()
-                            .filter(|s| !s.starts_with("Attached"))
-                            .cloned(),
-                    );
-                    if !got.oversized.is_empty() {
-                        self.send_troubles.push(too_large_to_send(&got.oversized));
-                    }
-                }
-                // More read for these words: they wait for them too (K1-35).
-                if self.image_queue.front().is_some_and(|q| q.for_send) {
-                    self.send_after_load = Some((load, draft));
-                    return Action::None;
-                }
-                let troubles = std::mem::take(&mut self.send_troubles);
-                if !troubles.is_empty() {
-                    // Not everything read went in (none found, the box full, too many or too
-                    // big). His words may be about it, so whether they go without it is his
-                    // call (intent 0591, K1-37).
-                    self.ask_send_without(draft, &troubles);
-                    return Action::None;
-                }
-                return self.send_draft(draft);
+        self.apply_reads()
+    }
+
+    /// What reads found, put in in the order they were asked: the box's into the box, unless a
+    /// question about an earlier one's images is up, which they wait for; the words Enter sent go
+    /// once every read they waited for is in, the action that sends them (intent 0445).
+    pub fn apply_reads(&mut self) -> Action {
+        loop {
+            let Some(front) = self.image_reads.front() else {
+                return Action::None;
+            };
+            if front.got.is_none() {
+                return Action::None;
             }
-            self.send_after_load = Some((load, draft));
+            let behind_question = matches!(&self.mode, Mode::Confirm { back, .. }
+                if matches!(**back, Mode::Compose { .. }));
+            if !front.for_send && behind_question {
+                return Action::None;
+            }
+            let Some(read) = self.image_reads.pop_front() else {
+                return Action::None;
+            };
+            let loading = read.got.unwrap_or_default();
+            if !read.for_send {
+                self.attach_images_at(loading, Some(read.at));
+                continue;
+            }
+            let Some((load, mut draft)) = self.send_after_load.take() else {
+                continue;
+            };
+            let fix = self.fixes_input(draft.machine);
+            let got = attach_into(&mut draft, loading, Some(read.at), fix);
+            self.shift_queued(true, got.at, got.inserted);
+            if got.refused || !got.oversized.is_empty() {
+                self.send_troubles.extend(
+                    got.said
+                        .iter()
+                        .filter(|s| !s.starts_with("Attached"))
+                        .cloned(),
+                );
+                if !got.oversized.is_empty() {
+                    self.send_troubles.push(too_large_to_send(&got.oversized));
+                }
+            }
+            // More read for these words: they wait for them too (K1-35).
+            if self.image_reads.iter().any(|r| r.for_send) {
+                self.send_after_load = Some((load, draft));
+                continue;
+            }
+            let troubles = std::mem::take(&mut self.send_troubles);
+            if !troubles.is_empty() {
+                // Not everything read went in (none found, the box full, too many or too big).
+                // His words may be about it, so whether they go without it is his call (intent
+                // 0591, K1-37).
+                self.ask_send_without(draft, &troubles);
+                return Action::None;
+            }
+            return self.send_draft(draft);
         }
-        self.attach_images_at(loading, Some(self.image_at));
-        Action::None
     }
 
     /// Asks whether a new intent's words go without the image that didn't go in. They're given
