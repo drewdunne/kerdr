@@ -1861,11 +1861,10 @@ impl App {
             .key
             .as_ref()
             .and_then(|k| list.iter().position(|&i| &self.board.cards[i].key == k));
+        // Past either end there's nowhere to go: the selection stays (Codex's review 85, 1).
         let step = |dir: i32| -> Option<usize> {
-            let at = at? as i32 + dir;
-            (0..list.len() as i32)
-                .contains(&at)
-                .then_some(list[at as usize])
+            let at = usize::try_from(at? as i64 + dir as i64).ok()?;
+            list.get(at).copied()
         };
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         match key.code {
@@ -3950,6 +3949,38 @@ pub(crate) mod tests {
         app.width = 120;
         app.height = 40;
         assert!(!app.compact());
+    }
+
+    #[test]
+    fn j_and_k_past_either_end_of_the_compact_list_stay_where_they_are() {
+        // Codex's review 85, 1: k on the first row, j on the last, and either on a list of one.
+        let mut app = demo_app();
+        app.width = 28;
+        app.height = 12;
+        let list = app.compact_cards();
+        let key = |app: &App, i: usize| app.board.cards[i].key.clone();
+        let (first, last) = (key(&app, list[0]), key(&app, *list.last().unwrap()));
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key, Some(first.clone()));
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key, Some(first.clone()), "k on the first row");
+        for _ in 0..list.len() + 2 {
+            press(&mut app, 'j');
+        }
+        assert_eq!(app.sel.key, Some(last), "j on the last row");
+        // A list of one: only the first card still needs you.
+        for (n, i) in list.iter().enumerate().skip(1) {
+            app.board.cards[*i].attention = crate::model::Attention::Idle;
+            app.board.cards[*i].why = format!("quiet {n}");
+        }
+        app.waiting.clear();
+        let list = app.compact_cards();
+        assert_eq!(list.len(), 1, "one card left: {list:?}");
+        press_code(&mut app, KeyCode::Down);
+        press_code(&mut app, KeyCode::Up);
+        press(&mut app, 'j');
+        press(&mut app, 'k');
+        assert_eq!(app.sel.key, Some(key(&app, list[0])));
     }
 
     #[test]
