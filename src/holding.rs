@@ -2291,22 +2291,31 @@ impl App {
             n => format!(" (and {n} images, which can't be shown here)"),
         };
         let mut parts = vec![];
+        let mut escaped = false;
+        let mut shown = |text: &str| {
+            let (text, any) = shown_escaped(text);
+            escaped |= any;
+            text
+        };
         for e in &words.edits {
             let reference = self.reference_for(&e.id);
-            parts.push(format!("Your new text for {reference}:\n{}", e.text));
+            parts.push(format!(
+                "Your new text for {reference}:\n{}",
+                shown(&e.text)
+            ));
         }
         if let Some(d) = &words.draft {
             parts.push(format!(
                 "Your new intent's words, not sent{}:\n{}",
                 images(d.images.len()),
-                d.words
+                shown(&d.words)
             ));
         }
         for r in &words.returned {
             parts.push(format!(
                 "Words given back to you, not saved{}:\n{}",
                 images(r.images.len()),
-                r.words
+                shown(&r.words)
             ));
         }
         for a in &words.answers {
@@ -2317,9 +2326,9 @@ impl App {
                 .iter()
                 .map(|(n, question, answer)| {
                     if question.is_empty() {
-                        answer.clone()
+                        shown(answer)
                     } else {
-                        format!("{n}. {question}\n{answer}")
+                        format!("{n}. {}\n{}", shown(question), shown(answer))
                     }
                 })
                 .collect();
@@ -2331,8 +2340,13 @@ impl App {
         if parts.is_empty() {
             return String::new();
         }
+        let note = if escaped {
+            "\nControl characters in them are shown escaped, so none acts on your terminal: \\x1b is an escape, \\\\ a backslash."
+        } else {
+            ""
+        };
         format!(
-            "Kerdr couldn't keep these for the next Kerdr, so here they are to copy:\n\n{}\n",
+            "Kerdr couldn't keep these for the next Kerdr, so here they are to copy:{note}\n\n{}\n",
             parts.join("\n\n")
         )
     }
@@ -2357,6 +2371,36 @@ impl App {
     }
 }
 
+/// His text as it's printed for him to copy: control characters other than new lines and tabs as
+/// \xNN (\u{NNNN} past ASCII), and a backslash doubled, so nothing in it acts on the terminal
+/// (clears it, hides what came before, sets its clipboard) and each can be turned back (Codex's
+/// review 98, 3). Whether anything was escaped.
+pub(crate) fn shown_escaped(text: &str) -> (String, bool) {
+    use std::fmt::Write;
+    let mut out = String::with_capacity(text.len());
+    let mut any = false;
+    for c in text.chars() {
+        match c {
+            '\\' => {
+                out.push_str("\\\\");
+                any = true;
+            }
+            '\n' | '\t' => out.push(c),
+            c if c.is_control() => {
+                any = true;
+                let n = u32::from(c);
+                if n < 0x80 {
+                    let _ = write!(out, "\\x{n:02x}");
+                } else {
+                    let _ = write!(out, "\\u{{{n:04x}}}");
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    (out, any)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2371,6 +2415,70 @@ mod tests {
         let mut app = App::new(Config::default(), crate::demo::machines(false));
         app.cfg.actions.command = Some("test-adapter".into());
         app
+    }
+
+    #[test]
+    fn printed_words_show_control_characters_escaped_and_turn_back_to_his() {
+        // Codex's review 98, 3: an edit holding escape sequences (one clears the screen, one
+        // sets the terminal's clipboard, a carriage return writes over its line) is printed with
+        // each shown escaped, a backslash doubled, and said; turned back, it's his text exactly.
+        let mut app = app();
+        let card = app.board.cards[0].clone();
+        let text = "Danger \x1b[2J\x1b]52;c;ZXZpbA==\x07 over\r and a \\ backslash\nnext\u{9b}line";
+        app.edits.insert(
+            card.key.clone(),
+            crate::app::edit_controls::Held {
+                id: card.detail.as_ref().unwrap().id.clone(),
+                machine: card.machine_index,
+                current: "Old words.".into(),
+                was: "sha256:aa".into(),
+                read_at: Instant::now(),
+                mine: Some(crate::app::edit_controls::Mine {
+                    text: text.into(),
+                    from: "Old words.".into(),
+                }),
+                check_first: false,
+                read_only: None,
+            },
+        );
+        let printed = app.unkept_texts();
+        assert!(
+            !printed
+                .chars()
+                .any(|c| c.is_control() && c != '\n' && c != '\t'),
+            "a control character would reach the terminal: {printed:?}"
+        );
+        assert!(printed.contains("shown escaped"), "{printed}");
+        let shown = r"Danger \x1b[2J\x1b]52;c;ZXZpbA==\x07 over\x0d and a \\ backslash";
+        assert!(printed.contains(shown), "{printed}");
+        // Turned back.
+        let unescape = |shown: &str| {
+            let mut out = String::new();
+            let mut chars = shown.chars().peekable();
+            while let Some(c) = chars.next() {
+                if c != '\\' {
+                    out.push(c);
+                    continue;
+                }
+                match chars.next() {
+                    Some('\\') => out.push('\\'),
+                    Some('x') => {
+                        let hex: String = chars.by_ref().take(2).collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                    }
+                    Some('u') => {
+                        let hex: String =
+                            chars.by_ref().skip(1).take_while(|c| *c != '}').collect();
+                        out.push(char::from_u32(u32::from_str_radix(&hex, 16).unwrap()).unwrap());
+                    }
+                    other => panic!("not an escape: {other:?}"),
+                }
+            }
+            out
+        };
+        let start = printed.find("Danger").unwrap();
+        let end = printed[start..].find("line").unwrap() + start + "line".len();
+        assert_eq!(unescape(&printed[start..end]), text);
     }
 
     #[cfg(unix)]
