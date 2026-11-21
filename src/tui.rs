@@ -2252,6 +2252,7 @@ mod tests {
     }
 
     /// The runner's resend after a followed end refused with `retry` 1: `since`, when Kerdr had it.
+    #[cfg(unix)]
     fn after_follow(since: crate::actions::Clocks) -> Option<Box<crate::actions::After>> {
         let last = crate::actions::parse_response(
             r##"{"ok":false,"retry":1,"message":"#7 didn't start yet; ⏎ again in a moment."}"##,
