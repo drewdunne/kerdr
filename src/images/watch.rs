@@ -299,13 +299,10 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
     use x11rb::connection::Connection;
     use x11rb::protocol::Event;
     use x11rb::protocol::xfixes::{ConnectionExt as _, SelectionEventMask};
-    use x11rb::protocol::xproto::{
-        AtomEnum, ConnectionExt as _, CreateWindowAux, EventMask, PropMode, WindowClass,
-    };
+    use x11rb::protocol::xproto::{ConnectionExt as _, CreateWindowAux, EventMask, WindowClass};
     use x11rb::reexports::x11rb_protocol::parse_display::{ConnectAddress, parse_display};
     use x11rb::reexports::x11rb_protocol::xauth::get_auth;
     use x11rb::rust_connection::{DefaultStream, RustConnection};
-    use x11rb::wrapper::ConnectionExt as _;
     // DISPLAY, as x11rb reads it; a test's own socket by its path.
     let (stream, auth, screen) = match socket_at {
         None => {
@@ -389,31 +386,14 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
     let Some((window, ping)) = set_up() else {
         return;
     };
-    // Each check pings: a property changed on Kerdr's window, in order, one at a time to send.
-    // Its notice comes back after every notice the server sent before it, and this thread counts
-    // those in order, so once it's answered every copy made before the check is counted.
     let answered = Arc::new((Mutex::new(0u64), Condvar::new()));
-    let sync: SyncFn = {
-        let (conn, answered, sent) = (conn.clone(), answered.clone(), Mutex::new(0u64));
-        Box::new(move |bound| {
-            let want = {
-                let mut sent = sent.lock().unwrap_or_else(|e| e.into_inner());
-                let pinged = conn
-                    .change_property8(PropMode::REPLACE, window, ping, AtomEnum::STRING, b"k")
-                    .is_ok()
-                    && conn.flush().is_ok();
-                if !pinged {
-                    return false;
-                }
-                *sent += 1;
-                *sent
-            };
-            let (count, came) = &*answered;
-            let count = count.lock().unwrap_or_else(|e| e.into_inner());
-            let waited = came.wait_timeout_while(count, bound, |n| *n < want);
-            waited.is_ok_and(|(_, timeout)| !timeout.timed_out())
-        })
-    };
+    let sync = x11_sync(
+        conn.clone(),
+        window,
+        ping,
+        answered.clone(),
+        Arc::downgrade(shared),
+    );
     if !shared.ready(sync) {
         return;
     }
@@ -429,6 +409,73 @@ fn x11(shared: &Arc<Shared>, socket_at: Option<&std::path::Path>) {
             Err(_) => return,
         }
     }
+}
+
+/// How a check brings Kerdr's X11 watch up to date: it pings, a property changed on Kerdr's own
+/// window, in order, one at a time to send. The ping's notice comes back after every notice the
+/// server sent before it, and the watch's thread counts those in order, so once it's answered
+/// every copy made before the check is counted. The whole check is bounded, waiting its turn and
+/// sending included (Codex's review 92, 1): past the bound, wherever it's stuck, the watch is
+/// retired from outside it, which shuts the socket, and that ends a send the server stopped
+/// reading.
+#[cfg(not(any(target_os = "macos", windows)))]
+fn x11_sync(
+    conn: Arc<x11rb::rust_connection::RustConnection>,
+    window: u32,
+    ping: u32,
+    answered: Arc<(Mutex<u64>, std::sync::Condvar)>,
+    watch: std::sync::Weak<Shared>,
+) -> SyncFn {
+    use std::sync::TryLockError;
+    use std::time::Instant;
+    use x11rb::connection::Connection;
+    use x11rb::protocol::xproto::{AtomEnum, PropMode};
+    use x11rb::wrapper::ConnectionExt as _;
+    let sent = Mutex::new(0u64);
+    Box::new(move |bound| {
+        let until = Instant::now() + bound;
+        let (finished, finish) = std::sync::mpsc::channel::<()>();
+        let late = watch.clone();
+        let _ = std::thread::Builder::new()
+            .name("kerdr-clipboard-check".into())
+            .spawn(move || {
+                if finish.recv_timeout(bound) == Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                    && let Some(watch) = late.upgrade()
+                {
+                    watch.retire();
+                }
+            });
+        let checked = (|| {
+            let want = {
+                let mut sent = loop {
+                    match sent.try_lock() {
+                        Ok(sent) => break sent,
+                        Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+                        Err(TryLockError::WouldBlock) if Instant::now() < until => {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                        Err(TryLockError::WouldBlock) => return false,
+                    }
+                };
+                let pinged = conn
+                    .change_property8(PropMode::REPLACE, window, ping, AtomEnum::STRING, b"k")
+                    .is_ok()
+                    && conn.flush().is_ok();
+                if !pinged {
+                    return false;
+                }
+                *sent += 1;
+                *sent
+            };
+            let (count, came) = &*answered;
+            let count = count.lock().unwrap_or_else(|e| e.into_inner());
+            let left = until.saturating_duration_since(Instant::now());
+            let waited = came.wait_timeout_while(count, left, |n| *n < want);
+            waited.is_ok_and(|(_, timeout)| !timeout.timed_out())
+        })();
+        let _ = finished.send(());
+        checked
+    })
 }
 
 /// Kerdr's Wayland watch: each selection the desktop offers through data-control, counted as it
@@ -589,6 +636,61 @@ mod tests {
             take_since(watch.pasted(), || Ok(Found::Text("<B>".into()))),
             Ok(Found::Text("<B>".into()))
         );
+    }
+
+    #[cfg(not(any(target_os = "macos", windows)))]
+    #[test]
+    fn a_check_whose_write_stalls_is_given_up_at_its_bound_and_the_watch_retired() {
+        // Codex's review 92, 1: the X server stops reading, and Kerdr's side of the socket fills
+        // up, so the check's ping can't be sent. The check, a second one waiting its turn too, ends
+        // at its bound; the watch is retired, and its socket shut from outside the stuck send.
+        use std::io::Write;
+        use std::os::unix::net::UnixStream;
+        use std::sync::Condvar;
+        use x11rb::rust_connection::{DefaultStream, RustConnection};
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let fill = ours.try_clone().unwrap();
+        let (stream, _) = DefaultStream::from_unix_stream(ours).unwrap();
+        let mut filling = &fill;
+        loop {
+            match filling.write(&[0; 65536]) {
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(e) => panic!("{e}"),
+            }
+        }
+        let setup = x11rb::protocol::xproto::Setup {
+            resource_id_mask: 0x1f_ffff,
+            ..Default::default()
+        };
+        let conn = Arc::new(RustConnection::for_connected_stream(stream, setup).unwrap());
+        let shared = Arc::new(Shared::default());
+        shared.known.store(true, SeqCst);
+        let shut = fill.try_clone().unwrap();
+        assert!(shared.on_stop(Box::new(move || {
+            let _ = shut.shutdown(std::net::Shutdown::Both);
+        })));
+        let answered = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let sync = Arc::new(x11_sync(conn, 1, 2, answered, Arc::downgrade(&shared)));
+        let (done, came) = std::sync::mpsc::channel();
+        for _ in 0..2 {
+            let (sync, done) = (sync.clone(), done.clone());
+            std::thread::spawn(move || {
+                let began = Instant::now();
+                let synced = sync(Duration::from_millis(300));
+                let _ = done.send((synced, began.elapsed()));
+            });
+        }
+        for _ in 0..2 {
+            let (synced, took) = came
+                .recv_timeout(Duration::from_secs(3))
+                .expect("a check never returned: its write stalled");
+            assert!(!synced);
+            assert!(took < Duration::from_secs(1), "{took:?}");
+        }
+        assert!(shared.now().is_none(), "the watch wasn't retired");
+        assert!(shared.stopped(), "its socket wasn't shut");
+        drop(theirs);
     }
 
     #[cfg(not(any(target_os = "macos", windows)))]
