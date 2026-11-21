@@ -36,6 +36,64 @@ pub const MOST_READ: usize = 200_000_000;
 /// How long a clipboard reader may take before Kerdr gives up on it.
 const READ_DEADLINE: Duration = Duration::from_secs(5);
 
+/// The most reads for the box that run at once, one Kerdr has stopped waiting for counted until it
+/// really ends: past it, a paste is refused and said (Codex's review 86, 6).
+pub const MOST_READERS: usize = 8;
+
+/// The reads for the box running now, each counted from its start until its thread ends, however
+/// long after the board stopped waiting for it that is (Codex's review 86, 6).
+#[derive(Clone, Debug, Default)]
+pub struct Workers {
+    running: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+/// One running read, counted until it's dropped, as its thread ends.
+struct Running(Arc<std::sync::atomic::AtomicUsize>);
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Workers {
+    pub fn running(&self) -> usize {
+        self.running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Runs `f` on a thread of its own, counted until that thread ends, unless `most` are running
+    /// already: then false, and `f` isn't run.
+    pub fn start(&self, most: usize, f: impl FnOnce() + Send + 'static) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        let mut now = self.running.load(SeqCst);
+        loop {
+            if now >= most {
+                return false;
+            }
+            match self.running.compare_exchange(now, now + 1, SeqCst, SeqCst) {
+                Ok(_) => break,
+                Err(was) => now = was,
+            }
+        }
+        let counted = Running(self.running.clone());
+        // A thread that can't be made drops `f`, and its count with it.
+        std::thread::Builder::new()
+            .name("kerdr-read".into())
+            .spawn(move || {
+                let _counted = counted;
+                f();
+            })
+            .is_ok()
+    }
+}
+
+/// Why a paste didn't go in while `running` reads still run (Codex's review 86, 6).
+pub fn too_many_reads(running: usize) -> String {
+    format!(
+        "Kerdr is still waiting on {running} earlier reads that haven't ended (a drive or a clipboard that doesn't answer), so this one didn't go in. Paste it again once they have."
+    )
+}
+
 /// The most a read for the box may take, whatever it waits on (a clipboard program, a mount that
 /// doesn't answer), before the board lets it go and says so (Codex's review 85, 8): two clipboard
 /// readers' deadlines and some, or PowerShell's on a cold machine; longer for a smaller copy,
@@ -1139,21 +1197,13 @@ fn copied_files(uri_list: &str, any: bool) -> Result<Found, String> {
 }
 
 /// Kerdr's own ways of reading the clipboard, with no program to run (intent 0591, K3-63): the
-/// Wayland data-control protocol, and X11's selections. Each runs on a thread of its own, held to
-/// READ_DEADLINE, so a desktop that doesn't answer can't stop a read.
+/// Wayland data-control protocol, and X11's selections. Each runs on the paste's own read, which
+/// the board lets go at its deadline and counts until it ends (Codex's review 86, 6), so a
+/// desktop that doesn't answer can't stop the board, nor leave threads uncounted.
 #[cfg(not(any(target_os = "macos", windows)))]
 mod builtin {
     use super::{Listing, READ_DEADLINE, Reader};
     use std::io::Read;
-
-    /// Runs `f` on a thread of its own, held to READ_DEADLINE.
-    fn within<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> Option<T> {
-        let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::spawn(move || {
-            let _ = tx.send(f());
-        });
-        rx.recv_timeout(READ_DEADLINE).ok()
-    }
 
     pub fn readers(wayland: bool, x11: bool) -> Vec<Reader<'static>> {
         let mut out = vec![];
@@ -1176,39 +1226,30 @@ mod builtin {
 
     fn wayland_list() -> Listing {
         use wl_clipboard_rs::paste::{ClipboardType, Error, Seat, get_mime_types_ordered};
-        match within(|| get_mime_types_ordered(ClipboardType::Regular, Seat::Unspecified)) {
-            None => {
-                Listing::Failed("Couldn't read the clipboard: the desktop didn't answer.".into())
-            }
-            Some(Ok(types)) if types.is_empty() => Listing::Empty,
-            Some(Ok(types)) => Listing::Types(types),
-            Some(Err(Error::ClipboardEmpty | Error::NoMimeType)) => Listing::Empty,
-            Some(Err(
+        match get_mime_types_ordered(ClipboardType::Regular, Seat::Unspecified) {
+            Ok(types) if types.is_empty() => Listing::Empty,
+            Ok(types) => Listing::Types(types),
+            Err(Error::ClipboardEmpty | Error::NoMimeType) => Listing::Empty,
+            Err(
                 e @ (Error::MissingProtocol { .. }
                 | Error::WaylandConnection(_)
                 | Error::SocketOpenError(_)
                 | Error::NoSeats),
-            )) => Listing::Missing(e.to_string()),
-            Some(Err(e)) => Listing::Missing(e.to_string()),
+            ) => Listing::Missing(e.to_string()),
+            Err(e) => Listing::Missing(e.to_string()),
         }
     }
 
     fn wayland_read(t: &str, cap: usize) -> Result<Vec<u8>, String> {
         use wl_clipboard_rs::paste::{ClipboardType, MimeType, Seat, get_contents};
-        let t = t.to_string();
-        within(move || -> Result<Vec<u8>, String> {
-            let (pipe, _) = get_contents(
-                ClipboardType::Regular,
-                Seat::Unspecified,
-                MimeType::Specific(&t),
-            )
-            .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))?;
-            read_bounded(pipe, cap, READ_DEADLINE)
-                .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))
-        })
-        .unwrap_or_else(|| {
-            Err("Couldn't read the clipboard: the program that copied it didn't answer.".into())
-        })
+        let (pipe, _) = get_contents(
+            ClipboardType::Regular,
+            Seat::Unspecified,
+            MimeType::Specific(t),
+        )
+        .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))?;
+        read_bounded(pipe, cap, READ_DEADLINE)
+            .map_err(|e| format!("Couldn't read the clipboard's {t}: {e}."))
     }
 
     /// Reads a pipe to its end, at most `cap` bytes and one more, and for at most `deadline`: a
@@ -1259,35 +1300,24 @@ mod builtin {
     }
 
     fn x11_list() -> Listing {
-        match within(|| x11_get("TARGETS", 64 * 1024).map(|(_, names)| names)) {
-            None => {
-                Listing::Failed("Couldn't read the clipboard: the desktop didn't answer.".into())
-            }
-            Some(Ok(types)) if types.is_empty() => Listing::Empty,
-            Some(Ok(types)) => Listing::Types(types),
-            Some(Err(X11::Empty)) => Listing::Empty,
-            Some(Err(X11::Unusable(why))) => Listing::Missing(why),
-            Some(Err(X11::Failed(why))) => Listing::Failed(why),
+        match x11_get("TARGETS", 64 * 1024).map(|(_, names)| names) {
+            Ok(types) if types.is_empty() => Listing::Empty,
+            Ok(types) => Listing::Types(types),
+            Err(X11::Empty) => Listing::Empty,
+            Err(X11::Unusable(why)) => Listing::Missing(why),
+            Err(X11::Failed(why)) => Listing::Failed(why),
         }
     }
 
     fn x11_read(t: &str, cap: usize) -> Result<Vec<u8>, String> {
-        let t = t.to_string();
-        within(move || {
-            x11_get(&t, cap)
-                .map(|(bytes, _)| bytes)
-                .map_err(|e| match e {
-                    X11::Empty => {
-                        format!("Couldn't read the clipboard's {t}: it's no longer offered.")
-                    }
-                    X11::Unusable(why) | X11::Failed(why) => {
-                        format!("Couldn't read the clipboard's {t}: {why}.")
-                    }
-                })
-        })
-        .unwrap_or_else(|| {
-            Err("Couldn't read the clipboard: the program that copied it didn't answer.".into())
-        })
+        x11_get(t, cap)
+            .map(|(bytes, _)| bytes)
+            .map_err(|e| match e {
+                X11::Empty => format!("Couldn't read the clipboard's {t}: it's no longer offered."),
+                X11::Unusable(why) | X11::Failed(why) => {
+                    format!("Couldn't read the clipboard's {t}: {why}.")
+                }
+            })
     }
 
     /// How many 32-bit units to ask a property for when `room` bytes are left: enough for them,

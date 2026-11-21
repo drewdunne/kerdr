@@ -208,6 +208,7 @@ fn event_loop(
         });
     });
     let (image_tx, image_rx) = mpsc::channel::<(u64, crate::images::Loading)>();
+    let readers = crate::images::Workers::default();
     let holds = RefCell::new(if live.is_some() && !app.demo {
         Holds::on()
     } else {
@@ -515,8 +516,12 @@ fn event_loop(
         match action {
             Action::None => {}
             Action::LoadImages(source) => {
-                if let Some((id, room)) = app.begin_image_load(&source) {
-                    read_images(&image_tx, id, source, room);
+                if let Some(read) = app.begin_image_load(&source) {
+                    let reading = Reading {
+                        workers: &readers,
+                        load: |source: crate::images::Source, room| source.load(room),
+                    };
+                    start_read(app, &image_tx, read, source, reading);
                 }
             }
             Action::CopyLink(url) => {
@@ -1046,17 +1051,38 @@ fn send_loaded_images(app: &mut App, bg: &Bg, wait: Option<Duration>) {
     }
 }
 
-/// Reads images on a thread of its own; what it found comes back on `tx`.
-fn read_images(
+/// How a read for the box is done: on `workers`, at most images::MOST_READERS at once, read
+/// with `load`.
+pub(crate) struct Reading<'a, L> {
+    pub workers: &'a crate::images::Workers,
+    pub load: L,
+}
+
+/// Starts a read begun by begin_image_load; what it found comes back on `tx`. Every read runs on
+/// a worker counted until it really ends, the board having let it go at its deadline or not; with
+/// images::MOST_READERS running, the paste is refused and said (Codex's review 86, 6).
+pub(crate) fn start_read<L>(
+    app: &mut App,
     tx: &mpsc::Sender<(u64, crate::images::Loading)>,
-    id: u64,
+    (id, room): (u64, crate::images::Room),
     source: crate::images::Source,
-    room: crate::images::Room,
-) {
+    reading: Reading<'_, L>,
+) where
+    L: FnOnce(crate::images::Source, crate::images::Room) -> crate::images::Loading
+        + Send
+        + 'static,
+{
+    use crate::images::{Loading, MOST_READERS};
+    let Reading { workers, load } = reading;
     let tx = tx.clone();
-    std::thread::spawn(move || {
-        let _ = tx.send((id, source.load(room)));
-    });
+    if !workers.start(MOST_READERS, move || {
+        let _ = tx.send((id, load(source, room)));
+    }) {
+        let _ = app.images_loaded(
+            id,
+            Loading::refused(crate::images::too_many_reads(workers.running())),
+        );
+    }
 }
 
 /// Runs an action in the background; its answer comes back on the channel. A change to a card goes
@@ -1897,6 +1923,144 @@ fn no_browser(why: &str, copied: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The demo's new-intent box, open, as a paste finds it.
+    fn box_open() -> App {
+        let mut app = App::new(
+            crate::config::Config::machine_split(),
+            crate::demo::machines(false),
+        );
+        use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+        assert!(matches!(app.mode, crate::app::Mode::Compose { .. }));
+        app
+    }
+
+    fn words_in(app: &App) -> (String, usize) {
+        match &app.mode {
+            crate::app::Mode::Compose { draft, .. } => (draft.words.clone(), draft.images.len()),
+            m => panic!("the box isn't open: {m:?}"),
+        }
+    }
+
+    /// What the reads send back, put in as the board's loop puts it, until none comes for `wait`.
+    fn take_back(
+        app: &mut App,
+        rx: &mpsc::Receiver<(u64, crate::images::Loading)>,
+        wait: Duration,
+    ) {
+        while let Ok((id, loading)) = rx.recv_timeout(wait) {
+            let _ = app.images_loaded(id, loading);
+        }
+    }
+
+    /// Waits up to five seconds for `done`.
+    fn soon(done: impl Fn() -> bool) -> bool {
+        let until = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            if Instant::now() > until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
+    }
+
+    #[test]
+    fn reads_that_stall_are_counted_until_they_end_and_one_past_the_most_is_refused_and_said() {
+        // Codex's review 86, 6: a mount that doesn't answer, and he pastes its image's path again
+        // and again. The board stops waiting for each at its deadline, but its read is counted
+        // until it really ends: past the most at once, a paste is refused and said, a clipboard
+        // paste too, with nothing more left running; once the mount answers, pastes go in again.
+        use crate::images::{Loaded, Loading, MOST_READERS, Source, Workers};
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        use std::sync::{Arc, Condvar, Mutex};
+        let gate = Arc::new((Mutex::new(false), Condvar::new()));
+        let (stalled, most) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let workers = Workers::default();
+        let (tx, rx) = mpsc::channel();
+        let mut app = box_open();
+        let path = || Source::Files(vec!["/mnt/slow/shot.png".into()]);
+        let stall = || {
+            let (gate, stalled, most) = (gate.clone(), stalled.clone(), most.clone());
+            move |_source: Source, _room| {
+                let now = stalled.fetch_add(1, SeqCst) + 1;
+                most.fetch_max(now, SeqCst);
+                let (open, opened) = &*gate;
+                let mut open = open.lock().unwrap();
+                while !*open {
+                    open = opened.wait(open).unwrap();
+                }
+                stalled.fetch_sub(1, SeqCst);
+                Loading::refused("The mount answered at last.")
+            }
+        };
+        fn reading<L>(workers: &Workers, load: L) -> Reading<'_, L> {
+            Reading { workers, load }
+        }
+        for _ in 0..MOST_READERS + 3 {
+            let read = app.begin_image_load(&path()).unwrap();
+            start_read(&mut app, &tx, read, path(), reading(&workers, stall()));
+            // Its deadline passes: the board stops waiting for it.
+            for r in app.image_reads.iter_mut() {
+                r.started = Instant::now() - Duration::from_secs(60);
+            }
+            let _ = app.apply_reads();
+            assert!(app.image_reads.is_empty());
+        }
+        assert!(soon(|| stalled.load(SeqCst) >= MOST_READERS));
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(
+            most.load(SeqCst),
+            MOST_READERS,
+            "more stalled reads ran at once than the most"
+        );
+        let (said, _) = app.message().unwrap();
+        assert!(
+            said.contains(&format!("still waiting on {MOST_READERS} earlier reads")),
+            "{said}"
+        );
+        // A clipboard paste: refused too, its reader never run.
+        let ran = Arc::new(AtomicBool::new(false));
+        let read = app.begin_image_load(&Source::Clipboard).unwrap();
+        let took = ran.clone();
+        let clipboard = reading(&workers, move |_source: Source, _room| {
+            took.store(true, SeqCst);
+            Loading {
+                text: Some("words".into()),
+                ..Default::default()
+            }
+        });
+        start_read(&mut app, &tx, read, Source::Clipboard, clipboard);
+        assert!(!ran.load(SeqCst));
+        assert!(app.message().unwrap().0.contains("still waiting on"));
+        // The mount answers: the reads end, and the count with them.
+        *gate.0.lock().unwrap() = true;
+        gate.1.notify_all();
+        assert!(
+            soon(|| workers.running() == 0),
+            "{} still counted",
+            workers.running()
+        );
+        take_back(&mut app, &rx, Duration::from_millis(100));
+        assert_eq!(
+            words_in(&app),
+            (String::new(), 0),
+            "a read let go put nothing in"
+        );
+        let read = app.begin_image_load(&path()).unwrap();
+        let png = |_source: Source, _room| Loading {
+            images: vec![Loaded {
+                media_type: "image/png",
+                bytes: b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR".to_vec(),
+                from: "shot.png".into(),
+            }],
+            ..Default::default()
+        };
+        start_read(&mut app, &tx, read, path(), reading(&workers, png));
+        take_back(&mut app, &rx, Duration::from_millis(500));
+        assert_eq!(words_in(&app).1, 1, "{:?}", app.message());
+    }
 
     #[test]
     fn no_browser_puts_the_link_on_the_clipboard_and_says_so_without_it() {
